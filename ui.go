@@ -120,7 +120,7 @@ progress { width: 160px; height: 8px; }
     </div>
     <div class="hint">
       <span id="keyStatus" class="muted"></span><br>
-      自动复用管理面板密钥；未生效可在此手动填入。
+      本页直接复用 CPA 管理面板已登录的密钥（面板需勾选「记住密码」）；读不到时在此填入一次即可。
     </div>
   </div>
 
@@ -256,20 +256,32 @@ progress { width: 160px; height: 8px; }
   var queueTimer = null;
   var lastQueueSeq = 0;
   var stopped = false;
+  // authReady 表示管理密钥已通过探针验证；定时器与首屏加载都以它为门。
+  var authReady = false;
 
   // ---- 管理密钥的获取 ----
   //
-  // 本页与 CPA 管理面板**同源**，因此可以复用面板已保存的密钥，
-  // 不需要用户再输入一遍。面板把它存在 localStorage 的 "managementKey" 键下，
-  // 且做了可逆的 XOR 混淆（前缀 enc::v1::，密钥由
-  // "cli-proxy-api-webui::secure-storage|<host>|<userAgent>" 派生——
-  // 全是本页也能读到的公开值，因此可以解出来）。
+  // 本页与 CPA 管理面板（CPAMC）**同源**，所以可以直接复用面板已保存的
+  // 管理密钥，用户不必再输入一遍。面板把整份认证状态存在 localStorage 的
+  // "cli-proxy-auth" 键下，值是可逆的 XOR 混淆：
   //
-  // 面板只在勾选「记住密码」时才落盘该键，所以自动读取是**尽力而为**：
-  // 读不到时回落到让用户手填（见 ensureKeyBanner）。
+  //   enc::v1:: + base64( utf8(JSON) XOR key )
+  //   key = utf8("cli-proxy-api-webui::secure-storage|<host>|<userAgent>")
+  //
+  // 明文形如 {"state":{...,"managementKey":"<密钥>",...},"version":N}，
+  // 密钥在 state.managementKey。
+  //
+  // 注意：面板只在登录时勾选「记住密码」才把 managementKey 写进去——未勾选
+  // 时这个键仍然存在，但没有该字段。因此自动复用是**尽力而为**：读不到就
+  // 退回让用户手填一次（见 revealKeyInput）。
+  var PANEL_STORE_KEY = "cli-proxy-auth";
+  var PANEL_KEY_FIELD = "managementKey";
+  var MANUAL_STORE_KEY = "cpa-management-key";
   var OBF_PREFIX = "enc::v1::";
   var OBF_SEED = "cli-proxy-api-webui::secure-storage";
   var manualKey = "";
+  var keyBusy = false;
+  var keyRetryAfter = 0;
 
   function obfuscationKey() {
     return new TextEncoder().encode(
@@ -317,35 +329,39 @@ progress { width: 160px; height: 8px; }
     return text;
   }
 
-  // detectKey 依次尝试：手工输入 → 明文键 → 面板的混淆键。
-  function detectKey() {
-    if (manualKey) return manualKey;
-    var direct = [];
-    try {
-      direct.push(localStorage.getItem("managementKey"));
-      direct.push(sessionStorage.getItem("managementKey"));
-      direct.push(localStorage.getItem("cpa-management-key"));
-      direct.push(sessionStorage.getItem("cpa-management-key"));
-    } catch (e) { /* 隐私模式下存储可能不可用 */ }
-    for (var i = 0; i < direct.length; i++) {
-      var value = normalizeKeyValue(direct[i]);
-      if (value) return value;
+  // panelAuthKey 从面板的持久化快照里取出管理密钥。
+  //
+  //   localStorage["cli-proxy-auth"] = "enc::v1::" + XOR(JSON) 或纯 JSON
+  //   JSON.state.managementKey
+  //
+  // 面板未勾选「记住密码」时快照里没有 managementKey 字段，这里返回空串。
+  function panelAuthKey() {
+    var raw = "";
+    try { raw = localStorage.getItem(PANEL_STORE_KEY) || ""; } catch (e) { return ""; }
+    if (!raw) return "";
+    var text = raw;
+    if (raw.indexOf(OBF_PREFIX) === 0) {
+      text = deobfuscate(raw) || "";
+      if (!text) return "";
     }
-    try {
-      var decoded = deobfuscate(localStorage.getItem("managementKey"));
-      var fromPanel = normalizeKeyValue(decoded);
-      if (fromPanel) return fromPanel;
-    } catch (e) { /* 忽略 */ }
-    return "";
+    var snapshot = null;
+    try { snapshot = JSON.parse(text); } catch (e) { return ""; }
+    if (!snapshot || typeof snapshot !== "object") return "";
+    // zustand persist 的落盘格式是 {state:{...},version:N}，也兼容直接存 state。
+    var state = (snapshot.state && typeof snapshot.state === "object") ? snapshot.state : snapshot;
+    return normalizeKeyValue(state[PANEL_KEY_FIELD]);
   }
 
+  // managementKey 返回当前生效的管理密钥。
+  //
+  // 优先级：本页刚手输的值 → 面板快照 → 本标签页早前手输并**验证过**的值。
+  // 返回空串表示没有任何可用密钥，此时 api() 不会发出任何请求。
   function managementKey() {
-    try {
-      var key = detectKey();
-      // 手工输入的密钥只存本标签页（关闭即失效），不落盘成明文。
-      if (key) sessionStorage.setItem("cpa-management-key", key);
-      return key;
-    } catch (e) { return manualKey; }
+    if (manualKey) return manualKey;
+    var fromPanel = panelAuthKey();
+    if (fromPanel) return fromPanel;
+    try { return normalizeKeyValue(sessionStorage.getItem(MANUAL_STORE_KEY)); }
+    catch (e) { return ""; }
   }
 
   var bannerTimer = null;
@@ -371,24 +387,28 @@ progress { width: 160px; height: 8px; }
     if (el) el.className = "banner";
   }
 
-  // 鉴权失败立即停掉所有自动刷新：CPA 会按 IP 统计失败次数并封禁。
+  // haltOnAuthFailure 判定密钥失效：立即停止一切自动请求并展开手填框。
+  //
+  // CPA 按 IP 统计管理密钥失败次数，5 次封禁 30 分钟；未携带密钥也计数，且
+  // 封禁作用于整个 /v0/management（即整个后台）。所以必须一次失败就停。
   function haltOnAuthFailure(status) {
     if (status !== 401 && status !== 403) return false;
     stopped = true;
+    authReady = false;
     if (logTimer) { clearInterval(logTimer); logTimer = null; }
     if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }
+    stopLoginPolling();
     revealKeyInput();
-    banner("err", "管理密钥无效或缺失（HTTP " + status + "）。已停止自动刷新以免触发 IP 封禁。"
-      + "请在上方填入管理密钥——若 CPA 面板勾选了「记住密码」，本页本应能自动读取；"
-      + "未勾选时需手动填一次。");
+    setKeyStatus("管理密钥无效或缺失（HTTP " + status + "）");
+    banner("err", "管理密钥无效或缺失（HTTP " + status + "）。已停止全部自动请求，避免触发 CPA 的 IP 封禁。"
+      + "若面板勾选了「记住密码」，本页会自动复用；未勾选请在上方填入一次。");
     return true;
   }
 
-  // revealKeyInput 展开密钥输入框（自动读取失败时的手动兜底）。
+  // revealKeyInput 展开密钥输入框（自动复用失败时的手动兜底）；此时不发任何请求。
   function revealKeyInput() {
     var box = document.getElementById("keyBox");
     if (box) box.hidden = false;
-    setKeyStatus("需要手动填写");
   }
 
   function setKeyStatus(text) {
@@ -402,9 +422,15 @@ progress { width: 160px; height: 8px; }
   function hostPath(path) { return HOST_PREFIX + path; }
 
   function api(method, path, body) {
-    var headers = { "Content-Type": "application/json" };
+    // 闸门：身份未确认（或已判定失效）时绝不发请求。
+    //
+    // CPA 把「未携带管理密钥」也计为一次失败，5 次即封禁 30 分钟，且封的是
+    // 整个 /v0/management——页面多发一个请求都是在拿整个后台冒险。
+    if (stopped) return Promise.resolve(null);
     var key = managementKey();
-    if (key) headers["Authorization"] = "Bearer " + key;
+    if (!key) return Promise.resolve(null);
+    var headers = { "Content-Type": "application/json" };
+    headers["Authorization"] = "Bearer " + key;
     var url = path.indexOf(HOST_PREFIX) === 0
       ? HOST_MGMT + path.slice(HOST_PREFIX.length)
       : MGMT + path;
@@ -1072,15 +1098,42 @@ progress { width: 160px; height: 8px; }
   // ---- 视图切换与事件绑定 ----
 
   document.getElementById("btnUseKey").addEventListener("click", function () {
+    if (keyBusy) return;
+    if (Date.now() < keyRetryAfter) {
+      banner("warn", "密钥刚验证失败，请稍候几秒再试（CPA 按 IP 统计失败次数，不能连续重试）。");
+      return;
+    }
     var input = document.getElementById("keyInput");
     var value = (input.value || "").trim();
     if (!value) { banner("err", "请先填入管理密钥"); return; }
+    if (!KEY_RE.test(value)) { banner("err", "管理密钥只能包含可见 ASCII 字符"); return; }
+
+    // 先发**一个**探针请求验证；通过后才记忆并加载数据。失败就到此为止，
+    // 绝不把首屏请求全打出去（那会正好撞上 CPA 的 5 次封禁阈值）。
+    keyBusy = true;
     manualKey = value;
-    try { sessionStorage.setItem("cpa-management-key", value); } catch (e) { /* 忽略 */ }
     stopped = false;
-    document.getElementById("keyBox").hidden = true;
-    clearBanner();
-    loadStatus();
+    authReady = false;
+    setKeyStatus("正在验证密钥…");
+    probeManagementAuth().then(function (ok) {
+      keyBusy = false;
+      if (!ok) {
+        manualKey = "";
+        keyRetryAfter = Date.now() + 10000;
+        revealKeyInput();
+        setKeyStatus("密钥无效，请重新输入（面板勾选「记住密码」可免输）");
+        if (!stopped) banner("err", "密钥验证失败：请求未能通过 CPA 鉴权。");
+        return;
+      }
+      // 只在本标签页记住（关闭即失效），且必须是验证过的值。
+      try { sessionStorage.setItem(MANUAL_STORE_KEY, value); } catch (e) { /* 忽略 */ }
+      authReady = true;
+      input.value = "";
+      document.getElementById("keyBox").hidden = true;
+      setKeyStatus("已使用手动填入的密钥");
+      clearBanner();
+      startConsole();
+    });
   });
 
   // ---- 添加账号（OAuth 设备授权）----
@@ -1369,38 +1422,80 @@ progress { width: 160px; height: 8px; }
   });
   document.getElementById("btnLogs").addEventListener("click", function () { loadLogs(true); });
   document.getElementById("autoLogs").addEventListener("change", function (event) {
-    if (logTimer) { clearInterval(logTimer); logTimer = null; }
-    if (event.target.checked && !stopped) {
-      loadLogs(true);
-      logTimer = setInterval(function () { loadLogs(false); }, 5000);
-    }
+    if (event.target.checked && authReady) loadLogs(true);
+    syncLogPolling();
   });
 
-  // 启动：报告密钥来源。自动读取失败时直接展开手填框，避免用户面对一片空白。
-  (function boot() {
-    var auto = "";
-    try {
-      auto = detectKey();
-    } catch (e) { auto = ""; }
-    if (auto) {
-      setKeyStatus("已自动复用 CPA 面板的密钥");
-    } else {
-      revealKeyInput();
-      // 区分两种情况：面板没保存，或保存了但解不出来（浏览器 UA 变了等）。
-      var saved = "";
-      try { saved = localStorage.getItem("managementKey") || ""; } catch (e) { saved = ""; }
-      setKeyStatus(saved
-        ? "检测到面板保存的密钥但无法解码（通常是浏览器版本变化导致），请手动填入一次"
-        : "面板未保存密钥（未勾选「记住密码」），请手动填入一次");
+  // syncLogPolling 按登录状态与「自动刷新」勾选情况启停日志轮询。
+  //
+  // 定时器是封禁的放大器（每 5 秒一次失败），必须在身份确认之前一律不启动。
+  function syncLogPolling() {
+    if (logTimer) { clearInterval(logTimer); logTimer = null; }
+    var box = document.getElementById("autoLogs");
+    if (authReady && box && box.checked) {
+      logTimer = setInterval(function () { loadLogs(false); }, 5000);
     }
-    // 供应商表要最先拉：账号表与模型表的展示名都依赖它，
-    // 否则首屏会先闪一下原始 id 再变成展示名。
+  }
+
+  // probeManagementAuth 用**单个**请求验证管理密钥是否有效。
+  //
+  // 这是本页最重要的安全阀：CPA 按 IP 统计管理密钥失败次数，5 次即封禁
+  // 30 分钟且封的是整个后台。首屏若并发 5 个请求，一旦密钥失效就会正好打满
+  // 阈值。因此先只发 1 个请求，成功了才继续。
+  function probeManagementAuth() {
+    return api("GET", "/vendors").then(function (data) {
+      return !!(data && data.vendors);
+    }).catch(function () { return false; });
+  }
+
+  // startConsole 首屏加载。
+  //
+  // 串行而非并发：任何一步返回 401/403 都会立刻置 stopped，后面的请求被
+  // api() 的闸门挡下，因此一次打开最多造成 1 次失败。
+  // 供应商表仍排第一：账号表与模型表的展示名都依赖它。
+  function startConsole() {
     loadVendors().then(function () {
+      // 单步失败不应阻断后续模块；鉴权失败时 api() 闸门会挡下所有后续请求。
+      return loadStatus().catch(function () { return null; });
+    }).then(function () {
+      return loadQuotas(true).catch(function () { return null; });
+    }).then(function () {
       loadModels(true);   // 进入页面自动获取模型清单
       loadLogs(true);     // 进入页面自动拉一次日志
-      // 串行：账号表先渲染，额度再填充（并行会被"查询中"覆盖）。
-      loadStatus().then(function () { loadQuotas(true); });
+      syncLogPolling();
     });
+  }
+
+  // authSourceLabel 描述当前密钥来源，用于密钥框下方的状态文案。
+  function authSourceLabel() {
+    if (manualKey) return "正在验证手动填入的密钥…";
+    if (panelAuthKey()) return "已自动复用 CPA 管理面板的密钥";
+    return "未检测到面板保存的管理密钥";
+  }
+
+  // ensureAuth 确认管理密钥可用后才开始加载数据。
+  //
+  // 没有密钥时 probeManagementAuth() 里的 api() 直接返回空，**不会发出任何
+  // 请求**，因此未勾选「记住密码」的用户打开本页也不会让 CPA 记失败次数。
+  function ensureAuth() {
+    setKeyStatus(authSourceLabel());
+    probeManagementAuth().then(function (ok) {
+      if (!ok) {
+        revealKeyInput();
+        setKeyStatus("未检测到可用的管理密钥：可在面板退出后用「记住密码」重新登录一次，或在此填入");
+        return;
+      }
+      authReady = true;
+      stopped = false;
+      document.getElementById("keyBox").hidden = true;
+      clearBanner();
+      startConsole();
+    });
+  }
+
+  // 启动：能自动复用面板密钥就直接加载；读不到才展开手填框。
+  (function boot() {
+    ensureAuth();
   })();
 })();
 </script>

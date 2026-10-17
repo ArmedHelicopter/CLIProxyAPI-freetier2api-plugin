@@ -6,7 +6,7 @@
 // 宿主 internal/pluginstore 的安装契约：
 //
 //   - 归档资产名：{id}_{version}_{goos}_{goarch}.zip
-//     （version 是 tag 去掉前导 v，例如 tag v0.1.1 → 0.1.1）
+//     （version 是 tag 去掉前导 v，例如 tag v0.0.10 → 0.0.10）
 //   - 校验和资产名必须**恰好**是 checksums.txt，格式为 `<sha256>  <文件名>`
 //   - zip 内**根目录**必须有且仅有一个动态库，文件名必须是 {id}{ext}
 //     或 {id}-v{version}{ext}；zip 内出现其它动态库会被拒绝
@@ -15,7 +15,7 @@
 // 两种模式：
 //
 //	打包：  packstore -lib dist/freetier2api-linux-amd64.so -id freetier2api \
-//	                 -version 0.1.0 -goos linux -goarch amd64 -out-dir dist
+//	                 -version 0.0.10 -goos linux -goarch amd64 -out-dir dist
 //	校验和：packstore -checksums-dir dist      # 汇总目录下所有 *.zip → checksums.txt
 //
 // 汇总步骤必须单独做：矩阵里每个平台各生成一份 checksums.txt 会互相覆盖，

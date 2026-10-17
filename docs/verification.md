@@ -158,3 +158,51 @@ libc.musl-aarch64.so.1: cannot open shared object file
 docker run --rm -v "$PWD":/app -w /app golang:1.24-bookworm \
   sh -c 'CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o dist/freetier2api.so .'
 ```
+
+## 六、控制台页复用管理面板密钥（0.0.10）
+
+### 6.1 根因（实测 CPAMC 线上 bundle）
+
+打开 `http://<CPA>/management.html` 下载到的 bundle（约 3.3 MB）后确认：
+
+| 事实 | 证据 |
+| --- | --- |
+| 面板认证状态存在 `localStorage["cli-proxy-auth"]` | zustand persist `{name:Bc}`，`Bc = "cli-proxy-auth"` |
+| 值是可逆 XOR 混淆 | `_l = "enc::v1::"`、`vl = "cli-proxy-api-webui::secure-storage"`，seed 由 `vl` + host + userAgent 用竖线拼接 |
+| 明文是 `{state:{...},version:N}` | persist 落盘格式；`state.managementKey` 即 CPA 管理密钥 |
+| **未勾选「记住密码」时快照里没有密钥** | `partialize: e => ({apiBase, ...(e.rememberPassword ? {managementKey} : {}), rememberPassword, ...})` |
+| 登录表单默认不勾选记住密码 | 登录组件 `useState(!1)` |
+| 插件资源页由面板 iframe 加载，同源 | `<iframe src={apiBase + menu.path} referrerPolicy="no-referrer">`，无 sandbox |
+| 面板请求头 | axios 拦截器 `Authorization = "Bearer " + managementKey` |
+
+旧版插件页只读 `localStorage["managementKey"]` / `cpa-management-key`，因此即使用户
+勾选了「记住密码」也复用不到，只能手输。
+
+### 6.2 封禁机制（来自 CPA 源码）
+
+`internal/api/handlers/management/handler.go`：
+
+- `AuthenticateManagementKey`：`provided == ""`（没带密钥）也调用 `fail()`；
+- `maxFailures = 5`、`banDuration = 30 * time.Minute`，计数按 `c.ClientIP()`；
+- 中间件挂在整个 `/v0/management` 路由组上（含插件管理路由），因此封禁会锁死整个后台。
+
+旧版控制台页在拿不到密钥时仍按 `vendors → models + logs + status → quotas` 并发发起
+**5 个**请求 → 正好打满 5 次失败 → 立即封禁 30 分钟。
+
+### 6.3 修复后的不变量
+
+- 只读 `localStorage["cli-proxy-auth"]` → XOR 解码 → `JSON.parse` → `state.managementKey`；
+- 没有密钥：**0 个管理请求**，只展开手填框；
+- 有密钥：先发 **1 个** `GET /vendors` 探针，成功后才串行加载首屏；
+- 任一 401/403：置 `stopped`，清空日志/队列/登录轮询，后续 `api()` 一律不出网；
+- 手输值只在探针通过后写入 `sessionStorage`（仅当前标签页）。
+
+### 6.4 验收步骤
+
+1. 面板勾选「记住密码」登录 → 打开插件页：输入框不出现；DevTools Network 中首个请求是
+   `GET /v0/management/plugins/freetier2api/vendors`，成功后才出现其余请求。
+2. 面板未勾选「记住密码」→ 打开插件页：Network **无** `/v0/management/...` 请求，页面
+   直接展开手填框；填入密钥后仅 1 个探针请求，成功后才加载数据。
+3. 故意填错密钥：只产生 1 次 401/403；10 秒内再次提交会被前端拦截；CPA 后台仍可正常登录
+   （失败计数从 1 开始而不是 5）。
+4. 无密钥场景同时打开 3 个标签页：`/v0/management` 失败计数不增长。

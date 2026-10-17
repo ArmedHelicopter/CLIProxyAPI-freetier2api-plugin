@@ -129,31 +129,48 @@ func TestConsolePagePathsAreDeclared(t *testing.T) {
 	}
 }
 
-// TestConsolePageDecodesPanelKey 验证控制台页能解开 CPA 面板保存的管理密钥。
+// TestConsolePageDecodesPanelKey 验证控制台页能从 CPA 管理面板的持久化快照里解出管理密钥。
 //
-// 本页与面板同源，因此可以复用面板已保存的密钥，避免用户重复输入。
-// 面板把密钥存在 localStorage 的 "managementKey" 键下，并做了可逆的 XOR 混淆：
+// 本页与面板同源，因此可以复用面板已保存的密钥，避免用户重复输入。面板
+// （CPAMC）把整份认证状态存在 localStorage 的 "cli-proxy-auth" 键下，值是可逆
+// 的 XOR 混淆：
 //
-//	前缀 "enc::v1::" + base64( utf8(明文) XOR key )
+//	前缀 "enc::v1::" + base64( utf8(JSON) XOR key )
 //	key = utf8("cli-proxy-api-webui::secure-storage|<host>|<userAgent>")
+//	JSON = {"state":{...,"managementKey":"<密钥>",...},"version":N}
 //
 // 密钥由公开值派生，所以同源页面能解出来。这里断言页面确实实现了这套算法
 // （算法细节若与面板不一致，用户会看到 401 且原因极难定位）。
 func TestConsolePageDecodesPanelKey(t *testing.T) {
 	page := consolePageHTML(managementRoutePrefix)
 
-	// 混淆格式的常量必须与面板一致。
+	// 混淆格式与快照字段必须与面板一致。
 	for _, literal := range []string{
-		`"enc::v1::"`,                           // 前缀
-		`"cli-proxy-api-webui::secure-storage"`, // 种子
-		`localStorage.getItem("managementKey")`, // 面板的存储键
-		"location.host",                         // 密钥派生输入
-		"navigator.userAgent",                   // 密钥派生输入
-		"atob(",                                 // base64 解码
-		"TextDecoder",                           // utf8 解码
+		`"enc::v1::"`,                            // 前缀
+		`"cli-proxy-api-webui::secure-storage"`,  // 种子
+		`var PANEL_STORE_KEY = "cli-proxy-auth"`, // 面板的存储键名
+		`var PANEL_KEY_FIELD = "managementKey"`,  // 密钥在快照里的字段名
+		`localStorage.getItem(PANEL_STORE_KEY)`,  // 只读面板快照
+		"snapshot.state",                         // zustand persist 的 {state,version}
+		"location.host",                          // 密钥派生输入
+		"navigator.userAgent",                    // 密钥派生输入
+		"atob(",                                  // base64 解码
+		"TextDecoder",                            // utf8 解码
 	} {
 		if !strings.Contains(page, literal) {
 			t.Fatalf("console page is missing %s (key decoding would break)", literal)
+		}
+	}
+
+	// 旧版面板的键名不再读取：读到过期值会让页面带着错密钥去打探针，
+	// 白白消耗 CPA 的失败次数配额。
+	for _, legacy := range []string{
+		`getItem("managementKey")`,
+		"detectKey(",
+		`localStorage.getItem("cpa-management-key")`,
+	} {
+		if strings.Contains(page, legacy) {
+			t.Fatalf("console page must not read the legacy key source %s", legacy)
 		}
 	}
 
@@ -164,11 +181,70 @@ func TestConsolePageDecodesPanelKey(t *testing.T) {
 		t.Fatal("console page must validate the key charset before using it in a header")
 	}
 
-	// 自动读取失败时必须能退回手填，否则用户会面对一片空白。
+	// 自动复用失败时必须能退回手填，否则用户会面对一片空白。
 	for _, literal := range []string{`id="keyBox"`, `id="keyInput"`, `id="btnUseKey"`, "revealKeyInput"} {
 		if !strings.Contains(page, literal) {
 			t.Fatalf("console page is missing the manual key fallback (%s)", literal)
 		}
+	}
+}
+
+// TestConsolePageNeverCallsWithoutKey 验证控制台页在身份确认之前不发任何管理请求。
+//
+// CPA 按 IP 统计管理密钥失败次数（**未携带密钥也算**），5 次即把整个
+// /v0/management 封禁 30 分钟。早期版本在拿不到密钥时仍并发发 5 个首屏请求，
+// 因此"打开插件页"会直接把后台锁掉。本测试把修复后的三条不变量锁住：
+//
+//  1. 没有密钥 → 一个请求都不发；
+//  2. 有密钥 → 只发一个探针，成功才加载首屏，且首屏串行；
+//  3. 任一 401/403 → 立刻停掉全部自动刷新与轮询定时器。
+func TestConsolePageNeverCallsWithoutKey(t *testing.T) {
+	page := consolePageHTML(managementRoutePrefix)
+
+	// 1) api() 闸门：未认证/已失效不出网，没有密钥也不出网。
+	for _, literal := range []string{
+		"if (stopped) return Promise.resolve(null);",
+		"if (!key) return Promise.resolve(null);",
+	} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("console page is missing the api() guard %q", literal)
+		}
+	}
+
+	// 2) 单探针先于首屏；首屏是串行链而不是并发铺开。
+	if !regexp.MustCompile(`probeManagementAuth\(\)[\s\S]{0,800}startConsole\(\)`).MatchString(page) {
+		t.Fatal("console page must validate the key with a single probe before loading data")
+	}
+	if !strings.Contains(page, `loadVendors().then(function () {`) {
+		t.Fatal("console page must load the first screen serially (vendors first)")
+	}
+
+	// 定时器是失败放大器：只能在密钥验证通过（authReady）之后启动。
+	if !strings.Contains(page, "if (authReady && box && box.checked)") {
+		t.Fatal("log polling must require a verified key (authReady)")
+	}
+	if strings.Contains(page, "if (event.target.checked && !stopped)") {
+		t.Fatal("log polling must not start from the raw stopped flag")
+	}
+
+	// 3) 鉴权失败必须一次就停掉全部定时器，不能只停日志。
+	for _, literal := range []string{
+		"function haltOnAuthFailure(status) {",
+		"stopLoginPolling();",
+		"if (queueTimer) { clearInterval(queueTimer); queueTimer = null; }",
+	} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("console page is missing the auth-failure stop %q", literal)
+		}
+	}
+
+	// 手输也必须先探针验证再记忆，不能先写 sessionStorage 再试；
+	// 验证通过后要把 authReady 置真，否则日志轮询永远不会启动。
+	if !regexp.MustCompile(`probeManagementAuth\(\)[\s\S]{0,900}setItem\(MANUAL_STORE_KEY`).MatchString(page) {
+		t.Fatal("manually entered keys must be probe-verified before being remembered")
+	}
+	if !regexp.MustCompile(`setItem\(MANUAL_STORE_KEY, value\)[\s\S]{0,200}authReady = true`).MatchString(page) {
+		t.Fatal("manual login must mark authReady after the probe succeeds")
 	}
 }
 
