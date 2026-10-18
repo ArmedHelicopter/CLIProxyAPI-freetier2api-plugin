@@ -15,14 +15,23 @@ CGO_ENABLED=1 go build -buildmode=c-shared  # 产出 freetier2api.so（约 10 MB
 
 | 文件 | 覆盖主题 |
 | --- | --- |
-| `plugin_test.go` | 注册响应契约（含 `executor_model_scope`）、热更新、未知方法、凭证归属判定、**realm 隔离**、静态模型元数据、非流式聚合、流式分帧与错误上报 |
-| `registry_test.go` | 三方源清单格式、插件 ID 与产物名一致、控制台页路由声明、页面静态自包含、能力与实现一致 |
+| `plugin_register_test.go` | 注册响应契约（含 `executor_model_scope`）、热更新、未知方法、凭证解析与登录元数据 |
+| `plugin_models_test.go` | **realm 隔离**、静态模型合并、禁用并集、别名路由、提示词改写、重启待生效标记 |
+| `plugin_executor_test.go` | 非流式聚合、流式分帧与错误上报、格式校验、签到式额度重置、SSE 分帧 |
+| `registry_test.go` | 三方源清单格式、插件 ID 与产物名一致、管理响应线格式、能力与实现一致 |
+| `auth_test.go` / `identity_test.go` | 供应商归属矩阵、账号身份跨路径稳定 |
 | `internal/vendors/workbuddy/cb_test.go` | 错误分类 15 级顺序、模型避让的字段边界、重试与状态码映射、等待信息解析、凭证双形态、合并写回、指纹稳定性、缓存键隔离、改写管线各步、工具配对、SSE 聚合与白名单重建、脱敏 |
-| `internal/core/core_test.go` | 归属三级判定、注册表幂等约束、模型键协议、`ParseCredential` 身份兜底、`ToPluginError` 映射、`BaseVendor` 默认行为 |
+| `internal/core/core_test.go` | 归属三级判定、注册表幂等约束、模型键协议、`ParseCredential` 身份兜底、`ToPluginError` 映射、`core.Meta` 默认行为 |
 | `internal/loginsession/loginsession_test.go` | 会话登记/TTL/轮询节流/归属查询/并发（`-race`） |
 | `vendor_compat_test.go` | 13 个供应商实例的 ID/名称/区域 golden 对比、供应商专属配置键兼容 |
 | `internal/httpx/transport_test.go` | 宿主 HTTP 桥的**双形态键名兼容**、缺状态码的显式报错 |
-| `internal/vendors/workbuddy/tasks/tasks_test.go` | 各事件链结构与关键字段、小程序事件形态、指纹注入、夜猫子窗口边界 |
+| `internal/vendors/workbuddy/task_flows_test.go` | 各事件链结构与关键字段、小程序事件形态、指纹注入、夜猫子窗口边界 |
+| `internal/admin/admin_test.go` | 管理路由声明、状态接口分发、未知路由 404 |
+| `internal/pluginconfig/config_test.go` | 列表写法、未知键容忍、校验与时钟解析 |
+| `internal/state/state_test.go` | state.json 往返、损坏回退、深拷贝快照、并发（`-race`） |
+| `internal/modelconfig/modelconfig_test.go` | 禁用键展开、别名唯一性、配置∪状态并集、同名合并 |
+| `internal/console/console_test.go` | 控制台页密钥解码、请求闸门、单页布局与静态自包含 |
+| `internal/logger/logger_test.go` | 日志环边界、增量快照、并发写入（`-race`） |
 
 ## 二、关键机制验证（读宿主源码确认）
 

@@ -38,26 +38,38 @@
 `type` 字段严格相等才认领该文件）。因此本插件用统一的 `providerKey = "freetier"`，
 **供应商的区分落在凭证文件名前缀与文件内的 `vendor` 字段上**。
 
-代码分三层（依赖方向单向：`main → internal/vendors/* → internal/core`）：
+依赖方向始终单向：`main → internal/{admin,taskengine,hostabi} → internal/{vendors/*,modelconfig,...} → internal/core`。
+根层只做 ABI 翻译与进程级编排，领域规则全部在 internal。
 
 ```
-package main                     纯 ABI 适配层：把宿主 RPC 翻译成 Vendor 调用
-  ├─ vendor_register.go            唯一的供应商注册点（composition root）
-  ├─ hostbridge.go                 把宿主能力注入 core.Host 端口
-  └─ auth*/models*/executor*/…     五类能力处理器（不含任何供应商协议逻辑）
+package main                    纯 ABI 适配层（CGO 入口、注册、能力分发、任务队列）
+  ├─ main.go / cgo_bridge.go      cliproxy_plugin_init 与 RPC 总入口
+  ├─ vendor_register.go           唯一的供应商注册点（composition root）
+  ├─ hostcall.go / hostbridge.go  宿主 RPC 与 core.Host 端口实现
+  ├─ lifecycle.go                 后台循环与在途流的生命周期
+  ├─ auth.go                      auth provider（解析/登录/刷新/凭证写回）
+  ├─ models.go                    model provider（注册、隔离、别名、禁用）
+  ├─ executor.go / quota.go       executor 与 quota provider
+  ├─ taskrun.go / taskcenter.go   通用调度器与任务队列（只认能力接口）
+  └─ management.go                管理路由入口（薄层，实现见 internal/admin）
 
-internal/core                    供应商无关的骨架：必需的 Vendor 接口 +
-                                 可选能力接口（登录/额度/签到/任务/配置…）、
-                                 注册表、共享 Credential、模型 ID 协议、错误映射
-                                 （core.Meta / core.Host / 通用助手）
-
+internal/core                    供应商无关骨架：必需 Vendor 接口 + 可选能力接口
+                                 （登录/续期/额度/签到/任务/配置/存储合并…）、
+                                 注册表、Credential、模型 ID 协议、错误映射
+internal/admin                   管理接口实现（accounts/models/quota/settings/vendors）
+internal/modelconfig             模型禁用集合、别名、额外模型、同名合并与静态缓存
+internal/pluginconfig            全局配置解析/校验（供应商专属键保留在 Raw）
+internal/state                   state.json 的类型化读写与并发快照
+internal/hostabi                 宿主 RPC 封装（调用、准入、回调 ID、凭证枚举）
+internal/httpx                   出站 HTTP 桥（宿主代理/日志）与 SSE 转发
+internal/loginsession            登录会话登记（TTL / 轮询节流 / 归属）
+internal/logger                  内存日志环与文件落盘
 internal/console                 内嵌控制台页面（console.html + go:embed）
+internal/testhost                测试用假宿主与上游桩（只被测试 import）
 
-internal/loginsession             供应商无关的登录会话登记表（TTL / 轮询节流 / 归属）
-
-internal/vendors/<name>           协议层 + 适配层同包：
-  ├─ adapter.go                     core.Vendor 实现（原名 vendor_<name>.go）
-  ├─ config.go                      解析本供应商的专属配置键
+internal/vendors/<name>          协议层 + 适配层同包：
+  ├─ adapter.go                     core.Vendor 实现（嵌入 core.Meta）
+  ├─ config.go                      解析本供应商专属配置键（Configurable）
   └─ catalog/chat/credential/…      纯协议实现（出站 HTTP 一律经 internal/httpx）
 ```
 

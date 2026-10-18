@@ -200,3 +200,17 @@ func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Cre
 	}
 	return cred, false, nil
 }
+
+// ValidateCredential 校验凭证形态与上游可用性。
+//
+// 只做本地形态校验，不产生上游流量：宿主会在每次刷新时调用本方法，
+// 让它去打上游等于把额度查询变成了周期性的风控信号。
+func ValidateCredential(ctx context.Context, cred *Credential) error {
+	if cred == nil {
+		return transientErr("zcode credential is nil")
+	}
+	if strings.TrimSpace(cred.APIKey) == "" && strings.TrimSpace(cred.JWTToken) == "" {
+		return transientErr("zcode credential missing both api_key and jwt_token")
+	}
+	return nil
+}

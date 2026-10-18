@@ -17,7 +17,10 @@ package workbuddy
 //	11. reasoning_content 回填    —— 部分租户要求 assistant 消息带非空 reasoning
 //	12. 指纹脱敏                  —— 上游内容审核是逐字匹配
 
-import "strings"
+import (
+	"encoding/json"
+	"strings"
+)
 
 // PrepareOptions 是改写管线的输入。
 type PrepareOptions struct {
@@ -363,4 +366,21 @@ func applyPromptMode(payload map[string]any, mode, text string) {
 		out = append(out, messages[insertAt:]...)
 		payload["messages"] = out
 	}
+}
+
+// decodeBodyMap 把请求体解析成 map。解析失败返回 nil（调用方按"无法解析"处理）。
+func decodeBodyMap(body []byte) map[string]any {
+	if len(body) == 0 {
+		return nil
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		return nil
+	}
+	return payload
+}
+
+// encodeBodyMap 把 map 序列化回请求体。
+func encodeBodyMap(payload map[string]any) ([]byte, error) {
+	return json.Marshal(payload)
 }
