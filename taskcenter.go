@@ -543,7 +543,9 @@ func runAutoAll(ctx context.Context, account *accountContext) []autoAllResult {
 			Code: item.Code, Status: item.Status, Message: item.Message,
 			Credit: item.Credit, Energy: item.Energy, Progress: item.Progress,
 		}
-		recordTaskResult(account.uid(), item.Code, item.Message, item.Status, item.Credit, item.Energy)
+		if !strings.HasPrefix(item.Code, "(") {
+			recordTaskResult(account.uid(), item.Code, item.Message, item.Status, item.Credit, item.Energy)
+		}
 		results = append(results, result)
 	}
 	return results

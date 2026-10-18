@@ -45,6 +45,11 @@ func newInstance(region Region) core.Vendor {
 	}
 }
 
+// Configure 解析 WorkBuddy 专属配置（UA、设备令牌、提示词、机器盐）。
+func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
+	Configure(settings, raw)
+}
+
 // ---- 凭证 ----
 
 // Match 判断一份凭证是否属于本区域。

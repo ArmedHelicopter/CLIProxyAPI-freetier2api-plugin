@@ -118,8 +118,8 @@ func TestVendorCapabilities(t *testing.T) {
 		"traecn":            {login: true, refresh: true, quota: true, checkin: true, merge: true, loginOwner: true},
 		"traeglobal":        {login: true, refresh: true, quota: true, checkin: true, merge: true, loginOwner: true},
 		"traesolo":          {login: true, refresh: true, quota: true, checkin: true, merge: true, loginOwner: true},
-		"workbuddycn":       {login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, loginOwner: true, console: true},
-		"workbuddyglobal":   {login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, loginOwner: true, console: true},
+		"workbuddycn":       {login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, configure: true, loginOwner: true, console: true},
+		"workbuddyglobal":   {login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, configure: true, loginOwner: true, console: true},
 		"zcode":             {login: true, refresh: true, quota: true, merge: true, configure: true, loginOwner: true, authMode: "oauth"},
 	}
 	for _, vendor := range core.Vendors() {
