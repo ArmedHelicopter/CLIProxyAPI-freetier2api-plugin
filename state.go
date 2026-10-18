@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
 )
 
@@ -83,9 +82,3 @@ func taskStateKey(uid, code string) string {
 
 // nowRFC3339 返回当前时间的 RFC3339 字符串。
 func nowRFC3339() string { return nowFunc().Format(time.RFC3339) }
-
-// nowUnixMs 返回当前毫秒时间戳。
-func nowUnixMs() int64 { return nowFunc().UnixMilli() }
-
-// stateFileName 供测试与文档引用（值来自 pluginconfig）。
-const stateFileName = pluginconfig.StateFileName

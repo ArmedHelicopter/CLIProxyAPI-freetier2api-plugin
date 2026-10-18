@@ -21,11 +21,6 @@ import (
 // pluginConfig 是插件有效配置（全局键的强类型视图 + 供应商原始键）。
 type pluginConfig = pluginconfig.Config
 
-// 允许外部（测试/管理接口）复用的解析助手。
-var (
-	parseClock = pluginconfig.ParseClock
-)
-
 // defaultPluginConfig 返回内置默认配置。
 //
 // 供应商专属默认值（UA、提示词、设备令牌）由各供应商的 Configure 自己补，

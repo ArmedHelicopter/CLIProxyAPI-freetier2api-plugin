@@ -287,8 +287,6 @@ func (a *accountContext) label() string {
 	return core.FirstNonEmpty(a.credential.LabelValue(), a.entry.Label, a.entry.Name, a.entry.ID)
 }
 
-func (a *accountContext) isGlobal() bool { return a.vendor.Region() == "global" }
-
 // ---- 定时任务族（原 tasks_schedule.go） ----
 
 // runCheckinAll 执行全账号签到，并在启用自动任务时驱动从属闭环。

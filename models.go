@@ -129,7 +129,6 @@ func refreshModelsFromUpstream(ctx context.Context) (int, error) {
 	return total, nil
 }
 
-// mergeSameNameModels 是 modelconfig 的薄包装（测试复用）。
 func mergeSameNameModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 	return modelconfig.MergeSameNameModels(models)
 }
@@ -139,12 +138,10 @@ func registeredModelsForVendor(vendorID string) []pluginapi.ModelInfo {
 	return modelCatalog.Registered(vendorID)
 }
 
-// cacheStaticModels 记录官方模型清单（控制台回读用）。
 func cacheStaticModels(vendorID string, models []pluginapi.ModelInfo) {
 	modelCatalog.CacheStatic(vendorID, models)
 }
 
-// cachedStaticModels 返回全部缓存的副本。
 func cachedStaticModels() map[string][]pluginapi.ModelInfo {
 	return modelCatalog.SnapshotCached()
 }
@@ -154,12 +151,10 @@ func modelSupportsImages(model pluginapi.ModelInfo) bool {
 	return core.ModelSupportsImages(model)
 }
 
-// modelSupportsTools 报告模型是否声明工具调用能力（兼容旧调用点）。
 func modelSupportsTools(model pluginapi.ModelInfo) bool {
 	return core.ModelSupportsTools(model)
 }
 
-// extraModels 返回当前配置的额外模型条目（管理页展示用）。
 func extraModels(_ pluginConfig) []pluginapi.ModelInfo { return modelCatalog.ExtraModels() }
 
 // ---- 模型别名（原 modelalias.go） ----
