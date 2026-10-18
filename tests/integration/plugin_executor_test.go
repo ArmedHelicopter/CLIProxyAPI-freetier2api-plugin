@@ -29,6 +29,19 @@ func TestExecutorNonStreamingAggregatesUpstream(t *testing.T) {
 				"",
 			}, "\n")}
 		}
+		// 国际版每日活跃奖励：热力图未点亮 → 上报信标 → 回读仍为 0 也算成功。
+		if strings.Contains(url, "/activity/growth/heatmap") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{"cells":[{"date":"2026-10-18","score":0}]}}`,
+			}
+		}
+		if strings.Contains(url, "/v2/report") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{}}`,
+			}
+		}
 		return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
 	})
 
@@ -92,6 +105,19 @@ func TestExecutorStreamEmitsNormalizedFrames(t *testing.T) {
 				"",
 			}, "\n")}
 		}
+		// 国际版每日活跃奖励：热力图未点亮 → 上报信标 → 回读仍为 0 也算成功。
+		if strings.Contains(url, "/activity/growth/heatmap") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{"cells":[{"date":"2026-10-18","score":0}]}}`,
+			}
+		}
+		if strings.Contains(url, "/v2/report") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{}}`,
+			}
+		}
 		return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
 	})
 
@@ -150,6 +176,19 @@ func TestExecutorStreamReportsUpstreamError(t *testing.T) {
 				Body:   `{"code":6004,"msg":"The model provider is rate-limiting requests."}`,
 			}
 		}
+		// 国际版每日活跃奖励：热力图未点亮 → 上报信标 → 回读仍为 0 也算成功。
+		if strings.Contains(url, "/activity/growth/heatmap") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{"cells":[{"date":"2026-10-18","score":0}]}}`,
+			}
+		}
+		if strings.Contains(url, "/v2/report") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{}}`,
+			}
+		}
 		return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
 	})
 
@@ -186,7 +225,8 @@ func TestExecutorRejectsUnsupportedFormat(t *testing.T) {
 	_ = http.StatusOK
 }
 
-// TestQuotaResetDomesticAndGlobal 验证国内版账号可签到重置额度，国际版被正确拒绝。
+// TestQuotaResetDomesticAndGlobal 验证国内版走 daily-checkin 签到、
+// 国际版走每日活跃奖励（活跃信标），两条路径都能成功重置。
 func TestQuotaResetDomesticAndGlobal(t *testing.T) {
 	host := installFakeHost(t)
 	setupTestPlugin(t)
@@ -200,17 +240,33 @@ func TestQuotaResetDomesticAndGlobal(t *testing.T) {
 				Body:   `{"code":0,"data":{"credit":10,"energy":5,"streak":3}}`,
 			}
 		}
+		// 国际版每日活跃奖励：热力图未点亮 → 上报信标 → 回读仍为 0 也算成功。
+		if strings.Contains(url, "/activity/growth/heatmap") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{"cells":[{"date":"2026-10-18","score":0}]}}`,
+			}
+		}
+		if strings.Contains(url, "/v2/report") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{}}`,
+			}
+		}
 		return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
 	})
 
-	// 国际版账号重置应被拦截并提示
+	// 国际版账号重置执行每日活跃奖励（活跃信标已上报）
 	resGlobal := callMethod(t, pluginabi.MethodQuotaReset, pluginapi.QuotaResetRequest{AuthID: "2"})
 	var respGlobal pluginapi.QuotaResetResponse
 	if errUnmarshal := json.Unmarshal(resGlobal, &respGlobal); errUnmarshal != nil {
 		t.Fatalf("decode global quota reset: %v", errUnmarshal)
 	}
-	if respGlobal.Success {
-		t.Fatal("global account quota reset must not succeed via checkin")
+	if !respGlobal.Success {
+		t.Fatalf("global account quota reset should run the daily bonus, message: %s", respGlobal.Message)
+	}
+	if !strings.Contains(respGlobal.Message, "活跃信标") {
+		t.Fatalf("global quota reset message should mention the beacon, got: %s", respGlobal.Message)
 	}
 
 	// 国内版账号重置应成功执行签到

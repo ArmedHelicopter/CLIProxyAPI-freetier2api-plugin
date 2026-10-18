@@ -258,7 +258,10 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 	return &response, nil
 }
 
-// Checkin 执行一次签到。国际版返回 nil（无此活动）。
+// Checkin 执行一次签到。
+//
+// CN 调 daily-checkin 端点；global 没有该端点活动，走每日活跃奖励
+// （活跃信标点亮成长热力图，Bonus Pack 次日凌晨发放），同样幂等。
 func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.CheckinResult, error) {
 	if !v.SupportsCheckin() {
 		return nil, nil
@@ -268,6 +271,21 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 		return nil, errNative
 	}
 	client := v.client(ctx)
+	if v.region.IsGlobal() {
+		result, errBonus := client.GlobalDailyBonus(ctx, native)
+		if errBonus != nil {
+			return nil, errBonus
+		}
+		if result.Already {
+			return &core.CheckinResult{
+				Already: true,
+				Message: fmt.Sprintf("今日活跃已点亮（已连续点亮 %d 天）", result.Streak),
+			}, nil
+		}
+		return &core.CheckinResult{
+			Message: fmt.Sprintf("活跃信标已上报，今日已点亮（已连续点亮 %d 天），奖励积分次日凌晨发放", result.Streak),
+		}, nil
+	}
 	result, errCheckin := client.DailyCheckin(native)
 	if errCheckin != nil {
 		return nil, errCheckin
@@ -398,7 +416,11 @@ func (v *adapter) client(ctx context.Context) *Client {
 	return NewClient(v.rt, v.rt.options(ctx))
 }
 
-func (v *adapter) SupportsCheckin() bool { return !v.region.IsGlobal() }
+// SupportsCheckin 报告本区域是否提供签到。
+//
+// CN 走 daily-checkin 端点；global 走每日活跃奖励（见 dailybonus.go），
+// 两个域都有每日收入路径，因此恒为 true。
+func (v *adapter) SupportsCheckin() bool { return true }
 
 // LoadModelCache 实现 core.ModelCacheLoader：只加载本实例的缓存。
 func (v *adapter) LoadModelCache(cached []core.CachedModel) {

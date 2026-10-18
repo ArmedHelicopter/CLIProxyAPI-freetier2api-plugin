@@ -498,10 +498,11 @@ func realmField(level map[string]any) Region {
 	return ""
 }
 
-// 本文件实现 WorkBuddy 的每日签到。
+// 本文件实现 WorkBuddy（国内版）的每日签到。
 //
-// 签到是 CodeBuddy 国内版独有的活动；国际版没有该活动，调用方应在
-// SupportsCheckin 为 false 时跳过（不报错、不发请求）。
+// daily-checkin 端点只有国内版入账；国际版的每日收入路径是每日活跃奖励
+// （活跃信标，见 dailybonus.go），由 Checkin/RunScheduled 按 realm 分流，
+// 不应把国际版凭证打进这里的端点。
 
 // CheckinResult 是一次签到的结果。
 type CheckinResult struct {

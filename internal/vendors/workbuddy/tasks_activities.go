@@ -1195,12 +1195,27 @@ const (
 	TaskKindBlackcat = "blackcat"
 	TaskKindSchool   = "school"
 	TaskKindStreak   = "streak"
+	// TaskKindDailyBonus 是国际版专属任务族：每日活跃奖励（国际版签到）。
+	TaskKindDailyBonus = "dailybonus"
 )
 
 // TaskSpecsFor 返回本区域注册的任务族与默认排程。
+//
+// 国际版只有一个任务族：每日活跃奖励。它的机制与 CN 签到不同（活跃信标
+// 点亮热力图，见 dailybonus.go），因此不并入 checkin 族的 9/21 点，
+// 而是按参考实现取 4 个排程点兜底。
 func TaskSpecsFor(region Region) []core.TaskSpec {
 	if region.IsGlobal() {
-		return nil
+		return []core.TaskSpec{
+			{
+				Kind:         TaskKindDailyBonus,
+				Label:        "每日活跃奖励",
+				Description:  "国际版每日签到：活跃信标点亮成长热力图，Bonus Pack 次日凌晨发放",
+				DefaultHours: GlobalDailyBonusHours,
+				Manual:       true,
+				Route:        "/dailybonus",
+			},
+		}
 	}
 	return []core.TaskSpec{
 		{Kind: TaskKindTravel, Label: "猫猫旅行", Description: "每日猫猫旅行任务", DefaultHours: []int{9, 21}, Manual: true, Route: "/travel"},
@@ -1590,7 +1605,21 @@ func (v *adapter) TaskStatus(ctx context.Context, cred *core.Credential) core.Ta
 
 func (v *adapter) RunScheduled(ctx context.Context, cred *core.Credential, kind string) (string, error) {
 	if v.region.IsGlobal() {
-		return "", nil
+		if kind != TaskKindDailyBonus {
+			return "", nil
+		}
+		native, errNative := v.Native(cred)
+		if errNative != nil {
+			return "", errNative
+		}
+		result, errBonus := v.client(ctx).GlobalDailyBonus(ctx, native)
+		if errBonus != nil {
+			return "", errBonus
+		}
+		if result.Already {
+			return fmt.Sprintf("今日已点亮（已连续点亮 %d 天）", result.Streak), nil
+		}
+		return fmt.Sprintf("活跃信标已上报（已连续点亮 %d 天）", result.Streak), nil
 	}
 	native, err := v.Native(cred)
 	if err != nil {

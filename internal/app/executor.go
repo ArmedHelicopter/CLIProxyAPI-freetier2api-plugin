@@ -387,8 +387,8 @@ func (a *App) handleQuotaFetch(request []byte) ([]byte, error) {
 
 // handleQuotaReset 执行一次签到以恢复额度。
 //
-// 语义由供应商决定：WorkBuddy 的「重置」是签到；不支持签到的供应商
-// （国际版）返回明确的不可用说明，而不是假装成功。
+// 语义由供应商决定：WorkBuddy 的「重置」是签到（CN 签到 / 国际版每日
+// 活跃奖励）；不支持签到的供应商返回明确的不可用说明，而不是假装成功。
 func (a *App) handleQuotaReset(request []byte) ([]byte, error) {
 	var rpc pluginapi.QuotaResetRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
