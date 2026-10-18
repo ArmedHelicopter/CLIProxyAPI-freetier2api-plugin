@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/modelconfig"
 	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
@@ -27,13 +28,10 @@ var (
 
 // defaultPluginConfig 返回内置默认配置。
 //
-// UA 默认值属于 WorkBuddy：这里只补齐供应商默认值，其余键由各包自行解释。
+// 供应商专属默认值（UA、提示词、设备令牌）由各供应商的 Configure 自己补，
+// 不再出现在全局配置结构里。
 func defaultPluginConfig() pluginConfig {
-	cfg := pluginconfig.Default()
-	cfg.ClientVersion = workbuddy.DefaultClientVersion
-	cfg.CLIVersion = workbuddy.DefaultCLIVersion
-	cfg.ClientName = workbuddy.DefaultClientName
-	return cfg
+	return pluginconfig.Default()
 }
 
 // defaultStateDir 是 internal/pluginconfig 的薄包装（测试可直接调用）。
@@ -60,7 +58,7 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 	}
 	// 区域别名（cn:glm-5.2）在这里展开成每家供应商的规范键，
 	// 保证 loadedConfig().DisabledModels 可直接参与集合运算。
-	cfg.DisabledModels = expandDisabledList(cfg.DisabledModels)
+	cfg.DisabledModels = modelconfig.ExpandDisabledList(cfg.DisabledModels)
 	return cfg, nil
 }
 
@@ -80,30 +78,11 @@ func realmEnabled(cfg pluginConfig, realm string) bool {
 	return false
 }
 
-// applyPromptConfig 应用提示词配置到供应商包。
-//
-// 提示词体系是 WorkBuddy 特有的（上游按逐字匹配做内容审核），
-// 因此状态存在供应商包里，根层只负责解析配置并推送。
-func applyPromptConfig(cfg pluginConfig) {
-	text := workbuddy.BuiltinPrompt()
-	if path := strings.TrimSpace(cfg.PromptFile); path != "" {
-		loaded, errLoad := loadPromptFromFile(path)
-		if errLoad != nil {
-			logger.Error("load prompt file failed, falling back to built-in prompt: %v", errLoad)
-		} else if loaded != "" {
-			text = loaded
-		}
-	}
-	mode := strings.TrimSpace(cfg.PromptMode)
-	// 页面设置覆盖 YAML 配置：用户在控制台页改过的模式以页面为准。
-	if state := snapshotState(); state.PromptMode != nil && strings.TrimSpace(*state.PromptMode) != "" {
-		mode = strings.TrimSpace(*state.PromptMode)
-	}
-	workbuddy.SetPrompt(mode, text)
-}
-
 // promptModeFor 返回当前生效的提示词模式（供管理端展示）。
 func promptModeFor() string { return workbuddy.PromptMode() }
+
+// currentMachineSalt 是本部署的指纹盐，由 applyConfig 计算后随 Settings 下发。
+var currentMachineSalt string
 
 // applyConfig 应用配置：初始化日志与状态目录、设置指纹盐、下发供应商配置。
 //
@@ -117,15 +96,22 @@ func applyConfig(cfg pluginConfig) error {
 		logger.Error("init log file sink failed: %v", errLog)
 	}
 	stateStore.Configure(cfg.StateDir)
-	if errSalt := configureInstallSalt(cfg); errSalt != nil {
+	salt, errSalt := ensureMachineSalt(cfg)
+	if errSalt != nil {
 		return errSalt
 	}
-	applyPromptConfig(cfg)
+	currentMachineSalt = salt
 	storeConfig(cfg)
+	// 模型层需要全局设置快照：启用域、额外模型、配置声明的禁用项。
+	modelCatalog.Configure(modelconfig.Settings{
+		EnabledRealms:    cfg.EnabledRealms,
+		ExtraModels:      cfg.ExtraModels,
+		DisabledModels:   cfg.DisabledModels,
+		ContextWindowFor: workbuddy.DefaultContextWindowFor,
+	})
+	modelCatalog.RefreshFromState()
 	// 供应商专属配置：根层只提供原始键，由各包自己解释。
 	configureVendors(cfg)
-	refreshDisabledModelCache()
-	refreshModelAliasCache()
 	return nil
 }
 
@@ -149,22 +135,4 @@ func stateFilePath(cfg pluginConfig) string {
 // saltFilePath 返回机器盐文件路径。
 func saltFilePath(cfg pluginConfig) string {
 	return filepath.Join(cfg.StateDir, pluginconfig.SaltFileName)
-}
-
-// loadPromptFromFile 读取自定义提示词文件。
-//
-// 读不到返回错误而不是静默降级，否则运维会以为提示词生效了、实际还在用内置的。
-func loadPromptFromFile(path string) (string, error) {
-	trimmed := strings.TrimSpace(path)
-	if trimmed == "" {
-		return "", nil
-	}
-	raw, errRead := os.ReadFile(trimmed)
-	if errRead != nil {
-		return "", fmt.Errorf("read prompt file %s: %w", trimmed, errRead)
-	}
-	if len(raw) > 1<<20 {
-		return "", fmt.Errorf("prompt file %s exceeds %d bytes", trimmed, 1<<20)
-	}
-	return strings.TrimSpace(string(raw)), nil
 }

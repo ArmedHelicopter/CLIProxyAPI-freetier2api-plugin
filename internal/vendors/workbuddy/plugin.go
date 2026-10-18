@@ -33,17 +33,18 @@ func SetClientFactory(factory func(context.Context) *Client) {
 	clientFactoryMu.Unlock()
 }
 
-// UpstreamClient 用注入的工厂构造一个客户端。
+// UpstreamClient 构造一个客户端。
 //
-// 未注入时返回 nil：调用方必须检查（测试与未注册场景）。
+// 优先使用注入的工厂（测试替换），否则用本包持有的配置快照自行构造：
+// 配置解析属于供应商，根层不再拼装 WorkBuddy 的 Options。
 func UpstreamClient(ctx context.Context) *Client {
 	clientFactoryMu.RLock()
 	factory := clientFactory
 	clientFactoryMu.RUnlock()
-	if factory == nil {
-		return nil
+	if factory != nil {
+		return factory(ctx)
 	}
-	return factory(ctx)
+	return NewClient(currentOptions(ctx))
 }
 
 // ChatMetaFromBody 从请求体与请求头派生会话头族。

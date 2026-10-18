@@ -47,6 +47,10 @@ type Settings struct {
 	StateDir string
 	// PassthroughIP 报告是否把客户端 IP 透传给上游。
 	PassthroughIP bool
+	// SanitizeFingerprints 报告是否开启出站请求体指纹脱敏。
+	SanitizeFingerprints bool
+	// MachineSalt 是本部署的设备指纹盐（为空表示供应商未配置）。
+	MachineSalt string
 	// AutoCheckin / AutoCheckinAt / AutoTasks 是后台自动化开关。
 	AutoCheckin   bool
 	AutoCheckinAt string

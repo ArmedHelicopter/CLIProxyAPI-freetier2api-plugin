@@ -151,7 +151,7 @@ func scanOneAccount(ctx context.Context, account *accountContext) accountScan {
 		return scan
 	}
 
-	client := newUpstreamClient(ctx)
+	client := workbuddy.UpstreamClient(ctx)
 	growth, errGrowth := client.ListTasks(ctx, accountNative(account))
 	if errGrowth != nil {
 		scan.Error = errGrowth.Error()
@@ -541,7 +541,7 @@ func acceptPendingTasks(ctx context.Context, account *accountContext) int {
 	if account.isGlobal() {
 		return 0
 	}
-	client := newUpstreamClient(ctx)
+	client := workbuddy.UpstreamClient(ctx)
 	tasksList, errTasks := client.ListTasks(ctx, accountNative(account))
 	if errTasks != nil {
 		return 0
@@ -583,7 +583,7 @@ func runGrowthTask(ctx context.Context, account *accountContext, code string) (s
 	if action == nil {
 		return "", 0, 0, fmt.Errorf("该任务没有对应的自动动作（可能需要客户端内交互）")
 	}
-	client := newUpstreamClient(ctx)
+	client := workbuddy.UpstreamClient(ctx)
 
 	// 达标预检：如果任务已经完成/达标，直接尝试领奖，绝不再重新执行动作（避免重复消耗额度）。
 	task, errTask := findGrowthTask(ctx, client, accountNative(account), code)
@@ -692,7 +692,7 @@ func claimGrowthReward(ctx context.Context, client *workbuddy.Client, credential
 
 // runSchoolDaily 执行单账号的开学季闭环。
 func runSchoolDaily(ctx context.Context, account *accountContext) (string, int64, int64, error) {
-	client := newUpstreamClient(ctx)
+	client := workbuddy.UpstreamClient(ctx)
 	message, errRun := tasks.RunSchool(ctx, client, accountNative(account))
 	if errRun != nil {
 		return "", 0, 0, errRun
@@ -850,7 +850,7 @@ type autoAllResult struct {
 //
 // 顺序即依赖序：first_buddy 需要前置的活跃上报，专家类需要前置的召唤链。
 func runAutoAll(ctx context.Context, account *accountContext) []autoAllResult {
-	client := newUpstreamClient(ctx)
+	client := workbuddy.UpstreamClient(ctx)
 	results := make([]autoAllResult, 0, len(autoActions))
 
 	// 前置：批量报名（不报名的话部分任务的事件不落账）。
@@ -966,7 +966,7 @@ func schoolStatusForAccounts(ctx context.Context, callbackID string) []map[strin
 				mu.Unlock()
 				return
 			}
-			client := newUpstreamClient(ctx)
+			client := workbuddy.UpstreamClient(ctx)
 			status, errStatus := client.SchoolTasks(ctx, accountNative(target))
 			if errStatus != nil {
 				entry["error"] = errStatus.Error()

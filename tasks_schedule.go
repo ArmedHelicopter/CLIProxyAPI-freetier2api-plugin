@@ -76,7 +76,7 @@ func runActivityAll(ctx context.Context) {
 		if account.isGlobal() {
 			return nil
 		}
-		client := newUpstreamClient(ctx)
+		client := workbuddy.UpstreamClient(ctx)
 		conversationID := fmt.Sprintf("wb2api-%d", nowUnixMs())
 		if errReport := client.ReportChatActivity(ctx, accountNative(account), conversationID, "", "", ""); errReport != nil {
 			logger.Error("activity %s: %v", account.label(), errReport)
@@ -115,7 +115,7 @@ func runKeepaliveAll(ctx context.Context) {
 	logger.Info("keepalive: starting for all accounts")
 	count := 0
 	forEachAccount(ctx, "", func(ctx context.Context, account *accountContext) error {
-		client := newUpstreamClient(ctx)
+		client := workbuddy.UpstreamClient(ctx)
 		if errRefresh := client.RefreshToken(accountNative(account)); errRefresh != nil {
 			logger.Error("keepalive %s: %v", account.label(), errRefresh)
 			return nil
@@ -152,7 +152,7 @@ func runTravelAll(ctx context.Context) {
 		if account.isGlobal() {
 			return nil
 		}
-		client := newUpstreamClient(ctx)
+		client := workbuddy.UpstreamClient(ctx)
 		message := tasks.RunTravel(ctx, client, accountNative(account))
 		if message != "" {
 			logger.Info("travel %s: %s", account.label(), message)
@@ -178,7 +178,7 @@ func runBlackcatAll(ctx context.Context) {
 		if account.isGlobal() {
 			return nil
 		}
-		client := newUpstreamClient(ctx)
+		client := workbuddy.UpstreamClient(ctx)
 		message, errRun := tasks.RunBlackcat(ctx, client, accountNative(account))
 		if errRun != nil {
 			logger.Error("blackcat %s: %v", account.label(), errRun)
@@ -204,7 +204,7 @@ func runSchoolAll(ctx context.Context) {
 		if account.isGlobal() {
 			return nil
 		}
-		client := newUpstreamClient(ctx)
+		client := workbuddy.UpstreamClient(ctx)
 		summary, errRun := tasks.RunSchool(ctx, client, accountNative(account))
 		if errRun != nil {
 			logger.Error("school %s: %v", account.label(), errRun)
@@ -230,7 +230,7 @@ func runStreakBonusAll(ctx context.Context) {
 		if account.isGlobal() {
 			return nil
 		}
-		client := newUpstreamClient(ctx)
+		client := workbuddy.UpstreamClient(ctx)
 		summary, errRun := tasks.RunStreakBonus(ctx, client, accountNative(account))
 		if errRun != nil {
 			logger.Error("streak %s: %v", account.label(), errRun)

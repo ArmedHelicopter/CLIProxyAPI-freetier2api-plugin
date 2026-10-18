@@ -141,8 +141,8 @@ func buildConfigYAML(cfg pluginConfig) []byte {
 	if len(cfg.DisabledModels) > 0 {
 		fmt.Fprintf(&builder, "disabled_models: %s\n", strings.Join(cfg.DisabledModels, ","))
 	}
-	if cfg.PromptMode != "" {
-		fmt.Fprintf(&builder, "prompt_mode: %s\n", cfg.PromptMode)
+	if mode := cfg.Raw["prompt_mode"]; mode != "" {
+		fmt.Fprintf(&builder, "prompt_mode: %s\n", mode)
 	}
 	fmt.Fprintf(&builder, "auto_checkin_at: %q\n", cfg.AutoCheckinAt)
 	return []byte(builder.String())

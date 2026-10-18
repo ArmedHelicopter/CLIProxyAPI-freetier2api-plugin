@@ -33,31 +33,10 @@ type Config struct {
 	// LogToFile 为 true 时把日志写入 <StateDir>/logs。
 	LogToFile bool
 
-	// PromptMode 决定系统提示词处理：passthrough / custom / append。
-	PromptMode string
-	// PromptFile 是自定义提示词文件；空则用内置默认提示词。
-	PromptFile string
-
 	// SanitizeFingerprints 开启出站请求体黑名单指纹脱敏。
 	SanitizeFingerprints bool
 	// PassthroughIP 决定是否把客户端 IP 透传给上游。
 	PassthroughIP bool
-
-	// UserAgent 显式覆盖出站 UA（非空时全路径生效）。
-	UserAgent string
-	// ClientVersion / CLIVersion 分别覆盖 UA 中的 WorkBuddy 段与 CLI 段。
-	ClientVersion string
-	CLIVersion    string
-	// ClientName 覆盖归属头取值；空表示默认值。
-	ClientName string
-
-	// DeviceToken 是 X-Device-Token 的全局兜底（账号级优先）。
-	DeviceToken string
-	// DeviceTokenFile 是 device token 文件路径兜底。
-	DeviceTokenFile string
-
-	// MachineSalt 覆盖自动生成的设备指纹盐。
-	MachineSalt string
 
 	// AutoCheckin 开启每日自动签到。
 	AutoCheckin bool
@@ -73,8 +52,6 @@ type Config struct {
 const (
 	// DefaultLogLevel 是默认日志级别。
 	DefaultLogLevel = "info"
-	// DefaultPromptMode 是默认提示词模式。
-	DefaultPromptMode = "passthrough"
 	// DefaultCheckinAt 是默认签到时间。
 	DefaultCheckinAt = "10:00"
 	// DefaultStateDirName 是默认状态目录名。
@@ -111,7 +88,6 @@ func Default() Config {
 		EnabledRealms:        SplitList(DefaultRealmList),
 		StateDir:             DefaultStateDir(),
 		LogLevel:             DefaultLogLevel,
-		PromptMode:           DefaultPromptMode,
 		SanitizeFingerprints: true,
 		AutoCheckin:          true,
 		AutoCheckinAt:        DefaultCheckinAt,
@@ -190,35 +166,27 @@ func applyConfigLine(cfg *Config, key, value string) error {
 	case "log_to_file":
 		cfg.LogToFile = ParseBool(value, cfg.LogToFile)
 	case "prompt_mode":
-		if trimmed := strings.ToLower(strings.TrimSpace(value)); trimmed != "" {
-			cfg.PromptMode = trimmed
+		// 提示词体系属于供应商标属，但枚举值在全局层校验：
+		// 写错时明确报错，而不是让供应商静默回落 passthrough。
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "", PromptModeCustom, PromptModeAppend, PromptModePassThrough:
+		default:
+			return fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", value)
 		}
-	case "prompt_file":
-		cfg.PromptFile = strings.TrimSpace(value)
 	case "sanitize_fingerprints":
 		cfg.SanitizeFingerprints = ParseBool(value, cfg.SanitizeFingerprints)
 	case "passthrough_ip":
 		cfg.PassthroughIP = ParseBool(value, cfg.PassthroughIP)
 	case "user_agent":
-		cfg.UserAgent = strings.TrimSpace(value)
-	case "client_version":
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			cfg.ClientVersion = trimmed
-		}
-	case "cli_version":
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			cfg.CLIVersion = trimmed
-		}
-	case "client_name":
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			cfg.ClientName = trimmed
-		}
+		// 供应商专属键：值已存入 Raw，由供应商自行解释。
+	case "client_version", "cli_version", "client_name":
+		// 供应商专属键：值已存入 Raw，由供应商自行解释。
 	case "device_token":
-		cfg.DeviceToken = strings.TrimSpace(value)
+		// 供应商专属键：值已存入 Raw，由供应商自行解释。
 	case "device_token_file":
-		cfg.DeviceTokenFile = strings.TrimSpace(value)
+		// 供应商专属键：值已存入 Raw，由供应商自行解释。
 	case "machine_salt":
-		cfg.MachineSalt = strings.TrimSpace(value)
+		// 供应商专属键：值已存入 Raw，由供应商自行解释。
 	case "auto_checkin":
 		cfg.AutoCheckin = ParseBool(value, cfg.AutoCheckin)
 	case "auto_checkin_at":
@@ -245,11 +213,6 @@ func Validate(cfg Config) error {
 	case "debug", "info", "error":
 	default:
 		return fmt.Errorf("log_level %q is not supported (want debug, info or error)", cfg.LogLevel)
-	}
-	switch cfg.PromptMode {
-	case PromptModeCustom, PromptModeAppend, PromptModePassThrough:
-	default:
-		return fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", cfg.PromptMode)
 	}
 	if strings.TrimSpace(cfg.StateDir) == "" {
 		return fmt.Errorf("state_dir is empty")

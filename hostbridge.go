@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"strings"
 
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostabi"
@@ -29,13 +30,15 @@ func (hostBridge) AuthJSON(ctx context.Context, authIndex string) ([]byte, bool)
 func (hostBridge) Settings() core.Settings {
 	cfg := loadedConfig()
 	return core.Settings{
-		EnabledRealms: append([]string(nil), cfg.EnabledRealms...),
-		StateDir:      cfg.StateDir,
-		PassthroughIP: cfg.PassthroughIP,
-		AutoCheckin:   cfg.AutoCheckin,
-		AutoCheckinAt: cfg.AutoCheckinAt,
-		AutoTasks:     cfg.AutoTasks,
-		LogLevel:      cfg.LogLevel,
+		EnabledRealms:        append([]string(nil), cfg.EnabledRealms...),
+		StateDir:             cfg.StateDir,
+		PassthroughIP:        cfg.PassthroughIP,
+		SanitizeFingerprints: cfg.SanitizeFingerprints,
+		MachineSalt:          currentMachineSalt,
+		AutoCheckin:          cfg.AutoCheckin,
+		AutoCheckinAt:        cfg.AutoCheckinAt,
+		AutoTasks:            cfg.AutoTasks,
+		LogLevel:             cfg.LogLevel,
 	}
 }
 
@@ -45,9 +48,18 @@ func (hostBridge) Settings() core.Settings {
 // 自行解析自己的键并更新配置快照。
 func configureVendors(cfg pluginConfig) {
 	settings := hostBridge{}.Settings()
+	raw := make(map[string]string, len(cfg.Raw)+1)
+	for key, value := range cfg.Raw {
+		raw[key] = value
+	}
+	// 页面设置覆盖 YAML 配置：用户在控制台页改过的提示词模式以页面为准。
+	// 这是唯一一个「状态文件覆盖配置」的键，合并后再交给供应商解析。
+	if state := snapshotState(); state.PromptMode != nil && strings.TrimSpace(*state.PromptMode) != "" {
+		raw["prompt_mode"] = strings.TrimSpace(*state.PromptMode)
+	}
 	for _, vendor := range core.Vendors() {
 		if configurable, okConfigurable := vendor.(core.Configurable); okConfigurable {
-			configurable.Configure(settings, cfg.Raw)
+			configurable.Configure(settings, raw)
 		}
 	}
 }

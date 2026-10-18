@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/state"
 )
 
 // modelCacheEntry 是某个域的模型目录缓存。
@@ -328,6 +329,61 @@ func applyCatalogFallbacks(models []ModelInfo, region Region) []ModelInfo {
 //
 // 上游模型普遍是 1M 上下文，低估会让客户端过早截断对话。
 const defaultContextWindow int64 = 1000000
+
+// LoadCachedModelsFromState 用 state.json 里的缓存预热模型目录。
+//
+// 状态结构由 internal/state 定义，根层只负责把快照传进来，
+// 不再在这里重复一遍 WorkBuddy 的字段映射。
+func LoadCachedModelsFromState(cached []state.CachedModel) {
+	byRegion := map[Region][]ModelInfo{}
+	for _, item := range cached {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		region := NormalizeRegion(item.Realm)
+		byRegion[region] = append(byRegion[region], ModelInfo{
+			ID:                 item.ID,
+			Name:               item.Name,
+			ContextWindow:      item.ContextLength,
+			MaxTokens:          item.MaxOutputTokens,
+			Efforts:            item.Efforts,
+			DefaultEffort:      item.DefaultEffort,
+			SupportsImages:     item.SupportsImages,
+			SupportsToolCall:   item.SupportsTool,
+			CanDisableThinking: item.CanDisableThink,
+			OnlyReasoning:      item.OnlyReasoning,
+			Description:        item.Description,
+		})
+	}
+	for region, models := range byRegion {
+		LoadCachedModels(models, region)
+	}
+}
+
+// CachedModelsForState 把当前缓存拍平成 state.json 的模型清单。
+func CachedModelsForState() []state.CachedModel {
+	cached := CachedModels()
+	out := make([]state.CachedModel, 0, len(cached))
+	for region, models := range cached {
+		for _, model := range models {
+			out = append(out, state.CachedModel{
+				ID:              model.ID,
+				Name:            model.Name,
+				Realm:           string(region),
+				ContextLength:   model.ContextWindow,
+				MaxOutputTokens: model.MaxTokens,
+				Efforts:         model.Efforts,
+				DefaultEffort:   model.DefaultEffort,
+				SupportsImages:  model.SupportsImages,
+				SupportsTool:    model.SupportsToolCall,
+				CanDisableThink: model.CanDisableThinking,
+				OnlyReasoning:   model.OnlyReasoning,
+				Description:     model.Description,
+			})
+		}
+	}
+	return out
+}
 
 // DefaultContextWindowFor 返回某个模型的兜底窗口（静态表优先，否则用全局默认）。
 //

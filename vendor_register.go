@@ -59,10 +59,9 @@ func registerVendors() {
 
 // wireWorkBuddy 注入 WorkBuddy 需要的根层能力。
 //
-// 任务执行与上游客户端构造都依赖宿主回调、状态目录与提示词配置，属于根层
-// 职责；供应商包只消费注入进来的能力，不反向感知宿主。
+// 上游客户端与专属配置已由包自己解析；这里只注入任务动作清单
+// （任务执行仍由根层编排）。
 func wireWorkBuddy() {
-	workbuddy.SetClientFactory(newUpstreamClient)
 	workbuddy.SetTaskSource(func(region workbuddy.Region) []core.Task {
 		if region.IsGlobal() {
 			return nil

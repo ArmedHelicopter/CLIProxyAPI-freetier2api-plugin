@@ -105,3 +105,23 @@ type ModelDescriptor struct {
 	// CanDisableThinking 报告该模型是否允许关闭思考。
 	CanDisableThinking bool
 }
+
+// ModelSupportsImages 报告模型是否声明了图片输入能力。
+func ModelSupportsImages(model pluginapi.ModelInfo) bool {
+	for _, modality := range model.SupportedInputModalities {
+		if strings.EqualFold(strings.TrimSpace(modality), "image") {
+			return true
+		}
+	}
+	return false
+}
+
+// ModelSupportsTools 报告模型是否声明了工具调用能力。
+func ModelSupportsTools(model pluginapi.ModelInfo) bool {
+	for _, method := range model.SupportedGenerationMethods {
+		if strings.EqualFold(strings.TrimSpace(method), "tool_calls") {
+			return true
+		}
+	}
+	return false
+}

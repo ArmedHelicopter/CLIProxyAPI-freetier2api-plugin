@@ -1542,43 +1542,6 @@ func vendorSupportsLogin(vendor core.Vendor) bool {
 	return okLogin
 }
 
-// registeredModelsForVendor 返回某个供应商当前注册给宿主的模型清单。
-//
-// 数据来自插件自己的模型目录（与 model.static 同源），因此不会额外打上游——
-// 管理页的「读取模型清单」应当是轻量操作。
-func registeredModelsForVendor(vendorID string) []pluginapi.ModelInfo {
-	return cachedStaticModels()[vendorID]
-}
-
-// staticModelsCache 缓存最近一次 staticModels 的结果，供管理页回读。
-//
-// 为什么不直接调 vendor.StaticModels：那会打上游（Qoder 需要建 cosy 会话），
-// 而管理页刷新是高频操作。模型注册路径已经拉过一次，这里复用它的结果。
-var (
-	staticModelsMu    sync.RWMutex
-	staticModelsCache = map[string][]pluginapi.ModelInfo{}
-)
-
-// cacheStaticModels 记录某个供应商的模型清单（由注册路径调用）。
-func cacheStaticModels(vendorID string, models []pluginapi.ModelInfo) {
-	staticModelsMu.Lock()
-	defer staticModelsMu.Unlock()
-	staticModelsCache[vendorID] = models
-}
-
-// cachedStaticModels 返回缓存的模型清单副本。
-func cachedStaticModels() map[string][]pluginapi.ModelInfo {
-	staticModelsMu.RLock()
-	defer staticModelsMu.RUnlock()
-	out := make(map[string][]pluginapi.ModelInfo, len(staticModelsCache))
-	for vendorID, models := range staticModelsCache {
-		copied := make([]pluginapi.ModelInfo, len(models))
-		copy(copied, models)
-		out[vendorID] = copied
-	}
-	return out
-}
-
 // saveRefreshedCredential 把续期后的凭证写回宿主与磁盘。
 //
 // 写两处是刻意的双保险：

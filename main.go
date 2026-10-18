@@ -16,7 +16,6 @@ package main
 //   - internal/* 是纯逻辑层，不知道宿存在，对配置/宿主的能力一律走函数注入。
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -25,7 +24,6 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
 // pluginVersion 是插件版本，会在注册/状态接口里回给宿主。
@@ -193,7 +191,7 @@ func handlePluginRegister(request []byte) ([]byte, error) {
 		startBackgroundWork()
 	}
 	logger.Info("registered: realms=%v state_dir=%s prompt=%s",
-		cfg.EnabledRealms, cfg.StateDir, cfg.PromptMode)
+		cfg.EnabledRealms, cfg.StateDir, cfg.Raw["prompt_mode"])
 	return core.OKEnvelope(pluginRegistration())
 }
 
@@ -308,31 +306,4 @@ func decodeRequest(raw []byte, target any) error {
 		return fmt.Errorf("decode request: %w", errUnmarshal)
 	}
 	return nil
-}
-
-// newUpstreamClient 用当前配置构造一个 CodeBuddy 客户端。
-//
-// 每个请求新建：客户端本身很轻（只是配置快照），而它需要绑定请求级
-// callbackID 才能让出站请求进宿主的请求日志。
-//
-// 提示词状态由 workbuddy 包自己持有（SetPrompt 推入），这里只取用，
-// 不再从 cfg 里读——页面设置覆盖 YAML 的逻辑收敛在 applyPromptConfig。
-func newUpstreamClient(ctx context.Context) *workbuddy.Client {
-	cfg := loadedConfig()
-	return workbuddy.NewClient(workbuddy.Options{
-		Context:              ctx,
-		EnabledRealms:        cfg.EnabledRealms,
-		PromptMode:           workbuddy.PromptMode(),
-		PromptText:           workbuddy.PromptText(),
-		OnContentBlocked:     workbuddy.MarkPromptDegraded,
-		SanitizeFingerprints: cfg.SanitizeFingerprints,
-		PassthroughIP:        cfg.PassthroughIP,
-		UserAgent:            cfg.UserAgent,
-		ClientVersion:        cfg.ClientVersion,
-		CLIVersion:           cfg.CLIVersion,
-		ClientName:           cfg.ClientName,
-		DeviceToken:          cfg.DeviceToken,
-		DeviceTokenFile:      cfg.DeviceTokenFile,
-		StateDir:             cfg.StateDir,
-	})
 }

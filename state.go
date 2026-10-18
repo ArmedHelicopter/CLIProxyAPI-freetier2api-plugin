@@ -16,7 +16,6 @@ import (
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
-	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
 // 状态类型的别名：调用方（管理接口、任务中心）继续使用包内短名。
@@ -37,9 +36,8 @@ func loadState(cfg pluginConfig) (*pluginState, error) {
 	if errLoad != nil {
 		return nil, errLoad
 	}
-	// 锁内只做纯计算合并（refreshDisabledModelCache 会重入存储锁）。
-	reloadDisabledModelCache(mergeDisabledLists(loaded.DisabledModels))
-	reloadModelAliasCache(loaded.ModelAliases)
+	// 状态加载后重算模型缓存（禁用并集与别名表）。
+	modelCatalog.ReloadFromState(*loaded)
 	return loaded, nil
 }
 
@@ -49,22 +47,9 @@ func snapshotState() pluginState { return stateStore.Snapshot() }
 // mutateState 在锁内修改状态并立即落盘。
 func mutateState(mutate func(*pluginState)) { stateStore.Mutate(mutate) }
 
-// configureInstallSalt 计算并注入设备指纹盐。
-//
-// 盐一旦生成必须保持不变：变更会让全部账号的派生机器码漂移（等价于换设备），
-// 上游风控会把它当成新设备。
-func configureInstallSalt(cfg pluginConfig) error {
-	salt, errSalt := ensureMachineSalt(cfg)
-	if errSalt != nil {
-		return errSalt
-	}
-	workbuddy.SetInstallSalt(salt)
-	return nil
-}
-
 // ensureMachineSalt 返回本机指纹盐：配置覆盖 > 已有盐文件 > 首次生成后落盘。
 func ensureMachineSalt(cfg pluginConfig) (string, error) {
-	if override := strings.TrimSpace(cfg.MachineSalt); override != "" {
+	if override := strings.TrimSpace(cfg.Raw["machine_salt"]); override != "" {
 		return override, nil
 	}
 	path := saltFilePath(cfg)

@@ -13,11 +13,14 @@ package workbuddy
 // 单路失败降级为另一路；全部失败才返回错误。
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // v3ConfigResponse 是 /v3/config 的响应体。
@@ -67,19 +70,49 @@ func SetProbeCredentialFunc(fn func(region Region) *Credential) {
 
 // probeCredential 取一个用于探测的凭证。
 //
-// 未注入或取不到时返回一个空凭证：请求会带上 X-No-Authorization 标记，
-// 上游返回的 401 会被正常分类，而不是让探测静默失败。
-func (c *Client) probeCredential() *Credential {
+// 优先使用注入的回调（测试替换）；否则直接从宿主端口挑一个同区域的
+// 可用账号。取不到时返回空凭证：请求会带着无鉴权标记，上游的 401
+// 会被正常分类，而不是让探测静默失败。
+func (c *Client) probeCredential(region Region) *Credential {
 	probeCredentialMu.RLock()
 	fn := probeCredentialFn
 	probeCredentialMu.RUnlock()
-	if fn == nil {
+	if fn != nil {
+		if cred := fn(region); cred != nil {
+			return cred
+		}
 		return &Credential{}
 	}
-	if cred := fn(RegionCN); cred != nil {
+	if cred := hostProbeCredential(region); cred != nil {
 		return cred
 	}
 	return &Credential{}
+}
+
+// hostProbeCredential 从宿主凭证里挑第一个同区域的 WorkBuddy 账号。
+func hostProbeCredential(region Region) *Credential {
+	ctx := context.Background()
+	entries, errList := core.ListHostAuths(ctx)
+	if errList != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		if entry.Disabled || entry.Unavailable {
+			continue
+		}
+		stored, okStored := core.HostAuthJSON(ctx, entry.AuthIndex)
+		if !okStored {
+			continue
+		}
+		credential, okCredential := core.ParseCredential(stored, entry.Name, nil)
+		if !okCredential || credential.RegionValue() != string(region) {
+			continue
+		}
+		if native, okNative := credential.Native.(*Credential); okNative && native != nil {
+			return native
+		}
+	}
+	return nil
 }
 
 // fetchModelsFromUpstream 并发探测某个域的模型清单。
@@ -177,7 +210,7 @@ func (c *Client) fetchModelsFromUpstream(region Region) ([]ModelInfo, error) {
 // probeV3Config 拉取 /v3/config 并解析模型清单。
 func (c *Client) probeV3Config(region Region, userAgent string) ([]ModelInfo, error) {
 	// 探测需要一个凭证：没有凭证就无法请求上游。
-	cred := c.probeCredential()
+	cred := c.probeCredential(region)
 	if cred == nil {
 		return nil, fmt.Errorf("no credential available for model probe")
 	}
@@ -226,7 +259,7 @@ func (c *Client) probeV3Config(region Region, userAgent string) ([]ModelInfo, er
 
 // probeEnterpriseModels 拉取企业模型目录。
 func (c *Client) probeEnterpriseModels(region Region) ([]ModelInfo, error) {
-	cred := c.probeCredential()
+	cred := c.probeCredential(region)
 	if cred == nil {
 		return nil, fmt.Errorf("no credential available for model probe")
 	}
