@@ -95,7 +95,7 @@ func (r *Registry) Resolve(fileName, provider string, raw map[string]any) (Vendo
 			return ids[i] < ids[j]
 		})
 		for _, id := range ids {
-			if fileNameHasVendorPrefix(base, id) {
+			if FileNameMatchesConvention(base, id) {
 				return r.byID[id], true
 			}
 		}
@@ -152,18 +152,6 @@ func (r *Registry) SplitModelID(modelID string) (vendorID, bareModel string) {
 func (r *Registry) ModelKeyFor(vendorID, modelID string) string {
 	_, bare := r.SplitModelID(modelID)
 	return strings.ToLower(strings.TrimSpace(vendorID)) + ":" + strings.TrimSpace(bare)
-}
-
-func fileNameHasVendorPrefix(base, vendorID string) bool {
-	if base == vendorID {
-		return true
-	}
-	for _, separator := range []string{"-", "_", "."} {
-		if strings.HasPrefix(base, vendorID+separator) || strings.Contains(base, separator+vendorID) {
-			return true
-		}
-	}
-	return false
 }
 
 // FileNameFor 生成 <vendor>-<标识>.json。

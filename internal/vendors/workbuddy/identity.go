@@ -18,15 +18,13 @@ package workbuddy
 
 import (
 	"context"
-	"time"
-
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"freetier2api-plugin/internal/core"
-	"math/big"
 	"strings"
+	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // 节流参数。全部照抄原项目实测值——这些数字是风控边界，
@@ -62,13 +60,9 @@ var (
 // fingerprint 生成某个账号某用途的稳定设备标识。
 //
 // 36 位 hex（18 字节），与官方客户端的设备 id 长度一致。
-// 跨重启稳定、账号间互异、部署间隔离（混入机器盐，见 SetInstallSalt）。
-func fingerprint(credential *Credential, purpose string) string {
-	return DeriveID(credential.UIDValue(), purpose)
-}
-
+// 跨重启稳定、账号间互异、部署间隔离（混入机器盐，见 runtime.configure）。
 func randomHex(n int) string {
-	return RandomHex(n)
+	return core.RandomHex(n)
 }
 
 // nowUnixMs 返回当前毫秒时间戳。
@@ -78,7 +72,7 @@ func nowUnixMs() int64 { return time.Now().UnixMilli() }
 //
 // 这些字段共同把请求标识成「来自一台固定的 Windows 桌面客户端」。
 // 业务字段可以覆盖它们（map 合并时业务优先）。
-func desktopFingerprint(credential *Credential) map[string]any {
+func desktopFingerprint(credential *Credential, rt *runtime) map[string]any {
 	now := nowUnixMs()
 	return map[string]any{
 		"timezone":     "Asia/Shanghai",
@@ -93,8 +87,8 @@ func desktopFingerprint(credential *Credential) map[string]any {
 		"ideName":     "WorkBuddy",
 		"ideType":     "WorkBuddy",
 		"ideVersion":  DesktopClientVersion,
-		"machineId":   fingerprint(credential, "machine"),
-		"sessionId":   fingerprint(credential, "session"),
+		"machineId":   rt.fingerprint(credential, "machine"),
+		"sessionId":   rt.fingerprint(credential, "session"),
 		"extName":     "workbuddy-desktop",
 		"extVersion":  DesktopClientVersion,
 		"os":          "win32",
@@ -344,7 +338,7 @@ type desktopContext struct {
 
 // run 让事件带上指纹并发出去。
 func (c *desktopContext) run(ctx context.Context, client *Client) error {
-	base := desktopFingerprint(c.credential)
+	base := desktopFingerprint(c.credential, client.rt)
 	merged := make([]map[string]any, 0, len(c.events))
 	for _, event := range c.events {
 		merged = append(merged, mergeEvent(base, event))
@@ -353,8 +347,8 @@ func (c *desktopContext) run(ctx context.Context, client *Client) error {
 }
 
 // ApplyDesktopFingerprint 给事件链注入桌面指纹（导出给 main 包编排使用）。
-func ApplyDesktopFingerprint(credential *Credential, events []map[string]any) []map[string]any {
-	return withFingerprint(credential, events)
+func ApplyDesktopFingerprint(credential *Credential, events []map[string]any, rt *runtime) []map[string]any {
+	return withFingerprint(credential, events, rt)
 }
 
 // DesktopExpertSummonSequence 构造专家召唤链（3 事件）。
@@ -423,38 +417,11 @@ func tailOfString(text string, n int) string {
 
 // NewHexID 生成 32 位十六进制随机 ID（与官方客户端的 messageId 形态一致）。
 func NewHexID() string {
-	return RandomHex(16)
+	return core.RandomHex(16)
 }
 
 func newHexID() string {
 	return NewHexID()
-}
-
-// RandomHex 生成 n 字节的随机十六进制串。
-func RandomHex(n int) string {
-	if n <= 0 {
-		return ""
-	}
-	buf := make([]byte, n)
-	if _, errRand := rand.Read(buf); errRand != nil {
-		sum := sha256.Sum256([]byte(fmt.Sprintf("fallback-%d", nextFallbackSeed())))
-		if n > len(sum) {
-			n = len(sum)
-		}
-		return hex.EncodeToString(sum[:n])
-	}
-	return hex.EncodeToString(buf)
-}
-
-var fallbackSeed int64
-
-func nextFallbackSeed() int64 {
-	value, errRand := rand.Int(rand.Reader, big.NewInt(1<<62))
-	if errRand == nil {
-		return value.Int64()
-	}
-	fallbackSeed++
-	return fallbackSeed
 }
 
 // ConversationKey 从请求体里提取会话键，用于生成稳定的会话头族。
@@ -601,9 +568,3 @@ func TurnRequestID(key string) string {
 	sum := sha256.Sum256([]byte("turn|" + key))
 	return hex.EncodeToString(sum[:16])
 }
-
-// HasImagePart 报告请求体里是否携带图片。
-//
-// 用于错误提示：上游对「模型不支持图片」与「图片请求本身有问题」
-// 返回的码很近，区分它们才能给出有用的提示。
-func HasImagePart(body []byte) bool { return core.HasImagePart(body) }

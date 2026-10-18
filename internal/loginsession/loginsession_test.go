@@ -6,10 +6,12 @@ import (
 	"time"
 )
 
-func TestRegisterPollOwnsDelete(t *testing.T) {
-	Register("vendor-a", "sess-1", time.Minute, 0, "payload")
+var testRegistry = NewRegistry()
 
-	session, state := Poll("sess-1")
+func TestRegisterPollOwnsDelete(t *testing.T) {
+	testRegistry.Register("vendor-a", "sess-1", time.Minute, 0, "payload")
+
+	session, state := testRegistry.Poll("sess-1")
 	if state != PollReady {
 		t.Fatalf("poll state = %v, want ready", state)
 	}
@@ -17,53 +19,53 @@ func TestRegisterPollOwnsDelete(t *testing.T) {
 		t.Fatalf("session = %+v", session)
 	}
 
-	vendorID, okOwns := Owns("sess-1")
+	vendorID, okOwns := testRegistry.Owns("sess-1")
 	if !okOwns || vendorID != "vendor-a" {
 		t.Fatalf("owns = %q %v", vendorID, okOwns)
 	}
 
-	Delete("sess-1")
-	if _, stateMissing := Poll("sess-1"); stateMissing != PollMissing {
+	testRegistry.Delete("sess-1")
+	if _, stateMissing := testRegistry.Poll("sess-1"); stateMissing != PollMissing {
 		t.Fatalf("after delete poll state = %v", stateMissing)
 	}
-	if _, okAfter := Owns("sess-1"); okAfter {
+	if _, okAfter := testRegistry.Owns("sess-1"); okAfter {
 		t.Fatal("deleted session must not be owned")
 	}
 }
 
 func TestPollThrottling(t *testing.T) {
-	Register("vendor-b", "sess-2", time.Minute, time.Hour, nil)
+	testRegistry.Register("vendor-b", "sess-2", time.Minute, time.Hour, nil)
 
-	if _, state := Poll("sess-2"); state != PollReady {
+	if _, state := testRegistry.Poll("sess-2"); state != PollReady {
 		t.Fatalf("first poll = %v, want ready", state)
 	}
-	if _, state := Poll("sess-2"); state != PollThrottled {
+	if _, state := testRegistry.Poll("sess-2"); state != PollThrottled {
 		t.Fatalf("second poll = %v, want throttled", state)
 	}
 }
 
 func TestPollExpiry(t *testing.T) {
-	Register("vendor-c", "sess-3", time.Millisecond, 0, nil)
+	testRegistry.Register("vendor-c", "sess-3", time.Millisecond, 0, nil)
 	time.Sleep(5 * time.Millisecond)
 
-	if _, state := Poll("sess-3"); state != PollMissing {
+	if _, state := testRegistry.Poll("sess-3"); state != PollMissing {
 		t.Fatalf("expired poll = %v, want missing", state)
 	}
-	if _, okOwns := Owns("sess-3"); okOwns {
+	if _, okOwns := testRegistry.Owns("sess-3"); okOwns {
 		t.Fatal("expired session must not be owned")
 	}
 }
 
 func TestPollMissingAndEmptyID(t *testing.T) {
-	if _, state := Poll(""); state != PollMissing {
+	if _, state := testRegistry.Poll(""); state != PollMissing {
 		t.Fatalf("empty id state = %v", state)
 	}
-	if _, state := Poll("nope"); state != PollMissing {
+	if _, state := testRegistry.Poll("nope"); state != PollMissing {
 		t.Fatalf("unknown id state = %v", state)
 	}
 	// 空 id 不得登记，避免所有空串会话互相覆盖。
-	Register("vendor-d", "  ", time.Minute, 0, nil)
-	if _, okOwns := Owns(""); okOwns {
+	testRegistry.Register("vendor-d", "  ", time.Minute, 0, nil)
+	if _, okOwns := testRegistry.Owns(""); okOwns {
 		t.Fatal("empty id must not be registered")
 	}
 }
@@ -90,10 +92,10 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for j := 0; j < 100; j++ {
 				id := NewID(4)
-				Register("vendor-e", id, time.Minute, 0, nil)
-				_, _ = Poll(id)
-				_, _ = Owns(id)
-				Delete(id)
+				testRegistry.Register("vendor-e", id, time.Minute, 0, nil)
+				_, _ = testRegistry.Poll(id)
+				_, _ = testRegistry.Owns(id)
+				testRegistry.Delete(id)
 			}
 		}()
 	}

@@ -14,20 +14,22 @@ import (
 
 type adapter struct {
 	*core.NativeAdapter[*Credential]
-	config Config
+	config   Config
+	sessions *SessionStore
 }
 
 // Instances 构造 Trae 家族的全部实例。
 func Instances(env core.Env) []core.Vendor {
 	configs := AllConfigs()
+	sessions := NewSessionStore()
 	out := make([]core.Vendor, 0, len(configs))
 	for _, cfg := range configs {
-		out = append(out, newInstance(env, cfg))
+		out = append(out, newInstance(env, cfg, sessions))
 	}
 	return out
 }
 
-func newInstance(env core.Env, cfg Config) core.Vendor {
+func newInstance(env core.Env, cfg Config, sessions *SessionStore) core.Vendor {
 	return &adapter{
 		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
 			Meta: core.Meta{VendorID: cfg.VendorID, VendorName: cfg.VendorName, VendorRegion: string(cfg.Region)},
@@ -79,7 +81,7 @@ func newInstance(env core.Env, cfg Config) core.Vendor {
 				return MergeStorageJSON(original, native)
 			},
 		}),
-		config: cfg,
+		config: cfg, sessions: sessions,
 	}
 }
 
@@ -182,15 +184,15 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 // ---- 登录与续期 ----
 
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return LoginStart(ctx, v.config)
+	return LoginStart(ctx, v.config, v.sessions)
 }
 
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	return LoginPoll(ctx, state)
+	return LoginPoll(ctx, state, v.sessions)
 }
 
 func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	return OwnsLoginSession(sessionID, v.ID())
+	return OwnsLoginSession(v.sessions, sessionID, v.ID())
 }
 
 func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.config) }

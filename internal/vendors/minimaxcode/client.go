@@ -3,6 +3,8 @@ package minimaxcode
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -11,10 +13,9 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
-
-	"freetier2api-plugin/cpasdk/pluginapi"
 )
 
 // Target 是一次签名的 MiniMax 上游请求。
@@ -476,29 +477,160 @@ func findDeepString(data any, keys ...string) string {
 
 // 本文件解析 MiniMax Code 的供应商专属配置。
 
-var (
-	baseURLCN     core.URLOverride
-	baseURLGlobal core.URLOverride
-)
-
-// Configure 解析两个区域的基地址覆盖，兼容新旧键名。
-func Configure(_ core.Settings, raw map[string]string) {
-	baseURLCN.Set(core.FirstNonEmpty(raw["minimaxcode_cn_base_url"]))
-	baseURLGlobal.Set(core.FirstNonEmpty(raw["minimaxcode_global_base_url"]))
-}
-
-// BaseURLFor 返回某区域的基地址覆盖值；空表示用内置默认。
-func BaseURLFor(region Region) string {
-	if region == RegionGlobal {
-		return strings.TrimSpace(baseURLGlobal.Raw())
-	}
-	return strings.TrimSpace(baseURLCN.Raw())
-}
-
 // ConfigFields 声明 MiniMax Code 专属配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
 		{Name: "minimaxcode_cn_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "国内版上游基地址覆盖。"},
 		{Name: "minimaxcode_global_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "国际版上游基地址覆盖。"},
 	}
+}
+
+// isUnreserved 判断是否为 JavaScript encodeURIComponent 不转义的字符集。
+// JS 规范字符集：A-Z a-z 0-9 - _ . ! ~ * ' ( )
+func isUnreserved(b byte) bool {
+	return (b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9') ||
+		b == '-' || b == '_' || b == '.' ||
+		b == '!' || b == '~' || b == '*' ||
+		b == '\'' || b == '(' || b == ')'
+}
+
+// EncodeURIComponent 模拟 JavaScript 的 encodeURIComponent 行为。
+// 对非 ASCII 字符按 UTF-8 字节编码为大写 %XX 形式。
+func EncodeURIComponent(value string) string {
+	var buf strings.Builder
+	for i := 0; i < len(value); i++ {
+		b := value[i]
+		if isUnreserved(b) {
+			buf.WriteByte(b)
+		} else {
+			fmt.Fprintf(&buf, "%%%02X", b)
+		}
+	}
+	return buf.String()
+}
+
+// FormEncode 模拟 URLSearchParams 的表单键值编码。
+// 字符集与 EncodeURIComponent 一致，但空格转义为 +。
+func FormEncode(value string) string {
+	return strings.ReplaceAll(EncodeURIComponent(value), "%20", "+")
+}
+
+// MD5Hex 计算字符串的小写 32 位 MD5 哈希。
+func MD5Hex(value string) string {
+	h := md5.Sum([]byte(value))
+	return hex.EncodeToString(h[:])
+}
+
+// XSignature 计算 x-signature 请求头：MD5(unix_seconds + salt + body)。
+func XSignature(unixSeconds int64, body string) string {
+	return MD5Hex(fmt.Sprintf("%d%s%s", unixSeconds, SignatureSalt, body))
+}
+
+// YYSignature 计算 yy 请求头：MD5(encodeURIComponent(sign_url) + "_" + body + MD5(ms) + "ooui")。
+func YYSignature(signURL, body string, unixMS int64) string {
+	msMD5 := MD5Hex(strconv.FormatInt(unixMS, 10))
+	input := EncodeURIComponent(signURL) + "_" + body + msMD5 + SignatureSuffix
+	return MD5Hex(input)
+}
+
+// Region 是 MiniMax Code 服务部署区域。
+type Region string
+
+const (
+	RegionCN     Region = "cn"
+	RegionGlobal Region = "global"
+
+	VendorIDCN       = "minimaxcodecn"
+	VendorNameCN     = "MiniMax Code 国内版"
+	VendorIDGlobal   = "minimaxcodeglobal"
+	VendorNameGlobal = "MiniMax Code 国际版"
+
+	// 国内版 (CN)
+	AccountHostCN = "https://account.minimax.cn"
+	AgentHostCN   = "https://agent.minimaxi.com"
+	StreamHostCN  = "https://agent-stream.minimaxi.com"
+
+	// 国际版 (Global)
+	AccountHostGlobal = "https://account.minimax.io"
+	AgentHostGlobal   = "https://agent.minimax.io"
+	StreamHostGlobal  = "https://agent-stream.minimax.io"
+
+	// OAuth2 设备码配置（与桌面客户端对齐）
+	ClientID         = "mcode-public"
+	OAuthScope       = "agent.default"
+	OAuthAudience    = "agent-backend"
+	DeviceGrantType  = "urn:ietf:params:oauth:grant-type:device_code"
+	RefreshGrantType = "refresh_token"
+
+	// 官方签名协议盐值与后缀
+	SignatureSalt   = "I*7Cf%WZ#S&%1RlZJ&C2"
+	SignatureSuffix = "ooui"
+
+	// 客户端 UA 指纹
+	DesktopUA = "MiniMaxAgent Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) MiniMaxAgent/3.0.73 Chrome/148.0.7778.280 Safari/537.36"
+	WebUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+
+	// 端点路径
+	EpDeviceCode    = "/oauth2/device/code"
+	EpToken         = "/oauth2/token"
+	EpUserInfo      = "/v1/api/user/info"
+	EpConfig        = "/minimax-cloud/api/v1/config"
+	EpAgentList     = "/minimax-cloud/api/v1/agent"
+	EpConnections   = "/minimax-cloud/api/v1/channel/connections"
+	EpSession       = "/minimax-cloud/api/v1/agent/%s/session"
+	EpMessage       = "/minimax-cloud/api/v1/session/%s/message"
+	EpCheckinStatus = "/minimax-cloud/api/v1/signin/status"
+	EpCheckinClaim  = "/minimax-cloud/api/v1/signin/claim"
+	EpMembership    = "/matrix/api/v1/commerce/get_membership_info"
+	EpCreditDetails = "/minimax-cloud/api/v1/credit/details"
+)
+
+// VendorIDFor 返回某区域对应的 VendorID。
+func VendorIDFor(r Region) string {
+	if r == RegionGlobal {
+		return VendorIDGlobal
+	}
+	return VendorIDCN
+}
+
+// VendorNameFor 返回某区域对应的展示名。
+func VendorNameFor(r Region) string {
+	if r == RegionGlobal {
+		return VendorNameGlobal
+	}
+	return VendorNameCN
+}
+
+// AccountHostFor 返回账号服务基础地址。
+func AccountHostFor(r Region) string {
+	if r == RegionCN {
+		return AccountHostCN
+	}
+	return AccountHostGlobal
+}
+
+// AgentHostFor 返回 Agent 业务基础地址。
+func AgentHostFor(r Region, override string) string {
+	if trimmed := strings.TrimRight(strings.TrimSpace(override), "/"); trimmed != "" {
+		return trimmed
+	}
+	if r == RegionCN {
+		return AgentHostCN
+	}
+	return AgentHostGlobal
+}
+
+// StreamHostFor 返回流式对话消息基础地址。
+func StreamHostFor(r Region, override string) string {
+	base := AgentHostFor(r, override)
+	// 如果是 agent.xxx 转换为 agent-stream.xxx
+	if strings.Contains(base, "://agent.") {
+		return strings.Replace(base, "://agent.", "://agent-stream.", 1)
+	}
+	if r == RegionCN {
+		return StreamHostCN
+	}
+	return StreamHostGlobal
 }

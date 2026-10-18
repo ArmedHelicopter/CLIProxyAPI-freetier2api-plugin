@@ -10,11 +10,11 @@ package state
 import (
 	"encoding/json"
 	"fmt"
-	"freetier2api-plugin/internal/core"
 	"os"
 	"path/filepath"
 	"sync"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
 )
 

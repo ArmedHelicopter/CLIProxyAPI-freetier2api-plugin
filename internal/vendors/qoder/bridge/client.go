@@ -5,15 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/vendors/qoder/cosy"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/vendors/qoder/cosy"
 )
 
 type BearerClient struct {
@@ -136,7 +137,9 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 	maxQueueWaits := QueueMaxWaits()
 	for attempt := 0; attempt <= TransientMaxRetries+maxQueueWaits; attempt++ {
 		if attempt > 0 {
-			time.Sleep(RetryBackoff(attempt))
+			if !core.SleepContext(ctx, RetryBackoff(attempt)) {
+				return ctx.Err()
+			}
 		}
 		headers, err := c.buildHeaders(pathSig, bodyStr, "text/event-stream", extra)
 		if err != nil {
@@ -171,8 +174,8 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 				queueWaits++
 				logger.Info("upstream queues model %s opening stream %s (%s); waiting %s before retry %d/%d",
 					signal.ModelKey, fullURL, signal.QueueType, wait, queueWaits, maxQueueWaits)
-				if errWait := sleepCtx(ctx, wait); errWait != nil {
-					return errWait
+				if !core.SleepContext(ctx, wait) {
+					return ctx.Err()
 				}
 				continue
 			}
@@ -235,14 +238,4 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 	}
 	// 防御性兜底：所有失败分支均在循环内直接 return，正常不可达
 	return WrapTransportError(lastErr)
-}
-
-// sleepCtx 可被 ctx 取消的退避等待。
-func sleepCtx(ctx context.Context, d time.Duration) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(d):
-		return nil
-	}
 }

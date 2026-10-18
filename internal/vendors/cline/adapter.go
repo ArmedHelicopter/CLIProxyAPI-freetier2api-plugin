@@ -25,6 +25,7 @@ import (
 type adapter struct {
 	*core.NativeAdapter[*Credential]
 	contextFallback func(string) int64
+	baseURL         string
 }
 
 // pendingLogin 是一次进行中的 Cline 登录（会话数据）。
@@ -37,55 +38,56 @@ func Instances(env core.Env, contextFallback func(string) int64) []core.Vendor {
 	if contextFallback == nil {
 		contextFallback = core.DefaultContextWindow
 	}
-	return []core.Vendor{&adapter{
-		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
-			Meta: core.Meta{VendorID: VendorID, VendorName: VendorName},
-			Env:  env,
-			Extract: func(c *core.Credential) (*Credential, bool) {
-				native, ok := c.Native.(*Credential)
-				return native, ok
-			},
-			ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
-				native, errParse := ParseCredential(raw)
-				if errParse != nil {
-					return core.CredentialSeed{}, nil, errParse
-				}
-				label := native.Label
-				if label == "" {
-					label = native.Email
-				}
-				if label == "" {
-					label = fileName
-				}
-				return core.CredentialSeed{
-					VendorID: VendorID, Label: label, FileID: core.FileIDFromFileName(fileName),
-					Token: native.AccessToken, RefreshToken: native.RefreshToken,
-					ExpiresAt: native.ExpiresAt, AuthMode: "oauth",
-				}, native, nil
-			},
-			RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
-				updated, refreshed, errRefresh := RefreshCredential(ctx, BaseURLOverride(), native)
-				if errRefresh != nil {
-					return core.NativeRefresh[*Credential]{}, errRefresh
-				}
-				return core.NativeRefresh[*Credential]{
-					Native: updated, Token: updated.AccessToken, RefreshToken: updated.RefreshToken,
-					ExpiresAt: updated.ExpiresAt, Changed: refreshed,
-				}, nil
-			},
-			MergeNative: func(original []byte, native *Credential) ([]byte, error) {
-				return MergeStorageJSON(original, native)
-			},
-		}),
-		contextFallback: contextFallback,
-	}}
+	inst := &adapter{contextFallback: contextFallback}
+	inst.NativeAdapter = core.NewNativeAdapter(core.NativeSpec[*Credential]{
+		Meta: core.Meta{VendorID: VendorID, VendorName: VendorName},
+		Env:  env,
+		Extract: func(c *core.Credential) (*Credential, bool) {
+			native, ok := c.Native.(*Credential)
+			return native, ok
+		},
+		ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+			native, errParse := ParseCredential(raw)
+			if errParse != nil {
+				return core.CredentialSeed{}, nil, errParse
+			}
+			label := native.Label
+			if label == "" {
+				label = native.Email
+			}
+			if label == "" {
+				label = fileName
+			}
+			return core.CredentialSeed{
+				VendorID: VendorID, Label: label, FileID: core.FileIDFromFileName(fileName),
+				Token: native.AccessToken, RefreshToken: native.RefreshToken,
+				ExpiresAt: native.ExpiresAt, AuthMode: "oauth",
+			}, native, nil
+		},
+		RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
+			updated, refreshed, errRefresh := RefreshCredential(ctx, inst.baseURL, native)
+			if errRefresh != nil {
+				return core.NativeRefresh[*Credential]{}, errRefresh
+			}
+			return core.NativeRefresh[*Credential]{
+				Native: updated, Token: updated.AccessToken, RefreshToken: updated.RefreshToken,
+				ExpiresAt: updated.ExpiresAt, Changed: refreshed,
+			}, nil
+		},
+		MergeNative: func(original []byte, native *Credential) ([]byte, error) {
+			return MergeStorageJSON(original, native)
+		},
+	})
+	return []core.Vendor{inst}
 }
 
 // AuthMode 报告本供应商的凭证形态。
 func (v *adapter) AuthMode() string { return "oauth" }
 
 // Configure 解析供应商专属配置。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
+func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
+	v.baseURL = strings.TrimSpace(raw["cline_base_url"])
+}
 
 // Match 判断一份凭证是否属于本供应商。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
@@ -96,7 +98,7 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 
 // StaticModels 返回 Cline 的模型清单（上游接口无需认证）。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	models, errModels := FetchModels(ctx, BaseURLOverride())
+	models, errModels := FetchModels(ctx, v.baseURL)
 	if errModels != nil {
 		// 探测失败退回内置兜底清单：没有模型注册比注册一份可能过时的
 		// 清单更糟（客户端会看不到任何模型）。
@@ -162,7 +164,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	if errNative != nil {
 		return nil, errNative
 	}
-	payload, errChat := Chat(ctx, BaseURLOverride(), ChatRequest{
+	payload, errChat := Chat(ctx, v.baseURL, ChatRequest{
 		BearerToken: native.BearerToken(),
 		Body:        req.Payload,
 		Stream:      false,
@@ -182,7 +184,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errNative != nil {
 		return errNative
 	}
-	resp, errStream := ChatStream(ctx, BaseURLOverride(), ChatRequest{
+	resp, errStream := ChatStream(ctx, v.baseURL, ChatRequest{
 		BearerToken: native.BearerToken(),
 		Body:        req.Payload,
 		Stream:      true,
@@ -203,7 +205,7 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 		return nil, core.ToPluginError(errStart)
 	}
 	sessionID := "cline_" + loginsession.NewID(16)
-	loginsession.Register(VendorID, sessionID, time.Until(device.ExpiresAt), device.Interval, &pendingLogin{deviceCode: device.DeviceCode})
+	v.Env.Logins.Register(VendorID, sessionID, time.Until(device.ExpiresAt), device.Interval, &pendingLogin{deviceCode: device.DeviceCode})
 	logger.Info("started cline login (user_code=%s)", device.UserCode)
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
@@ -221,7 +223,7 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 
 // LoginPoll 轮询一次登录状态。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	session, pollState := loginsession.Poll(state)
+	session, pollState := v.Env.Logins.Poll(state)
 	if pollState == loginsession.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
@@ -242,7 +244,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 			Message: "登录会话数据已损坏，请重新发起登录",
 		}, nil
 	}
-	credential, errPoll := LoginPoll(ctx, BaseURLOverride(), pending.deviceCode)
+	credential, errPoll := LoginPoll(ctx, v.baseURL, pending.deviceCode)
 	if errPoll != nil {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
@@ -257,7 +259,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 		}, nil
 	}
 
-	loginsession.Delete(strings.TrimSpace(state))
+	v.Env.Logins.Delete(strings.TrimSpace(state))
 	storageJSON, errStorage := credential.StorageJSON()
 	if errStorage != nil {
 		return &pluginapi.AuthLoginPollResponse{
@@ -281,7 +283,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 
 // OwnsLoginSession 报告该会话是否由本供应商创建。
 func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	if vendorID, okOwns := loginsession.Owns(sessionID); okOwns {
+	if vendorID, okOwns := v.Env.Logins.Owns(sessionID); okOwns {
 		return vendorID == VendorID
 	}
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "cline_")

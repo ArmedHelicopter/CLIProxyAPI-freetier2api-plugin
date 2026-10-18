@@ -20,7 +20,7 @@ func (s *Service) buildVendorsPayload() map[string]any {
 	cfg := s.deps.Config()
 	vendors := make([]vendorDescriptor, 0, len(s.registry.Vendors()))
 	for _, vendor := range s.registry.Vendors() {
-		if !realmEnabled(cfg, vendor.Region()) {
+		if !core.RealmEnabled(cfg.EnabledRealms, vendor.Region()) {
 			continue
 		}
 		vendors = append(vendors, vendorDescriptor{

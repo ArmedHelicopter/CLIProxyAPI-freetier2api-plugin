@@ -1,16 +1,5 @@
 package qoder
 
-// 本文件实现 Qoder 的 OAuth 设备授权登录（PKCE）。
-//
-// 流程（与上游 Qoder 桌面端一致）：
-//  1. 生成 PKCE verifier/challenge 与 nonce，拼出授权链接（DeviceLoginBase）；
-//  2. 用户在浏览器里完成授权；
-//  3. 轮询 poll 端点：404 = 还没授权，200 = 拿到 device_token；
-//  4. 取账号信息与套餐名，组装凭证 JSON。
-//
-// 与 WorkBuddy 的差异：WorkBuddy 是自有 state/token 三接口，Qoder 是标准
-// PKCE 设备码流。两者形状完全不同，因此登录协议属于供应商层。
-
 import (
 	"context"
 	"encoding/json"
@@ -24,8 +13,22 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/loginsession"
+	"freetier2api-plugin/internal/upstream"
+	"freetier2api-plugin/internal/vendors/qoder/bridge"
+	"freetier2api-plugin/internal/vendors/qoder/cosy"
 	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
+
+// 本文件实现 Qoder 的 OAuth 设备授权登录（PKCE）。
+//
+// 流程（与上游 Qoder 桌面端一致）：
+//  1. 生成 PKCE verifier/challenge 与 nonce，拼出授权链接（DeviceLoginBase）；
+//  2. 用户在浏览器里完成授权；
+//  3. 轮询 poll 端点：404 = 还没授权，200 = 拿到 device_token；
+//  4. 取账号信息与套餐名，组装凭证 JSON。
+//
+// 与 WorkBuddy 的差异：WorkBuddy 是自有 state/token 三接口，Qoder 是标准
+// PKCE 设备码流。两者形状完全不同，因此登录协议属于供应商层。
 
 const (
 	// oauthClientID 是 Qoder 桌面端使用的公开 client id（与上游实现一致）。
@@ -59,7 +62,7 @@ type LoginProfile struct {
 }
 
 // LoginStart 生成 PKCE 参数与登录 URL，并登记一个待轮询的登录会话。
-func LoginStart(ctx context.Context, region qoderapi.Region) (loginURL, state string, expiresAt time.Time, err error) {
+func LoginStart(ctx context.Context, logins core.LoginSessions, region qoderapi.Region) (loginURL, state string, expiresAt time.Time, err error) {
 	verifier, challenge, errPKCE := core.NewPKCEPair()
 	if errPKCE != nil {
 		return "", "", time.Time{}, errPKCE
@@ -76,7 +79,7 @@ func LoginStart(ctx context.Context, region qoderapi.Region) (loginURL, state st
 	loginURL = endpoints.DeviceLoginBase + "?" + params.Encode()
 
 	deadline := time.Now().Add(loginFlowTTL)
-	loginsession.Register(VendorIDFor(region), state, time.Until(deadline), loginPollInterval, &pendingLogin{
+	logins.Register(VendorIDFor(region), state, time.Until(deadline), loginPollInterval, &pendingLogin{
 		nonce:    nonce,
 		verifier: verifier,
 		region:   region,
@@ -100,8 +103,8 @@ type LoginPollResult struct {
 //
 // 返回错误表示会话已失效（不存在或超时），调用方应终止轮询；
 // 返回 Pending=true 表示用户还没完成授权，继续轮询即可。
-func LoginPoll(ctx context.Context, state string) (LoginPollResult, error) {
-	session, pollState := loginsession.Poll(state)
+func LoginPoll(ctx context.Context, logins core.LoginSessions, state string) (LoginPollResult, error) {
+	session, pollState := logins.Poll(state)
 	if pollState == loginsession.PollMissing {
 		return LoginPollResult{}, fmt.Errorf("登录会话不存在或已过期，请重新发起登录")
 	}
@@ -124,7 +127,7 @@ func LoginPoll(ctx context.Context, state string) (LoginPollResult, error) {
 	}
 
 	profile := fetchLoginProfile(ctx, token, entry.region)
-	loginsession.Delete(state)
+	logins.Delete(state)
 	return LoginPollResult{
 		Token:        token,
 		RefreshToken: refreshToken,
@@ -134,8 +137,8 @@ func LoginPoll(ctx context.Context, state string) (LoginPollResult, error) {
 }
 
 // OwnsLoginSession 报告该会话是否由本供应商创建且仍有效。
-func OwnsLoginSession(sessionID string) bool {
-	_, okEntry := loginsession.Owns(sessionID)
+func OwnsLoginSession(logins core.LoginSessions, sessionID string) bool {
+	_, okEntry := logins.Owns(sessionID)
 	return okEntry
 }
 
@@ -187,10 +190,10 @@ func fetchLoginProfile(ctx context.Context, token string, region qoderapi.Region
 		return LoginProfile{}
 	}
 	return LoginProfile{
-		UserID: stringField(result, "userId"),
-		Email:  strings.ToLower(stringField(result, "email")),
-		Name:   stringField(result, "name"),
-		Type:   stringField(result, "userType"),
+		UserID: core.StringField(result, "userId"),
+		Email:  strings.ToLower(core.StringField(result, "email")),
+		Name:   core.StringField(result, "name"),
+		Type:   core.StringField(result, "userType"),
 	}
 }
 
@@ -201,7 +204,7 @@ func FetchPlanName(ctx context.Context, token string, region qoderapi.Region) st
 	if errPlan != nil {
 		return ""
 	}
-	return stringField(result, "plan_tier_name")
+	return core.StringField(result, "plan_tier_name")
 }
 
 // BuildLoginStorage 生成落盘用的凭证 JSON（扁平格式）。
@@ -289,18 +292,64 @@ func sanitizeAuthID(value string) string {
 	return out
 }
 
-// stringField 读一个字符串字段并去空白。
-func stringField(payload map[string]any, key string) string {
-	value, okValue := payload[key].(string)
-	if !okValue {
-		return ""
-	}
-	return strings.TrimSpace(value)
-}
-
 // summarizeBody 截断响应正文用于错误信息。
 func summarizeBody(body []byte) string {
-	return truncateForMessage(string(body), 200)
+	return upstream.Truncate(string(body), 200)
 }
 
 // 编译期确认 bridge 的凭证解析在本包可用（登录落盘要用它解回 token）。
+
+// 本文件实现 Qoder 的凭证续期（校验 + 刷新）。
+//
+// 两条路径的语义差别：
+//   - PAT（pt-…）走 jobToken 交换，**会拿到新 refreshToken**；
+//   - 设备令牌（dt-…）用 userinfo 保活，内容不变时不写盘
+//     （否则 mtime 会无意义地变动，用户无法判断是否真的续期过）。
+//
+// refreshed=false 表示仅校验通过、上游没下发新凭证。
+
+// RefreshCredential 校验并刷新凭证。
+func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool, error) {
+	if cred == nil {
+		return nil, false, fmt.Errorf("credential is nil")
+	}
+	deviceToken, refreshToken := bridge.ParseOAuthSecret(cred.Token)
+	if strings.HasPrefix(deviceToken, "dt-") {
+		// 设备令牌：用 userinfo 保活，内容不变。
+		if _, errInfo := bridge.FetchUserInfoWithToken(ctx, deviceToken, cred.Region); errInfo != nil {
+			return nil, false, ClassifyCredentialError(errInfo)
+		}
+		return cred, false, nil
+	}
+
+	// PAT：换 jobToken 拿新的 securityOauthToken / refreshToken。
+	seed := cosy.FingerprintSeed("", cred.Token)
+	endpoints := qoderapi.GetEndpoints(cred.Region)
+	jobToken, errExchange := cosy.ExchangeJobToken(ctx, cred.Token,
+		cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed),
+		endpoints.JobTokenURL)
+	if errExchange != nil {
+		return nil, false, ClassifyCredentialError(errExchange)
+	}
+	oauthToken := bridge.StrVal(jobToken, "securityOauthToken")
+	if oauthToken == "" {
+		return nil, false, NewError("qoder_credential_invalid",
+			"jobToken 响应里没有 securityOauthToken", 401)
+	}
+	nextRefresh := bridge.StrVal(jobToken, "refreshToken")
+	if nextRefresh == "" {
+		nextRefresh = refreshToken
+	}
+	if oauthToken == cred.Token && nextRefresh == cred.RefreshToken {
+		// 上游回了同样的值：算「有效」但不算「已刷新」，避免无意义写盘。
+		return cred, false, nil
+	}
+	updated := &Credential{
+		Token:        oauthToken,
+		RefreshToken: nextRefresh,
+		Region:       cred.Region,
+		Label:        cred.Label,
+		Email:        cred.Email,
+	}
+	return updated, true, nil
+}

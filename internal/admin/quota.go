@@ -7,6 +7,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	accountpkg "freetier2api-plugin/internal/accounts"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
 )
 
 // quotaResult 是单个账号的额度结果。
@@ -32,14 +33,14 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
 	}
-	ctx, cancel := managementContext(req)
+	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
 	defer cancel()
-	callbackID := hostCallbackID(req)
+	callbackID := hostabi.RequestCallbackID(req)
 
 	cfg := s.deps.Config()
-	accounts, failures := s.pool.Load(ctx, callbackID, accountpkg.Options{
+	loaded, failures := s.pool.Load(ctx, callbackID, accountpkg.Options{
 		Targets:      body.AccountIDs,
-		RealmEnabled: func(region string) bool { return realmEnabled(cfg, region) },
+		RealmEnabled: func(region string) bool { return core.RealmEnabled(cfg.EnabledRealms, region) },
 	})
 	type job struct {
 		entry      core.HostAuth
@@ -55,51 +56,37 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 			Message: failure.Message,
 		})
 	}
-	jobs := make([]job, 0, len(accounts))
-	for _, account := range accounts {
+	jobs := make([]job, 0, len(loaded))
+	for _, account := range loaded {
 		jobs = append(jobs, job{entry: account.Entry, vendor: account.Vendor, credential: account.Credential})
 	}
-	jobResults := make([]quotaResult, len(jobs))
-	semaphore := make(chan struct{}, batchConcurrency)
-	done := make(chan int, len(jobs))
-	for index := range jobs {
-		go func(slot int) {
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-			current := jobs[slot]
-			result := quotaResult{
-				AuthID:     core.FirstNonEmpty(current.entry.ID, current.entry.Name),
-				AuthIndex:  current.entry.AuthIndex,
-				Name:       current.entry.Name,
-				UID:        current.credential.FileIDValue(),
-				Label:      core.FirstNonEmpty(current.credential.LabelValue(), current.entry.Label, current.entry.Name),
-				VendorID:   current.vendor.ID(),
-				VendorName: current.vendor.Name(),
-				Realm:      current.credential.RegionValue(),
-			}
-			quotaProvider, okQuota := core.As[core.QuotaProvider](current.vendor)
-			if !okQuota {
-				result.Message = core.QuotaUnsupported(current.vendor).Error()
-				jobResults[slot] = result
-				done <- slot
-				return
-			}
-			quota, errQuota := quotaProvider.Quota(ctx, current.credential)
-			if errQuota != nil {
-				result.Message = errQuota.Error()
-			} else {
-				result.OK = true
-				result.Summary = accountpkg.Summary(quota)
-				result.Remain, result.Total = accountpkg.Totals(quota)
-				result.Metrics = quota.Summary
-				cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
-			}
-			jobResults[slot] = result
-			done <- slot
-		}(index)
-	}
-	for range jobs {
-		<-done
-	}
+	jobResults := accountpkg.RunBatch(jobs, batchConcurrency, func(current job) quotaResult {
+		result := quotaResult{
+			AuthID:     core.FirstNonEmpty(current.entry.ID, current.entry.Name),
+			AuthIndex:  current.entry.AuthIndex,
+			Name:       current.entry.Name,
+			UID:        current.credential.FileIDValue(),
+			Label:      core.FirstNonEmpty(current.credential.LabelValue(), current.entry.Label, current.entry.Name),
+			VendorID:   current.vendor.ID(),
+			VendorName: current.vendor.Name(),
+			Realm:      current.credential.RegionValue(),
+		}
+		quotaProvider, okQuota := core.As[core.QuotaProvider](current.vendor)
+		if !okQuota {
+			result.Message = core.QuotaUnsupported(current.vendor).Error()
+			return result
+		}
+		quota, errQuota := quotaProvider.Quota(ctx, current.credential)
+		if errQuota != nil {
+			result.Message = errQuota.Error()
+			return result
+		}
+		result.OK = true
+		result.Summary = accountpkg.Summary(quota)
+		result.Remain, result.Total = accountpkg.Totals(quota)
+		result.Metrics = quota.Summary
+		s.cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
+		return result
+	})
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": append(preResults, jobResults...)})
 }

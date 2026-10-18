@@ -13,7 +13,8 @@ import (
 // adapter 是 core.Vendor 在 MiniMax Code 上的实现（每个区域一个实例）。
 type adapter struct {
 	*core.NativeAdapter[*Credential]
-	region Region
+	region  Region
+	baseURL string
 }
 
 // Instances 构造两个区域实例。
@@ -22,60 +23,65 @@ func Instances(env core.Env) []core.Vendor {
 }
 
 func newInstance(env core.Env, region Region) core.Vendor {
-	return &adapter{
-		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
-			Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
-			Env:  env,
-			Extract: func(c *core.Credential) (*Credential, bool) {
-				native, ok := c.Native.(*Credential)
-				return native, ok
-			},
-			ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
-				native, errParse := ParseCredential(raw, region)
-				if errParse != nil {
-					return core.CredentialSeed{}, nil, errParse
+	inst := &adapter{region: region}
+	inst.NativeAdapter = core.NewNativeAdapter(core.NativeSpec[*Credential]{
+		Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
+		Env:  env,
+		Extract: func(c *core.Credential) (*Credential, bool) {
+			native, ok := c.Native.(*Credential)
+			return native, ok
+		},
+		ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+			native, errParse := ParseCredential(raw, region)
+			if errParse != nil {
+				return core.CredentialSeed{}, nil, errParse
+			}
+			label := native.Label
+			if label == "" {
+				if native.Email != "" {
+					label = native.Email
+				} else if native.UserID != "" {
+					label = VendorNameFor(region) + "-" + native.UserID
+				} else {
+					label = fileName
 				}
-				label := native.Label
-				if label == "" {
-					if native.Email != "" {
-						label = native.Email
-					} else if native.UserID != "" {
-						label = VendorNameFor(region) + "-" + native.UserID
-					} else {
-						label = fileName
-					}
-				}
-				uid := native.UserID
-				if uid == "" {
-					uid = core.FirstNonEmpty(native.Email, fileName)
-				}
-				return core.CredentialSeed{
-					VendorID: VendorIDFor(region), Region: string(region), Label: label,
-					FileID: core.FileIDFromFileName(fileName), UID: uid,
-					Token: native.AccessToken, RefreshToken: native.RefreshToken,
-					ExpiresAt: native.ExpiresAt, AuthMode: native.AuthMode,
-				}, native, nil
-			},
-			RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
-				updated, refreshed, errRefresh := RefreshCredential(ctx, native, BaseURLFor(region))
-				if errRefresh != nil {
-					return core.NativeRefresh[*Credential]{}, errRefresh
-				}
-				return core.NativeRefresh[*Credential]{
-					Native: updated, Token: updated.AccessToken, RefreshToken: updated.RefreshToken,
-					ExpiresAt: updated.ExpiresAt, Changed: refreshed,
-				}, nil
-			},
-			MergeNative: func(original []byte, native *Credential) ([]byte, error) {
-				return MergeStorageJSON(original, native)
-			},
-		}),
-		region: region,
-	}
+			}
+			uid := native.UserID
+			if uid == "" {
+				uid = core.FirstNonEmpty(native.Email, fileName)
+			}
+			return core.CredentialSeed{
+				VendorID: VendorIDFor(region), Region: string(region), Label: label,
+				FileID: core.FileIDFromFileName(fileName), UID: uid,
+				Token: native.AccessToken, RefreshToken: native.RefreshToken,
+				ExpiresAt: native.ExpiresAt, AuthMode: native.AuthMode,
+			}, native, nil
+		},
+		RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
+			updated, refreshed, errRefresh := RefreshCredential(ctx, native, inst.baseURL)
+			if errRefresh != nil {
+				return core.NativeRefresh[*Credential]{}, errRefresh
+			}
+			return core.NativeRefresh[*Credential]{
+				Native: updated, Token: updated.AccessToken, RefreshToken: updated.RefreshToken,
+				ExpiresAt: updated.ExpiresAt, Changed: refreshed,
+			}, nil
+		},
+		MergeNative: func(original []byte, native *Credential) ([]byte, error) {
+			return MergeStorageJSON(original, native)
+		},
+	})
+	return inst
 }
 
 // Configure 解析供应商专属配置。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
+func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
+	if v.region == RegionGlobal {
+		v.baseURL = strings.TrimSpace(raw["minimaxcode_global_base_url"])
+		return
+	}
+	v.baseURL = strings.TrimSpace(raw["minimaxcode_cn_base_url"])
+}
 
 // Match 判断一份凭证是否属于本区域。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
@@ -119,7 +125,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	if errNative != nil {
 		return nil, errNative
 	}
-	payload, errChat := Chat(ctx, native, req, BaseURLFor(v.region))
+	payload, errChat := Chat(ctx, native, req, v.baseURL)
 	if errChat != nil {
 		return nil, core.ToPluginError(errChat)
 	}
@@ -135,7 +141,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errNative != nil {
 		return errNative
 	}
-	errStream := ChatStream(ctx, native, req, BaseURLFor(v.region), func(chunk []byte) error {
+	errStream := ChatStream(ctx, native, req, v.baseURL, func(chunk []byte) error {
 		return sink.Emit(chunk)
 	})
 	if errStream != nil {
@@ -152,7 +158,7 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 	if errNative != nil {
 		return nil, errNative
 	}
-	return FetchQuota(ctx, native, BaseURLFor(v.region))
+	return FetchQuota(ctx, native, v.baseURL)
 }
 
 // Checkin 执行一次签到。
@@ -161,24 +167,24 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if errNative != nil {
 		return nil, errNative
 	}
-	return Checkin(ctx, native, BaseURLFor(v.region))
+	return Checkin(ctx, native, v.baseURL)
 }
 
 // ---- 登录与续期 ----
 
 // LoginStart 发起一次登录。
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return LoginStart(ctx, v.region)
+	return LoginStart(ctx, v.Env.Logins, v.region)
 }
 
 // LoginPoll 轮询一次登录状态。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	return LoginPoll(ctx, state, BaseURLFor(v.region))
+	return LoginPoll(ctx, v.Env.Logins, state, v.baseURL)
 }
 
 // OwnsLoginSession 报告该会话是否由本区域创建。
 func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	return OwnsLoginSession(sessionID, v.region)
+	return OwnsLoginSession(v.Env.Logins, sessionID, v.region)
 }
 
 func (v *adapter) SupportsCheckin() bool { return v.region == RegionGlobal }

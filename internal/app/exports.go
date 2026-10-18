@@ -68,13 +68,9 @@ func (a *App) ManagementRegistration() pluginapi.ManagementRegistrationResponse 
 }
 
 func JSONResponse(status int, payload any) pluginapi.ManagementResponse {
-	return jsonResponse(status, payload)
+	return admin.JSONResponse(status, payload)
 }
 
 func HTMLResponse(status int, body []byte) pluginapi.ManagementResponse {
-	return htmlResponse(status, body)
+	return admin.HTMLResponse(status, body)
 }
-
-func ErrorResponse(err error) pluginapi.ManagementResponse { return admin.ErrorResponse(err) }
-
-func (a *App) ConfigureVendors(cfg Config) { a.configureVendors(cfg) }

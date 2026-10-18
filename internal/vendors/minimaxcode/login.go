@@ -12,17 +12,11 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
-)
-
-var (
-	pendingMu       sync.Mutex
-	pendingSessions = make(map[string]*PendingLogin)
 )
 
 // PendingLogin 记录进行中的 OAuth 设备码授权会话。
@@ -50,7 +44,7 @@ func pkcePair() (verifier, challenge string, err error) {
 }
 
 // LoginStart 向 MiniMax 账号服务申请 OAuth2 设备码。
-func LoginStart(ctx context.Context, r Region) (*pluginapi.AuthLoginStartResponse, error) {
+func LoginStart(ctx context.Context, logins core.LoginSessions, r Region) (*pluginapi.AuthLoginStartResponse, error) {
 	verifier, challenge, errPKCE := pkcePair()
 	if errPKCE != nil {
 		return nil, fmt.Errorf("generate PKCE: %w", errPKCE)
@@ -120,9 +114,7 @@ func LoginStart(ctx context.Context, r Region) (*pluginapi.AuthLoginStartRespons
 		ExpiresAt:  expiresAt,
 	}
 
-	pendingMu.Lock()
-	pendingSessions[sessionID] = pending
-	pendingMu.Unlock()
+	logins.Register(VendorIDFor(r), sessionID, time.Duration(expiresInSec)*time.Second, time.Duration(intervalSec)*time.Second, pending)
 
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
@@ -138,36 +130,28 @@ func LoginStart(ctx context.Context, r Region) (*pluginapi.AuthLoginStartRespons
 }
 
 // LoginPoll 轮询设备码授权状态。
-func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*pluginapi.AuthLoginPollResponse, error) {
+func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, baseURLOverride string) (*pluginapi.AuthLoginPollResponse, error) {
 	cleanState := strings.TrimSpace(state)
-	pendingMu.Lock()
-	session, exists := pendingSessions[cleanState]
-	if !exists {
-		pendingMu.Unlock()
+	entry, pollState := logins.Poll(cleanState)
+	if pollState == core.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期，请重新发起登录",
 		}, nil
 	}
-	if time.Now().After(session.ExpiresAt) {
-		delete(pendingSessions, cleanState)
-		pendingMu.Unlock()
-		return &pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusError,
-			Message: "登录会话已超时，请重新发起登录",
-		}, nil
-	}
-
-	// 轮询节流防踩限流
-	if time.Since(session.LastPoll) < session.Interval {
-		pendingMu.Unlock()
+	if pollState == core.PollThrottled {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
 			Message: "正在等待用户在浏览器中授权...",
 		}, nil
 	}
-	session.LastPoll = time.Now()
-	pendingMu.Unlock()
+	session, okSession := entry.Data.(*PendingLogin)
+	if !okSession {
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: "登录会话数据已损坏，请重新发起登录",
+		}, nil
+	}
 
 	accountHost := AccountHostFor(session.Region)
 	tokenURL := accountHost + EpToken
@@ -205,25 +189,19 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 			Message: "正在等待用户在浏览器中授权...",
 		}, nil
 	case "slow_down":
-		pendingMu.Lock()
 		session.Interval += 2 * time.Second
-		pendingMu.Unlock()
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
 			Message: "正在等待用户在浏览器中授权...",
 		}, nil
 	case "expired_token":
-		pendingMu.Lock()
-		delete(pendingSessions, cleanState)
-		pendingMu.Unlock()
+		logins.Delete(cleanState)
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "授权码已超时失效，请重新发起登录",
 		}, nil
 	case "access_denied":
-		pendingMu.Lock()
-		delete(pendingSessions, cleanState)
-		pendingMu.Unlock()
+		logins.Delete(cleanState)
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "用户在浏览器中拒绝了授权",
@@ -231,9 +209,7 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 	}
 
 	if resp.StatusCode >= 400 || errCode != "" {
-		pendingMu.Lock()
-		delete(pendingSessions, cleanState)
-		pendingMu.Unlock()
+		logins.Delete(cleanState)
 		errDesc := core.FirstNonEmpty(core.GetString(payload, "error_description"), errCode, fmt.Sprintf("HTTP %d", resp.StatusCode))
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
@@ -250,9 +226,7 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 	}
 
 	// 授权成功，清理会话并构建凭据
-	pendingMu.Lock()
-	delete(pendingSessions, cleanState)
-	pendingMu.Unlock()
+	logins.Delete(cleanState)
 
 	refreshToken := core.GetString(payload, "refresh_token", "refreshToken")
 	expiresIn := core.GetInt64(payload, "expires_in", "expiresIn")
@@ -301,15 +275,79 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 }
 
 // OwnsLoginSession 检查 sessionID 是否属于本 MiniMax Code 供应商实例。
-func OwnsLoginSession(sessionID string, r Region) bool {
+func OwnsLoginSession(logins core.LoginSessions, sessionID string, r Region) bool {
 	prefix := "minimaxcode_" + string(r) + "_"
 	if strings.HasPrefix(strings.ToLower(sessionID), prefix) {
 		return true
 	}
-	pendingMu.Lock()
-	defer pendingMu.Unlock()
-	if s, ok := pendingSessions[sessionID]; ok && s.Region == r {
-		return true
+	if vendorID, okOwns := logins.Owns(sessionID); okOwns {
+		return vendorID == VendorIDFor(r)
 	}
 	return false
+}
+
+// RefreshCredential 使用 refresh_token 刷新 MiniMax OAuth 访问令牌。
+func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride string) (*Credential, bool, error) {
+	if cred == nil {
+		return nil, false, core.NewPluginError("credential_missing", "credential is nil", http.StatusUnauthorized)
+	}
+
+	refreshToken := strings.TrimSpace(cred.RefreshToken)
+	if refreshToken == "" || cred.AuthMode == "token" {
+		// 没有 refresh_token 的 Web JWT 令牌无法自动续期
+		return cred, false, nil
+	}
+
+	accountHost := AccountHostFor(cred.Region)
+	tokenURL := accountHost + EpToken
+
+	data := url.Values{}
+	data.Set("client_id", ClientID)
+	data.Set("grant_type", RefreshGrantType)
+	data.Set("refresh_token", refreshToken)
+
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(data.Encode()))
+	if errReq != nil {
+		return nil, false, fmt.Errorf("build refresh request: %w", errReq)
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp, errDo := httpx.Client(ctx, 20*time.Second).Do(req)
+	if errDo != nil {
+		return nil, false, fmt.Errorf("refresh request failed: %w", errDo)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	var payload map[string]any
+	if errDec := json.NewDecoder(resp.Body).Decode(&payload); errDec != nil {
+		return nil, false, fmt.Errorf("decode refresh response (HTTP %d): %w", resp.StatusCode, errDec)
+	}
+
+	if resp.StatusCode >= 400 || core.GetString(payload, "error") != "" {
+		errDesc := core.FirstNonEmpty(
+			core.GetString(payload, "error_description"),
+			core.GetString(payload, "error"),
+			fmt.Sprintf("HTTP %d", resp.StatusCode),
+		)
+		return nil, false, fmt.Errorf("minimax refresh token rejected: %s", errDesc)
+	}
+
+	accessToken := core.GetString(payload, "access_token", "accessToken")
+	if accessToken == "" {
+		return nil, false, fmt.Errorf("minimax refresh response missing access_token")
+	}
+
+	newRefreshToken := core.GetString(payload, "refresh_token", "refreshToken")
+	expiresIn := core.GetInt64(payload, "expires_in", "expiresIn")
+	if expiresIn <= 0 {
+		expiresIn = 3600
+	}
+
+	cred.AccessToken = accessToken
+	if newRefreshToken != "" {
+		cred.RefreshToken = newRefreshToken
+	}
+	cred.ExpiresAt = time.Now().Unix() + expiresIn
+
+	return cred, true, nil
 }

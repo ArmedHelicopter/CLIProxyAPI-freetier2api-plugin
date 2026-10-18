@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
@@ -29,10 +28,10 @@ func (s *Service) StatusPayload(req pluginapi.ManagementRequest) map[string]any 
 func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string]any {
 	cfg := s.deps.Config()
 	current := s.deps.State()
-	ctx, cancel := managementContext(req)
+	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
 	defer cancel()
 
-	accounts := s.listAccountSummaries(ctx, hostCallbackID(req))
+	accounts := s.listAccountSummaries(ctx, hostabi.RequestCallbackID(req))
 	modelCounts := map[string]int{}
 	for _, model := range current.Models {
 		modelCounts[model.Realm]++
@@ -50,8 +49,8 @@ func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string
 		"model_counts":          modelCounts,
 		"models_fetched_at":     current.ModelsFetchedAt,
 		"restart_pending":       current.RestartPending,
-		"settings":              s.deps.EffectiveSettings(),
-		"scheduler":             s.deps.SchedulerStatus(),
+		"settings":              s.tasks.EffectiveSettings(),
+		"scheduler":             s.tasks.Status(),
 	}
 }
 
@@ -71,17 +70,12 @@ type accountSummary struct {
 	SupportsCheckin bool                 `json:"supports_checkin"`
 }
 
-var (
-	quotaCacheMu sync.RWMutex
-	quotaCache   = map[string]quotaResult{}
-)
-
-func getCachedQuota(keys ...string) *quotaResult {
-	quotaCacheMu.RLock()
-	defer quotaCacheMu.RUnlock()
+func (s *Service) getCachedQuota(keys ...string) *quotaResult {
+	s.quotaMu.RLock()
+	defer s.quotaMu.RUnlock()
 	for _, key := range keys {
 		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			if q, ok := quotaCache[trimmed]; ok {
+			if q, ok := s.quotaCache[trimmed]; ok {
 				copyQ := q
 				return &copyQ
 			}
@@ -90,104 +84,57 @@ func getCachedQuota(keys ...string) *quotaResult {
 	return nil
 }
 
-func cacheQuotaResult(q quotaResult, keys ...string) {
-	quotaCacheMu.Lock()
-	defer quotaCacheMu.Unlock()
+func (s *Service) cacheQuotaResult(q quotaResult, keys ...string) {
+	s.quotaMu.Lock()
+	defer s.quotaMu.Unlock()
 	for _, key := range keys {
 		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			quotaCache[trimmed] = q
+			s.quotaCache[trimmed] = q
 		}
 	}
 }
 
 func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
-	entries, errList := hostabi.ListAuths(ctx, callbackID, s.registry)
-	if errList != nil {
-		logger.Debug("list host auths failed: %v", errList)
-		return nil
-	}
 	current := s.deps.State()
-	out := make([]accountSummary, 0, len(entries))
-	seenIndex := make(map[string]int)
-
-	for _, entry := range entries {
+	loaded, failures := s.pool.Load(ctx, callbackID, accounts.Options{IncludeDisabled: true})
+	for _, failure := range failures {
+		logger.Debug("skip account %s: %s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
+	}
+	out := make([]accountSummary, 0, len(loaded))
+	for _, account := range loaded {
+		entry := account.Entry
+		credential := account.Credential
+		vendor := account.Vendor
 		summary := accountSummary{
-			AuthID:    core.FirstNonEmpty(entry.ID, entry.Name),
-			AuthIndex: entry.AuthIndex,
-			Label:     core.FirstNonEmpty(entry.Label, entry.Name, entry.ID),
-			Status:    entry.Status,
-			Disabled:  entry.Disabled,
+			AuthID:          core.FirstNonEmpty(entry.ID, entry.Name),
+			AuthIndex:       entry.AuthIndex,
+			Label:           core.FirstNonEmpty(credential.LabelValue(), entry.Label, entry.Name, entry.ID),
+			VendorID:        vendor.ID(),
+			VendorName:      vendor.Name(),
+			Realm:           credential.RegionValue(),
+			Status:          entry.Status,
+			Disabled:        entry.Disabled,
+			SupportsCheckin: core.SupportsCheckin(vendor),
 		}
 		var modTime time.Time
 		if !entry.ModTime.IsZero() {
 			modTime = entry.ModTime
-		} else if entry.Path != "" {
-			if fi, err := os.Stat(entry.Path); err == nil {
-				modTime = fi.ModTime()
-			}
-		}
-		var accountUID string
-		if raw, filePath, okRaw := hostabi.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex); okRaw {
-			if modTime.IsZero() && filePath != "" {
-				if fi, err := os.Stat(filePath); err == nil {
-					modTime = fi.ModTime()
-				}
-			}
-			if credential, okParse := s.registry.ParseCredential(raw, hostabi.AccountIdentity(entry), nil); okParse {
-				summary.VendorID = credential.VendorIDValue()
-				summary.Realm = credential.RegionValue()
-				if vendor, okVendor := s.registry.ByID(summary.VendorID); okVendor {
-					summary.VendorName = vendor.Name()
-					summary.SupportsCheckin = core.SupportsCheckin(vendor)
-				}
-				if label := credential.LabelValue(); label != "" {
-					summary.Label = label
-				}
-				if uid := credential.FileIDValue(); uid != "" {
-					accountUID = uid
-					if record, okRecord := current.Checkin[uid]; okRecord {
-						summary.Checkin = &record
-					} else if record, okLegacy := lookupLegacyCheckin(current, credential); okLegacy {
-						summary.Checkin = &record
-					}
-				}
-			}
-		}
-		if modTime.IsZero() && entry.Name != "" {
-			for _, dir := range []string{"/root/.cli-proxy-api", "."} {
-				candidate := filepath.Join(dir, entry.Name)
-				if fi, err := os.Stat(candidate); err == nil {
-					modTime = fi.ModTime()
-					break
-				}
+		} else if path := core.FirstNonEmpty(account.FilePath, entry.Path); path != "" {
+			if info, errStat := os.Stat(path); errStat == nil {
+				modTime = info.ModTime()
 			}
 		}
 		if !modTime.IsZero() {
 			summary.RefreshedAt = modTime.Format(time.RFC3339)
 		}
-		if q := getCachedQuota(accountUID, summary.AuthID, summary.AuthIndex, entry.Name, summary.Label); q != nil {
+		uid := credential.FileIDValue()
+		if record, okRecord := current.Checkin[uid]; okRecord {
+			summary.Checkin = &record
+		} else if record, okLegacy := lookupLegacyCheckin(current, credential); okLegacy {
+			summary.Checkin = &record
+		}
+		if q := s.getCachedQuota(uid, summary.AuthID, summary.AuthIndex, entry.Name, summary.Label); q != nil {
 			summary.Quota = q
-		}
-		dedupKey := accountUID
-		if dedupKey == "" {
-			dedupKey = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(summary.AuthID), ".json"))
-		}
-		if idx, exists := seenIndex[dedupKey]; exists && dedupKey != "" {
-			if out[idx].RefreshedAt == "" && summary.RefreshedAt != "" {
-				out[idx].RefreshedAt = summary.RefreshedAt
-			}
-			if out[idx].Label == "" || out[idx].Label == out[idx].AuthID {
-				if summary.Label != "" {
-					out[idx].Label = summary.Label
-				}
-			}
-			if out[idx].Checkin == nil && summary.Checkin != nil {
-				out[idx].Checkin = summary.Checkin
-			}
-			continue
-		}
-		if dedupKey != "" {
-			seenIndex[dedupKey] = len(out)
 		}
 		out = append(out, summary)
 	}
@@ -223,9 +170,9 @@ func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pl
 	if len(body.AccountIDs) == 0 {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "account_ids 不能为空"})
 	}
-	ctx, cancel := managementContext(req)
+	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
 	defer cancel()
-	callbackID := hostCallbackID(req)
+	callbackID := hostabi.RequestCallbackID(req)
 
 	entries, errList := hostabi.ListAuths(ctx, callbackID, s.registry)
 	if errList != nil {
@@ -354,7 +301,7 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 		seed = core.RandomHex(8)
 	}
 	fileName := core.FileNameFor(vendor.ID(), seed)
-	callbackID := hostCallbackID(req)
+	callbackID := hostabi.RequestCallbackID(req)
 
 	saved := false
 	if _, errSave := hostabi.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
@@ -397,9 +344,9 @@ func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginap
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
 	}
-	ctx, cancel := managementContext(req)
+	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
 	defer cancel()
-	results := s.runForAccounts(ctx, hostCallbackID(req), body.AccountIDs,
+	results := s.runForAccounts(ctx, hostabi.RequestCallbackID(req), body.AccountIDs,
 		func(vendor core.Vendor, _ *core.Credential) bool { return core.SupportsCheckin(vendor) },
 		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (string, error) {
 			checkin, okCheckin := core.As[core.CheckinProvider](vendor)
@@ -413,7 +360,7 @@ func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginap
 			if result == nil {
 				return "", fmt.Errorf("签到未返回结果")
 			}
-			s.deps.RecordCheckin(credential, result)
+			s.tasks.RecordCheckin(credential, result)
 			return result.Message, nil
 		})
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": results})
@@ -436,14 +383,14 @@ func (s *Service) runForAccounts(
 	action func(context.Context, core.Vendor, *core.Credential) (string, error),
 ) []accountActionResult {
 	cfg := s.deps.Config()
-	accounts, failures := s.pool.Load(ctx, callbackID, accounts.Options{
+	loaded, failures := s.pool.Load(ctx, callbackID, accounts.Options{
 		Targets:      targets,
-		RealmEnabled: func(region string) bool { return realmEnabled(cfg, region) },
+		RealmEnabled: func(region string) bool { return core.RealmEnabled(cfg.EnabledRealms, region) },
 		Filter: func(account accounts.Account) bool {
 			return filter == nil || filter(account.Vendor, account.Credential)
 		},
 	})
-	results := make([]accountActionResult, 0, len(accounts)+len(failures))
+	results := make([]accountActionResult, 0, len(loaded)+len(failures))
 	for _, failure := range failures {
 		results = append(results, accountActionResult{
 			AuthID: core.FirstNonEmpty(failure.Entry.ID, failure.Entry.Name),
@@ -451,41 +398,22 @@ func (s *Service) runForAccounts(
 			OK:     false, Message: failure.Message,
 		})
 	}
-	concurrency := batchConcurrency
-	if concurrency > len(accounts) {
-		concurrency = len(accounts)
-	}
-	if concurrency < 1 {
-		concurrency = 1
-	}
-	jobResults := make([]accountActionResult, len(accounts))
-	semaphore := make(chan struct{}, concurrency)
-	done := make(chan int, len(accounts))
-	for index := range accounts {
-		go func(slot int) {
-			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-			current := accounts[slot]
-			result := accountActionResult{
-				AuthID:   core.FirstNonEmpty(current.Entry.ID, current.Entry.Name),
-				Label:    core.FirstNonEmpty(current.Credential.LabelValue(), current.Entry.Label),
-				VendorID: current.Vendor.ID(),
-				Realm:    current.Credential.RegionValue(),
-			}
-			message, errAction := action(ctx, current.Vendor, current.Credential)
-			if errAction != nil {
-				result.OK = false
-				result.Message = errAction.Error()
-			} else {
-				result.OK = true
-				result.Message = message
-			}
-			jobResults[slot] = result
-			done <- slot
-		}(index)
-	}
-	for range accounts {
-		<-done
-	}
+	jobResults := accounts.RunBatch(loaded, batchConcurrency, func(current accounts.Account) accountActionResult {
+		result := accountActionResult{
+			AuthID:   core.FirstNonEmpty(current.Entry.ID, current.Entry.Name),
+			Label:    core.FirstNonEmpty(current.Credential.LabelValue(), current.Entry.Label),
+			VendorID: current.Vendor.ID(),
+			Realm:    current.Credential.RegionValue(),
+		}
+		message, errAction := action(ctx, current.Vendor, current.Credential)
+		if errAction != nil {
+			result.OK = false
+			result.Message = errAction.Error()
+		} else {
+			result.OK = true
+			result.Message = message
+		}
+		return result
+	})
 	return append(results, jobResults...)
 }

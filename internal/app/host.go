@@ -5,7 +5,6 @@ package app
 
 import (
 	"context"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -73,11 +72,7 @@ func (a *App) StartBackgroundWork() {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a.backgroundCancel = cancel
-	a.backgroundWG.Add(1)
-	go func() {
-		defer a.backgroundWG.Done()
-		a.runTaskScheduler(ctx)
-	}()
+	a.tasks.Start(ctx)
 }
 
 // StopBackgroundWork 取消后台循环并等待退出。
@@ -89,6 +84,7 @@ func (a *App) StopBackgroundWork() {
 	if cancel != nil {
 		cancel()
 	}
+	a.tasks.Stop()
 	a.backgroundWG.Wait()
 }
 
@@ -168,14 +164,8 @@ func (d adminDeps) State() state.State          { return d.app.SnapshotState() }
 func (d adminDeps) MutateState(fn func(*state.State)) {
 	d.app.MutateState(fn)
 }
-func (d adminDeps) Model() *modelconfig.Manager       { return d.app.models }
-func (d adminDeps) WorkbuddyPromptMode() string       { return d.app.promptModeFor() }
-func (d adminDeps) SchedulerStatus() map[string]any   { return d.app.schedulerStatus() }
-func (d adminDeps) EffectiveSettings() map[string]any { return d.app.effectiveSettings() }
-
-func (d adminDeps) ResolveCredential(ctx context.Context, callbackID string, storageJSON []byte, authID string, attrs map[string]string) (*core.Credential, core.Vendor, error) {
-	return d.app.resolveVendorCredential(ctx, callbackID, storageJSON, authID, attrs)
-}
+func (d adminDeps) Model() *modelconfig.Manager { return d.app.models }
+func (d adminDeps) WorkbuddyPromptMode() string { return d.app.promptModeFor() }
 
 func (d adminDeps) SaveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor, entry core.HostAuth, original []byte, updated *core.Credential, filePath string) {
 	d.app.saveRefreshedCredential(ctx, callbackID, vendor, entry, original, updated, filePath)
@@ -187,57 +177,8 @@ func (d adminDeps) RefreshModels(ctx context.Context) (int, error) {
 
 func (d adminDeps) Reconfigure() error { return d.app.ApplyConfig(d.app.Config()) }
 
-func (d adminDeps) RecordCheckin(credential *core.Credential, result *core.CheckinResult) {
-	d.app.recordCheckinResult(credential, result)
-}
-
-func (d adminDeps) PokeScheduler()           { d.app.pokeScheduler() }
-func (d adminDeps) RunScheduled(kind string) { d.app.runScheduledTask(kind) }
-
-func (d adminDeps) TaskRoutes(req pluginapi.ManagementRequest, route string) (pluginapi.ManagementResponse, bool) {
-	switch route {
-	case "/tasks/scan":
-		return d.app.handleTasksScan(req), true
-	case "/tasks/run":
-		return d.app.handleTasksRun(req), true
-	case "/tasks/queue":
-		return jsonResponse(http.StatusOK, d.app.taskQueueSnapshot()), true
-	case "/tasks/auto":
-		return d.app.handleTasksAuto(req), true
-	case "/tasks/auto_all":
-		return d.app.handleTasksAutoAll(req), true
-	case "/school/status":
-		ctx, cancel := managementContext(req)
-		defer cancel()
-		return jsonResponse(http.StatusOK, map[string]any{"ok": true, "accounts": d.app.schoolStatusForAccounts(ctx, hostCallbackID(req))}), true
-	}
-	return pluginapi.ManagementResponse{}, false
-}
-
 func (a *App) managementRegistration() pluginapi.ManagementRegistrationResponse {
 	return a.admin.Registration()
 }
 
 func (a *App) handleManagement(request []byte) ([]byte, error) { return a.admin.Handle(request) }
-
-func htmlResponse(status int, body []byte) pluginapi.ManagementResponse {
-	return admin.HTMLResponse(status, body)
-}
-
-func jsonResponse(status int, payload any) pluginapi.ManagementResponse {
-	return admin.JSONResponse(status, payload)
-}
-
-func managementContext(req pluginapi.ManagementRequest) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), managementRequestTimeout)
-	return hostabi.WithCallbackID(ctx, hostCallbackID(req)), cancel
-}
-
-func hostCallbackID(req pluginapi.ManagementRequest) string {
-	if req.Headers == nil {
-		return ""
-	}
-	return strings.TrimSpace(req.Headers.Get("X-Host-Callback-Id"))
-}
-
-const managementRequestTimeout = 3 * time.Minute

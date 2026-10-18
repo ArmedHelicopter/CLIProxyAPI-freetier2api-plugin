@@ -246,7 +246,7 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 
 // LoginStart 发起一次 PKCE 设备授权登录。
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	loginURL, state, expiresAt, errStart := LoginStart(ctx, v.region)
+	loginURL, state, expiresAt, errStart := LoginStart(ctx, v.Env.Logins, v.region)
 	if errStart != nil {
 		return nil, errStart
 	}
@@ -264,7 +264,7 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 
 // LoginPoll 轮询一次登录状态。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	result, errPoll := LoginPoll(ctx, state)
+	result, errPoll := LoginPoll(ctx, v.Env.Logins, state)
 	if errPoll != nil {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
@@ -293,7 +293,9 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 }
 
 // OwnsLoginSession 报告该会话是否由本供应商创建。
-func (v *adapter) OwnsLoginSession(sessionID string) bool { return OwnsLoginSession(sessionID) }
+func (v *adapter) OwnsLoginSession(sessionID string) bool {
+	return OwnsLoginSession(v.Env.Logins, sessionID)
+}
 
 // MergeStorageJSON 实现 core.StorageMerger：把续期后的令牌合并回原凭证 JSON。
 //

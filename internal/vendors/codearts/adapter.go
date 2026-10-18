@@ -180,13 +180,15 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 
 // LoginStart 发起一次登录。
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return LoginStart(ctx)
+	return LoginStart(ctx, v.Env.Logins)
 }
 
 // LoginPoll 轮询一次登录状态。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	return LoginPoll(ctx, state)
+	return LoginPoll(ctx, v.Env.Logins, state)
 }
 
 // OwnsLoginSession 报告该会话是否由本供应商创建。
-func (v *adapter) OwnsLoginSession(sessionID string) bool { return OwnsLoginSession(sessionID) }
+func (v *adapter) OwnsLoginSession(sessionID string) bool {
+	return OwnsLoginSession(v.Env.Logins, sessionID)
+}

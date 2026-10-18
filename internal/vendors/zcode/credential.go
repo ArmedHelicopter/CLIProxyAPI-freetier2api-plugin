@@ -1,5 +1,23 @@
 package zcode
 
+import (
+	"bytes"
+	"context"
+	"crypto/rand"
+	"encoding/json"
+	"fmt"
+	"io"
+	"math/big"
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/httpx"
+)
+
 // ZCode 凭证的解析、特征识别与脱敏。
 //
 // 一个 ZCode 账号可能同时持有两种凭证，语义完全不同：
@@ -10,14 +28,6 @@ package zcode
 //
 // 因此对话一律优先 APIKey；JWT 仅用于 billing 族（额度查询 / 套餐领取）。
 // OAuth 登录会一次拿到两者（JWT 直接下发，API Key 由 access_token 兑换）。
-
-import (
-	"encoding/json"
-	"fmt"
-	"strings"
-
-	"freetier2api-plugin/internal/core"
-)
 
 // Credential 是归一化后的 ZCode 账号凭证。
 type Credential struct {
@@ -272,3 +282,508 @@ func decodeJWTPayload(segment string) map[string]any {
 	}
 	return claims
 }
+
+// 计费族（billing/*、usage、event/report）的公共请求层。
+//
+// 这些端点都在 zcode.z.ai 的 zcode-plan 之下，共用同一套身份头，且都**必须**
+// 带 X-Device-Mid——缺失时上游返回 code=3001。鉴权用 Coding Plan JWT
+// （API Key 通道没有套餐概念，不参与计费族）。
+//
+// 参考 zcode2api/app/quota.py 的 _auth_headers 与 app/claim.py 的 _billing_request。
+
+const (
+	// billingHTTPTimeout 是计费族单次请求的上限。
+	billingHTTPTimeout = 20 * time.Second
+	// billingMaxBody 是计费响应的读取上限。
+	billingMaxBody = 4 << 20
+)
+
+// billingHeaders 构造计费族请求头。
+//
+// 平台/语言/时区/设备 ID 全部取账号档案：上游按设备聚类做风控，
+// 全局伪装值会让所有账号聚成同一台机器。
+func billingHeaders(cred *Credential) map[string]string {
+	headers := map[string]string{
+		"Content-Type": "application/json",
+		"User-Agent":   UserAgent,
+	}
+	BuildIdentityHeaders(cred.Profile).Apply(headers)
+	headers["Authorization"] = "Bearer " + cred.JWTToken
+	headers["x-request-id"] = NewUUID()
+	return headers
+}
+
+// billingRequest 发起一次计费族请求并解析业务码。
+//
+// 返回业务码与响应体（解析失败时业务码为 -1）。网络与鉴权失败统一返回
+// 分类后的上游错误，调用方不必各自判断状态码。
+func billingRequest(ctx context.Context, cred *Credential, method, path string, payload any) (int, map[string]any, error) {
+	var bodyReader io.Reader
+	if payload != nil {
+		encoded, errMarshal := json.Marshal(payload)
+		if errMarshal != nil {
+			return 0, nil, errMarshal
+		}
+		bodyReader = bytes.NewReader(encoded)
+	}
+
+	req, errNew := http.NewRequestWithContext(ctx, method, BillingBase+path, bodyReader)
+	if errNew != nil {
+		return 0, nil, errNew
+	}
+	for key, value := range billingHeaders(cred) {
+		req.Header.Set(key, value)
+	}
+
+	resp, errDo := httpx.Client(ctx, billingHTTPTimeout).Do(req)
+	if errDo != nil {
+		return 0, nil, transientErr("计费请求失败: " + errDo.Error())
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, billingMaxBody))
+	if errRead != nil {
+		return 0, nil, transientErr("读取计费响应失败: " + errRead.Error())
+	}
+
+	// 非 2xx 一律交给 Classify：它内部已经处理了「403 先判验证码挑战、再判凭证失效」
+	// 的顺序（见 errors.go），此处不重复那套判定。
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return 0, nil, Classify(resp.StatusCode, string(raw))
+	}
+
+	var parsed map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &parsed); errUnmarshal != nil {
+		return -1, nil, nil
+	}
+	return businessCode(parsed), parsed, nil
+}
+
+// businessCode 取上游业务码；缺失或非数字返回 -1（视为失败）。
+func businessCode(body map[string]any) int {
+	if body == nil {
+		return -1
+	}
+	switch v := body["code"].(type) {
+	case float64:
+		return int(v)
+	case int:
+		return v
+	case string:
+		if out, errParse := strconv.Atoi(strings.TrimSpace(v)); errParse == nil {
+			return out
+		}
+	}
+	return -1
+}
+
+// dataMap 取响应体的 data 对象。
+func dataMap(body map[string]any) map[string]any {
+	if body == nil {
+		return nil
+	}
+	data, _ := body["data"].(map[string]any)
+	return data
+}
+
+// billingBlockReason 报告该凭证为何不能打计费族；可打时返回空串。
+//
+// 计费族只服务 Coding Plan（JWT）。纯 API Key 账号没有套餐，不该产生
+// billing 流量——既拿不到数据，又会白增一条上游风控信号。
+func billingBlockReason(cred *Credential) string {
+	if cred == nil {
+		return "凭证缺失"
+	}
+	if !cred.UsesPlanChannel() {
+		return "该账号没有 Coding Plan 凭证（JWT），不参与套餐与额度查询"
+	}
+	return ""
+}
+
+// classifyBillingOutcome 把计费族的业务失败码翻成可读文案。
+func classifyBillingOutcome(code int, body map[string]any) string {
+	serverMsg := core.FirstNonEmpty(core.RawStringField(body, "msg"), core.RawStringField(body, "message"))
+	base := map[int]string{
+		1001: "套餐不存在",
+		1002: "活动已结束或套餐暂不可领取",
+		1003: "该套餐已经领取过",
+		1004: "不符合领取条件",
+		1005: "今日领取名额已用完",
+		3001: "请求参数不全（缺少设备标识）",
+		3007: "验证码校验失败",
+		401:  "请先登录后再领取",
+	}[code]
+	if base == "" {
+		base = "上游返回业务错误"
+	}
+	if serverMsg != "" {
+		return base + "（" + serverMsg + "）"
+	}
+	return base
+}
+
+// 额度查询：billing/current（套餐）+ billing/balance（余量）。
+//
+// 只对 Coding Plan（JWT）账号有意义——API Key 是用户自带的按量付费 Key，
+// 没有套餐窗口。参考 zcode2api/app/quota.py。
+
+// FetchQuota 查询 ZCode 账号的套餐与余量。
+func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchResponse, error) {
+	if cred == nil {
+		return nil, transientErr("zcode credential is nil")
+	}
+
+	response := &pluginapi.QuotaFetchResponse{
+		Subscription: &pluginapi.QuotaSubscription{
+			Plan:     "ZCode Coding Plan",
+			TierName: "Standard",
+			TierID:   "zcode",
+		},
+	}
+
+	if reason := billingBlockReason(cred); reason != "" {
+		// 非 Coding Plan 账号：如实说明，不伪装成「查询成功但无数据」。
+		response.Summary = append(response.Summary, pluginapi.QuotaMetric{
+			Key: "status", Label: "账号状态", Value: 1, Unit: reason,
+		})
+		return response, nil
+	}
+
+	fillSubscription(ctx, cred, response)
+	metrics, errBalance := fetchBalances(ctx, cred)
+	if errBalance != nil {
+		return nil, errBalance
+	}
+	response.Summary = append(response.Summary, metrics...)
+	return response, nil
+}
+
+// fillSubscription 用 billing/current 补充套餐名（失败时保留默认值）。
+func fillSubscription(ctx context.Context, cred *Credential, response *pluginapi.QuotaFetchResponse) {
+	code, body, errRequest := billingRequest(ctx, cred, "GET", PathBillingCurrent, nil)
+	if errRequest != nil || code != codeSuccess {
+		return
+	}
+	plans, _ := dataMap(body)["plans"].([]any)
+	if len(plans) == 0 {
+		return
+	}
+	first, ok := plans[0].(map[string]any)
+	if !ok {
+		return
+	}
+	if name := core.RawStringField(first, "name"); name != "" {
+		response.Subscription.Plan = name
+	}
+	if planID := core.FirstNonEmpty(core.RawStringField(first, "plan_id"), core.RawStringField(first, "planId")); planID != "" {
+		response.Subscription.TierName = planID
+	}
+}
+
+// fetchBalances 读取各模型余量并转成指标。
+func fetchBalances(ctx context.Context, cred *Credential) ([]pluginapi.QuotaMetric, error) {
+	code, body, errRequest := billingRequest(ctx, cred, "GET", PathBillingBalance, nil)
+	if errRequest != nil {
+		return nil, errRequest
+	}
+	if code != codeSuccess {
+		return nil, Classify(0, classifyBillingOutcome(code, body))
+	}
+
+	balances, _ := dataMap(body)["balances"].([]any)
+	if len(balances) == 0 {
+		return nil, nil
+	}
+
+	metrics := make([]pluginapi.QuotaMetric, 0, len(balances))
+	for _, item := range balances {
+		entry, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := core.FirstNonEmpty(core.RawStringField(entry, "show_name"), core.RawStringField(entry, "model"))
+		if name == "" {
+			continue
+		}
+		metrics = append(metrics, pluginapi.QuotaMetric{
+			Key:   "remaining_" + sanitizeMetricKey(name),
+			Label: name + " 剩余",
+			Value: floatField(entry, "remaining_units"),
+			Unit:  "tokens",
+		})
+	}
+	return metrics, nil
+}
+
+// sanitizeMetricKey 把模型名转成稳定的指标键。
+func sanitizeMetricKey(name string) string {
+	replacer := strings.NewReplacer(" ", "_", ".", "_", "/", "_", "-", "_")
+	return strings.ToLower(replacer.Replace(strings.TrimSpace(name)))
+}
+
+// floatField 宽松取浮点字段（JSON 数字一律 float64）。
+func floatField(m map[string]any, key string) float64 {
+	switch v := m[key].(type) {
+	case float64:
+		return v
+	case int:
+		return float64(v)
+	}
+	return 0
+}
+
+// 每账号客户端设备档案（一号一台设备）与上游身份头构造。
+//
+// 为什么需要它：billing 族（current/balance/preview/claim）**必需** X-Device-Mid，
+// 缺失时上游返回 code=3001；同时上游按设备聚类做风控，多个账号共用同一套
+// 平台/内核/分辨率会聚成「一台机器开了 N 个账号」的关联信号。
+//
+// 因此档案从**成套 SKU** 抽样（platform × arch × os_version × screen 绑定），
+// 禁止字段笛卡尔积——「darwin-arm64 + 1366x768」这类组合不是真实电脑。
+// 池内不含 linux：官方桌面端主形态是 Mac / Windows，服务器内核特征反而扎眼。
+//
+// 参考 zcode2api/app/fingerprint.py 与 app/identity.py。
+
+// DeviceProfile 是单个账号的设备档案，字段直接映射上游身份头与事件字段。
+type DeviceProfile struct {
+	Platform  string `json:"platform"`   // darwin / win32
+	Arch      string `json:"arch"`       // arm64 / x64
+	OSVersion string `json:"os_version"` // X-Os-Version（os.release() 语义）
+	Language  string `json:"language"`   // X-Client-Language
+	Timezone  string `json:"timezone"`   // X-Client-Timezone（IANA）
+	Screen    string `json:"screen"`     // 激活事件 screen_resolution
+	DeviceMID string `json:"device_mid"` // X-Device-Mid，一号一台
+}
+
+// PlatformFull 返回 X-Platform 取值形态（darwin-arm64）。
+func (p DeviceProfile) PlatformFull() string {
+	if p.Platform == "" {
+		return DefaultPlatform
+	}
+	return p.Platform + "-" + p.Arch
+}
+
+// OSCategory 返回 X-Os-Category（darwin→macos / win32→windows）。
+func (p DeviceProfile) OSCategory() string {
+	switch p.Platform {
+	case "darwin", "macos":
+		return "macos"
+	case "win32", "windows":
+		return "windows"
+	default:
+		return "linux"
+	}
+}
+
+// sku 是一套完整可用的桌面设备组合。
+type sku struct {
+	weight    int
+	platform  string
+	arch      string
+	osVersion string
+	screen    string
+}
+
+// desktopSKUs 是从官方桌面端常见形态归纳的成套组合。
+//
+// 权重即抽样概率：Apple silicon 与 Win11 主流机型占多数，老旧机型少量。
+var desktopSKUs = []sku{
+	// Apple silicon MacBook Air/Pro 13–14"（darwin 24 = Sequoia，25 = Tahoe）
+	{10, "darwin", "arm64", "24.5.0", "1512x982"},
+	{10, "darwin", "arm64", "24.6.0", "1512x982"},
+	{8, "darwin", "arm64", "24.5.0", "1728x1117"},
+	{8, "darwin", "arm64", "24.6.0", "1728x1117"},
+	{8, "darwin", "arm64", "25.5.0", "1512x982"},
+	{6, "darwin", "arm64", "25.5.0", "1728x1117"},
+	{5, "darwin", "arm64", "23.6.0", "1512x982"},
+	{4, "darwin", "arm64", "24.5.0", "2560x1440"},
+	{3, "darwin", "arm64", "24.6.0", "2560x1600"},
+	// Intel Mac 存量（darwin 24+ 不再配 x64）
+	{2, "darwin", "x64", "23.6.0", "1920x1080"},
+	{2, "darwin", "x64", "22.6.0", "1440x900"},
+	// Windows 11 主流 + 少量 Win10
+	{8, "win32", "x64", "10.0.22631", "1920x1080"},
+	{7, "win32", "x64", "10.0.26100", "1920x1080"},
+	{5, "win32", "x64", "10.0.22631", "2560x1440"},
+	{4, "win32", "x64", "10.0.26200", "1920x1080"},
+	{3, "win32", "x64", "10.0.26100", "2560x1440"},
+	{3, "win32", "x64", "10.0.22621", "1920x1080"},
+	{2, "win32", "x64", "10.0.22631", "3840x2160"},
+	{2, "win32", "x64", "10.0.19045", "1920x1080"},
+	{1, "win32", "x64", "10.0.22000", "1920x1080"},
+}
+
+// locales 是真实地区对（语言 ↔ 时区同源，激活事件共用）。
+var locales = []struct{ language, timezone string }{
+	{"zh-CN", "Asia/Shanghai"},
+	{"en-US", "America/New_York"},
+	{"en-US", "America/Los_Angeles"},
+	{"en-GB", "Europe/London"},
+	{"de-DE", "Europe/Berlin"},
+	{"ja-JP", "Asia/Tokyo"},
+	{"ko-KR", "Asia/Seoul"},
+	{"en-SG", "Asia/Singapore"},
+}
+
+// NewDeviceProfile 抽样生成一份成套桌面档案（登录入池时调用一次并持久化）。
+func NewDeviceProfile() DeviceProfile {
+	total := 0
+	for _, item := range desktopSKUs {
+		total += item.weight
+	}
+	picked := desktopSKUs[0]
+	if n, err := rand.Int(rand.Reader, big.NewInt(int64(total))); err == nil {
+		remaining := n.Int64()
+		for _, item := range desktopSKUs {
+			remaining -= int64(item.weight)
+			if remaining < 0 {
+				picked = item
+				break
+			}
+		}
+	}
+	locale := locales[0]
+	if n, err := rand.Int(rand.Reader, big.NewInt(int64(len(locales)))); err == nil {
+		locale = locales[n.Int64()]
+	}
+	return DeviceProfile{
+		Platform:  picked.platform,
+		Arch:      picked.arch,
+		OSVersion: picked.osVersion,
+		Language:  locale.language,
+		Timezone:  locale.timezone,
+		Screen:    picked.screen,
+		DeviceMID: NewUUID(),
+	}
+}
+
+// ensureProfile 就地补齐档案中缺失的字段（旧凭证升级用）。
+//
+// 整台设备都缺失时补一套完整 SKU；否则只在**同一平台内**补空字段——
+// 混搭平台会产生自相矛盾的档案（如 win32 + macOS 内核号），比字段缺失更糟。
+func (p *DeviceProfile) ensure() {
+	if p.Platform == "" && p.Arch == "" && p.OSVersion == "" && p.Screen == "" {
+		fresh := NewDeviceProfile()
+		fresh.DeviceMID = core.FirstNonEmpty(p.DeviceMID, fresh.DeviceMID)
+		*p = fresh
+		return
+	}
+	if p.Platform == "" {
+		p.Platform = "darwin"
+	}
+	if p.Arch == "" {
+		if p.Platform == "win32" {
+			p.Arch = "x64"
+		} else {
+			p.Arch = "arm64"
+		}
+	}
+	if p.OSVersion == "" || !osVersionMatchesPlatform(p.Platform, p.OSVersion) {
+		p.OSVersion = defaultOSVersionFor(p.Platform)
+	}
+	if p.Screen == "" {
+		p.Screen = "1920x1080"
+	}
+	if p.Language == "" {
+		p.Language = DefaultLanguage
+	}
+	if p.Timezone == "" {
+		p.Timezone = DefaultTimezone
+	}
+	if p.DeviceMID == "" {
+		p.DeviceMID = NewUUID()
+	}
+}
+
+// osVersionMatchesPlatform 报告内核版本串是否与平台相符。
+//
+// 上游按平台解析该字段的形态，混搭（win32 + 25.5.0）是明显的伪造信号。
+func osVersionMatchesPlatform(platform, osVersion string) bool {
+	switch platform {
+	case "win32", "windows":
+		return strings.HasPrefix(osVersion, "10.")
+	case "darwin", "macos":
+		// darwin 内核版本为两位主版本号（22–25）。
+		return !strings.HasPrefix(osVersion, "10.")
+	default:
+		return true
+	}
+}
+
+// defaultOSVersionFor 返回某平台的默认内核版本。
+func defaultOSVersionFor(platform string) string {
+	switch platform {
+	case "win32", "windows":
+		return "10.0.22631"
+	default:
+		return DefaultOSVersion
+	}
+}
+
+// IdentityHeaders 是上游要求的 X- 身份头集合（不含鉴权头）。
+type IdentityHeaders struct {
+	values map[string]string
+}
+
+// Set 写入一个身份头。
+func (h *IdentityHeaders) Set(key, value string) {
+	if h.values == nil {
+		h.values = map[string]string{}
+	}
+	h.values[key] = value
+}
+
+// Apply 把身份头写入目标 map（键名保持上游要求的原样大小写）。
+func (h *IdentityHeaders) Apply(target map[string]string) {
+	for key, value := range h.values {
+		target[key] = value
+	}
+}
+
+// BuildIdentityHeaders 构造完整身份头（对齐官方桌面端 companion 头集合）。
+//
+// 有账号时取该账号的设备档案；profile 为零值时回退全局伪装常量。
+func BuildIdentityHeaders(profile DeviceProfile) *IdentityHeaders {
+	profile.ensure()
+	headers := &IdentityHeaders{}
+	headers.Set("HTTP-Referer", HTTPReferer)
+	headers.Set("User-Agent", UserAgent)
+	headers.Set("X-ZCode-App-Version", ClientAppVersion)
+	headers.Set("X-Title", ClientTitle)
+	headers.Set("X-ZCode-Agent", ClientAgent)
+	headers.Set("X-Platform", profile.PlatformFull())
+	headers.Set("X-Release-Channel", ReleaseChannel)
+	headers.Set("X-Client-Language", profile.Language)
+	headers.Set("X-Client-Timezone", profile.Timezone)
+	headers.Set("X-Os-Category", profile.OSCategory())
+	headers.Set("X-Os-Version", profile.OSVersion)
+	headers.Set("X-Device-Mid", profile.DeviceMID)
+	return headers
+}
+
+// BuildTraceHeaders 构造追踪头。
+//
+// JWT/Plan 通道（= 上游的 start-plan）**只允许**这三个头：官方客户端不带
+// x-query-id / x-session-id，误发会触发上游 3012「unusual activity」风控。
+// 每请求重新生成。
+func BuildTraceHeaders() map[string]string {
+	return map[string]string{
+		"x-request-id":         NewUUID(),
+		"x-zcode-session-type": "main",
+		"x-zcode-trace-id":     NewUUID(),
+	}
+}
+
+// NewUUID 生成 RFC 4122 v4 UUID。
+func NewUUID() string {
+	var buf [16]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return "00000000-0000-4000-8000-000000000000"
+	}
+	buf[6] = (buf[6] & 0x0f) | 0x40
+	buf[8] = (buf[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", buf[0:4], buf[4:6], buf[6:8], buf[8:10], buf[10:16])
+}
+
+// NewHexID 生成 n 字节的随机十六进制串。
+func NewHexID(n int) string { return core.RandomHex(n) }

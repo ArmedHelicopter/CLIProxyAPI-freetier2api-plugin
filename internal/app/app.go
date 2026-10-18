@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/accounts"
 	"freetier2api-plugin/internal/admin"
 	"freetier2api-plugin/internal/core"
@@ -65,17 +66,9 @@ type App struct {
 	nextStreamKey  uint64
 	pluginStreamID uint64
 
-	pool        *accounts.Pool
-	taskCatalog *tasks.Catalog
-	admin       *admin.Service
-
-	schedulerMu      sync.Mutex
-	schedulerPoke    chan string
-	schedulerRunning bool
-
-	taskLockMu sync.Mutex
-	taskLocks  map[string]*sync.Mutex
-	taskQueue  *queueState
+	pool  *accounts.Pool
+	tasks *tasks.Service
+	admin *admin.Service
 }
 
 // New 构造一个 App。
@@ -96,9 +89,6 @@ func New(opts Options) (*App, error) {
 		store:           state.NewStore(),
 		credentialCache: map[string]credentialCacheEntry{},
 		streamCancels:   map[uint64]context.CancelFunc{},
-		schedulerPoke:   make(chan string, 4),
-		taskLocks:       map[string]*sync.Mutex{},
-		taskQueue:       &queueState{},
 	}
 	if opts.Host != nil {
 		a.host = opts.Host
@@ -118,8 +108,8 @@ func New(opts Options) (*App, error) {
 	}
 	a.models = modelconfig.New(a.store, a.registry)
 	a.pool = accounts.NewPool(a.registry, a.resolveVendorCredential)
-	a.taskCatalog = tasks.NewCatalog(a.registry)
-	a.admin = admin.New(adminDeps{app: a}, a.registry, a.pool, a.taskCatalog)
+	a.tasks = tasks.New(taskDeps{app: a})
+	a.admin = admin.New(adminDeps{app: a}, a.registry, a.pool, a.tasks)
 	defaults := defaultPluginConfig()
 	a.storeConfig(defaults)
 	a.models.Configure(modelconfig.Settings{
@@ -148,3 +138,14 @@ func (a *App) Registry() *core.Registry { return a.registry }
 
 // Model 返回模型管理器。
 func (a *App) Model() *modelconfig.Manager { return a.models }
+
+// taskDeps 实现 tasks.Deps。
+type taskDeps struct{ app *App }
+
+func (d taskDeps) Registry() *core.Registry               { return d.app.registry }
+func (d taskDeps) Pool() *accounts.Pool                   { return d.app.pool }
+func (d taskDeps) Config() pluginconfig.Config            { return d.app.Config() }
+func (d taskDeps) State() state.State                     { return d.app.SnapshotState() }
+func (d taskDeps) MutateState(fn func(*state.State))      { d.app.MutateState(fn) }
+func (d taskDeps) Now() time.Time                         { return d.app.now() }
+func (d taskDeps) RuntimeFields() []pluginapi.ConfigField { return d.app.runtimeFields() }

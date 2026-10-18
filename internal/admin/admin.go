@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -46,19 +47,10 @@ type Deps interface {
 	MutateState(func(*state.State))
 	Model() *modelconfig.Manager
 	WorkbuddyPromptMode() string
-	SchedulerStatus() map[string]any
-	EffectiveSettings() map[string]any
-	// ResolveCredential 取回凭证并解析出供应商。
-	ResolveCredential(ctx context.Context, callbackID string, storageJSON []byte, authID string, attrs map[string]string) (*core.Credential, core.Vendor, error)
 	// SaveRefreshedCredential 把续期后的凭证写回宿主与磁盘。
 	SaveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor, entry core.HostAuth, original []byte, updated *core.Credential, filePath string)
 	RefreshModels(ctx context.Context) (int, error)
 	Reconfigure() error
-	RecordCheckin(*core.Credential, *core.CheckinResult)
-	PokeScheduler()
-	RunScheduled(kind string)
-	// TaskRoutes 处理任务相关路由（实现留在根层，因为要共享队列与账号锁）。
-	TaskRoutes(req pluginapi.ManagementRequest, route string) (pluginapi.ManagementResponse, bool)
 }
 
 // Service 是管理接口的实例。
@@ -66,12 +58,18 @@ type Service struct {
 	deps     Deps
 	registry *core.Registry
 	pool     *accounts.Pool
-	catalog  *tasks.Catalog
+	tasks    *tasks.Service
+
+	quotaMu    sync.RWMutex
+	quotaCache map[string]quotaResult
 }
 
 // New 构造管理 Service。
-func New(deps Deps, registry *core.Registry, pool *accounts.Pool, catalog *tasks.Catalog) *Service {
-	return &Service{deps: deps, registry: registry, pool: pool, catalog: catalog}
+func New(deps Deps, registry *core.Registry, pool *accounts.Pool, taskService *tasks.Service) *Service {
+	return &Service{
+		deps: deps, registry: registry, pool: pool, tasks: taskService,
+		quotaCache: map[string]quotaResult{},
+	}
 }
 
 // Registration 返回管理路由与资源页声明。
@@ -110,7 +108,7 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "GET", Path: prefix + "/school/status", Description: "开学季活动状态。"},
 		{Method: "POST", Path: prefix + "/keepalive", Description: "手动执行 token 保活。"},
 	}
-	for _, spec := range s.catalog.ManualSpecs() {
+	for _, spec := range s.tasks.Catalog().ManualSpecs() {
 		if spec.Route == "" {
 			continue
 		}
@@ -171,7 +169,7 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 		return core.OKEnvelope(s.modelAliasHandler(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/models/refresh"):
-		ctx, cancel := managementContext(rpc)
+		ctx, cancel := hostabi.ManagementContext(rpc, requestTimeout)
 		defer cancel()
 		count, errRefresh := s.deps.RefreshModels(ctx)
 		if errRefresh != nil {
@@ -184,26 +182,27 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/keepalive"):
 		return core.OKEnvelope(s.handleKeepaliveRequest(rpc))
+
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/tasks/scan"):
+		return core.OKEnvelope(s.handleTasksScan(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/tasks/run"):
+		return core.OKEnvelope(s.handleTasksRun(rpc))
+	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/tasks/queue"):
+		return core.OKEnvelope(s.handleTasksQueue(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/tasks/auto"):
+		return core.OKEnvelope(s.handleTasksAuto(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/tasks/auto_all"):
+		return core.OKEnvelope(s.handleTasksAutoAll(rpc))
+	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/school/status"):
+		return core.OKEnvelope(s.handleSchoolStatus(rpc))
 	}
 	if method == http.MethodPost {
 		if suffix, okSuffix := managementSuffix(rpc.Path, id.ID); okSuffix {
-			for _, spec := range s.catalog.ManualSpecs() {
+			for _, spec := range s.tasks.Catalog().ManualSpecs() {
 				if spec.Route != "" && suffix == spec.Route {
 					return core.OKEnvelope(s.handleScheduledRun(rpc, spec.Kind))
 				}
 			}
-		}
-	}
-
-	// 任务路由：扫描/队列/一键完成等需要与根层共享队列状态。
-	if suffix, okSuffix := managementSuffix(rpc.Path, id.ID); okSuffix && strings.HasPrefix(suffix, "/tasks/") {
-		if response, okResponse := s.deps.TaskRoutes(rpc, suffix); okResponse {
-			return core.OKEnvelope(response)
-		}
-	}
-	if method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/school/status") {
-		if response, okResponse := s.deps.TaskRoutes(rpc, "/school/status"); okResponse {
-			return core.OKEnvelope(response)
 		}
 	}
 
@@ -247,19 +246,6 @@ func normalizeRequestPath(path string) string {
 		trimmed = trimmed[:index]
 	}
 	return trimmed
-}
-
-// managementContext 给管理接口里的上游调用一个可取消的上下文。
-func managementContext(req pluginapi.ManagementRequest) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
-	return hostabi.WithCallbackID(ctx, hostCallbackID(req)), cancel
-}
-
-func hostCallbackID(req pluginapi.ManagementRequest) string {
-	if req.Headers == nil {
-		return ""
-	}
-	return strings.TrimSpace(req.Headers.Get("X-Host-Callback-Id"))
 }
 
 // HTMLResponse 构造 HTML 管理响应。
@@ -317,10 +303,6 @@ func queryInt64(query map[string][]string, key string, fallback int64) int64 {
 }
 
 // 供子文件使用的共享助手。
-
-func realmEnabled(cfg pluginconfig.Config, realm string) bool {
-	return core.RealmEnabled(cfg.EnabledRealms, realm)
-}
 
 // hostActiveVendors 返回有凭证的供应商集合。
 func (s *Service) hostActiveVendors(ctx context.Context, callbackID string) map[string]bool {

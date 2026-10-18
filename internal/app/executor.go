@@ -258,7 +258,7 @@ func (a *App) prepareExecution(request []byte) (preparedExecution, error) {
 	}
 
 	// 供应商所在的区域被配置关闭时直接拒绝（而不是让请求打到错误的上游域名）。
-	if !realmEnabled(a.Config(), vendor.Region()) {
+	if !core.RealmEnabled(a.Config().EnabledRealms, vendor.Region()) {
 		return prepared, core.NewPluginError("vendor_disabled",
 			fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
 	}

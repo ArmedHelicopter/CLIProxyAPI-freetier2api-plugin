@@ -8,6 +8,8 @@ package workbuddy
 import (
 	"testing"
 	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // testTaskCredential 构造一个测试凭证。
@@ -182,9 +184,10 @@ func TestMiniExpertUseEventShape(t *testing.T) {
 // TestApplyDesktopFingerprintInjectsCommonFields 验证指纹注入。
 func TestApplyDesktopFingerprintInjectsCommonFields(t *testing.T) {
 	credential := testTaskCredential("uid-1")
+	rt := newRuntime(core.Env{})
 	events := ApplyDesktopFingerprint(credential, []map[string]any{
 		{"eventCode": "x", "userId": "business-wins"},
-	})
+	}, rt)
 	event := events[0]
 	// 业务字段优先于指纹基底。
 	if event["userId"] != "business-wins" {
@@ -206,17 +209,18 @@ func TestFingerprintStability(t *testing.T) {
 	credentialA := testTaskCredential("uid-a")
 	credentialB := testTaskCredential("uid-b")
 
-	machineA := fingerprint(credentialA, "machine")
-	if machineA != fingerprint(credentialA, "machine") {
+	rt := newRuntime(core.Env{})
+	machineA := rt.fingerprint(credentialA, "machine")
+	if machineA != rt.fingerprint(credentialA, "machine") {
 		t.Fatal("fingerprint must be stable")
 	}
 	if len(machineA) != 36 {
 		t.Fatalf("fingerprint length = %d, want 36", len(machineA))
 	}
-	if fingerprint(credentialB, "machine") == machineA {
+	if rt.fingerprint(credentialB, "machine") == machineA {
 		t.Fatal("different accounts must get different fingerprints")
 	}
-	if fingerprint(credentialA, "session") == machineA {
+	if rt.fingerprint(credentialA, "session") == machineA {
 		t.Fatal("different purposes must get different fingerprints")
 	}
 }

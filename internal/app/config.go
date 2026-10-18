@@ -23,12 +23,7 @@ import (
 
 type pluginConfig = pluginconfig.Config
 
-type (
-	pluginState   = state.State
-	taskRecord    = state.TaskRecord
-	checkinRecord = state.CheckinRecord
-	cachedModel   = core.CachedModel
-)
+type pluginState = state.State
 
 func defaultPluginConfig() pluginConfig { return pluginconfig.Default() }
 
@@ -51,10 +46,6 @@ func (a *App) decodeConfig(raw []byte) (pluginConfig, error) {
 	}
 	cfg.DisabledModels = a.models.ExpandDisabledList(cfg.DisabledModels)
 	return cfg, nil
-}
-
-func realmEnabled(cfg pluginConfig, realm string) bool {
-	return core.RealmEnabled(cfg.EnabledRealms, realm)
 }
 
 // promptModeFor 返回当前生效的提示词模式（WorkBuddy 运行时设置）。
@@ -148,10 +139,4 @@ func (a *App) ensureMachineSalt(cfg pluginConfig) (string, error) {
 	return salt, nil
 }
 
-func (a *App) todayString() string { return a.now().Format("2006-01-02") }
-
 func (a *App) nowRFC3339() string { return a.now().Format(time.RFC3339) }
-
-func taskStateKey(uid, code string) string {
-	return strings.TrimSpace(uid) + "\x1f" + strings.TrimSpace(code)
-}

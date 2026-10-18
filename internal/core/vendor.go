@@ -1,3 +1,12 @@
+package core
+
+import (
+	"context"
+	"time"
+
+	"freetier2api-plugin/cpasdk/pluginapi"
+)
+
 // Package core 是本插件的供应商无关骨架：共享类型、供应商接口与注册表。
 //
 // 分层纪律：
@@ -9,13 +18,6 @@
 // 为什么需要这一层：宿主 ABI 限制一个插件进程只能声明一个 provider key
 // （见 ProviderKey 的说明），因此多个供应商必须共存于一个插件内。若没有
 // 这层抽象，每加一个供应商都要在根层的能力文件里改一处 switch。
-package core
-
-import (
-	"context"
-
-	"freetier2api-plugin/cpasdk/pluginapi"
-)
 
 // ProviderKey 是本插件在 CPA 里占用的 provider 键，**所有供应商共用**。
 //
@@ -110,4 +112,80 @@ type CheckinResult struct {
 	Energy int64
 	// Message 是可读说明。
 	Message string
+}
+
+// 本文件定义供应商运行时环境与组合根工厂。
+//
+// Env 是供应商唯一允许依赖的宿主面：host 端口、注册表、登录会话表。
+// 供应商不再读取包级全局注册表或全局 host port。
+
+// VendorFactory 负责构造一个供应商家族的实例（区域变体在 family 内展开）。
+type VendorFactory struct {
+	Instances func(Env) []Vendor
+}
+
+// Env 是供应商实例的运行时依赖。
+type Env struct {
+	Host     Host
+	Registry *Registry
+	Logins   LoginSessions
+}
+
+// Settings 返回当前全局设置快照。
+func (e Env) Settings() Settings {
+	if e.Host == nil {
+		return Settings{}
+	}
+	return e.Host.Settings()
+}
+
+// PollState 是登录轮询的准入结果。
+type PollState int
+
+const (
+	PollMissing PollState = iota
+	PollThrottled
+	PollReady
+)
+
+// LoginSessions 是登录会话登记表接口；实现由 internal/loginsession 提供。
+type LoginSession struct {
+	VendorID string
+	Data     any
+}
+
+type LoginSessions interface {
+	Register(vendorID, sessionID string, ttl, interval time.Duration, data any)
+	Poll(sessionID string) (*LoginSession, PollState)
+	Owns(sessionID string) (vendorID string, ok bool)
+	Delete(sessionID string)
+}
+
+// ProbeNativeCredential 从宿主凭证中挑第一个属于 vendorID 的可用原生凭证。
+func ProbeNativeCredential[T any](env Env, vendorID string, extract NativeExtractor[T]) (*T, bool) {
+	if env.Host == nil || env.Registry == nil {
+		return nil, false
+	}
+	ctx := context.Background()
+	entries, errList := env.Host.ListAuths(ctx)
+	if errList != nil {
+		return nil, false
+	}
+	for _, entry := range entries {
+		if entry.Disabled || entry.Unavailable {
+			continue
+		}
+		raw, okRaw := env.Host.AuthJSON(ctx, entry.AuthIndex)
+		if !okRaw {
+			continue
+		}
+		credential, okParse := env.Registry.ParseCredential(raw, entry.Name, nil)
+		if !okParse || credential.VendorIDValue() != vendorID {
+			continue
+		}
+		if native, okNative := extract(credential); okNative && native != nil {
+			return native, true
+		}
+	}
+	return nil, false
 }

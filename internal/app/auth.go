@@ -519,7 +519,7 @@ func (a *App) vendorForLoginSession(sessionID string) (core.Vendor, error) {
 
 // vendorEnabled 报告供应商的区域是否被配置启用。
 func (a *App) vendorEnabled(vendor core.Vendor) bool {
-	return realmEnabled(a.Config(), vendor.Region())
+	return core.RealmEnabled(a.Config().EnabledRealms, vendor.Region())
 }
 
 // firstEnabledVendor 返回配置里第一个启用的供应商。
@@ -544,32 +544,6 @@ func (a *App) firstVendorForRegion(region string) (core.Vendor, bool) {
 }
 
 // ---- 凭证写回（原 credentials.go） ----
-
-// recordCheckinResult 把一次签到结果写进状态（供页面展示）。
-//
-// 接收中立的 core.CheckinResult：各家的签到结果字段不同，状态里只记
-// 两家都有的部分。
-func (a *App) recordCheckinResult(credential *core.Credential, result *core.CheckinResult) {
-	if credential == nil || result == nil {
-		return
-	}
-	uid := credential.FileIDValue()
-	if uid == "" {
-		return
-	}
-	today := a.todayString()
-	a.MutateState(func(state *pluginState) {
-		record := state.Checkin[uid]
-		record.LastDate = today
-		if result.Credit > 0 {
-			record.Credit = result.Credit
-		}
-		if result.Energy > 0 {
-			record.Energy = result.Energy
-		}
-		state.Checkin[uid] = record
-	})
-}
 
 // saveRefreshedCredential 把续期后的凭证写回宿主与磁盘。
 //

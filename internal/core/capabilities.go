@@ -56,7 +56,6 @@ type LoginProvider interface {
 	LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error)
 }
 
-// LoginSessionOwner 由持有登录会话状态的供应商实现。
 // Refresher 由需要校验/续期凭证的供应商实现。
 //
 // 未实现时调用方视为「已校验且无需写盘」（refreshed=false）。
@@ -127,25 +126,6 @@ type ConsoleModelProvider interface {
 	ConsoleModels() []ConsoleModel
 }
 
-// TaskSpec 是供应商注册的一条任务规格。
-//
-// 调度器、管理页与状态文件都从 TaskSpec 生成，不再硬编码某家供应商的活动名。
-type TaskSpec struct {
-	Kind         string `json:"kind"`
-	Label        string `json:"label"`
-	Description  string `json:"description,omitempty"`
-	DefaultHours []int  `json:"default_hours,omitempty"`
-	AfterCheckin bool   `json:"after_checkin,omitempty"`
-	Manual       bool   `json:"manual,omitempty"`
-	UsesChat     bool   `json:"uses_chat,omitempty"`
-	Route        string `json:"route,omitempty"`
-}
-
-// TaskCatalogProvider 由需要注册任务族/排程的供应商实现。
-type TaskCatalogProvider interface {
-	TaskSpecs() []TaskSpec
-}
-
 // As 把供应商断言为某个可选能力接口。
 //
 // 用法：if quota, ok := core.As[core.QuotaProvider](vendor); ok { ... }
@@ -203,96 +183,6 @@ func QuotaUnsupported(vendor Vendor) error {
 func LoginUnsupported(vendor Vendor) error {
 	return NewPluginError("login_unsupported",
 		vendor.Name()+" 不支持登录：请用「添加 API Key」方式添加", http.StatusNotImplemented)
-}
-
-// 任务调度的中立类型与接口。
-//
-// 供应商只在支持任务/签到时实现这些接口；根层调度器按类型断言调用，
-// 不支持的供应商直接跳过，不需要任何占位实现。
-
-// 通用任务族标识。供应商专属任务族由各供应商的 TaskSpec 提供。
-const (
-	TaskKindCheckin   = "checkin"
-	TaskKindKeepalive = "keepalive"
-)
-
-// TaskItem 是一条待办任务（扫描结果）。
-type TaskItem struct {
-	Kind     string `json:"kind"`
-	Code     string `json:"code"`
-	Title    string `json:"title"`
-	Current  int64  `json:"current"`
-	Target   int64  `json:"target"`
-	UsesChat bool   `json:"uses_chat"`
-}
-
-// TaskInspection 是一次账号扫描的结果。
-type TaskInspection struct {
-	Items    []TaskItem
-	InPeriod bool
-}
-
-// TaskRunResult 是单条任务的执行结果。
-type TaskRunResult struct {
-	Status  string
-	Message string
-	Credit  int64
-	Energy  int64
-}
-
-// AutoTaskResult 是一键完成里单条任务的结果（含任务码与最终进度）。
-type AutoTaskResult struct {
-	Code     string
-	Status   string
-	Message  string
-	Credit   int64
-	Energy   int64
-	Progress string
-}
-
-// SchoolTaskView 是开学季任务的展示形态。
-type SchoolTaskView struct {
-	Code     string
-	Title    string
-	Status   string
-	Progress int64
-	Target   int64
-}
-
-// SchoolStatusResult 是开学季活动状态。
-type SchoolStatusResult struct {
-	InPeriod bool
-	Tasks    []SchoolTaskView
-	Chances  any
-	Error    string
-}
-
-// TaskRunner 由支持自动任务执行的供应商实现。
-type TaskRunner interface {
-	// RunTask 执行单条任务（school_daily 表示开学季闭环）。
-	RunTask(ctx context.Context, cred *Credential, code string) (TaskRunResult, error)
-	// RunAllTasks 按依赖序执行全部可自动完成的任务。
-	RunAllTasks(ctx context.Context, cred *Credential) []AutoTaskResult
-}
-
-// TaskInspector 由支持任务扫描的供应商实现。
-type TaskInspector interface {
-	InspectTasks(ctx context.Context, cred *Credential) (TaskInspection, error)
-}
-
-// SchoolStatusProvider 由有开学季活动的供应商实现。
-type SchoolStatusProvider interface {
-	SchoolStatus(ctx context.Context, cred *Credential) SchoolStatusResult
-}
-
-// ScheduledRunner 由需要执行定时任务族的供应商实现。
-type ScheduledRunner interface {
-	RunScheduled(ctx context.Context, cred *Credential, kind string) (message string, err error)
-}
-
-// TaskPreparer 由需要在执行前批量报名/准备的供应商实现。
-type TaskPreparer interface {
-	PrepareTasks(ctx context.Context, cred *Credential) int
 }
 
 // ConfigFieldsProvider 由需要声明 YAML 配置字段的供应商实现。

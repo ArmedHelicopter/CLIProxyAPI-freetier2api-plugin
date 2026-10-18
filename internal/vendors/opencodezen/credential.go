@@ -108,7 +108,7 @@ func MaskedKey(key string) string {
 // 刻意不用 "key" / "token" 这类通用字段名做判据：Qoder 的凭证也有 token
 // 字段，拿它当判据必然跨供应商误吞。
 func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
-	if fileNameMatchesConvention(fileName) {
+	if core.FileNameMatchesConvention(fileName, VendorID, "opencode", "zen") {
 		return true
 	}
 	if raw == nil {
@@ -147,8 +147,4 @@ func hasForeignMarker(raw map[string]any) bool {
 		}
 	}
 	return false
-}
-
-func fileNameMatchesConvention(fileName string) bool {
-	return core.FileNameMatchesConvention(fileName, VendorID, "opencode", "zen")
 }

@@ -20,6 +20,8 @@ package workbuddy
 import (
 	"encoding/json"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // PrepareOptions 是改写管线的输入。
@@ -840,7 +842,7 @@ func StripToolCallNames(frame map[string]any, seen map[int]bool) {
 			if !okCall {
 				continue
 			}
-			index := intFromAny(call["index"])
+			index := core.IntFromAny(call["index"])
 			function, okFunction := call["function"].(map[string]any)
 			if !okFunction {
 				continue
@@ -854,17 +856,4 @@ func StripToolCallNames(frame map[string]any, seen map[int]bool) {
 			}
 		}
 	}
-}
-
-// intFromAny 把 JSON 数值转 int（缺失或非法返回 0）。
-func intFromAny(value any) int {
-	switch typed := value.(type) {
-	case float64:
-		return int(typed)
-	case int:
-		return typed
-	case int64:
-		return int(typed)
-	}
-	return 0
 }

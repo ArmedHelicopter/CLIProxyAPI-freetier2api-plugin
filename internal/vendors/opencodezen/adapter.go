@@ -27,6 +27,7 @@ import (
 type adapter struct {
 	*core.NativeAdapter[*Credential]
 	contextFallback func(string) int64
+	baseURL         string
 }
 
 // Instances 构造 ZEN 实例（只有一个，没有区域之分）。
@@ -65,7 +66,9 @@ func Instances(env core.Env, contextFallback func(string) int64) []core.Vendor {
 func (v *adapter) AuthMode() string { return "apikey" }
 
 // Configure 解析供应商专属配置。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
+func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
+	v.baseURL = strings.TrimSpace(raw["opencodezen_base_url"])
+}
 
 // Match 判断一份凭证是否属于本供应商。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
@@ -84,7 +87,7 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	if apiKey == "" {
 		return nil, fmt.Errorf("no opencodezen credential available for model probe")
 	}
-	models, errModels := FetchModels(ctx, BaseURLOverride(), apiKey)
+	models, errModels := FetchModels(ctx, v.baseURL, apiKey)
 	if errModels != nil {
 		return nil, errModels
 	}
@@ -101,7 +104,7 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 	if errNative != nil {
 		return nil, errNative
 	}
-	models, errModels := FetchModels(ctx, BaseURLOverride(), native.APIKey)
+	models, errModels := FetchModels(ctx, v.baseURL, native.APIKey)
 	if errModels != nil {
 		// 探测失败返回空清单而不是报错：宿主会因为空清单跳过该凭证，
 		// 这正是我们想要的结果（避免用坏 key 打上游）。
@@ -150,7 +153,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	if errNative != nil {
 		return nil, errNative
 	}
-	payload, errChat := Chat(ctx, BaseURLOverride(), ChatRequest{
+	payload, errChat := Chat(ctx, v.baseURL, ChatRequest{
 		APIKey: native.APIKey,
 		Body:   req.Payload,
 		Stream: false,
@@ -173,7 +176,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errNative != nil {
 		return errNative
 	}
-	resp, errStream := ChatStream(ctx, BaseURLOverride(), ChatRequest{
+	resp, errStream := ChatStream(ctx, v.baseURL, ChatRequest{
 		APIKey: native.APIKey,
 		Body:   req.Payload,
 		Stream: true,

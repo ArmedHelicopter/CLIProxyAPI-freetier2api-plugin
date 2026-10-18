@@ -54,7 +54,7 @@ type pendingLogin struct {
 // 不接收上游基地址覆盖参数：OAuth 的 init/poll 固定在 zcode.z.ai，与对话
 // 通道（api.z.ai，可经 zcode_base_url 覆盖）是两个不同的域名。早期版本把
 // 对话的覆盖值传进来，会让只想改对话地址的用户连带改坏登录链路。
-func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) {
+func LoginStart(ctx context.Context, logins core.LoginSessions) (*pluginapi.AuthLoginStartResponse, error) {
 	pollToken := NewHexID(32)
 
 	body, _ := json.Marshal(map[string]string{"provider": "zai"})
@@ -99,7 +99,7 @@ func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) 
 	effectiveToken := core.FirstNonEmpty(payload.Data.PollToken, pollToken)
 
 	sessionID := "zcode_" + NewHexID(8)
-	loginsession.Register(VendorID, sessionID, loginFlowTTL, loginPollInterval, &pendingLogin{
+	logins.Register(VendorID, sessionID, loginFlowTTL, loginPollInterval, &pendingLogin{
 		FlowID:    payload.Data.FlowID,
 		PollToken: effectiveToken,
 	})
@@ -113,8 +113,8 @@ func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) 
 }
 
 // LoginPoll 轮询一次授权状态；完成时兑换出完整凭证。
-func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollResponse, error) {
-	session, pollState := loginsession.Poll(sessionID)
+func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string) (*pluginapi.AuthLoginPollResponse, error) {
+	session, pollState := logins.Poll(sessionID)
 	if pollState == loginsession.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
@@ -169,14 +169,14 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 	// code=3004 是上游明示的会话过期，其余 4xx 视为终态失败。
 	if payload.Code != codeSuccess {
 		if payload.Code == codeSessionExpired {
-			loginsession.Delete(sessionID)
+			logins.Delete(sessionID)
 			return &pluginapi.AuthLoginPollResponse{
 				Status:  pluginapi.AuthLoginStatusError,
 				Message: "授权会话已过期，请重新发起登录",
 			}, nil
 		}
 		if resp.StatusCode >= 400 {
-			loginsession.Delete(sessionID)
+			logins.Delete(sessionID)
 			return &pluginapi.AuthLoginPollResponse{
 				Status:  pluginapi.AuthLoginStatusError,
 				Message: fmt.Sprintf("上游拒绝轮询（HTTP %d, code=%d）：%s", resp.StatusCode, payload.Code, payload.Msg),
@@ -184,7 +184,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 		}
 	}
 	if payload.Data.Status == "failed" {
-		loginsession.Delete(sessionID)
+		logins.Delete(sessionID)
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "授权被拒绝或失败",
@@ -197,7 +197,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 	if jwt == "" {
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
-	loginsession.Delete(sessionID)
+	logins.Delete(sessionID)
 	cred := &Credential{
 		Vendor:   VendorID,
 		JWTToken: jwt,
@@ -457,8 +457,8 @@ func decryptSecret(ctx context.Context, client *http.Client, bizToken, keyURL, a
 }
 
 // OwnsLoginSession 报告会话是否归属本供应商且仍有效。
-func OwnsLoginSession(sessionID string) bool {
-	if vendorID, okOwns := loginsession.Owns(sessionID); okOwns {
+func OwnsLoginSession(logins core.LoginSessions, sessionID string) bool {
+	if vendorID, okOwns := logins.Owns(sessionID); okOwns {
 		return vendorID == VendorID
 	}
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "zcode_")

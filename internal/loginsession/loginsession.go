@@ -109,18 +109,6 @@ func (r *Registry) Owns(sessionID string) (string, bool) {
 // NewID 生成会话 ID。
 func NewID(n int) string { return core.RandomHex(n) }
 
-// Default 返回进程级默认会话表，仅用于逐步迁移中的旧调用点。
-var defaultRegistry = NewRegistry()
-
-func Register(vendorID, sessionID string, ttl, interval time.Duration, data any) {
-	defaultRegistry.Register(vendorID, sessionID, ttl, interval, data)
-}
-func Poll(sessionID string) (*core.LoginSession, core.PollState) {
-	return defaultRegistry.Poll(sessionID)
-}
-func Delete(sessionID string)              { defaultRegistry.Delete(sessionID) }
-func Owns(sessionID string) (string, bool) { return defaultRegistry.Owns(sessionID) }
-
 const (
 	PollMissing   = core.PollMissing
 	PollThrottled = core.PollThrottled

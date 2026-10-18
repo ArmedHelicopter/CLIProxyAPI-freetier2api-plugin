@@ -36,16 +36,16 @@ type PendingLogin struct {
 }
 
 // StoreLoginSession 登记一次进行中的登录会话（TTL 与节流交给共享登记表）。
-func StoreLoginSession(sessionID string, session *PendingLogin) {
+func StoreLoginSession(logins core.LoginSessions, sessionID string, session *PendingLogin) {
 	if session == nil {
 		return
 	}
-	loginsession.Register(VendorIDFor(session.Region), sessionID, LoginSessionTTL, loginPollInterval, session)
+	logins.Register(VendorIDFor(session.Region), sessionID, LoginSessionTTL, loginPollInterval, session)
 }
 
 // OwnsLoginSession 报告该会话是否由 WorkBuddy 持有且仍有效。
-func OwnsLoginSession(sessionID string) bool {
-	if _, okOwns := loginsession.Owns(sessionID); okOwns {
+func OwnsLoginSession(logins core.LoginSessions, sessionID string) bool {
+	if _, okOwns := logins.Owns(sessionID); okOwns {
 		return true
 	}
 	// 历史会话 id 以 workbuddy_ 开头；保留兜底以兼容极短的 GC 竞争窗口。
@@ -53,16 +53,16 @@ func OwnsLoginSession(sessionID string) bool {
 }
 
 // RemoveLoginSession 登录成功或终止后清理会话。
-func RemoveLoginSession(sessionID string) {
-	loginsession.Delete(sessionID)
+func RemoveLoginSession(logins core.LoginSessions, sessionID string) {
+	logins.Delete(sessionID)
 }
 
 // CheckLoginSession 检查登录会话状态与节流。
 // 返回 (session, exists, shouldPoll):
 //   - exists: 会话是否存在且在 TTL 内；
 //   - shouldPoll: 是否已过节流间隔，可以向上游发起 token 请求。
-func CheckLoginSession(sessionID string) (session *PendingLogin, exists bool, shouldPoll bool) {
-	entry, pollState := loginsession.Poll(sessionID)
+func CheckLoginSession(logins core.LoginSessions, sessionID string) (session *PendingLogin, exists bool, shouldPoll bool) {
+	entry, pollState := logins.Poll(sessionID)
 	if pollState == loginsession.PollMissing {
 		return nil, false, false
 	}

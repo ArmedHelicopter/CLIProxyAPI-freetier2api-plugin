@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // 连登状态类型（Streak / StreakTier）定义在 activity.go —— 它们是上游接口的
@@ -57,7 +59,7 @@ func RunStreakBonus(ctx context.Context, client *Client, credential *Credential)
 			continue
 		}
 		redeemed++
-		if !sleepCtx(ctx, reportGap) {
+		if !core.SleepContext(ctx, reportGap) {
 			return strings.Join(parts, "；"), ctx.Err()
 		}
 	}
@@ -74,7 +76,7 @@ func RunStreakBonus(ctx context.Context, client *Client, credential *Credential)
 				break
 			}
 			drawn++
-			if !sleepCtx(ctx, 2*time.Second) {
+			if !core.SleepContext(ctx, 2*time.Second) {
 				return strings.Join(parts, "；"), ctx.Err()
 			}
 		}
@@ -156,7 +158,7 @@ func adoptBuddy(ctx context.Context, client *Client, credential *Credential) str
 	if errReport := client.ReportChatActivity(ctx, credential, conversationID, "", "", ""); errReport != nil {
 		return ""
 	}
-	if !sleepCtx(ctx, reportGap) {
+	if !core.SleepContext(ctx, reportGap) {
 		return ""
 	}
 	// 同意协议是幂等的，重复调用无害。
@@ -196,7 +198,7 @@ func RunBlackcat(ctx context.Context, client *Client, credential *Credential) (s
 			break
 		}
 		completed++
-		if !sleepCtx(ctx, nightChatGap) {
+		if !core.SleepContext(ctx, nightChatGap) {
 			return "", ctx.Err()
 		}
 	}
@@ -260,7 +262,7 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 				break
 			}
 			drawn++
-			if !sleepCtx(ctx, 2*time.Second) {
+			if !core.SleepContext(ctx, 2*time.Second) {
 				break
 			}
 		}
@@ -285,7 +287,7 @@ func runSchoolTask(ctx context.Context, client *Client, credential *Credential, 
 			return errChat
 		}
 		return client.ReportDesktopEvents(ctx, credential, withFingerprint(credential,
-			DesktopChatSequence(conversationID, requestID, randomHex(16), "fast-model", "fast-model")))
+			DesktopChatSequence(conversationID, requestID, randomHex(16), "fast-model", "fast-model"), client.rt))
 	case "chat_3_times":
 		// 3 条小程序对话埋点（无需真实会话）。
 		for index := 0; index < 3; index++ {
@@ -293,7 +295,7 @@ func runSchoolTask(ctx context.Context, client *Client, credential *Credential, 
 			if errReport := client.ReportMPEvents(ctx, credential, SchoolChatTimesEvents(conversationID, "")); errReport != nil {
 				return errReport
 			}
-			if !sleepCtx(ctx, mpActionGap) {
+			if !core.SleepContext(ctx, mpActionGap) {
 				return ctx.Err()
 			}
 		}
@@ -319,7 +321,7 @@ const (
 // 立即回读会误判「未达标」从而跳过领奖。
 func waitSchoolDone(ctx context.Context, client *Client, credential *Credential, code string) bool {
 	for attempt := 0; attempt < schoolPollLoops; attempt++ {
-		if !sleepCtx(ctx, schoolPollGap) {
+		if !core.SleepContext(ctx, schoolPollGap) {
 			return false
 		}
 		status, errStatus := client.SchoolTasks(ctx, credential)
@@ -336,8 +338,8 @@ func waitSchoolDone(ctx context.Context, client *Client, credential *Credential,
 }
 
 // withFingerprint 给事件链注入桌面指纹（供包内直接调用 ReportDesktopEvents 的场景）。
-func withFingerprint(credential *Credential, events []map[string]any) []map[string]any {
-	base := desktopFingerprint(credential)
+func withFingerprint(credential *Credential, events []map[string]any, rt *runtime) []map[string]any {
+	base := desktopFingerprint(credential, rt)
 	out := make([]map[string]any, 0, len(events))
 	for _, event := range events {
 		out = append(out, mergeEvent(base, event))

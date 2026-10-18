@@ -18,6 +18,9 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/upstream"
 )
 
 // errEmptyStream 表示上游流里没有任何有效数据帧。
@@ -364,14 +367,14 @@ func Aggregate(body io.Reader) ([]byte, error) {
 			continue
 		}
 		if isErrorFrame(payload) {
-			return nil, fmt.Errorf("upstream error: %s", truncate(payload, 512))
+			return nil, fmt.Errorf("upstream error: %s", upstream.Truncate(payload, 512))
 		}
 		validEvents++
 
-		if got := stringField(frame, "id"); got != "" && id == "" {
+		if got := core.StringField(frame, "id"); got != "" && id == "" {
 			id = got
 		}
-		if got := stringField(frame, "model"); got != "" {
+		if got := core.StringField(frame, "model"); got != "" {
 			model = got
 		}
 		if value, okValue := toFloat64(frame["created"]); okValue {
@@ -462,11 +465,6 @@ func Aggregate(body io.Reader) ([]byte, error) {
 	return json.Marshal(response)
 }
 
-func stringField(frame map[string]any, key string) string {
-	value, _ := frame[key].(string)
-	return strings.TrimSpace(value)
-}
-
 func appendContent(builder *strings.Builder, value any) {
 	if text, okText := value.(string); okText && text != "" {
 		builder.WriteString(text)
@@ -485,7 +483,7 @@ func mergeToolCalls(existing []any, incoming []any) []any {
 		if !okCall {
 			continue
 		}
-		index := intFromAny(call["index"])
+		index := core.IntFromAny(call["index"])
 		byIndex[index] = call
 		order = append(order, index)
 	}
@@ -499,7 +497,7 @@ func mergeToolCalls(existing []any, incoming []any) []any {
 		index, okIndex := call["index"]
 		var key int
 		if okIndex {
-			key = intFromAny(index)
+			key = core.IntFromAny(index)
 		} else {
 			// 缺 index：延续最近一次调用（上游偶发行为）。
 			if len(order) > 0 {
@@ -560,7 +558,7 @@ func sortToolCalls(calls []any) []any {
 		for j := i; j > 0; j-- {
 			left, _ := out[j-1].(map[string]any)
 			right, _ := out[j].(map[string]any)
-			if intFromAny(left["index"]) <= intFromAny(right["index"]) {
+			if core.IntFromAny(left["index"]) <= core.IntFromAny(right["index"]) {
 				break
 			}
 			out[j-1], out[j] = out[j], out[j-1]

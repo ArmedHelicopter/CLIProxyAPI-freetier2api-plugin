@@ -5,15 +5,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"freetier2api-plugin/internal/vendors/qoder/cosy"
 	"io"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/upstream"
+	"freetier2api-plugin/internal/vendors/qoder/cosy"
 	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
 
@@ -72,7 +74,7 @@ func FetchUserInfoWithToken(ctx context.Context, token string, region qoderapi.R
 	}
 	// DEBUG 用途排查原始 userinfo 响应结构：降为 Debug 级并截断至 500 字节，
 	// 默认日志级别不再落盘用户名/组织等 PII，保留低级别排查能力
-	logger.Debug("userinfo raw (%d bytes): %s", len(raw), truncate(string(raw), 500))
+	logger.Debug("userinfo raw (%d bytes): %s", len(raw), upstream.Truncate(string(raw), 500))
 	return result, nil
 }
 
@@ -438,7 +440,7 @@ func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages [
 				logger.Info("upstream queues model %s (%s); waiting %s before reopening (queue wait %d/%d)",
 					signal.ModelKey, signal.QueueType, wait, queueWaits, maxQueueWaits)
 			}
-			if serr := sleepCtx(ctx, wait); serr != nil {
+			if !core.SleepContext(ctx, wait) {
 				return lastErr
 			}
 			logger.Info("reopen upstream after in-stream error (try %d/%d): %v",
@@ -562,11 +564,11 @@ func InferAgent(model string) string {
 	}
 }
 
-// defaultModelMapping 是当用户未在 Settings.ModelMappings 中配置时，bridge 的内置兜底映射。
-// 采用「家族关键字 → Qoder model.key」形式，依赖下面 mapModel 的双向 substring 模糊匹配，
+// defaultModelMapping 是 bridge 的内置静态映射表。
+// 采用「家族关键字 → Qoder model.key」形式，依赖下面 lookupMapping 的双向 substring 模糊匹配，
 // 一条 "sonnet" 即可覆盖 claude-sonnet-4-6 / claude-sonnet-4-20250514 等所有变体。
 //
-// 设计原则：默认表只负责让请求落到合法 SKU 不出错，差异化由用户在 UI 自行覆盖。
+// 设计原则：默认表只负责让请求落到合法 SKU 不出错。
 // Qoder 上游合法 key 见 /v1/models 返回，随上游变化动态调整。
 // GPT / Gemini 没有专属 SKU，统一映射到主力档 performance —— 既不浪费 ultimate 高 price_factor，
 // 也不被 lite 限频；想分档（如 gpt-5→ultimate / gpt-5-mini→efficient）请在 UI 配置。
@@ -580,15 +582,12 @@ var defaultModelMapping = map[string]string{
 	"gemini": "gmodel",
 }
 
-// MapModel 解析顺序（参考 ccx 的 RedirectModel 算法）：
-//  1. 用户 Settings.ModelMappings[agent] 精确命中
-//  2. 用户 Settings.ModelMappings[agent] 双向 substring 模糊匹配（按 source 长度倒序，最长优先）
-//  3. 用户旧 Settings.ModelMapping (deprecated 扁平表) 命中
-//  4. defaultModelMapping 精确命中
-//  5. defaultModelMapping 双向 substring 模糊匹配
-//  6. ToLower 兜底（如客户端传 "Performance" 这种 display_name 大小写）
+// MapModel 解析顺序（当前仅使用静态映射）：
+//  1. defaultModelMapping 精确命中
+//  2. defaultModelMapping 双向 substring 模糊匹配（按 source 长度倒序，最长优先）
+//  3. ToLower 兜底（如客户端传 "Performance" 这种 display_name 大小写）
 //
-// agent 取值 "claude" / "codex" / "gemini"，由 handler 入口决定；空串表示未知 agent，跳过 agent 桶。
+// agent 由 handler 入口传入并保留用于未来按 agent 区分的扩展；当前不参与映射。
 //
 // 双向 substring 含义：source 包含 model（短关键字匹配长模型名，如 "sonnet" → "claude-sonnet-4-6"）
 // 或 model 包含 source（长别名匹配短模型名，反向也能命中）。
@@ -597,28 +596,12 @@ func MapModel(agent, model string) string {
 		return model
 	}
 
-	agentTables, flatTable := currentModelMappings()
-
-	// 1. agent 维度的用户配置优先（信任用户配置值，UI 已限制为上游合法 key）
-	if agent != "" && len(agentTables) > 0 {
-		if mapped := lookupMapping(model, agentTables[agent]); mapped != "" {
-			return mapped
-		}
-	}
-
-	// 2. 扁平映射表（页面/配置提供的兜底覆盖）
-	if len(flatTable) > 0 {
-		if mapped := lookupMapping(model, flatTable); mapped != "" {
-			return mapped
-		}
-	}
-
-	// 3. 内置默认映射兜底
+	// 内置默认映射兜底
 	if mapped := lookupMapping(model, defaultModelMapping); mapped != "" {
 		return mapped
 	}
 
-	// 4. 大小写归一化兜底（客户端可能直接传 Qoder key 如 "Performance"/"dmodel"）
+	// 大小写归一化兜底（客户端可能直接传 Qoder key 如 "Performance"/"dmodel"）
 	return strings.ToLower(model)
 }
 

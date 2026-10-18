@@ -21,6 +21,7 @@ import (
 // adapter 是 core.Vendor 在 ZCode 上的实现。
 type adapter struct {
 	*core.NativeAdapter[*Credential]
+	baseURL string
 }
 
 // Instances 构造 ZCode 实例。
@@ -57,7 +58,9 @@ func Instances(env core.Env) []core.Vendor {
 func (v *adapter) AuthMode() string { return "oauth" }
 
 // Configure 解析供应商专属配置。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
+func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
+	v.baseURL = strings.TrimSpace(raw["zcode_base_url"])
+}
 
 // Match 判断一份凭证是否属于本供应商。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
@@ -100,7 +103,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	if errNative != nil {
 		return nil, errNative
 	}
-	payload, errChat := Chat(ctx, BaseURLOverride(), ChatRequest{
+	payload, errChat := Chat(ctx, v.baseURL, ChatRequest{
 		Credential: native,
 		Body:       req.Payload,
 		Stream:     false,
@@ -120,7 +123,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errNative != nil {
 		return errNative
 	}
-	return ChatStream(ctx, BaseURLOverride(), ChatRequest{
+	return ChatStream(ctx, v.baseURL, ChatRequest{
 		Credential: native,
 		Body:       req.Payload,
 		Stream:     true,
@@ -144,16 +147,18 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 
 // LoginStart 发起一次登录。
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return LoginStart(ctx)
+	return LoginStart(ctx, v.Env.Logins)
 }
 
 // LoginPoll 轮询一次登录状态。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	return LoginPoll(ctx, state)
+	return LoginPoll(ctx, v.Env.Logins, state)
 }
 
 // OwnsLoginSession 报告该会话是否由本供应商创建。
-func (v *adapter) OwnsLoginSession(sessionID string) bool { return OwnsLoginSession(sessionID) }
+func (v *adapter) OwnsLoginSession(sessionID string) bool {
+	return OwnsLoginSession(v.Env.Logins, sessionID)
+}
 
 // Refresh 校验凭证。
 //

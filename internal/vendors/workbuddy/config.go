@@ -12,6 +12,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
@@ -20,7 +22,7 @@ import (
 
 const maxPromptFileSize = 1 << 20
 
-// runtimeConfig 是所有 Client 共享的配置快照。
+// runtimeConfig 是单个适配器实例的配置快照。
 type runtimeConfig struct {
 	enabledRealms        []string
 	sanitizeFingerprints bool
@@ -39,11 +41,6 @@ type runtimeConfig struct {
 	deviceTokenFile string
 }
 
-var (
-	runtimeMu  sync.RWMutex
-	runtimeCfg = defaultRuntimeConfig()
-)
-
 func defaultRuntimeConfig() runtimeConfig {
 	return runtimeConfig{
 		sanitizeFingerprints: true,
@@ -55,10 +52,8 @@ func defaultRuntimeConfig() runtimeConfig {
 	}
 }
 
-// Configure 解析 WorkBuddy 专属键并更新运行时快照。
-//
-// 未知键一律忽略：配置里保留其它供应商的键不该让本包报错。
-func Configure(settings core.Settings, raw map[string]string) {
+// configure 解析 WorkBuddy 专属键并更新当前实例的运行时快照。
+func (r *runtime) configure(settings core.Settings, raw map[string]string) {
 	cfg := defaultRuntimeConfig()
 	cfg.enabledRealms = append([]string(nil), settings.EnabledRealms...)
 	cfg.sanitizeFingerprints = ParseBool(raw["workbuddy_sanitize_fingerprints"], true)
@@ -86,18 +81,15 @@ func Configure(settings core.Settings, raw map[string]string) {
 	if path := strings.TrimSpace(raw["workbuddy_prompt_file"]); path != "" {
 		text, errRead := readPromptFile(path)
 		if errRead != nil {
-			// 不静默降级：运维会以为提示词生效了，实际还在用内置的。
 			logger.Error("load prompt file failed, falling back to built-in prompt: %v", errRead)
 		} else if text != "" {
 			cfg.promptText = text
 		}
 	}
-	SetPrompt(cfg.promptMode, cfg.promptText)
-	SetInstallSalt(settings.MachineSalt)
-
-	runtimeMu.Lock()
-	runtimeCfg = cfg
-	runtimeMu.Unlock()
+	r.cfg.Store(&cfg)
+	r.prompt.Store(&promptState{Mode: cfg.promptMode, Text: cfg.promptText})
+	salt := strings.TrimSpace(settings.MachineSalt)
+	r.salt.Store(&salt)
 }
 
 func readPromptFile(path string) (string, error) {
@@ -111,17 +103,20 @@ func readPromptFile(path string) (string, error) {
 	return strings.TrimSpace(string(raw)), nil
 }
 
-// currentOptions 返回一次请求要用的 Options（快照 + 当前提示词降级态）。
-func currentOptions(ctx context.Context) Options {
-	runtimeMu.RLock()
-	cfg := runtimeCfg
-	runtimeMu.RUnlock()
+// options 返回一次请求要用的 Options（配置快照 + 当前提示词降级态）。
+func (r *runtime) options(ctx context.Context) Options {
+	cfg := *r.cfg.Load()
+	prompt := *r.prompt.Load()
+	promptText := prompt.Text
+	if prompt.Degraded {
+		promptText = degradedPrompt
+	}
 	return Options{
 		Context:              ctx,
 		EnabledRealms:        append([]string(nil), cfg.enabledRealms...),
-		PromptMode:           PromptMode(),
-		PromptText:           PromptText(),
-		OnContentBlocked:     MarkPromptDegraded,
+		PromptMode:           prompt.Mode,
+		PromptText:           promptText,
+		OnContentBlocked:     r.markPromptDegraded,
 		SanitizeFingerprints: cfg.sanitizeFingerprints,
 		PassthroughIP:        cfg.passthroughIP,
 		UserAgent:            cfg.userAgent,
@@ -167,97 +162,170 @@ func ParseBool(raw string, fallback bool) bool {
 	return fallback
 }
 
-// 本文件实现系统提示词体系。
-//
-// 为什么需要它：客户端的 system prompt 里带着大量固定模板句（工具说明、
-// 身份声明、环境描述），上游的内容审核按逐字匹配拦截。把 system 换成
-// 网关自有提示词是从源头解决，比逐句改写（sanitize）更彻底。
-//
-// 三种模式：
-//   - passthrough：完全透传客户端 system（默认，最不干扰）；
-//   - custom：删除全部 system/developer 消息，换成网关自有提示词；
-//   - append：在开头连续的 system/developer 块之后追加一条网关提示词，
-//     既有消息逐字保留。
-//
-// 这是**本供应商特有**的机制：CodeBuddy 的上游按逐字匹配做内容审核，
-// 其它供应商的上游未必如此，因此提示词体系属于协议层而非通用核心。
-
 //go:embed prompt_default.md
 var defaultPromptRaw []byte
 
-// degradedPrompt 是内容被拦截后降级重试时使用的极简提示词。
-//
-// 长提示词更容易命中逐字审核，降级到一句中性指令能显著提高通过率。
 const degradedPrompt = "You are a helpful assistant. Respond in the user's language, " +
 	"follow the user's instructions, and be direct and concise."
 
-// 提示词模式取值（与根层 config 的解析结果对齐）。
 const (
-	// PromptModePassThrough 完全透传客户端 system。
 	PromptModePassThrough = "passthrough"
-	// PromptModeCustom 替换为网关自有提示词。
-	PromptModeCustom = "custom"
-	// PromptModeAppend 在既有 system 之后追加网关提示词。
-	PromptModeAppend = "append"
+	PromptModeCustom      = "custom"
+	PromptModeAppend      = "append"
 )
-
-var (
-	promptMu       sync.RWMutex
-	promptMode     = PromptModePassThrough
-	promptText     = ""
-	promptDegraded bool
-)
-
-// SetPrompt 设置当前生效的提示词模式与文本。
-//
-// 由根层在配置热更新时调用：配置结构属于根层，供应商包只接收结果，
-// 避免反向依赖 package main。
-func SetPrompt(mode, text string) {
-	mode = strings.TrimSpace(mode)
-	if mode == "" {
-		mode = PromptModePassThrough
-	}
-	promptMu.Lock()
-	promptMode = mode
-	promptText = strings.TrimSpace(text)
-	promptMu.Unlock()
-}
 
 // BuiltinPrompt 返回内置的默认提示词文本。
 func BuiltinPrompt() string {
 	return strings.TrimSpace(string(defaultPromptRaw))
 }
 
-// PromptMode 返回当前生效的提示词模式。
-func PromptMode() string {
-	promptMu.RLock()
-	defer promptMu.RUnlock()
-	return promptMode
-}
-
-// PromptText 返回当前生效的提示词文本（降级态返回极简提示词）。
-func PromptText() string {
-	if PromptDegraded() {
-		return degradedPrompt
-	}
-	promptMu.RLock()
-	defer promptMu.RUnlock()
-	return promptText
-}
-
-// MarkPromptDegraded 标记进入降级态。
+// 本文件是 WorkBuddy 每个适配器实例独占的运行时状态。
 //
-// 降级态一旦开启就持续到进程重启：上游的内容审核策略变化通常是长期性的，
-// 反复在「完整提示词 ↔ 降级提示词」之间来回试探只会让一半请求失败。
-func MarkPromptDegraded() {
-	promptMu.Lock()
-	promptDegraded = true
-	promptMu.Unlock()
+// 配置、提示词降级态、档位表、设备令牌缓存、机器盐与模型探测宿主面
+// 都放在 runtime 里，不再使用包级变量；多个 App 实例互不影响。
+
+type promptState struct {
+	Mode     string
+	Text     string
+	Degraded bool
 }
 
-// PromptDegraded 报告是否处于降级态。
-func PromptDegraded() bool {
-	promptMu.RLock()
-	defer promptMu.RUnlock()
-	return promptDegraded
+type effortState struct {
+	Defaults  map[string]string
+	Supported map[string][]string
+}
+
+type runtime struct {
+	env core.Env
+
+	cfg    atomic.Pointer[runtimeConfig]
+	prompt atomic.Pointer[promptState]
+	effort atomic.Pointer[effortState]
+	salt   atomic.Pointer[string]
+
+	deviceMu    sync.Mutex
+	devicePath  string
+	deviceToken string
+	deviceAt    time.Time
+
+	modelMu    sync.Mutex
+	modelCache map[Region]modelCacheEntry
+}
+
+func newRuntime(env core.Env) *runtime {
+	cfg := defaultRuntimeConfig()
+	rt := &runtime{env: env, modelCache: map[Region]modelCacheEntry{}}
+	rt.cfg.Store(&cfg)
+	rt.prompt.Store(&promptState{Mode: PromptModePassThrough, Text: BuiltinPrompt()})
+	rt.effort.Store(&effortState{Defaults: map[string]string{}, Supported: map[string][]string{}})
+	salt := ""
+	rt.salt.Store(&salt)
+	return rt
+}
+
+func (r *runtime) markPromptDegraded() {
+	current := *r.prompt.Load()
+	current.Degraded = true
+	r.prompt.Store(&current)
+}
+
+func (r *runtime) effortTables() (map[string]string, map[string][]string) {
+	state := r.effort.Load()
+	return state.Defaults, state.Supported
+}
+
+func (r *runtime) setEffortTables(defaults map[string]string, supported map[string][]string) {
+	old := r.effort.Load()
+	next := &effortState{
+		Defaults:  make(map[string]string, len(old.Defaults)+len(defaults)),
+		Supported: make(map[string][]string, len(old.Supported)+len(supported)),
+	}
+	for key, value := range old.Defaults {
+		next.Defaults[key] = value
+	}
+	for key, value := range old.Supported {
+		next.Supported[key] = value
+	}
+	for key, value := range defaults {
+		next.Defaults[key] = value
+	}
+	for key, value := range supported {
+		next.Supported[key] = value
+	}
+	r.effort.Store(next)
+}
+
+func (r *runtime) publishEffortTables(models []ModelInfo) {
+	defaults := make(map[string]string, len(models))
+	supported := make(map[string][]string, len(models))
+	for _, model := range models {
+		if model.DefaultEffort != "" {
+			defaults[model.ID] = model.DefaultEffort
+		}
+		if len(model.Efforts) > 0 {
+			supported[model.ID] = model.Efforts
+		}
+	}
+	r.setEffortTables(defaults, supported)
+}
+
+func (r *runtime) deriveID(uid, purpose string) string {
+	return deriveIDWithSalt(uid, purpose, *r.salt.Load())
+}
+
+func (r *runtime) fingerprint(credential *Credential, purpose string) string {
+	return r.deriveID(credential.UIDValue(), purpose)
+}
+
+func (r *runtime) readDeviceTokenFile(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	r.deviceMu.Lock()
+	defer r.deviceMu.Unlock()
+	if r.devicePath == trimmed && time.Since(r.deviceAt) < deviceTokenFileTTL {
+		return r.deviceToken
+	}
+	r.devicePath = trimmed
+	r.deviceAt = time.Now()
+	r.deviceToken = ""
+	info, errStat := os.Stat(trimmed)
+	if errStat != nil || info.Size() > deviceTokenFileMaxLen {
+		return ""
+	}
+	raw, errRead := os.ReadFile(trimmed)
+	if errRead != nil {
+		return ""
+	}
+	r.deviceToken = strings.TrimSpace(string(raw))
+	return r.deviceToken
+}
+
+func (r *runtime) hostProbeCredential(region Region) *Credential {
+	if r.env.Host == nil || r.env.Registry == nil {
+		return nil
+	}
+	ctx := context.Background()
+	entries, errList := r.env.Host.ListAuths(ctx)
+	if errList != nil {
+		return nil
+	}
+	for _, entry := range entries {
+		if entry.Disabled || entry.Unavailable {
+			continue
+		}
+		stored, okStored := r.env.Host.AuthJSON(ctx, entry.AuthIndex)
+		if !okStored {
+			continue
+		}
+		credential, okCredential := r.env.Registry.ParseCredential(stored, entry.Name, nil)
+		if !okCredential || credential.RegionValue() != string(region) {
+			continue
+		}
+		if native, okNative := credential.Native.(*Credential); okNative && native != nil {
+			return native
+		}
+	}
+	return nil
 }

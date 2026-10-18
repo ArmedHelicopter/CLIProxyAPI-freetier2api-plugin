@@ -24,67 +24,66 @@ import (
 type adapter struct {
 	*core.NativeAdapter[*Credential]
 	region Region
+	rt     *runtime
 }
 
 // Instances 构造 WorkBuddy 的两个区域实例。
 func Instances(env core.Env) []core.Vendor {
-	setProbeEnv(env)
 	return []core.Vendor{newInstance(env, RegionCN), newInstance(env, RegionGlobal)}
 }
 
 func newInstance(env core.Env, region Region) core.Vendor {
-	return &adapter{
-		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
-			Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
-			Env:  env,
-			Extract: func(c *core.Credential) (*Credential, bool) {
-				native, ok := c.Native.(*Credential)
-				return native, ok
-			},
-			ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
-				native, errParse := ParseCredential(raw, region)
-				if errParse != nil {
-					return core.CredentialSeed{}, nil, errParse
-				}
-				if native.Realm() != region {
-					return core.CredentialSeed{}, nil, fmt.Errorf("credential realm %q does not match vendor %q", native.Realm(), VendorIDFor(region))
-				}
-				token := native.AccessTokenValue()
-				authMode := "oauth"
-				if token == "" {
-					token = native.DeviceTokenValue()
-					authMode = "device"
-				}
-				return core.CredentialSeed{
-					VendorID: VendorIDFor(region), Region: string(native.Realm()),
-					Label:  core.FirstNonEmpty(native.NicknameValue(), native.UIDValue(), fileName),
-					FileID: core.FileIDFromFileName(fileName), UID: native.UIDValue(),
-					Token: token, RefreshToken: native.RefreshTokenValue(),
-					ExpiresAt: native.ExpiresAt, AuthMode: authMode,
-				}, native, nil
-			},
-			RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
-				client, errClient := clientFor(ctx)
-				if errClient != nil {
-					return core.NativeRefresh[*Credential]{}, errClient
-				}
-				accessBefore, refreshBefore := native.Snapshot()
-				if errRefresh := client.RefreshToken(native); errRefresh != nil {
-					return core.NativeRefresh[*Credential]{}, errRefresh
-				}
-				refreshed := !native.UnchangedSince(accessBefore, refreshBefore)
-				return core.NativeRefresh[*Credential]{
-					Native: native, Token: native.AccessTokenValue(), RefreshToken: native.RefreshTokenValue(),
-					ExpiresAt: native.ExpiresAt, Changed: refreshed,
-				}, nil
-			},
-		}),
-		region: region,
-	}
+	rt := newRuntime(env)
+	inst := &adapter{rt: rt, region: region}
+	inst.NativeAdapter = core.NewNativeAdapter(core.NativeSpec[*Credential]{
+		Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
+		Env:  env,
+		Extract: func(c *core.Credential) (*Credential, bool) {
+			native, ok := c.Native.(*Credential)
+			return native, ok
+		},
+		ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+			native, errParse := ParseCredential(raw, region)
+			if errParse != nil {
+				return core.CredentialSeed{}, nil, errParse
+			}
+			if native.Realm() != region {
+				return core.CredentialSeed{}, nil, fmt.Errorf("credential realm %q does not match vendor %q", native.Realm(), VendorIDFor(region))
+			}
+			token := native.AccessTokenValue()
+			authMode := "oauth"
+			if token == "" {
+				token = native.DeviceTokenValue()
+				authMode = "device"
+			}
+			return core.CredentialSeed{
+				VendorID: VendorIDFor(region), Region: string(native.Realm()),
+				Label:  core.FirstNonEmpty(native.NicknameValue(), native.UIDValue(), fileName),
+				FileID: core.FileIDFromFileName(fileName), UID: native.UIDValue(),
+				Token: token, RefreshToken: native.RefreshTokenValue(),
+				ExpiresAt: native.ExpiresAt, AuthMode: authMode,
+			}, native, nil
+		},
+		RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
+			client := NewClient(rt, rt.options(ctx))
+			accessBefore, refreshBefore := native.Snapshot()
+			if errRefresh := client.RefreshToken(native); errRefresh != nil {
+				return core.NativeRefresh[*Credential]{}, errRefresh
+			}
+			refreshed := !native.UnchangedSince(accessBefore, refreshBefore)
+			return core.NativeRefresh[*Credential]{
+				Native: native, Token: native.AccessTokenValue(), RefreshToken: native.RefreshTokenValue(),
+				ExpiresAt: native.ExpiresAt, Changed: refreshed,
+			}, nil
+		},
+	})
+	return inst
 }
 
 // Configure 解析 WorkBuddy 专属配置（UA、设备令牌、提示词、机器盐）。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
+func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
+	v.rt.configure(settings, raw)
+}
 
 // Match 判断一份凭证是否属于本区域。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
@@ -115,15 +114,12 @@ func (v *adapter) defaultRegionForParse() Region {
 // 探测由协议层做（按区域的路由最多三路并发并集），这里只做形态转换：
 // 上游的 ModelInfo → 中立的 ModelDescriptor → 宿主契约类型。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	client, errClient := clientFor(ctx)
-	if errClient != nil {
-		return nil, errClient
-	}
+	client := v.client(ctx)
 	models, errModels := client.FetchModels(v.region)
 	if errModels != nil {
 		return nil, errModels
 	}
-	PublishEffortTables(v.region, models)
+	v.rt.publishEffortTables(models)
 	return modelsToPluginAPI(models), nil
 }
 
@@ -184,10 +180,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	if errNative != nil {
 		return nil, errNative
 	}
-	client, errClient := clientFor(ctx)
-	if errClient != nil {
-		return nil, errClient
-	}
+	client := v.client(ctx)
 	result, errChat := client.Chat(ChatRequest{
 		Credential: native,
 		Body:       req.Payload,
@@ -210,10 +203,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errNative != nil {
 		return errNative
 	}
-	client, errClient := clientFor(ctx)
-	if errClient != nil {
-		return errClient
-	}
+	client := v.client(ctx)
 	reader, errStream := client.ChatStream(ChatRequest{
 		Credential: native,
 		Body:       req.Payload,
@@ -243,10 +233,7 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 	if errNative != nil {
 		return nil, errNative
 	}
-	client, errClient := clientFor(ctx)
-	if errClient != nil {
-		return nil, errClient
-	}
+	client := v.client(ctx)
 	balance, errBalance := client.FetchBalance(native)
 	if errBalance != nil {
 		return nil, errBalance
@@ -264,10 +251,7 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if errNative != nil {
 		return nil, errNative
 	}
-	client, errClient := clientFor(ctx)
-	if errClient != nil {
-		return nil, errClient
-	}
+	client := v.client(ctx)
 	result, errCheckin := client.DailyCheckin(native)
 	if errCheckin != nil {
 		return nil, errCheckin
@@ -293,7 +277,7 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 		return nil, errStart
 	}
 	sessionID := "workbuddy_" + string(v.region) + "_" + loginsession.NewID(16)
-	StoreLoginSession(sessionID, &PendingLogin{
+	StoreLoginSession(v.Env.Logins, sessionID, &PendingLogin{
 		Region: v.region,
 		State:  state,
 	})
@@ -311,7 +295,7 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 
 // LoginPoll 轮询一次登录状态。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	session, exists, shouldPoll := CheckLoginSession(state)
+	session, exists, shouldPoll := CheckLoginSession(v.Env.Logins, state)
 	if !exists {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
@@ -361,7 +345,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 			Message: "构建凭证失败：" + errStorage.Error(),
 		}, nil
 	}
-	RemoveLoginSession(state)
+	RemoveLoginSession(v.Env.Logins, state)
 	logger.Info("completed workbuddy login for %s (vendor=%s)",
 		core.FirstNonEmpty(credential.NicknameValue(), credential.UIDValue()), v.ID())
 	return &pluginapi.AuthLoginPollResponse{
@@ -376,7 +360,9 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 }
 
 // OwnsLoginSession 报告该会话是否由本供应商持有且仍有效。
-func (v *adapter) OwnsLoginSession(sessionID string) bool { return OwnsLoginSession(sessionID) }
+func (v *adapter) OwnsLoginSession(sessionID string) bool {
+	return OwnsLoginSession(v.Env.Logins, sessionID)
+}
 
 // MergeStorageJSON 实现 core.StorageMerger：把刷新后的令牌合并回原凭证 JSON。
 //
@@ -392,14 +378,8 @@ func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential)
 
 // ---- 内部工具 ----
 
-// clientFor 取上游客户端；未注入时返回明确错误。
-func clientFor(ctx context.Context) (*Client, error) {
-	client := UpstreamClient(ctx)
-	if client == nil {
-		return nil, core.NewPluginError("upstream_client_unavailable",
-			"workbuddy upstream client is not configured", 500)
-	}
-	return client, nil
+func (v *adapter) client(ctx context.Context) *Client {
+	return NewClient(v.rt, v.rt.options(ctx))
 }
 
 func (v *adapter) SupportsCheckin() bool { return !v.region.IsGlobal() }
@@ -416,12 +396,12 @@ func (v *adapter) LoadModelCache(cached []state.CachedModel) {
 			filtered = append(filtered, item)
 		}
 	}
-	LoadCachedModelsFromState(filtered)
+	v.rt.loadCachedModelsFromState(filtered)
 }
 
 // ConsoleModels 返回控制台模型页需要的展示明细（含积分倍率）。
 func (v *adapter) ConsoleModels() []core.ConsoleModel {
-	cached := CachedModels()[NormalizeRegion(string(v.region))]
+	cached := v.rt.cachedModels()[NormalizeRegion(string(v.region))]
 	out := make([]core.ConsoleModel, 0, len(cached))
 	for _, model := range cached {
 		out = append(out, core.ConsoleModel{
@@ -438,11 +418,6 @@ func (v *adapter) ConsoleModels() []core.ConsoleModel {
 		})
 	}
 	return out
-}
-
-// UpstreamClient 构造一个客户端。
-func UpstreamClient(ctx context.Context) *Client {
-	return NewClient(currentOptions(ctx))
 }
 
 // ChatMetaFromBody 从请求体与请求头派生会话头族。
@@ -473,24 +448,6 @@ func ChatMetaFromBody(body []byte, headers http.Header) ChatMeta {
 		ConversationRequestID: conversationRequestID,
 		TraceID:               traceID,
 	}
-}
-
-// PublishEffortTables 把模型清单里的档位信息按区域合并发布给对话路径。
-//
-// 对话请求构造时要按模型查推理档位（上游对档位校验很严），因此模型清单
-// 一拿到就把档位表推给协议层缓存。
-func PublishEffortTables(region Region, models []ModelInfo) {
-	defaults := make(map[string]string, len(models))
-	supported := make(map[string][]string, len(models))
-	for _, model := range models {
-		if model.DefaultEffort != "" {
-			defaults[model.ID] = model.DefaultEffort
-		}
-		if len(model.Efforts) > 0 {
-			supported[model.ID] = model.Efforts
-		}
-	}
-	SetEffortTablesForRegion(region, defaults, supported)
 }
 
 // BuildQuotaResponse 把账号额度转成宿主的归一化额度结构。

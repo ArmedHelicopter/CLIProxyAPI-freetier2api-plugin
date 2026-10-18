@@ -38,50 +38,86 @@
 `type` 字段严格相等才认领该文件）。因此本插件用统一的 `providerKey = "freetier"`，
 **供应商的区分落在凭证文件名前缀与文件内的 `vendor` 字段上**。
 
-依赖方向始终单向：`main/cgo → internal/app → internal/{admin,taskengine,accountspool,hostabi} → internal/{vendors/*,modelconfig,...} → internal/core`。
-根层只做 ABI 翻译；插件生命周期、认证/模型/执行器/任务编排都在 `internal/app`。
+依赖方向始终单向：
 
 ```
-package main                     C ABI 入口（main.go / cgo.go）
-internal/app               插件生命周期、RPC 分发、五类能力编排、组合根
-  ├─ main.go                      插件身份、RPC 方法分发、注册响应、供应商注册表
-  ├─ host.go                      core.Host 端口、生命周期、管理路由入口
-  ├─ config.go                    全局配置适配 + state.json/机器盐
-  ├─ auth.go                      auth provider（解析/登录/刷新/凭证写回）
-  ├─ models.go                    model provider（注册、隔离、别名、禁用）
-  ├─ executor.go                  executor + quota provider
-  └─ tasks.go                     任务 HTTP 路由与调度编排
-
-internal/core                    供应商无关骨架：必需 Vendor 接口 + 可选能力接口
-                                 （登录/续期/额度/签到/任务/配置/存储合并…）、
-                                 注册表、Credential、模型 ID 协议、错误映射
-internal/admin                   管理接口实现（accounts/models/quota/settings/vendors）
-internal/tasks              任务目录、排程、队列与任务 HTTP 路由
-internal/accounts           账号枚举/去重/批量执行 + 额度格式化
-internal/upstream                共享上游错误分类与宿主状态码映射
-internal/modelconfig             模型禁用集合、别名、额外模型、同名合并与静态缓存
-internal/pluginconfig            全局配置解析/校验（供应商专属键保留在 Raw）
-internal/state                   state.json 的类型化读写与并发快照
-internal/hostabi                 宿主 RPC 封装（调用、准入、回调 ID、凭证枚举）
-internal/httpx                   出站 HTTP 桥（宿主代理/日志）与 SSE 转发
-internal/loginsession            登录会话登记（TTL / 轮询节流 / 归属）
-internal/logger                  内存日志环与文件落盘
-internal/console                 内嵌控制台页面（console.html + go:embed）
-tests/testhost                    测试用假宿主与上游桩
-
-internal/vendors/<name>          协议层 + 适配层同包：
-  ├─ adapter.go                     core.Vendor 实现（嵌入 core.Meta）
-  ├─ config.go                      解析本供应商专属配置键（Configurable）
-  └─ catalog/chat/credential/…      纯协议实现（出站 HTTP 一律经 internal/httpx）
+package main / cgo        C ABI 入口
+  └─ internal/app         组合根与 ABI 适配（生命周期、RPC 分发、五类能力）
+       ├─ internal/admin    管理 HTTP 路由与响应
+       ├─ internal/tasks    供应商无关的任务目录、排程、队列与执行引擎
+       ├─ internal/accounts 账号枚举/去重/批量执行 + 额度格式化
+       └─ internal/vendors/* 各供应商协议与适配层
+            └─ internal/core 供应商无关契约（Vendor、能力接口、注册表、凭证）
 ```
 
-新增一个供应商：在 `internal/vendors/<name>` 写协议实现与 `adapter.go`
-（嵌入 `core.Meta`），只实现自己支持的能力接口（登录/额度/签到/任务等），
-在 `internal/app/main.go` 的 `registerVendors()` 加一行 `Instances()`，
-再在 README 的配置表里补一行。需要任务中心的供应商实现
-`core.TaskCatalogProvider` 即可自动出现在排程与设置页。
-**不支持的能力不实现、不建文件**；根层五类处理器全部经 `core.Vendor` 与
-能力断言分发，没有任何 per-vendor switch。
+`internal/core` 不 import 任何上层包或具体供应商；`internal/tasks` 只依赖
+`core`/`accounts`/`state`/`pluginconfig`，不 import `vendors`/`admin`；
+只有 `internal/app/vendors.go` 可以 import 具体供应商。`tests/architecture_test.go`
+用静态 import 图守住这三条边界。
+
+```
+package main                        C ABI 入口（main.go / cgo.go）
+internal/app                        组合根与 ABI 适配
+  ├─ main.go                        插件身份、RPC 方法分发、注册响应
+  ├─ host.go                        core.Host 端口、生命周期、供应商配置下发
+  ├─ config.go                      全局配置适配 + state.json/机器盐
+  ├─ auth.go                        auth provider（解析/登录/刷新/凭证写回）
+  ├─ models.go                      model provider（注册、隔离、别名、禁用）
+  ├─ executor.go                    executor + quota provider
+  └─ vendors.go                     BuiltinFactories()：唯一的供应商清单
+internal/core                       供应商无关骨架：Vendor 接口 + 可选能力接口
+                                    （登录/续期/额度/签到/任务/配置/存储合并…）、
+                                    注册表、凭证、模型 ID 协议、任务契约、错误映射
+internal/admin                     管理接口（accounts/models/quota/settings/vendors/tasks）
+internal/tasks                     任务目录、排程、队列、执行引擎与任务 API
+internal/accounts                  账号枚举/去重/批量执行 + 额度格式化
+internal/upstream                  共享上游错误分类与宿主状态码映射
+internal/modelconfig               模型禁用集合、别名、额外模型、同名合并与静态缓存
+internal/pluginconfig              全局配置解析/校验（供应商专属键保留在 Raw）
+internal/state                     state.json 的类型化读写与并发快照
+internal/hostabi                   宿主 RPC 封装（调用、准入、回调 ID、管理请求上下文）
+internal/httpx                     出站 HTTP 桥（宿主代理/日志）与 SSE 转发
+internal/loginsession              登录会话登记（TTL / 轮询节流 / 归属）
+internal/logger                    内存日志环与文件落盘
+internal/console                   内嵌控制台页面（console.html + go:embed）
+tests/architecture_test.go         分层与测试布局静态守卫
+tests/integration                  跨包集成测试（假宿主）
+tests/e2e                          完整 ABI 端到端
+tests/live                         实况探针（-tags live）
+tests/testhost                     共享假宿主
+
+internal/vendors/<name>            协议层 + 适配层同包，统一文件职责：
+  ├─ adapter.go                     core.Vendor 实现（嵌入 core.Meta，持有实例配置）
+  ├─ credential.go                  凭证类型/解析/归属/存储写回
+  ├─ client.go                      HTTP 端点/请求头/签名/对话执行
+  ├─ models.go                      模型目录与探测
+  ├─ login.go                       登录 + 续期
+  ├─ errors.go                      供应商专属错误分类
+  ├─ quota.go / checkin.go / tasks.go   可选能力
+  └─ payload.go / sse.go / protocol.go / sanitize.go   协议细节
+```
+
+供应商的可变状态（base URL、运行时配置、提示词、档位表、设备令牌缓存、
+登录会话）一律放在 adapter/runtime 实例里，不声明可变包级变量；只读的
+内嵌 JSON、静态端点表与正则等可作为包级常量/只读数据。这样同一进程内
+多个 App 实例互不影响。
+
+### 新增 / 删除供应商
+
+新增：
+
+1. 新建 `internal/vendors/<name>/`，实现 `adapter.go`（`core.Vendor`）与需要的
+   `credential.go`/`client.go`/`models.go`/`login.go`/`errors.go`；
+   只实现自己支持的可选能力接口（登录/额度/签到/任务/配置/存储合并）。
+2. 在 `internal/app/vendors.go` 的 `BuiltinFactories()` 里加一行
+   `{Instances: <name>.Instances}`。
+3. 在本文件的供应商表与凭证字段说明里补一行；如有区域/provider key 差异，
+   在 vendor 包内用 `Instances(env)` 返回多个实例。
+4. 补 `internal/vendors/<name>/adapter_test.go`（实例配置隔离）与
+   `tests/integration/` 下的归属/注册回归。
+
+删除：删除 vendor 目录与 `BuiltinFactories()` 中对应的一行，删除 README 表项；
+其余层不需要改动。
 
 ### 凭证归属判定
 
@@ -113,11 +149,64 @@ internal/vendors/<name>          协议层 + 适配层同包：
 - **敏感凭证脱敏与操作管理**：API key 类型账号在列表展示前4位与后4位、中间脱敏为 `***`，避免明文泄露；账号概览最后一列提供「操作」列，支持「删除」按钮直接删除本地凭证文件（带二次确认），宿主基于文件监听自动注销失效账号。
 - **零第三方依赖**：`go.mod` 只有 module 与 go 版本两行，构建不需要拉包。
 
-## 测试布局
+## 测试与验证
 
-- 单元测试 `xxx_test.go` 与源码同目录。
-- 跨包集成测试在顶层 `tests/`。
-- E2E 在 `tests/e2e/`；实况探针在 `tests/live/`（需 `-tags live` 与 `MINIMAX_LIVE=1`）。
+测试目录约定：
+
+| 目录 | 内容 |
+| --- | --- |
+| `internal/**/xxx_test.go` | 单元/白盒测试，与源码同目录 |
+| `tests/integration/` | 跨包集成测试（plugin register/models/executor/auth/registry、供应商兼容、App 隔离） |
+| `tests/e2e/` | 完整 ABI 端到端 |
+| `tests/live/` | 实况探针（`-tags live`，需真实凭证与 `MINIMAX_LIVE=1` 等环境变量） |
+| `tests/testhost/` | 共享假宿主 |
+| `tests/architecture_test.go` | 分层、import 方向与测试布局的静态守卫 |
+
+`tests/architecture_test.go` 会拒绝：供应商互相 import、`internal/app/vendors.go`
+之外的 app 文件 import 具体供应商、`internal/tasks` import `vendors`/`admin`、
+`internal/core` import 上层包，以及 `tests/` 根下出现集成测试文件。
+
+本机没有 Go 工具链时用 Docker：
+
+```bash
+./scripts/godocker.sh vet ./...
+./scripts/godocker.sh test ./... -count=1 -timeout 300s
+./scripts/godocker.sh test -race ./internal/core ./internal/state \
+  ./internal/loginsession ./internal/accounts ./internal/tasks -count=1
+CGO_ENABLED=1 go build -buildmode=c-shared -o dist/freetier2api.so .
+```
+
+`gofmt -l .` 应无输出（`cpasdk/` 按约定豁免）。主要覆盖：
+
+| 位置 | 覆盖主题 |
+| --- | --- |
+| `tests/integration/plugin_*_test.go` | 注册响应契约、realm 隔离、模型合并/禁用/别名、非流式聚合、流式分帧与错误上报、额度重置 |
+| `tests/integration/{auth,identity,vendor_compat}_test.go` | 供应商归属矩阵、身份跨路径稳定、13 个实例的 ID/名称/区域 golden |
+| `tests/integration/app_isolation_test.go` | 两个 App 的注册表/状态/登录会话/供应商配置互不可见 |
+| `internal/core/core_test.go` | 归属三级判定、注册表幂等约束、模型键协议、错误映射、共享 helper |
+| `internal/loginsession/loginsession_test.go` | 会话登记/TTL/轮询节流/归属查询/并发（`-race`） |
+| `internal/tasks/{schedule,engine}_test.go` | 任务目录、排程时间、队列聚合与供应商无关的任务契约 |
+| `internal/vendors/workbuddy/{errors,payload,credential,sse,sanitize}_test.go` | 错误分类顺序、请求体改写、凭证双形态、SSE 聚合、指纹脱敏 |
+| `internal/httpx/transport_test.go` | 宿主 HTTP 桥双形态键名兼容、缺状态码显式报错 |
+| `internal/admin/admin_test.go` | 管理路由声明、任务路由分发、未知路由 404 |
+| `internal/{pluginconfig,state,modelconfig,console,logger}` | 列表写法、快照/损坏回退/并发、别名唯一性、控制台密钥闸门、日志环边界 |
+
+实况验证（需真实 CPA 与账号）：
+
+```bash
+# 1. 账号是否被识别（应带 region 与余额）
+curl -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
+  http://127.0.0.1:8317/v0/management/plugins/freetier2api/status
+
+# 2. 模型清单是否拉到
+curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
+  http://127.0.0.1:8317/v0/management/plugins/freetier2api/models/refresh
+
+# 3. 对话（非流式与流式）
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer $CPA_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}'
+```
 
 ## 构建
 
@@ -549,6 +638,73 @@ CPA 按客户端 IP 统计管理鉴权失败次数，**未携带密钥的请求�
   删除了按 `trae_solo_` / `workbuddy_` 前缀猜测的兜底路径。
 - 供应商专属配置键（`*_base_url`、WorkBuddy 的 UA/设备字段等）改由各供应商包解析，
   **键名、默认值与语义保持不变**。
+
+## 排障与已知上游偏差
+
+### realm 隔离
+
+realm 隔离是本插件最容易失效的机制，已逐环节验证（宿主源码）：
+
+| 环节 | 证据 |
+| --- | --- |
+| 插件按凭证注册模型 | `sdk/cliproxy/service_executors.go:454` `RegisterClient(a.ID, providerKey, models)` |
+| 选凭证时按模型过滤 | `sdk/cliproxy/auth/conductor_selection.go:1202/1294/1756/2090/2314` → `:993` `ClientSupportsModel(auth.ID, routeKey)` |
+| 入站模型 → provider | `internal/registry/model_registry.go:1585`（map 精确匹配） |
+| `cn:` 冒号安全性 | `internal/thinking/suffix.go:25` 只解析尾部括号 |
+| `model.for_auth` 生效前提 | `internal/pluginhost/adapters.go:317` 必须声明 `executor_model_scope` 为 `oauth`/`both` |
+| 插件错误 → 宿主处置 | `internal/pluginhost/rpc_client.go:368` 只保留 `code`/`http_status`，只有 `http_status` 影响冷却 |
+| (凭证, 模型) 级冷却 | `sdk/cliproxy/auth/conductor_cooldown.go:872`（429 天然是 per-(auth, model)） |
+
+`tests/integration/plugin_models_test.go` 的 `TestModelsForAuthIsolatesRealms`
+与 `tests/integration/registry_test.go` 的 `TestCapabilitiesMatchImplementedHandlers`
+把这些契约锁进了回归。
+
+### sanitize 正则的上游偏差
+
+WorkBuddy 的 `sanitize.go` 移植自上游，但上游三个正则的实际内容与注释不符：
+
+| 名字 | 实际行为 |
+| --- | --- |
+| `sanitizeHdrRe` | 只匹配行尾片段，并不含键名，删不掉整段键值 |
+| `sanitizeKvRe` | 只删 `cc_` 前缀键值，不是通用 billing header |
+| `sanitizeBareHdrRe` | 只匹配 `x-anthropic-billing-hdr` 这一个键名 |
+
+本插件按注释所载**意图**实现（`sanitize_rules.json` 中按「键名 + 后续键值段整段删除」表达），
+其余两条沿用原样。若上游修正正则，需要同步 `internal/vendors/workbuddy/sanitize_rules.json`。
+该 JSON 是程序化提取生成的，以保证字节精确；修改后用
+`internal/vendors/workbuddy/sanitize_test.go` 的用例回归。
+
+### 多插件共存与 priority
+
+宿主解析凭证时按插件遍历，**一旦某个插件报错或认领就中止**，且文件没有 `type` 时会把
+当前询问插件的 identifier 兜底填进 `provider`。因此「provider 等于自己就认领」的插件
+会吞掉所有文件。遍历顺序是 `priority` 降序、同优先级按 `id` 升序；本插件需要更高
+`priority` 才能优先被询问：
+
+```yaml
+plugins:
+  configs:
+    freetier2api:
+      priority: 100
+```
+
+### glibc / musl
+
+本插件是 cgo 构建的 c-shared 动态库，libc 必须与宿主一致。alpine（musl）产物在
+Debian（glibc）宿主上会报 `libc.musl-*.so.1: cannot open shared object file`。
+请用 `golang:1.24`（Debian）或与宿主同族的镜像构建；`build.sh` 已固定。
+
+### 控制台页与封禁
+
+CPA 对 `/v0/management` 的鉴权失败计数包含**未带密钥**的请求，5 次封禁 30 分钟。
+控制台页因此只在拿到有效密钥后发**一个** `GET /vendors` 探针，成功后才串行加载；
+无密钥时一个请求都不发；401/403 后停止全部自动刷新。
+
+### 需要真实环境验证的部分
+
+无法在无 CPA 的环境下验证以下内容：`plugin.register` 实际往返、真实上游模型清单、
+真实对话出字、签到/余额/任务上报的真实返回、双域端到端隔离。按上一节「测试与验证」
+的 curl 顺序逐项确认。
 
 ## 已知限制
 

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
 
@@ -145,7 +146,7 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
 	if _, okSecret := raw["secret"].(string); okSecret {
 		return true
 	}
-	if fileNameMatchesConvention(fileName) {
+	if core.FileNameMatchesConvention(fileName, protocolName, VendorIDCN, VendorIDGlobal) {
 		return true
 	}
 	_ = provider
@@ -167,26 +168,6 @@ func hasQoderTokenPrefix(raw map[string]any) bool {
 		}
 		trimmed := strings.TrimSpace(value)
 		if strings.HasPrefix(trimmed, "pt-") || strings.HasPrefix(trimmed, "drt-") {
-			return true
-		}
-	}
-	return false
-}
-
-// fileNameMatchesConvention 判断文件名是否符合本协议的命名约定。
-//
-// 约定：qoder.json / qodercn-<id>.json / qoderglobal-<id>.json / qoder-login-<id>.json。
-func fileNameMatchesConvention(fileName string) bool {
-	base := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(fileName), ".json"))
-	if base == "" {
-		return false
-	}
-	if base == protocolName || base == VendorIDCN || base == VendorIDGlobal {
-		return true
-	}
-	for _, separator := range []string{"-", "_", "."} {
-		if strings.HasPrefix(base, protocolName+separator) ||
-			strings.Contains(base, separator+protocolName) {
 			return true
 		}
 	}

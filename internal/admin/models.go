@@ -9,6 +9,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/modelconfig"
 )
@@ -37,9 +38,9 @@ type consoleModel struct {
 }
 
 func (s *Service) handleModelsList(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	ctx, cancel := managementContext(req)
+	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
 	defer cancel()
-	callbackID := hostCallbackID(req)
+	callbackID := hostabi.RequestCallbackID(req)
 	cfg := s.deps.Config()
 	manager := s.deps.Model()
 	models := make([]consoleModel, 0, 128)
@@ -47,7 +48,7 @@ func (s *Service) handleModelsList(req pluginapi.ManagementRequest) pluginapi.Ma
 	active := s.hostActiveVendors(ctx, callbackID)
 
 	for _, vendor := range s.registry.Vendors() {
-		if !realmEnabled(cfg, vendor.Region()) || !active[vendor.ID()] {
+		if !core.RealmEnabled(cfg.EnabledRealms, vendor.Region()) || !active[vendor.ID()] {
 			continue
 		}
 		models = append(models, s.consoleModelsForVendor(manager, vendor)...)

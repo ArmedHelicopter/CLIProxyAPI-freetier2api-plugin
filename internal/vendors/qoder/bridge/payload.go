@@ -17,6 +17,7 @@ import (
 	"io"
 	"strings"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/vendors/qoder/cosy"
 )
 
@@ -161,11 +162,11 @@ func mergeToolCallDeltas(accumulated []interface{}, incoming []interface{}) []in
 		if !ok {
 			continue
 		}
-		idx := intFromAny(call["index"])
+		idx := core.IntFromAny(call["index"])
 		var target map[string]interface{}
 		for _, item := range accumulated {
 			if existing, okMap := item.(map[string]interface{}); okMap {
-				if intFromAny(existing["index"]) == idx {
+				if core.IntFromAny(existing["index"]) == idx {
 					target = existing
 					break
 				}
@@ -223,7 +224,7 @@ func filterValidToolCalls(calls []interface{}) []interface{} {
 		for j := i; j > 0; j-- {
 			left, _ := valid[j-1].(map[string]interface{})
 			right, _ := valid[j].(map[string]interface{})
-			if intFromAny(left["index"]) > intFromAny(right["index"]) {
+			if core.IntFromAny(left["index"]) > core.IntFromAny(right["index"]) {
 				valid[j-1], valid[j] = valid[j], valid[j-1]
 			}
 		}
@@ -247,21 +248,6 @@ func cloneToolCall(src map[string]interface{}) map[string]interface{} {
 		dst[k] = v
 	}
 	return dst
-}
-
-func intFromAny(v interface{}) int {
-	switch n := v.(type) {
-	case int:
-		return n
-	case float64:
-		return int(n)
-	case int64:
-		return int(n)
-	case json.Number:
-		i, _ := n.Int64()
-		return int(i)
-	}
-	return 0
 }
 
 // chatRequest 是一次对话请求的关键字段。

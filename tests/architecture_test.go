@@ -89,3 +89,77 @@ func fileImports(t *testing.T, path string) []string {
 	}
 	return out
 }
+
+func TestTaskEngineVendorNeutral(t *testing.T) {
+	dir := filepath.Join("..", "internal", "tasks")
+	entries, errRead := os.ReadDir(dir)
+	if errRead != nil {
+		t.Fatalf("read tasks: %v", errRead)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		path := filepath.Join(dir, entry.Name())
+		for _, imp := range fileImports(t, path) {
+			if strings.HasPrefix(imp, vendorImportPrefix) || imp == "freetier2api-plugin/internal/admin" {
+				t.Errorf("%s：任务引擎不得依赖供应商或管理接口（%s）", path, imp)
+			}
+		}
+	}
+
+	coreTask := filepath.Join("..", "internal", "core", "task.go")
+	raw, errRead := os.ReadFile(coreTask)
+	if errRead != nil {
+		t.Fatalf("read core/task.go: %v", errRead)
+	}
+	lower := strings.ToLower(string(raw))
+	for _, banned := range []string{"school", "growth"} {
+		if strings.Contains(lower, banned) {
+			t.Errorf("internal/core/task.go：通用任务契约不得出现供应商专属标识 %q", banned)
+		}
+	}
+}
+
+func TestCoreDoesNotImportUpperLayers(t *testing.T) {
+	entries, errRead := os.ReadDir(filepath.Join("..", "internal", "core"))
+	if errRead != nil {
+		t.Fatalf("read core: %v", errRead)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".go") || strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		path := filepath.Join("..", "internal", "core", entry.Name())
+		for _, imp := range fileImports(t, path) {
+			if strings.HasPrefix(imp, "freetier2api-plugin/internal/") {
+				t.Errorf("%s：internal/core 只能依赖 cpasdk 与标准库（发现 %s）", path, imp)
+			}
+		}
+	}
+}
+
+func TestTestLayout(t *testing.T) {
+	rootEntries, errRead := os.ReadDir(".")
+	if errRead != nil {
+		t.Fatalf("read tests root: %v", errRead)
+	}
+	for _, entry := range rootEntries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), "_test.go") {
+			continue
+		}
+		if entry.Name() != "architecture_test.go" {
+			t.Errorf("tests/%s：集成测试应放在 tests/integration/，tests/ 根只保留架构守卫", entry.Name())
+		}
+	}
+
+	integrationEntries, errRead := os.ReadDir(filepath.Join("integration"))
+	if errRead != nil {
+		t.Fatalf("read tests/integration: %v", errRead)
+	}
+	for _, entry := range integrationEntries {
+		if !entry.IsDir() && strings.HasSuffix(entry.Name(), ".go") && !strings.HasSuffix(entry.Name(), "_test.go") {
+			t.Errorf("tests/integration/%s：集成测试目录不应包含非测试源码", entry.Name())
+		}
+	}
+}

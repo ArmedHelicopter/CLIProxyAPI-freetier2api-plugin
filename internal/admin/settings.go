@@ -65,7 +65,7 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 			if kind == "" {
 				continue
 			}
-			if _, known := s.catalog.SpecByKind(kind); !known {
+			if _, known := s.tasks.Catalog().SpecByKind(kind); !known {
 				continue
 			}
 			current.TaskSchedules[kind] = tasks.NormalizeHours(hours)
@@ -87,15 +87,15 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 	if errReconfigure := s.deps.Reconfigure(); errReconfigure != nil {
 		return ErrorResponse(errReconfigure)
 	}
-	s.deps.PokeScheduler()
+	s.tasks.Poke()
 	return JSONResponse(http.StatusOK, map[string]any{
-		"ok": true, "changed": changed, "settings": s.deps.EffectiveSettings(),
+		"ok": true, "changed": changed, "settings": s.tasks.EffectiveSettings(),
 	})
 }
 
 // handleScheduledRun 手动触发一个定时任务。
 func (s *Service) handleScheduledRun(_ pluginapi.ManagementRequest, kind string) pluginapi.ManagementResponse {
-	go s.deps.RunScheduled(kind)
+	s.tasks.RunAsync(kind)
 	return JSONResponse(http.StatusOK, map[string]any{
 		"ok": true, "started": true, "task": kind,
 		"message": "任务已在后台开始执行，进度见插件日志",

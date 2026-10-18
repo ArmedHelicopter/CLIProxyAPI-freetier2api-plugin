@@ -1,16 +1,25 @@
 package core
 
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"freetier2api-plugin/cpasdk/pluginapi"
+)
+
 // 本文件提供各供应商共用的解析与转换助手。
 //
 // 这些函数原本在多个供应商包里各有一份（签名还漂移过），统一收敛到这里：
 // 同一种语义只允许有一份实现，供应商包只负责"哪些键、什么特征"的差异。
-
-import (
-	"encoding/json"
-	"strings"
-
-	"freetier2api-plugin/cpasdk/pluginapi"
-)
 
 // FirstNonEmpty 返回第一个去空白后非空的字符串（返回去空白后的值）。
 func FirstNonEmpty(values ...string) string {
@@ -156,23 +165,6 @@ func VendorFieldVerdict(raw map[string]any, vendorID string, aliases ...string) 
 // NativeExtractor 从归一化凭证里取回供应商原生对象。
 type NativeExtractor[T any] func(*Credential) (*T, bool)
 
-// NativeCredential 取回某凭证的供应商原生对象。
-//
-// extract 由各供应商提供，断言写在包内（Go 不允许对类型参数做断言）。
-// 统一在这里处理 nil 与「不是本供应商解析的凭证」两种错误，避免每个
-// 供应商各写一份错误文案。
-func NativeCredential[T any](cred *Credential, vendorID string, extract NativeExtractor[T]) (*T, error) {
-	if cred == nil {
-		return nil, NewPluginError("credential_missing", "credential is nil", 401)
-	}
-	native, okNative := extract(cred)
-	if !okNative || native == nil {
-		return nil, NewPluginError("credential_missing",
-			"credential was not parsed by the "+vendorID+" vendor", 401)
-	}
-	return native, nil
-}
-
 // ConvertModels 把供应商原生模型清单批量转成宿主契约类型。
 //
 // vendorID 传空串：本插件的模型以裸名注册（见 SplitModelID 的说明）。
@@ -206,3 +198,132 @@ const DefaultContextWindowTokens int64 = 1000000
 
 // DefaultContextWindow 返回兜底上下文窗口（忽略模型名）。
 func DefaultContextWindow(_ string) int64 { return DefaultContextWindowTokens }
+
+// 本文件提供与供应商无关的请求解析助手。
+
+// ExtractClientIP 从请求头里取客户端 IP（X-Forwarded-For 优先）。
+func ExtractClientIP(header http.Header) string {
+	if header == nil {
+		return ""
+	}
+	if forwarded := strings.TrimSpace(header.Get("X-Forwarded-For")); forwarded != "" {
+		if idx := strings.IndexByte(forwarded, ','); idx >= 0 {
+			forwarded = forwarded[:idx]
+		}
+		return strings.TrimSpace(forwarded)
+	}
+	return strings.TrimSpace(header.Get("X-Real-IP"))
+}
+
+// 本文件提供供应商共用的随机串与 PKCE 助手。
+//
+// 这些逻辑原本在 codearts/qoder/zcode/opencodezen/minimaxcode/workbuddy
+// 各有一份（签名还不一致）；统一到这里，随机源不可用时统一走确定性兜底。
+
+var randomFallbackCounter int64
+
+// RandomHex 生成 n 字节随机十六进制串（2n 个字符）。
+//
+// 随机源不可用时退回基于时间与计数的确定性串：这些 id 只用于会话/请求标识的
+// 唯一性，退化的熵比让整条链路失败更可接受。
+func RandomHex(n int) string {
+	if n <= 0 {
+		n = 16
+	}
+	buf := make([]byte, n)
+	if _, errRand := rand.Read(buf); errRand != nil {
+		return fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), atomic.AddInt64(&randomFallbackCounter, 1))
+	}
+	return hex.EncodeToString(buf)
+}
+
+// NewPKCEPair 生成 PKCE 的 verifier 与 S256 challenge。
+func NewPKCEPair() (verifier, challenge string, err error) {
+	buffer := make([]byte, 32)
+	if _, errRead := rand.Read(buffer); errRead != nil {
+		return "", "", errRead
+	}
+	verifier = base64.RawURLEncoding.EncodeToString(buffer)
+	sum := sha256.Sum256([]byte(verifier))
+	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
+	return verifier, challenge, nil
+}
+
+// FirstNonZero 返回第一个非零整数。
+func FirstNonZero(values ...int64) int64 {
+	for _, value := range values {
+		if value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+// IntFromAny 把 JSON 数值转成 int（缺失或非法返回 0）。
+func IntFromAny(value any) int {
+	switch number := value.(type) {
+	case float64:
+		return int(number)
+	case int64:
+		return int(number)
+	case int:
+		return number
+	case json.Number:
+		parsed, errParse := number.Int64()
+		if errParse == nil {
+			return int(parsed)
+		}
+	}
+	return 0
+}
+
+// StringField 读取 map 中的字符串字段（去空白）。
+func StringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	value, _ := m[key].(string)
+	return strings.TrimSpace(value)
+}
+
+// MaxInt 返回较大的整数。
+func MaxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// ContainsAny 报告文本是否包含任一标记。
+func ContainsAny(text string, markers []string) bool {
+	for _, marker := range markers {
+		if strings.Contains(text, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+// SleepContext 是可取消的睡眠；返回 false 表示上下文已取消。
+func SleepContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// RawStringField 读取 map 中的字符串字段（不裁剪空白）。
+func RawStringField(m map[string]any, key string) string {
+	if m == nil {
+		return ""
+	}
+	value, _ := m[key].(string)
+	return value
+}

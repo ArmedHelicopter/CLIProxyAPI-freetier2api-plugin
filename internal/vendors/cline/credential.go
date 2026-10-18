@@ -89,11 +89,11 @@ func ParseCredential(raw []byte) (*Credential, error) {
 		return nil, fmt.Errorf("credential is not valid JSON: %w", errUnmarshal)
 	}
 	cred := &Credential{
-		AccessToken:  firstString(payload, "accessToken", "access_token"),
-		RefreshToken: firstString(payload, "refreshToken", "refresh_token"),
-		Email:        firstString(payload, "email", "account", "userEmail"),
-		Label:        firstString(payload, "label", "name"),
-		AccountID:    firstString(payload, "accountId", "account_id", "uid"),
+		AccessToken:  core.GetString(payload, "accessToken", "access_token"),
+		RefreshToken: core.GetString(payload, "refreshToken", "refresh_token"),
+		Email:        core.GetString(payload, "email", "account", "userEmail"),
+		Label:        core.GetString(payload, "label", "name"),
+		AccountID:    core.GetString(payload, "accountId", "account_id", "uid"),
 	}
 	cred.ExpiresAt = parseExpiry(payload["expiresAt"])
 	if cred.ExpiresAt == 0 {
@@ -109,16 +109,6 @@ func ParseCredential(raw []byte) (*Credential, error) {
 	return cred, nil
 }
 
-// firstString 返回第一个非空的字符串字段。
-func firstString(payload map[string]any, keys ...string) string {
-	for _, key := range keys {
-		if value, okValue := payload[key].(string); okValue && strings.TrimSpace(value) != "" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}
-
 // LooksLikeCredential 判断一份 JSON 是否属于 Cline。
 //
 // **判定必须偏严**：宿主会把所有非内建格式的凭证依次喂给每个插件，
@@ -132,7 +122,7 @@ func firstString(payload map[string]any, keys ...string) string {
 // 刻意不用 "token" / "access_token" 这类通用字段名做判据：Qoder 与
 // WorkBuddy 的凭证也有这些字段，拿它们当判据必然跨供应商误吞。
 func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
-	if fileNameMatchesConvention(fileName) {
+	if core.FileNameMatchesConvention(fileName, VendorID) {
 		return true
 	}
 	if raw == nil {
@@ -160,8 +150,4 @@ func hasWorkOSPrefix(raw map[string]any) bool {
 		}
 	}
 	return false
-}
-
-func fileNameMatchesConvention(fileName string) bool {
-	return core.FileNameMatchesConvention(fileName, VendorID)
 }

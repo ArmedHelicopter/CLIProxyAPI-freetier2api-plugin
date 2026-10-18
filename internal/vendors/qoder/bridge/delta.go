@@ -5,9 +5,9 @@ import (
 	"fmt"
 	"strconv"
 
-	"freetier2api-plugin/internal/vendors/qoder/cosy"
-
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/upstream"
+	"freetier2api-plugin/internal/vendors/qoder/cosy"
 )
 
 type Delta struct {
@@ -97,13 +97,6 @@ func ExtractDelta(dataLine string) Delta {
 	return Delta{}
 }
 
-func truncate(s string, max int) string {
-	if len(s) <= max {
-		return s
-	}
-	return s[:max] + "..."
-}
-
 func mapKeys(m map[string]interface{}) []string {
 	keys := make([]string, 0, len(m))
 	for k := range m {
@@ -137,5 +130,5 @@ func envelopeDetail(wrapper map[string]interface{}) string {
 		return body
 	}
 	b, _ := json.Marshal(wrapper)
-	return truncate(string(b), 400)
+	return upstream.Truncate(string(b), 400)
 }

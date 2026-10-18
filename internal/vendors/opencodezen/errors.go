@@ -3,7 +3,6 @@ package opencodezen
 // 本文件实现 OpenCode ZEN 的上游错误分类。
 
 import (
-	"errors"
 	"strings"
 
 	"freetier2api-plugin/internal/upstream"
@@ -35,10 +34,4 @@ func Classify(status int, body string) *Error {
 		Msg:    upstream.Truncate(body, 300),
 		Kind:   kind,
 	}
-}
-
-// IsCredentialError 报告错误是否表示凭证失效。
-func IsCredentialError(err error) bool {
-	var upstreamErr *Error
-	return errors.As(err, &upstreamErr) && upstreamErr.Kind == KindCredential
 }

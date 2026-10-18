@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/accounts"
@@ -29,23 +30,15 @@ func (s stubDeps) State() state.State          { return s.store.Snapshot() }
 func (s stubDeps) MutateState(fn func(*state.State)) {
 	s.store.Mutate(fn)
 }
-func (s stubDeps) Model() *modelconfig.Manager       { return s.manager }
-func (s stubDeps) WorkbuddyPromptMode() string       { return "passthrough" }
-func (s stubDeps) SchedulerStatus() map[string]any   { return map[string]any{"running": false} }
-func (s stubDeps) EffectiveSettings() map[string]any { return map[string]any{} }
+func (s stubDeps) Model() *modelconfig.Manager { return s.manager }
+func (s stubDeps) WorkbuddyPromptMode() string { return "passthrough" }
 func (s stubDeps) ResolveCredential(context.Context, string, []byte, string, map[string]string) (*core.Credential, core.Vendor, error) {
 	return nil, nil, context.Canceled
 }
 func (s stubDeps) SaveRefreshedCredential(context.Context, string, core.Vendor, core.HostAuth, []byte, *core.Credential, string) {
 }
-func (s stubDeps) RefreshModels(context.Context) (int, error)          { return 0, nil }
-func (s stubDeps) Reconfigure() error                                  { return nil }
-func (s stubDeps) RecordCheckin(*core.Credential, *core.CheckinResult) {}
-func (s stubDeps) PokeScheduler()                                      {}
-func (s stubDeps) RunScheduled(string)                                 {}
-func (s stubDeps) TaskRoutes(pluginapi.ManagementRequest, string) (pluginapi.ManagementResponse, bool) {
-	return pluginapi.ManagementResponse{}, false
-}
+func (s stubDeps) RefreshModels(context.Context) (int, error) { return 0, nil }
+func (s stubDeps) Reconfigure() error                         { return nil }
 
 func newStubDeps(t *testing.T) stubDeps {
 	t.Helper()
@@ -61,7 +54,8 @@ func newStubDeps(t *testing.T) stubDeps {
 func newService(t *testing.T) *Service {
 	t.Helper()
 	deps := newStubDeps(t)
-	return New(deps, deps.registry, accounts.NewPool(deps.registry, deps.ResolveCredential), tasks.NewCatalog(deps.registry))
+	pool := accounts.NewPool(deps.registry, deps.ResolveCredential)
+	return New(deps, deps.registry, pool, tasks.New(stubTaskDeps{deps: deps, pool: pool}))
 }
 
 func TestRegistrationDeclaresRoutes(t *testing.T) {
@@ -112,3 +106,16 @@ func TestHandleStatusAndUnknownRoute(t *testing.T) {
 		t.Fatalf("unknown route should 404: %s", raw)
 	}
 }
+
+type stubTaskDeps struct {
+	deps stubDeps
+	pool *accounts.Pool
+}
+
+func (s stubTaskDeps) Registry() *core.Registry               { return s.deps.registry }
+func (s stubTaskDeps) Pool() *accounts.Pool                   { return s.pool }
+func (s stubTaskDeps) Config() pluginconfig.Config            { return s.deps.Config() }
+func (s stubTaskDeps) State() state.State                     { return s.deps.State() }
+func (s stubTaskDeps) MutateState(fn func(*state.State))      { s.deps.MutateState(fn) }
+func (s stubTaskDeps) Now() time.Time                         { return time.Now() }
+func (s stubTaskDeps) RuntimeFields() []pluginapi.ConfigField { return nil }

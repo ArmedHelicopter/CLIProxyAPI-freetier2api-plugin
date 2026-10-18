@@ -7,6 +7,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/accounts"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -20,13 +21,13 @@ type keepaliveResult struct {
 }
 
 func (s *Service) handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	ctx, cancel := managementContext(req)
+	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
 	defer cancel()
-	callbackID := hostCallbackID(req)
+	callbackID := hostabi.RequestCallbackID(req)
 
 	cfg := s.deps.Config()
-	accounts, _ := s.pool.Load(ctx, callbackID, accounts.Options{
-		RealmEnabled: func(region string) bool { return realmEnabled(cfg, region) },
+	loaded, _ := s.pool.Load(ctx, callbackID, accounts.Options{
+		RealmEnabled: func(region string) bool { return core.RealmEnabled(cfg.EnabledRealms, region) },
 	})
 	type job struct {
 		entry      core.HostAuth
@@ -35,8 +36,8 @@ func (s *Service) handleKeepaliveRequest(req pluginapi.ManagementRequest) plugin
 		rawJSON    []byte
 		filePath   string
 	}
-	jobs := make([]job, 0, len(accounts))
-	for _, account := range accounts {
+	jobs := make([]job, 0, len(loaded))
+	for _, account := range loaded {
 		if account.FilePath != "" {
 			account.Credential.SetFilePath(account.FilePath)
 		}
@@ -51,10 +52,7 @@ func (s *Service) handleKeepaliveRequest(req pluginapi.ManagementRequest) plugin
 		})
 	}
 
-	results := make([]keepaliveResult, len(jobs))
-	succeeded, failed := 0, 0
-	firstErrMsg := ""
-	for i, j := range jobs {
+	results := accounts.RunBatch(jobs, batchConcurrency, func(j job) keepaliveResult {
 		label := core.FirstNonEmpty(j.credential.LabelValue(), j.entry.Label, j.entry.Name)
 		result := keepaliveResult{
 			AuthID: core.FirstNonEmpty(j.entry.ID, j.entry.Name), Label: label,
@@ -62,24 +60,31 @@ func (s *Service) handleKeepaliveRequest(req pluginapi.ManagementRequest) plugin
 		}
 		updated, refreshed, errRefresh := core.RefreshVendor(j.vendor, ctx, j.credential)
 		if errRefresh != nil {
-			failed++
 			result.Message = errRefresh.Error()
-			if firstErrMsg == "" {
-				firstErrMsg = fmt.Sprintf("%s: %s", label, errRefresh.Error())
-			}
 			logger.Error("keepalive %s: %v", label, errRefresh)
-		} else {
-			succeeded++
-			result.OK = true
-			if refreshed {
-				result.Message = "Token 续期成功"
-				s.deps.SaveRefreshedCredential(ctx, callbackID, j.vendor, j.entry, j.rawJSON, updated, j.filePath)
-			} else {
-				result.Message = "凭证有效（未变更）"
-			}
-			logger.Info("keepalive %s: refreshed=%t", label, refreshed)
+			return result
 		}
-		results[i] = result
+		result.OK = true
+		if refreshed {
+			result.Message = "Token 续期成功"
+			s.deps.SaveRefreshedCredential(ctx, callbackID, j.vendor, j.entry, j.rawJSON, updated, j.filePath)
+		} else {
+			result.Message = "凭证有效（未变更）"
+		}
+		logger.Info("keepalive %s: refreshed=%t", label, refreshed)
+		return result
+	})
+	succeeded, failed := 0, 0
+	firstErrMsg := ""
+	for _, result := range results {
+		if result.OK {
+			succeeded++
+			continue
+		}
+		failed++
+		if firstErrMsg == "" {
+			firstErrMsg = result.Label + ": " + result.Message
+		}
 	}
 	message := ""
 	switch {

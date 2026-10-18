@@ -37,8 +37,7 @@ const TransientMaxRetries = 2
 var ErrEmptyStream = errors.New("empty upstream stream")
 
 // RetryBackoff 返回第 attempt 次重试（attempt 从 1 计）前的等待时长。
-// 生产为 1s、2s；测试中替换为毫秒级以加速。
-var RetryBackoff = func(attempt int) time.Duration {
+func RetryBackoff(attempt int) time.Duration {
 	return time.Duration(attempt) * time.Second
 }
 
@@ -78,18 +77,9 @@ var nonTransientTransportMarkers = []string{
 	"x509:", // 证书验证失败（区别于 TLS 握手超时——后者可重试）
 }
 
-func containsAny(detail string, markers []string) bool {
-	for _, m := range markers {
-		if strings.Contains(detail, m) {
-			return true
-		}
-	}
-	return false
-}
-
 // IsContentPolicy 判断是否上游内容安全审核拒绝。
 func IsContentPolicy(detail string) bool {
-	return containsAny(detail, contentPolicyMarkers)
+	return core.ContainsAny(detail, contentPolicyMarkers)
 }
 
 // IsTransientUpstream 判断一次上游 HTTP 错误是否属于瞬时故障（可重试）。
@@ -108,7 +98,7 @@ func IsTransientUpstream(code int, detail string) bool {
 	if code == 401 || code == 403 || code == 429 {
 		return false
 	}
-	if containsAny(detail, clientFaultMarkers) {
+	if core.ContainsAny(detail, clientFaultMarkers) {
 		return false
 	}
 	if transientHTTPCodes[code] || code >= 500 {
@@ -138,7 +128,7 @@ func IsTransientTransport(err error) bool {
 		return true
 	}
 	msg := strings.ToLower(err.Error())
-	if containsAny(msg, nonTransientTransportMarkers) {
+	if core.ContainsAny(msg, nonTransientTransportMarkers) {
 		return false
 	}
 	for _, k := range []string{"ssl", "eof", "reset", "timed out", "timeout", "deadline exceeded", "broken pipe", "connection"} {
@@ -178,7 +168,7 @@ func FriendlyUpstreamError(code int, detail string) (string, string) {
 	// 0) 排队/服务未就绪：免费模型常见，等一阵重试即可，绝不能当成额度或凭证错误。
 	if signal, queued := ParseQueueSignal(detail); queued {
 		return fmt.Sprintf("上游排队中（模型 %s，建议 %s 后重试）：该模型当前需要排队，不是额度或凭证问题。上游详情：%s",
-				firstNonEmptyValue(signal.ModelKey, "未知"), signal.WaitDuration(), truncateRunes(detail, 300)),
+				core.FirstNonEmpty(signal.ModelKey, "未知"), signal.WaitDuration(), truncateRunes(detail, 300)),
 			ErrTypeModelBusy
 	}
 	// 1) 内容安全审核（确定性拒绝，先于瞬时判断——重试无效）
@@ -225,9 +215,6 @@ func NewStreamBusinessError(detail string) *UpstreamError {
 	}
 	return &UpstreamError{Status: 0, Detail: detail, ErrType: ErrTypeUpstream, Message: detail}
 }
-
-// firstNonEmptyValue 返回第一个非空字符串（本地小工具，避免跨包依赖）。
-func firstNonEmptyValue(values ...string) string { return core.FirstNonEmpty(values...) }
 
 // WrapTransportError 传输层错误包装：瞬时类转成带友好消息的 UpstreamError，
 // 非瞬时（如 URL 配置错误）原样返回。

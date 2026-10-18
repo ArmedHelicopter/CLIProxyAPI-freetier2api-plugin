@@ -133,11 +133,11 @@ func emitCollapsedCompletion(completion []byte, model string, onChunk func([]byt
 			fn, _ := call["function"].(map[string]any)
 			delta := map[string]any{"tool_calls": []any{map[string]any{
 				"index": index,
-				"id":    stringField(call, "id"),
+				"id":    core.RawStringField(call, "id"),
 				"type":  "function",
 				"function": map[string]any{
-					"name":      stringField(fn, "name"),
-					"arguments": stringField(fn, "arguments"),
+					"name":      core.RawStringField(fn, "name"),
+					"arguments": core.RawStringField(fn, "arguments"),
 				},
 			}}}
 			if errEmit := onChunk(converter.chunk(delta, nil)); errEmit != nil {
@@ -299,7 +299,7 @@ func convertMessages(messages []any) ([]string, []map[string]any) {
 				"role": "user",
 				"content": []any{map[string]any{
 					"type":        "tool_result",
-					"tool_use_id": strings.TrimSpace(stringField(msg, "tool_call_id")),
+					"tool_use_id": strings.TrimSpace(core.RawStringField(msg, "tool_call_id")),
 					"content":     textFromContent(content),
 				}},
 			})
@@ -336,13 +336,13 @@ func assistantBlocks(content any, rawToolCalls any) []any {
 		if fn == nil {
 			continue
 		}
-		name := strings.TrimSpace(stringField(fn, "name"))
+		name := strings.TrimSpace(core.RawStringField(fn, "name"))
 		if name == "" {
 			continue
 		}
 		blocks = append(blocks, map[string]any{
 			"type":  "tool_use",
-			"id":    core.FirstNonEmpty(stringField(call, "id"), "toolu_"+NewHexID(12)),
+			"id":    core.FirstNonEmpty(core.RawStringField(call, "id"), "toolu_"+NewHexID(12)),
 			"name":  name,
 			"input": parseToolArguments(fn["arguments"]),
 		})
@@ -366,9 +366,9 @@ func userBlocks(content any) []any {
 			if !ok {
 				continue
 			}
-			switch stringField(part, "type") {
+			switch core.RawStringField(part, "type") {
 			case "text":
-				blocks = append(blocks, map[string]any{"type": "text", "text": stringField(part, "text")})
+				blocks = append(blocks, map[string]any{"type": "text", "text": core.RawStringField(part, "text")})
 			case "image_url":
 				if block := imageBlock(part["image_url"]); block != nil {
 					blocks = append(blocks, block)
@@ -393,7 +393,7 @@ func imageBlock(raw any) map[string]any {
 	case string:
 		url = v
 	case map[string]any:
-		url = stringField(v, "url")
+		url = core.RawStringField(v, "url")
 	}
 	if !strings.HasPrefix(url, "data:") {
 		return nil
@@ -432,12 +432,12 @@ func applyTools(out map[string]any, tools []any, toolChoice any) {
 			if fn == nil {
 				fn = tool
 			}
-			name := strings.TrimSpace(stringField(fn, "name"))
+			name := strings.TrimSpace(core.RawStringField(fn, "name"))
 			if name == "" {
 				continue
 			}
 			entry := map[string]any{"name": name}
-			if desc := stringField(fn, "description"); desc != "" {
+			if desc := core.RawStringField(fn, "description"); desc != "" {
 				entry["description"] = desc
 			}
 			if schema, ok := fn["parameters"].(map[string]any); ok && schema != nil {
@@ -463,7 +463,7 @@ func applyTools(out map[string]any, tools []any, toolChoice any) {
 		// "auto" / 缺省：Anthropic 默认即 auto，无需显式设置。
 	case map[string]any:
 		fn, _ := choice["function"].(map[string]any)
-		if name := strings.TrimSpace(stringField(fn, "name")); name != "" {
+		if name := strings.TrimSpace(core.RawStringField(fn, "name")); name != "" {
 			out["tool_choice"] = map[string]any{"type": "tool", "name": name}
 		}
 	}
@@ -610,29 +610,29 @@ func (c *streamConverter) emitStart(onChunk func([]byte) error) error {
 
 // feed 处理一条上游事件，产出零到多条 chunk。
 func (c *streamConverter) feed(event map[string]any, onChunk func([]byte) error) error {
-	switch stringField(event, "type") {
+	switch core.RawStringField(event, "type") {
 	case "message_start":
 		if msg, ok := event["message"].(map[string]any); ok {
-			if id := stringField(msg, "id"); id != "" {
+			if id := core.RawStringField(msg, "id"); id != "" {
 				c.chunkID = id
 			}
-			if model := stringField(msg, "model"); model != "" {
+			if model := core.RawStringField(msg, "model"); model != "" {
 				c.model = model
 			}
 		}
 
 	case "content_block_start":
 		block, _ := event["content_block"].(map[string]any)
-		if block != nil && stringField(block, "type") == "tool_use" {
+		if block != nil && core.RawStringField(block, "type") == "tool_use" {
 			index := c.toolIndex
 			c.toolIndex++
 			return onChunk(c.chunk(map[string]any{
 				"tool_calls": []any{map[string]any{
 					"index": index,
-					"id":    stringField(block, "id"),
+					"id":    core.RawStringField(block, "id"),
 					"type":  "function",
 					"function": map[string]any{
-						"name":      stringField(block, "name"),
+						"name":      core.RawStringField(block, "name"),
 						"arguments": "",
 					},
 				}},
@@ -644,16 +644,16 @@ func (c *streamConverter) feed(event map[string]any, onChunk func([]byte) error)
 		if delta == nil {
 			return nil
 		}
-		switch stringField(delta, "type") {
+		switch core.RawStringField(delta, "type") {
 		case "text_delta":
-			if text := stringField(delta, "text"); text != "" {
+			if text := core.RawStringField(delta, "text"); text != "" {
 				return onChunk(c.chunk(map[string]any{"content": text}, nil))
 			}
 		case "input_json_delta":
-			if partial := stringField(delta, "partial_json"); partial != "" {
+			if partial := core.RawStringField(delta, "partial_json"); partial != "" {
 				return onChunk(c.chunk(map[string]any{
 					"tool_calls": []any{map[string]any{
-						"index":    maxInt(c.toolIndex-1, 0),
+						"index":    core.MaxInt(c.toolIndex-1, 0),
 						"function": map[string]any{"arguments": partial},
 					}},
 				}, nil))
@@ -662,12 +662,12 @@ func (c *streamConverter) feed(event map[string]any, onChunk func([]byte) error)
 
 	case "message_delta":
 		delta, _ := event["delta"].(map[string]any)
-		reason := finishReason(stringField(delta, "stop_reason"), c.toolIndex > 0)
+		reason := finishReason(core.RawStringField(delta, "stop_reason"), c.toolIndex > 0)
 		return onChunk(c.chunk(map[string]any{}, &reason))
 
 	case "error":
 		errObj, _ := event["error"].(map[string]any)
-		return fmt.Errorf("上游流式错误: %s", core.FirstNonEmpty(stringField(errObj, "message"), "unknown"))
+		return fmt.Errorf("上游流式错误: %s", core.FirstNonEmpty(core.RawStringField(errObj, "message"), "unknown"))
 	}
 	return nil
 }
@@ -804,8 +804,8 @@ func textFromContent(content any) string {
 			if !ok {
 				continue
 			}
-			if stringField(part, "type") == "text" {
-				if text := stringField(part, "text"); text != "" {
+			if core.RawStringField(part, "type") == "text" {
+				if text := core.RawStringField(part, "text"); text != "" {
 					parts = append(parts, text)
 				}
 			}
@@ -813,21 +813,6 @@ func textFromContent(content any) string {
 		return strings.Join(parts, "\n")
 	}
 	return ""
-}
-
-func stringField(m map[string]any, key string) string {
-	if m == nil {
-		return ""
-	}
-	s, _ := m[key].(string)
-	return s
-}
-
-func maxInt(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 // chatHTTPTimeout 是非流式对话的上限。
