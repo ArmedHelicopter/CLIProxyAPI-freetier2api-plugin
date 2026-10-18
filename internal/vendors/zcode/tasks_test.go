@@ -202,25 +202,51 @@ func TestClaimEndpointsUseBillingBase(t *testing.T) {
 func TestClaimThrottleBlocksAndHonorsCancellation(t *testing.T) {
 	// 节流的语义是「阻塞到允许为止」，不是「拒绝」：调用方在同一次领取里等
 	// 一下即可，不该把等待当成失败。
-	markClaimIssued()
-	if !claimThrottle(context.Background(), 0) {
+	gate := newClaimGate()
+	gate.markIssued()
+	gate.setInterval(0)
+	if !gate.wait(context.Background()) {
 		t.Fatal("间隔为 0 时不应节流")
 	}
 
 	// 间隔远大于 context 剩余时间时应放弃，而不是把请求拖死。
+	gate.setInterval(time.Hour)
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
-	if claimThrottle(ctx, time.Hour) {
+	if gate.wait(ctx) {
 		t.Fatal("context 取消后应放弃本次领取")
 	}
 
 	// 短间隔应等到点后放行。
-	markClaimIssued()
+	gate.setInterval(60 * time.Millisecond)
+	gate.markIssued()
 	start := time.Now()
-	if !claimThrottle(context.Background(), 60*time.Millisecond) {
+	if !gate.wait(context.Background()) {
 		t.Fatal("短间隔应等待后放行")
 	}
 	if waited := time.Since(start); waited < 40*time.Millisecond {
 		t.Fatalf("实际等待 %s，短于节流间隔", waited)
+	}
+}
+
+// TestClaimGateIsPerInstance 锁定「节流窗口属于供应商实例」。
+//
+// 回归的是重构前的缺陷：间隔与计时器是包级变量，一个 App 的领取会
+// 阻塞另一个 App 的领取，与 README 声明的实例隔离相冲突。
+func TestClaimGateIsPerInstance(t *testing.T) {
+	busy := newClaimGate()
+	busy.setInterval(time.Hour)
+	busy.markIssued()
+
+	idle := newClaimGate()
+	idle.setInterval(time.Hour)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if !idle.wait(ctx) {
+		t.Fatal("另一个实例不应被本实例的领取节流阻塞")
+	}
+	if busy.wait(ctx) {
+		t.Fatal("本实例刚发过领取，应当节流")
 	}
 }

@@ -117,7 +117,7 @@ internal/vendors/<name>            协议层 + 适配层同包，文件名是**�
 
 八个供应商包的文件名集合**完全同构**：读任何一家都能立刻在另一家找到对应实现。
 可选文件按能力存在，**不需要就整份缺失**（不写空实现）——例如 opencodezen 没有
-`tasks.go`、minimaxcode 没有 `errors.go`。约定一条不落：
+`tasks.go`；八家现在都有 `errors.go`。约定一条不落：
 
 - 单实例供应商用 `VendorID`/`VendorName` 常量，多实例供应商用
   `VendorIDFor(region)`/`VendorNameFor(region)`；工厂统一是
@@ -128,8 +128,6 @@ internal/vendors/<name>            协议层 + 适配层同包，文件名是**�
 
 刻意的差异（都不是漏改）：
 
-- `minimaxcode` 没有 `errors.go`：它至今未做上游错误分类，401/403 不会让坏凭证失效
-  （其它 7 家都有）。补上会改变运行时行为，列为待办。
 - 只有 `qoder` 需要 `protocol.go`、只有 `workbuddy` 需要 `payload.go`、只有
   `minimaxcode` 需要 `prompt.go`。
 - `qoder` 原有的 `bridge/`、`cosy/`、`qoderapi/` 三个子包已扁平化进顶层包：
@@ -137,9 +135,12 @@ internal/vendors/<name>            协议层 + 适配层同包，文件名是**�
   qoder 只剩一条单包条目。
 
 供应商的可变状态（base URL、运行时配置、提示词、档位表、设备令牌缓存、
-登录会话）一律放在 adapter/runtime 实例里，不声明可变包级变量；只读的
-内嵌 JSON、静态端点表与正则等可作为包级常量/只读数据。这样同一进程内
-多个 App 实例互不影响。
+登录会话、领取节流窗口、登录回调监听）一律放在 adapter/runtime/SessionStore
+实例里，不声明可变包级变量；只读的内嵌 JSON、静态端点表与正则等可作为
+包级常量/只读数据。这样同一进程内多个 App 实例互不影响。
+
+Trae 的授权回调监听也随实例：优先 `127.0.0.1:18080`，端口被占用时退回系统
+分配的空闲端口，并把**实际**端口写进登录链接（否则回调永远到不了本进程）。
 
 ### 新增 / 删除供应商
 
@@ -232,6 +233,8 @@ CGO_ENABLED=1 go build -buildmode=c-shared -o dist/freetier2api.so .
 | `internal/auth/{pool,batch,quota}_test.go` | 账号枚举去重、批量并发顺序、额度摘要格式化 |
 | `internal/tasks/{schedule,engine}_test.go` | 任务目录、排程时间、队列聚合、保活编排与供应商无关的任务契约 |
 | `internal/vendors/workbuddy/{errors,payload,credential,chat,tasks}_test.go` | 错误分类顺序、请求体改写、凭证双形态、SSE 聚合、任务与签到编排 |
+| `internal/vendors/minimaxcode/errors_test.go` | 上游错误分类：凭证先于余额、流内业务码、错误码提取、分类能走到宿主 |
+| `internal/vendors/{trae,zcode}/*_test.go` | 实例隔离：登录会话与回调监听、领取节流窗口互不共享 |
 | `internal/hostbridge/http_test.go` | 宿主 HTTP 桥双形态键名兼容、缺状态码显式报错 |
 | `internal/admin/admin_test.go` | 管理路由声明、任务路由分发、未知路由 404 |
 | `tests/architecture_test.go` | 供应商互不 import、分层边界、内部包白名单、测试布局 |
@@ -709,6 +712,12 @@ CPA 按客户端 IP 统计管理鉴权失败次数，**未携带密钥的请求�
 
 ## 行为变更（分层重构）
 
+- **MiniMax Code 补上上游错误分类（v0.1.4）**：此前 401/403/402/429 全部退化成 502
+  可重试，坏凭证不会被停用、余额耗尽不会长冷却。现在 HTTP 状态码与流内业务码
+  （如 `50110:insufficient balance`）统一走 `Classify`，凭证失效 → 401 停用、余额耗尽
+  → 402、限流 → 429、5xx → 502 换号重试。
+- **实例隔离补全（v0.1.4）**：Trae 的回调监听与会话归属、ZCode 的领取节流窗口
+  从包级变量改为实例状态。此前同进程多个 App 会互相阻塞领取、互相认领登录回调。
 - **供应商包结构统一（v0.1.3）**：文件名收敛为封闭白名单（见「架构：按供应商插桩」），
   qoder 的 `bridge`/`cosy`/`qoderapi` 三个子包扁平化进顶层包，并删除了零引用的
   `OwnsLoginSession`（6 家 × 2 处）。属纯重构：13 个实例的 ID/名称/区域、配置键、

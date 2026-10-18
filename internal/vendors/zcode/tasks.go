@@ -284,38 +284,59 @@ const (
 
 // 领取节流：同一出口（= 同一台 CPA 主机）连打会触发 WAF 1005/3012，
 // 因此两次领取之间留出最小间隔。参考实现按代理端口做同样的事，这里没有
-// 代理概念，按进程内全局节流等价。
+// 代理概念，按实例内节流等价。
+//
+// **状态属于实例**：同一进程里的多个 App 各有自己的节流窗口，互不影响
+// （与 README 的实例隔离约定一致，也和测试里多 App 并存的场景相符）。
 const defaultClaimMinInterval = 15 * time.Second
 
-var (
-	claimMu       sync.Mutex
-	lastClaimTime time.Time
-)
-
-// claimThrottle 阻塞到允许发起下一次领取为止。
-//
-// 返回 false 表示 ctx 已取消：调用方应放弃本次领取而不是强发。
-func claimThrottle(ctx context.Context, minInterval time.Duration) bool {
-	if minInterval <= 0 {
-		return true
-	}
-	claimMu.Lock()
-	wait := minInterval - time.Since(lastClaimTime)
-	claimMu.Unlock()
-	if wait <= 0 {
-		return true
-	}
-	if !core.SleepContext(ctx, wait) {
-		return false
-	}
-	return true
+// claimGate 是一个 vendor 实例的领取节流器。
+type claimGate struct {
+	mu       sync.Mutex
+	last     time.Time
+	interval time.Duration
 }
 
-// markClaimIssued 记录一次领取已发出（节流计时起点）。
-func markClaimIssued() {
-	claimMu.Lock()
-	lastClaimTime = time.Now()
-	claimMu.Unlock()
+// newClaimGate 构造节流器，默认间隔为 defaultClaimMinInterval。
+func newClaimGate() *claimGate {
+	return &claimGate{interval: defaultClaimMinInterval}
+}
+
+// setInterval 覆盖最小间隔（0 表示不节流）。
+func (g *claimGate) setInterval(interval time.Duration) {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.interval = interval
+	g.mu.Unlock()
+}
+
+// wait 阻塞到允许发起下一次领取为止。
+//
+// 返回 false 表示 ctx 已取消：调用方应放弃本次领取而不是强发。
+func (g *claimGate) wait(ctx context.Context) bool {
+	if g == nil {
+		return true
+	}
+	g.mu.Lock()
+	interval := g.interval
+	wait := interval - time.Since(g.last)
+	g.mu.Unlock()
+	if interval <= 0 || wait <= 0 {
+		return true
+	}
+	return core.SleepContext(ctx, wait)
+}
+
+// markIssued 记录一次领取已发出（节流计时起点）。
+func (g *claimGate) markIssued() {
+	if g == nil {
+		return
+	}
+	g.mu.Lock()
+	g.last = time.Now()
+	g.mu.Unlock()
 }
 
 // ── 验证码配置 ──────────────────────────────────────────────────────────────
@@ -634,7 +655,7 @@ func secondsToMillis(seconds float64) int64 {
 //
 // 每次调用都会先做一次实时 preview：领取是用户手动触发的动作，拿到的是
 // 点击那一刻的真实可领集合，不复用任何缓存。
-func ClaimPlan(ctx context.Context, cred *Credential, req core.ClaimPlanRequest) (core.ClaimPlanResponse, error) {
+func (v *adapter) claimPlan(ctx context.Context, cred *Credential, req core.ClaimPlanRequest) (core.ClaimPlanResponse, error) {
 	if reason := billingBlockReason(cred); reason != "" {
 		return core.ClaimPlanResponse{}, core.NewPluginError("zcode_no_plan_channel", reason, http.StatusBadRequest)
 	}
@@ -649,7 +670,7 @@ func ClaimPlan(ctx context.Context, cred *Credential, req core.ClaimPlanRequest)
 		return core.ClaimPlanResponse{}, errPick
 	}
 
-	if !claimThrottle(ctx, claimMinInterval) {
+	if !v.claims.wait(ctx) {
 		return core.ClaimPlanResponse{}, core.NewPluginError(
 			"zcode_claim_canceled", "领取已取消（等待下一次可提交时间时中断）", http.StatusRequestTimeout)
 	}
@@ -658,7 +679,7 @@ func ClaimPlan(ctx context.Context, cred *Credential, req core.ClaimPlanRequest)
 	if region := strings.TrimSpace(req.VerifyRegion); region != "" {
 		headers[CaptchaRegionHeader] = region
 	}
-	markClaimIssued()
+	v.claims.markIssued()
 
 	code, body, errRequest := billingRequestWithHeaders(
 		ctx, cred, http.MethodPost, PathBillingClaim,
@@ -751,9 +772,6 @@ func formatClaimRecovery(at int64) string {
 // 与上游「每日 0 点重置」的口径一致。
 var claimTimezone = time.FixedZone("Asia/Shanghai", 8*3600)
 
-// claimMinInterval 可被 Configure 覆盖（0 表示不节流）。
-var claimMinInterval = defaultClaimMinInterval
-
 // CaptchaConfig 实现 core.CaptchaProvider。
 func (v *adapter) CaptchaConfig(ctx context.Context) (core.CaptchaConfig, error) {
 	return FetchCaptchaConfig(ctx)
@@ -774,7 +792,7 @@ func (v *adapter) ClaimPlan(ctx context.Context, cred *core.Credential, req core
 	if errNative != nil {
 		return core.ClaimPlanResponse{}, errNative
 	}
-	return ClaimPlan(ctx, native, req)
+	return v.claimPlan(ctx, native, req)
 }
 
 // compile-time断言：adapter 具备领取套餐的三项能力。

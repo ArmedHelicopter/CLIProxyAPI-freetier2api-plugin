@@ -51,17 +51,21 @@ func BuildLoginURL(cfg Config, machineID, deviceID, callbackURL string) string {
 
 // LoginStart 启动登录流程。
 func LoginStart(ctx context.Context, cfg Config, store *SessionStore) (*pluginapi.AuthLoginStartResponse, error) {
-	EnsureCallbackServer(store)
+	if errListen := store.EnsureCallbackServer(); errListen != nil {
+		// 监听起不来时不要继续：用户点完授权，回调没有进程接收。
+		return nil, core.NewPluginError("trae_callback_unavailable",
+			"无法在本机启动授权回调监听: "+errListen.Error(), http.StatusInternalServerError)
+	}
 
 	machineID := core.RandomHex(16)
 	deviceID := core.RandomHex(16)
 	traceID := MachineTraceID(machineID, deviceID)
-	callbackURL := "http://127.0.0.1:18080/authorize"
+	callbackURL := store.callbackURL()
 
 	loginURL := BuildLoginURL(cfg, machineID, deviceID, callbackURL)
 	sessionID := cfg.VendorID + "_" + core.RandomHex(8)
 
-	RegisterPending(store, &PendingSession{
+	store.register(&PendingSession{
 		SessionID: sessionID,
 		VendorID:  cfg.VendorID,
 		Region:    cfg.Region,
@@ -83,7 +87,7 @@ func LoginStart(ctx context.Context, cfg Config, store *SessionStore) (*pluginap
 
 // LoginPoll 轮询状态。
 func LoginPoll(ctx context.Context, state string, store *SessionStore) (*pluginapi.AuthLoginPollResponse, error) {
-	session, ok := GetPending(store, state)
+	session, ok := store.get(state)
 	if !ok || time.Since(session.CreatedAt) > 15*time.Minute {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
@@ -93,7 +97,7 @@ func LoginPoll(ctx context.Context, state string, store *SessionStore) (*plugina
 
 	switch session.State {
 	case "success":
-		RemovePending(store, state)
+		store.remove(state)
 		if session.AuthData != nil {
 			return &pluginapi.AuthLoginPollResponse{
 				Status:  pluginapi.AuthLoginStatusSuccess,
@@ -106,7 +110,7 @@ func LoginPoll(ctx context.Context, state string, store *SessionStore) (*plugina
 			Message: "登录成功",
 		}, nil
 	case "failed":
-		RemovePending(store, state)
+		store.remove(state)
 		errMsg := session.ErrMsg
 		if errMsg == "" {
 			errMsg = "授权登录失败"
@@ -138,21 +142,19 @@ type PendingSession struct {
 	CreatedAt time.Time
 }
 
-// 回调服务是进程级单例（固定端口），但会话表按 App 实例注册。
-//
-// 多个 App 同时登录时，回调请求需要轮流在各自实例的会话表里匹配，
-// 不能只记住最后一个实例，否则先发起的登录会永远等不到回调。
-var (
-	callbackServerMu sync.Mutex
-	callbackServerOn bool
-	callbackStoresMu sync.RWMutex
-	callbackStores   = map[*SessionStore]struct{}{}
-)
+// 一次登录的表单与监听全部属于 SessionStore（= 一个 App 实例），
+// 不放在包级变量里：同进程多个 App 并存时，一个实例发起登录不能
+// 影响另一个实例的会话，也不能让它们的回调互相认领。
 
-// SessionStore 是单个 App 实例的 Trae 登录会话表。
+// SessionStore 是单个 App 实例的 Trae 登录会话表与回调监听。
 type SessionStore struct {
 	mu       sync.Mutex
 	sessions map[string]*PendingSession
+
+	// serverMu 保护本实例的监听生命周期（懒启动，失败后允许重试）。
+	serverMu   sync.Mutex
+	listening  bool
+	serverAddr string
 }
 
 // NewSessionStore 构造会话表。
@@ -256,87 +258,57 @@ func (s *SessionStore) gcLocked() {
 	}
 }
 
-// registerCallbackStore 把某个 App 实例的会话表加入回调匹配集合。
-func registerCallbackStore(store *SessionStore) {
-	if store == nil {
-		return
+// matchCallback 先按 trace/machine 精确匹配，再退回归属最新的待处理会话。
+//
+// 只在**本实例**的会话表里查找：另一个 App 的登录会话不属于这里。
+func (s *SessionStore) matchCallback(info *CallbackInfo) *PendingSession {
+	if matched := s.matchExact(info); matched != nil {
+		return matched
 	}
-	callbackStoresMu.Lock()
-	callbackStores[store] = struct{}{}
-	callbackStoresMu.Unlock()
+	return s.latestPending()
 }
 
-func callbackStoresSnapshot() []*SessionStore {
-	callbackStoresMu.RLock()
-	defer callbackStoresMu.RUnlock()
-	stores := make([]*SessionStore, 0, len(callbackStores))
-	for store := range callbackStores {
-		stores = append(stores, store)
+// EnsureCallbackServer 保证本实例的授权回调监听已启动。
+//
+// 端口优先用 127.0.0.1:18080（与 Trae 桌面端回调地址一致）；被占用时
+// 退回系统分配的空闲端口，并把实际端口写进登录链接——否则回调永远
+// 不会到达本进程。监听生命周期随实例，不与其他 App 共享。
+func (s *SessionStore) EnsureCallbackServer() error {
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
+	if s.listening {
+		return nil
 	}
-	return stores
-}
 
-// matchCallbackSession 在全部已注册实例里先精确匹配，再退回归属最新的待处理会话。
-func matchCallbackSession(info *CallbackInfo) *PendingSession {
-	stores := callbackStoresSnapshot()
-	for _, store := range stores {
-		if matched := store.matchExact(info); matched != nil {
-			return matched
+	listener, errListen := net.Listen("tcp", "127.0.0.1:18080")
+	if errListen != nil {
+		logger.Debug("trae: 18080 已被占用，改用随机端口: %v", errListen)
+		listener, errListen = net.Listen("tcp", "127.0.0.1:0")
+		if errListen != nil {
+			return fmt.Errorf("listen callback: %w", errListen)
 		}
-	}
-	var latest *PendingSession
-	for _, store := range stores {
-		candidate := store.latestPending()
-		if candidate != nil && (latest == nil || candidate.CreatedAt.After(latest.CreatedAt)) {
-			latest = candidate
-		}
-	}
-	return latest
-}
-
-// EnsureCallbackServer 保证本机 18080 回调监听服务已启动。
-func EnsureCallbackServer(store *SessionStore) {
-	registerCallbackStore(store)
-
-	callbackServerMu.Lock()
-	defer callbackServerMu.Unlock()
-	if callbackServerOn {
-		return
-	}
-
-	listener, err := net.Listen("tcp", "127.0.0.1:18080")
-	if err != nil {
-		logger.Error("trae: 监听 127.0.0.1:18080 失败（可能有其他实例在运行）: %v", err)
-		return
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/authorize", handleAuthorizeCallback)
+	mux.HandleFunc("/authorize", s.handleAuthorizeCallback)
 
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
+	s.serverAddr = "http://" + listener.Addr().String()
+	s.listening = true
 	go func() {
-		logger.Info("trae: 本地授权回调监听已启动: http://127.0.0.1:18080/authorize")
+		logger.Info("trae: 本地授权回调监听已启动: %s/authorize", s.serverAddr)
 		if errServe := srv.Serve(listener); errServe != nil && errServe != http.ErrServerClosed {
 			logger.Error("trae: 回调服务退出: %v", errServe)
 		}
 	}()
-	callbackServerOn = true
+	return nil
 }
 
-// RegisterPending 注册一个进行中的登录会话。
-func RegisterPending(store *SessionStore, s *PendingSession) { store.register(s) }
-
-// GetPending 取出登录会话。
-func GetPending(store *SessionStore, sessionID string) (*PendingSession, bool) {
-	return store.get(sessionID)
-}
-
-// RemovePending 删除登录会话。
-func RemovePending(store *SessionStore, sessionID string) { store.remove(sessionID) }
-
-// OwnsSession 检查会话是否归属于该供应商。
-func OwnsSession(store *SessionStore, sessionID, vendorID string) bool {
-	return store.owns(sessionID, vendorID)
+// callbackURL 返回本实例的回调地址（EnsureCallbackServer 之后有效）。
+func (s *SessionStore) callbackURL() string {
+	s.serverMu.Lock()
+	defer s.serverMu.Unlock()
+	return s.serverAddr + "/authorize"
 }
 
 // MachineTraceID 从 machineID+deviceID 派生 16 位 trace ID。
@@ -449,14 +421,14 @@ func getInt64Param(m map[string]any, key string) int64 {
 	return 0
 }
 
-func handleAuthorizeCallback(w http.ResponseWriter, r *http.Request) {
+func (s *SessionStore) handleAuthorizeCallback(w http.ResponseWriter, r *http.Request) {
 	info, errParse := ParseCallback(r.URL.String())
 	if errParse != nil {
 		renderCallbackHTML(w, http.StatusBadRequest, "授权回调解析失败", errParse.Error())
 		return
 	}
 
-	matched := matchCallbackSession(info)
+	matched := s.matchCallback(info)
 
 	if matched == nil {
 		renderCallbackHTML(w, http.StatusNotFound, "未找到对应的登录会话", "登录会话可能已过期或已被处理，请返回控制台重新发起登录。")

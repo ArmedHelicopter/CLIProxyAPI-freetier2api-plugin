@@ -1,6 +1,10 @@
 package minimaxcode
 
 import (
+	"io"
+)
+
+import (
 	"context"
 	"encoding/json"
 	"fmt"
@@ -35,7 +39,7 @@ func Checkin(ctx context.Context, cred *Credential, baseURLOverride string) (*co
 	statusTarget := buildSigninTarget(cred, base, EpCheckinStatus, http.MethodGet, "")
 	statusResp, errStatus := doRequest(ctx, cred, statusTarget, base, 30*time.Second)
 	if errStatus != nil {
-		return nil, fmt.Errorf("check signin status: %w", errStatus)
+		return nil, core.ToPluginError(errStatus)
 	}
 	defer func() { _ = statusResp.Body.Close() }()
 
@@ -68,15 +72,13 @@ func Checkin(ctx context.Context, cred *Credential, baseURLOverride string) (*co
 	claimTarget := buildSigninTarget(cred, base, EpCheckinClaim, http.MethodPost, "{}")
 	claimResp, errClaim := doRequest(ctx, cred, claimTarget, base, 30*time.Second)
 	if errClaim != nil {
-		return nil, fmt.Errorf("claim signin: %w", errClaim)
+		return nil, core.ToPluginError(errClaim)
 	}
 	defer func() { _ = claimResp.Body.Close() }()
 
-	if claimResp.StatusCode == http.StatusUnauthorized || claimResp.StatusCode == http.StatusForbidden {
-		return nil, core.NewPluginError("minimax_unauthorized", "MiniMax 凭证无效或已过期", http.StatusUnauthorized)
-	}
 	if claimResp.StatusCode >= 400 {
-		return nil, fmt.Errorf("claim signin HTTP %d", claimResp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(claimResp.Body, 4096))
+		return nil, Classify(claimResp.StatusCode, string(body))
 	}
 
 	var claimRaw map[string]any
@@ -118,15 +120,13 @@ func FetchQuota(ctx context.Context, cred *Credential, baseURLOverride string) (
 
 	resp, errDo := doRequest(ctx, cred, target, base, 30*time.Second)
 	if errDo != nil {
-		return nil, fmt.Errorf("fetch quota: %w", errDo)
+		return nil, core.ToPluginError(errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return nil, core.NewPluginError("minimax_unauthorized", fmt.Sprintf("minimax quota HTTP %d", resp.StatusCode), http.StatusUnauthorized)
-	}
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("minimax quota HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return nil, Classify(resp.StatusCode, string(body))
 	}
 
 	var raw map[string]any

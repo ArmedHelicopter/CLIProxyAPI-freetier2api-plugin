@@ -252,7 +252,7 @@ func Chat(ctx context.Context, cred *Credential, req *core.ExecuteRequest, baseU
 
 		agg.add(payload)
 		if errMsg := agg.errorText(); errMsg != "" {
-			return nil, fmt.Errorf("minimax upstream error: %s", errMsg)
+			return nil, Classify(0, errMsg)
 		}
 	}
 
@@ -261,7 +261,7 @@ func Chat(ctx context.Context, cred *Credential, req *core.ExecuteRequest, baseU
 	}
 
 	if errMsg := agg.errorText(); errMsg != "" {
-		return nil, fmt.Errorf("minimax upstream error: %s", errMsg)
+		return nil, Classify(0, errMsg)
 	}
 
 	contentStr, reasoningStr := agg.finalize()
@@ -384,7 +384,7 @@ func ChatStream(ctx context.Context, cred *Credential, req *core.ExecuteRequest,
 		// 结构化错误、回显过滤与错误码文本识别都在 add 内完成。
 		agg.add(payload)
 		if errMsg := agg.errorText(); errMsg != "" {
-			return fmt.Errorf("minimax upstream error: %s", errMsg)
+			return Classify(0, errMsg)
 		}
 
 		// chunk 增量立即发射；完整消息节点的文本到流结束再按优先级取舍。
@@ -412,7 +412,7 @@ func ChatStream(ctx context.Context, cred *Credential, req *core.ExecuteRequest,
 		return fmt.Errorf("read stream: %w", errScan)
 	}
 	if errMsg := agg.errorText(); errMsg != "" {
-		return fmt.Errorf("minimax upstream error: %s", errMsg)
+		return Classify(0, errMsg)
 	}
 
 	// 没有任何 chunk 增量时，完整消息就是回复正文（错误检测已在 add 内触发）。
@@ -554,13 +554,14 @@ func doMessageRequest(ctx context.Context, cred *Credential, req *core.ExecuteRe
 	}
 
 	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
-		return nil, "", 0, core.NewPluginError("minimax_unauthorized", fmt.Sprintf("minimax HTTP %d", resp.StatusCode), http.StatusUnauthorized)
+		return nil, "", 0, Classify(resp.StatusCode, string(raw))
 	}
 	if resp.StatusCode >= 400 {
-		raw, _ := io.ReadAll(resp.Body)
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 		_ = resp.Body.Close()
-		return nil, "", 0, fmt.Errorf("minimax HTTP %d: %s", resp.StatusCode, string(raw))
+		return nil, "", 0, Classify(resp.StatusCode, string(raw))
 	}
 
 	return resp.Body, modelCfg.ID, promptTokens, nil
@@ -864,7 +865,8 @@ func fetchUserInfo(ctx context.Context, cred *Credential, baseURLOverride string
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", "", "", fmt.Errorf("fetch user info HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", "", "", Classify(resp.StatusCode, string(body))
 	}
 
 	var raw map[string]any
@@ -908,7 +910,8 @@ func fetchAgents(ctx context.Context, cred *Credential, baseURLOverride string) 
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("fetch agent list HTTP %d", resp.StatusCode)
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", Classify(resp.StatusCode, string(body))
 	}
 
 	var raw map[string]any
@@ -1004,12 +1007,9 @@ func createSession(ctx context.Context, cred *Credential, baseURLOverride string
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
-		return "", fmt.Errorf("minimax session HTTP %d: token invalid or expired", resp.StatusCode)
-	}
 	if resp.StatusCode >= 400 {
-		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("minimax session HTTP %d: %s", resp.StatusCode, string(body))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return "", Classify(resp.StatusCode, string(body))
 	}
 
 	var raw map[string]any

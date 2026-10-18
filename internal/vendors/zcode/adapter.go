@@ -23,11 +23,13 @@ import (
 type adapter struct {
 	*core.NativeAdapter[*Credential]
 	baseURL string
+	// claims 是本实例的领取节流器；不共享，多 App 并存时互不影响。
+	claims *claimGate
 }
 
 // Instances 构造 ZCode 实例。
 func Instances(env core.Env) []core.Vendor {
-	return []core.Vendor{&adapter{NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+	return []core.Vendor{&adapter{claims: newClaimGate(), NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
 		Meta: core.Meta{VendorID: VendorID, VendorName: VendorName, VendorRegion: "global"},
 		Env:  env,
 		Extract: func(c *core.Credential) (*Credential, bool) {
@@ -62,7 +64,7 @@ func (v *adapter) AuthMode() string { return "oauth" }
 func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
 	v.baseURL = strings.TrimSpace(raw["zcode_base_url"])
 	if interval, errParse := time.ParseDuration(strings.TrimSpace(raw["zcode_claim_min_interval"])); errParse == nil && interval >= 0 {
-		claimMinInterval = interval
+		v.claims.setInterval(interval)
 	}
 }
 

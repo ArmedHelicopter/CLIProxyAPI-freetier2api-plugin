@@ -127,7 +127,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	}
 	payload, errChat := Chat(ctx, native, req, v.baseURL)
 	if errChat != nil {
-		return nil, core.ToPluginError(errChat)
+		return nil, errChat
 	}
 	return &pluginapi.ExecutorResponse{
 		Payload: payload,
@@ -145,7 +145,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		return sink.Emit(chunk)
 	})
 	if errStream != nil {
-		return core.ToPluginError(errStream)
+		return errStream
 	}
 	return nil
 }
