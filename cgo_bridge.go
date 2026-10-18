@@ -14,10 +14,12 @@ package main
 import "C"
 
 import (
+	"time"
 	"unsafe"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
 )
 
 // cliproxy_plugin_init 由宿主在加载动态库后调用一次。
@@ -84,12 +86,18 @@ func cliproxyPluginFree(ptr unsafe.Pointer, length C.size_t) {
 //
 // 宿主在 Shutdown 之后会 dlclose 本动态库：任何仍在执行的 Go/CGO 栈都会崩溃，
 // 因此第 3 步必须等待排空（见 hostgate.go 的说明）。
-//
+const (
+	// shutdownDiagnosticInterval 是关闭排空期打印诊断日志的间隔。
+	shutdownDiagnosticInterval = 5 * time.Second
+	// shutdownWaitTimeout 只用于等待本插件自己的流式 goroutine。
+	shutdownWaitTimeout = 10 * time.Second
+)
+
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
 	stopBackgroundWork()
 	waitPluginStreams(shutdownWaitTimeout)
-	waitHostCallsForShutdown(shutdownDiagnosticInterval)
+	hostabi.WaitForShutdown(shutdownDiagnosticInterval)
 	C.clear_host_api()
 }
 

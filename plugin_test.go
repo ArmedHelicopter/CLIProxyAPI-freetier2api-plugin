@@ -438,8 +438,8 @@ func TestExecutorStreamEmitsNormalizedFrames(t *testing.T) {
 		t.Fatalf("missing id must be backfilled from the first frame: %s", chunks[1])
 	}
 	// 流必须以一次 close 收尾。
-	if !waitFor(t, 3e9, func() bool { return len(host.closed) == 1 }) {
-		t.Fatalf("expected exactly one stream close, got %d", len(host.closed))
+	if !waitFor(t, 3e9, func() bool { return len(host.closedStreams()) == 1 }) {
+		t.Fatalf("expected exactly one stream close, got %d", len(host.closedStreams()))
 	}
 	if len(host.streamErrors()) != 0 {
 		t.Fatalf("successful stream must not report an error: %v", host.streamErrors())

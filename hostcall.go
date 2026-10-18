@@ -1,18 +1,15 @@
 package main
 
-// 本文件实现插件侧对宿主回调（host.*）的调用。
-//
-// 唯一实现是 nativeHostCallScoped，它做三件事：
-//  1. 申请并发准入槽位（宿主回调不可取消，必须限流，见 hostgate.go）；
-//  2. 在载荷里注入 host_callback_id（把回调绑定到具体请求作用域）；
-//  3. 调用 C ABI 并把响应解成 JSON。
+// 本文件是宿主回调的 CGO 实现（唯一必须留在 main 的 host 层代码）：
+// //export/import "C" 只能出现在 main 包，因此这里只做「marshal → C 调用 →
+// 解信封」，并发准入、关闭排空与回调 ID 由 internal/hostabi 负责。
 
 import (
 	"encoding/json"
 	"fmt"
 	"unsafe"
 
-	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/hostabi"
 )
 
 /*
@@ -20,36 +17,9 @@ import (
 */
 import "C"
 
-// hostCallScopedImpl 指向真实的 CGO 宿主调用。
-//
-// 刻意做成可替换的包级变量：单元测试把它换成内存假宿主，
-// 从而在没有 CPA 进程参与的情况下验证出站 HTTP、任务上报、账号枚举等全部链路。
-var hostCallScopedImpl = nativeHostCallScoped
-
-// callHost 发起一次不带请求作用域的宿主回调（后台循环、管理接口等场景）。
-func callHost(method string, payload any) (json.RawMessage, error) {
-	return hostCallScopedImpl("", method, payload)
-}
-
-// callHostScoped 发起一次带请求作用域的宿主回调。
-//
-// host_callback_id 把宿主调用绑定到具体请求：流式转发（host.stream.emit）与
-// 出站 HTTP（host.http.do_stream）都必须携带它，否则宿主无法把上游请求/响应
-// 关联回原始请求，也无法在请求结束时回收流资源。
-func callHostScoped(callbackID, method string, payload any) (json.RawMessage, error) {
-	return hostCallScopedImpl(callbackID, method, payload)
-}
-
-// nativeHostCallScoped 是宿主回调的真实实现。
+// nativeHostCallScoped 是宿主回调的真实实现（由 hostabi.Configure 注入）。
 func nativeHostCallScoped(callbackID string, method string, payload any) (json.RawMessage, error) {
-	// 整个 CGO 调用期间持有准入槽位：宿主回调不可取消，
-	// 超时返回的调用仍会占用一个 OS 线程直到宿主返回。
-	if errAcquire := tryAcquireHostCall(); errAcquire != nil {
-		return nil, errAcquire
-	}
-	defer releaseHostCall()
-
-	rawPayload, errMarshal := marshalHostPayload(callbackID, payload)
+	rawPayload, errMarshal := hostabi.MarshalPayload(callbackID, payload)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("%s: %w", method, errMarshal)
 	}
@@ -78,7 +48,7 @@ func nativeHostCallScoped(callbackID string, method string, payload any) (json.R
 	if len(rawResponse) == 0 {
 		return nil, fmt.Errorf("%s: host callback returned no response, code=%d", method, int(callCode))
 	}
-	result, errDecode := decodeEnvelopeResult(rawResponse)
+	result, errDecode := hostabi.DecodeEnvelope(rawResponse)
 	if errDecode != nil {
 		return nil, fmt.Errorf("%s: %w", method, errDecode)
 	}
@@ -88,72 +58,7 @@ func nativeHostCallScoped(callbackID string, method string, payload any) (json.R
 	return result, nil
 }
 
-// marshalHostPayload 把载荷编码为 JSON，并按需注入 host_callback_id。
-//
-// 载荷是 any（各方法自有的请求结构体），所以采用「先序列化再塞字段」的方式注入，
-// 而不是给每个结构体都加上这个字段。
-func marshalHostPayload(callbackID string, payload any) ([]byte, error) {
-	raw, errMarshal := json.Marshal(payload)
-	if errMarshal != nil {
-		return nil, fmt.Errorf("marshal host callback payload: %w", errMarshal)
-	}
-	if callbackID == "" {
-		return raw, nil
-	}
-	fields := map[string]json.RawMessage{}
-	if len(raw) > 0 && string(raw) != "null" {
-		if errUnmarshal := json.Unmarshal(raw, &fields); errUnmarshal != nil {
-			return nil, fmt.Errorf("decode host callback payload: %w", errUnmarshal)
-		}
-	}
-	encodedID, errID := json.Marshal(callbackID)
-	if errID != nil {
-		return nil, fmt.Errorf("marshal host callback id: %w", errID)
-	}
-	fields["host_callback_id"] = encodedID
-	return json.Marshal(fields)
-}
-
-// decodeHostResult 把宿主回调的 result 解成目标结构。
-func decodeHostResult(raw json.RawMessage, target any) error {
-	if len(raw) == 0 {
-		return nil
-	}
-	if errUnmarshal := json.Unmarshal(raw, target); errUnmarshal != nil {
-		return fmt.Errorf("decode host result: %w", errUnmarshal)
-	}
-	return nil
-}
-
-// logHostCallFailure 记录一次宿主回调失败（供调用方在降级路径上使用）。
-func logHostCallFailure(method string, err error) {
-	if err == nil {
-		return
-	}
-	logger.Debug("host callback %s failed: %v", method, err)
-}
-
-// hostEnvelope 是宿主回调返回的信封（与插件响应信封同形）。
-type hostEnvelope struct {
-	OK     bool            `json:"ok"`
-	Result json.RawMessage `json:"result,omitempty"`
-	Error  *struct {
-		Code    string `json:"code"`
-		Message string `json:"message"`
-	} `json:"error,omitempty"`
-}
-
-// decodeEnvelopeResult 解开宿主回调返回的信封，取出 result 部分。
-func decodeEnvelopeResult(raw []byte) (json.RawMessage, error) {
-	var env hostEnvelope
-	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
-		return nil, fmt.Errorf("decode envelope: %w", errUnmarshal)
-	}
-	if !env.OK {
-		if env.Error != nil {
-			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
-		}
-		return nil, fmt.Errorf("host callback failed")
-	}
-	return append(json.RawMessage(nil), env.Result...), nil
+// init 注入 CGO 实现：之后 root 与 internal 包统一走 hostabi.Call。
+func init() {
+	hostabi.Configure(nativeHostCallScoped)
 }

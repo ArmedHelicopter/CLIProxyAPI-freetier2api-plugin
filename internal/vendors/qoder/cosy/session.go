@@ -166,20 +166,6 @@ func NewRequestID() string {
 	rand.Read(b)
 	return fmt.Sprintf("%x", b)[:24]
 }
-
-func NewBase64Token() string {
-	u1 := NewUUID()
-	u2 := NewUUID()
-	raw := (u1 + u2)[:50]
-	return base64.RawURLEncoding.EncodeToString([]byte(raw))
-}
-
-func NewHexToken(n int) string {
-	b := make([]byte, (n+1)/2)
-	rand.Read(b)
-	return fmt.Sprintf("%x", b)[:n]
-}
-
 func UnixSec() int64 {
 	return time.Now().Unix()
 }

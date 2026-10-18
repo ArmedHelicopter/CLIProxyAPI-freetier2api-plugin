@@ -7,57 +7,40 @@ package minimaxcode
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"testing"
 
-	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/testhost"
 )
 
 // installFakeUpstream 安装假宿主：session 创建返回固定 id，
-// message 调用返回 body 里的 SSE 文本。
+// message 调用返回给定的 SSE 文本。
 func installFakeUpstream(t *testing.T, sseBody string) {
 	t.Helper()
-	previous, _ := currentHostCallerForTest()
-	httpx.Configure(func(callbackID, method string, payload any) (json.RawMessage, error) {
-		if method != pluginabi.MethodHostHTTPDo {
-			return nil, fmt.Errorf("fake host: unsupported method %s", method)
+	host := testhost.New()
+	host.SetUpstream(func(method, url, body string) testhost.UpstreamResponse {
+		switch {
+		case strings.Contains(url, "/message"):
+			return testhost.UpstreamResponse{
+				Status: 200,
+				Header: map[string][]string{"Content-Type": {"text/event-stream"}},
+				Body:   sseBody,
+			}
+		case strings.Contains(url, "/session"):
+			return testhost.UpstreamResponse{
+				Status: 200,
+				Header: map[string][]string{"Content-Type": {"application/json"}},
+				Body:   `{"data":{"session_id":"sess-1"}}`,
+			}
 		}
-		rawPayload, _ := json.Marshal(payload)
-		var req struct {
-			Method string `json:"method"`
-			URL    string `json:"url"`
-		}
-		_ = json.Unmarshal(rawPayload, &req)
-
-		if strings.Contains(req.URL, "/message") {
-			return json.Marshal(map[string]any{
-				"StatusCode": 200,
-				"Headers":    map[string][]string{"Content-Type": {"text/event-stream"}},
-				"Body":       []byte(sseBody),
-			})
-		}
-		if strings.Contains(req.URL, "/session") {
-			return json.Marshal(map[string]any{
-				"StatusCode": 200,
-				"Headers":    map[string][]string{"Content-Type": {"application/json"}},
-				"Body":       []byte(`{"data":{"session_id":"sess-1"}}`),
-			})
-		}
-		return nil, fmt.Errorf("fake host: unexpected url %s", req.URL)
+		return testhost.UpstreamResponse{Status: 404, Body: `{"code":404,"msg":"not stubbed"}`}
 	})
+	hostabi.Configure(host.Call)
 	t.Cleanup(func() {
-		httpx.Configure(previous)
+		hostabi.Configure(nil)
 	})
-}
-
-// currentHostCallerForTest 读取当前宿主回调（测试内无导出访问器，借 Configure 反查）。
-// httpx 不提供读取接口，这里直接置 nil 后由 Cleanup 恢复为无回调即可——
-// 测试之间互不依赖，后续用例会自行安装。
-func currentHostCallerForTest() (httpx.HostCaller, error) {
-	return nil, nil
 }
 
 func fakeLiveCredential() *Credential {

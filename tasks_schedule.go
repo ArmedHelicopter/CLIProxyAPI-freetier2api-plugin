@@ -12,6 +12,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 	"freetier2api-plugin/internal/vendors/workbuddy/tasks"
@@ -122,7 +123,7 @@ func runKeepaliveAll(ctx context.Context) {
 		raw, okRaw := getAuthJSONByIndex(ctx, account.callbackID, account.entry.AuthIndex)
 		if okRaw {
 			if updated, errMerge := workbuddy.MergeStorageJSON(raw, accountNative(account)); errMerge == nil {
-				if _, errSave := callHostScoped(account.callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
+				if _, errSave := hostabi.Call(account.callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
 					Name: account.entry.Name,
 					JSON: updated,
 				}); errSave != nil {

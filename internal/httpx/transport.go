@@ -26,57 +26,8 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/hostabi"
 )
-
-// HostCaller 是宿主回调实现，由 package main 注入。
-type HostCaller func(callbackID, method string, payload any) (json.RawMessage, error)
-
-var (
-	hostCallerMu sync.RWMutex
-	hostCaller   HostCaller
-)
-
-// Configure 注入宿主回调实现。由 package main 的 init 调用一次。
-func Configure(caller HostCaller) {
-	hostCallerMu.Lock()
-	hostCaller = caller
-	hostCallerMu.Unlock()
-}
-
-func currentHostCaller() (HostCaller, error) {
-	hostCallerMu.RLock()
-	caller := hostCaller
-	hostCallerMu.RUnlock()
-	if caller == nil {
-		return nil, errors.New("host caller is not configured")
-	}
-	return caller, nil
-}
-
-type callbackIDKey struct{}
-
-// WithCallbackID 把宿主回调 ID 绑定到 context，后续出站请求会带上它。
-//
-// 绑定的意义：宿主用它把上游请求/响应关联回原始请求，并在请求结束时回收流资源。
-// 后台任务（签到、任务上报）没有请求作用域，传空串即可。
-func WithCallbackID(ctx context.Context, callbackID string) context.Context {
-	trimmed := strings.TrimSpace(callbackID)
-	if trimmed == "" {
-		return ctx
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	return context.WithValue(ctx, callbackIDKey{}, trimmed)
-}
-
-func callbackIDFrom(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	id, _ := ctx.Value(callbackIDKey{}).(string)
-	return id
-}
 
 // emptyReadBackoff 是宿主返回空分片时的让出间隔，避免桥接异常时读取循环空转。
 const emptyReadBackoff = time.Millisecond
@@ -105,11 +56,6 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.ctx != nil {
 		ctx = t.ctx
 	}
-	caller, errCaller := currentHostCaller()
-	if errCaller != nil {
-		return nil, errCaller
-	}
-
 	body, errBody := readRequestBody(req)
 	if errBody != nil {
 		return nil, errBody
@@ -125,7 +71,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	if t.stream {
 		method = pluginabi.MethodHostHTTPDoStream
 	}
-	raw, errCall := caller(callbackIDFrom(ctx), method, payload)
+	raw, errCall := hostabi.CallCtx(ctx, method, payload)
 	if errCall != nil {
 		return nil, errCall
 	}
@@ -151,10 +97,8 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("host http stream response has no status field (host ABI mismatch): %s", truncateForError(raw))
 	}
 	streamBody := &streamBody{
-		ctx:        ctx,
-		caller:     caller,
-		callbackID: callbackIDFrom(ctx),
-		streamID:   rpc.StreamID,
+		ctx:      ctx,
+		streamID: rpc.StreamID,
 	}
 	return buildResponse(req, rpc.StatusCode, rpc.Headers, streamBody), nil
 }
@@ -273,10 +217,8 @@ type rpcHostHTTPStreamCloseRequest struct {
 // 与宿主的约定：宿主返回 done=true 表示流结束；error 非空表示流错误。
 // 本类型负责把这两者翻译成 io.EOF 与 error。
 type streamBody struct {
-	ctx        context.Context
-	caller     HostCaller
-	callbackID string
-	streamID   string
+	ctx      context.Context
+	streamID string
 
 	mu       sync.Mutex
 	closed   bool
@@ -335,7 +277,7 @@ func (b *streamBody) readChunk() ([]byte, error) {
 			return nil, b.ctx.Err()
 		default:
 		}
-		raw, errCall := b.caller(b.callbackID, pluginabi.MethodHostHTTPStreamRead, rpcHostHTTPStreamReadRequest{StreamID: b.streamID})
+		raw, errCall := hostabi.CallCtx(b.ctx, pluginabi.MethodHostHTTPStreamRead, rpcHostHTTPStreamReadRequest{StreamID: b.streamID})
 		if errCall != nil {
 			return nil, fmt.Errorf("host http stream read: %w", errCall)
 		}
@@ -375,7 +317,7 @@ func (b *streamBody) Close() error {
 	if strings.TrimSpace(b.streamID) == "" {
 		return nil
 	}
-	_, errCall := b.caller(b.callbackID, pluginabi.MethodHostHTTPStreamClose, rpcHostHTTPStreamCloseRequest{StreamID: b.streamID})
+	_, errCall := hostabi.CallCtx(b.ctx, pluginabi.MethodHostHTTPStreamClose, rpcHostHTTPStreamCloseRequest{StreamID: b.streamID})
 	if errCall != nil {
 		errWrapped := fmt.Errorf("host http stream close: %w", errCall)
 		b.mu.Lock()

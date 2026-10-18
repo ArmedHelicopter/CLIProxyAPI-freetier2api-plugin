@@ -23,7 +23,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -57,7 +57,7 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 		return nil, errVendor
 	}
 
-	ctx, cancel := context.WithTimeout(httpx.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
+	ctx, cancel := context.WithTimeout(hostabi.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
 	defer cancel()
 
 	login, okLogin := core.As[core.LoginProvider](vendor)
@@ -103,7 +103,7 @@ func handleAuthLoginPoll(request []byte) ([]byte, error) {
 		return nil, errVendor
 	}
 
-	ctx, cancel := context.WithTimeout(httpx.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
+	ctx, cancel := context.WithTimeout(hostabi.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
 	defer cancel()
 
 	login, okLogin := core.As[core.LoginProvider](vendor)

@@ -18,7 +18,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
@@ -44,7 +44,7 @@ func handleModelStatic(request []byte) ([]byte, error) {
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
 		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
-	ctx := httpx.WithCallbackID(context.Background(), rpc.HostCallbackID)
+	ctx := hostabi.WithCallbackID(context.Background(), rpc.HostCallbackID)
 	models, errModels := staticModels(ctx)
 	if errModels != nil {
 		return nil, errModels
@@ -58,7 +58,7 @@ func handleModelRegister(request []byte) ([]byte, error) {
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
 		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
-	ctx := httpx.WithCallbackID(context.Background(), rpc.HostCallbackID)
+	ctx := hostabi.WithCallbackID(context.Background(), rpc.HostCallbackID)
 	models, errModels := staticModels(ctx)
 	if errModels != nil {
 		return nil, errModels
@@ -75,7 +75,7 @@ func handleModelForAuth(request []byte) ([]byte, error) {
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
 		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
-	ctx := httpx.WithCallbackID(context.Background(), rpc.HostCallbackID)
+	ctx := hostabi.WithCallbackID(context.Background(), rpc.HostCallbackID)
 
 	credential, vendor, errResolve := resolveVendorCredential(ctx, rpc.HostCallbackID,
 		rpc.StorageJSON, rpc.AuthID, rpc.Attributes)

@@ -24,7 +24,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/console"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/opencodezen"
 )
@@ -208,7 +208,7 @@ func normalizeRequestPath(path string) string {
 // host_callback_id 从 HTTP 头取（管理接口是 HTTP 进入的，回调 ID 走 header 而非 body）。
 func managementContext(req pluginapi.ManagementRequest) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(context.Background(), managementRequestTimeout)
-	return httpx.WithCallbackID(ctx, hostCallbackID(req)), cancel
+	return hostabi.WithCallbackID(ctx, hostCallbackID(req)), cancel
 }
 
 // hostCallbackID 从管理请求头里取宿主回调 ID。
@@ -856,7 +856,7 @@ func handleAccountAddRequest(req pluginapi.ManagementRequest) pluginapi.Manageme
 	callbackID := hostCallbackID(req)
 
 	saved := false
-	if _, errSave := callHostScoped(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
+	if _, errSave := hostabi.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
 		Name: fileName,
 		JSON: rawJSON,
 	}); errSave == nil {
@@ -1588,7 +1588,7 @@ func saveRefreshedCredential(ctx context.Context, callbackID string, vendor core
 	entry core.HostAuth, original []byte, updated *core.Credential, filePath string) {
 	payload, okPayload := refreshedStorageJSON(vendor, original, updated)
 	if okPayload {
-		if _, errSave := callHostScoped(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
+		if _, errSave := hostabi.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
 			Name: entry.Name,
 			JSON: payload,
 		}); errSave != nil {

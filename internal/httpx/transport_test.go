@@ -10,6 +10,8 @@ package httpx
 import (
 	"encoding/json"
 	"testing"
+
+	"freetier2api-plugin/internal/hostabi"
 )
 
 // TestHostHTTPResponseAcceptsGoFieldNames 验证宿主主路径的键名形态。
@@ -72,21 +74,11 @@ func TestHostHTTPStreamResponseUsesSnakeCase(t *testing.T) {
 
 // TestWithCallbackID 验证回调 ID 的绑定与读取。
 func TestWithCallbackID(t *testing.T) {
-	if got := callbackIDFrom(WithCallbackID(nil, "cb-1")); got != "cb-1" {
+	if got := hostabi.CallbackID(hostabi.WithCallbackID(nil, "cb-1")); got != "cb-1" {
 		t.Fatalf("callback id = %q, want cb-1", got)
 	}
 	// 空 ID 不写入 context（保持零值语义）。
-	if got := callbackIDFrom(WithCallbackID(nil, "   ")); got != "" {
+	if got := hostabi.CallbackID(hostabi.WithCallbackID(nil, "   ")); got != "" {
 		t.Fatalf("blank callback id must not be stored, got %q", got)
 	}
-}
-
-// TestConfigureIsRequired 验证未注入宿主回调时明确报错而不是静默失败。
-func TestConfigureIsRequired(t *testing.T) {
-	previous, _ := currentHostCaller()
-	Configure(nil)
-	if _, errCaller := currentHostCaller(); errCaller == nil {
-		t.Fatal("unconfigured host caller must return an error")
-	}
-	Configure(previous)
 }

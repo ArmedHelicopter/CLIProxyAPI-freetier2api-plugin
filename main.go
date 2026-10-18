@@ -24,7 +24,6 @@ import (
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
@@ -79,13 +78,6 @@ const (
 	// 避免与宿主的能力重复且在两侧产生不一致的分帧行为。
 	formatChatCompletions = "chat-completions"
 )
-
-// init 把宿主回调注入出站 HTTP 层。
-//
-// httpx 属于 internal 包，不能反向依赖 package main，因此在这里做一次性接线。
-func init() {
-	httpx.Configure(callHostScoped)
-}
 
 // lifecycleRequest 是 plugin.register / plugin.reconfigure 的请求体。
 type lifecycleRequest struct {

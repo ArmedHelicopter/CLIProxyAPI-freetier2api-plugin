@@ -15,7 +15,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -76,7 +76,7 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 		return nil, errPrepare
 	}
 	ctx, cancel := context.WithTimeout(
-		httpx.WithCallbackID(context.Background(), prepared.rpc.HostCallbackID), executorRPCTimeout)
+		hostabi.WithCallbackID(context.Background(), prepared.rpc.HostCallbackID), executorRPCTimeout)
 	defer cancel()
 
 	response, errExecute := prepared.vendor.Execute(ctx, prepared.credential, prepared.executeRequest())
@@ -137,7 +137,7 @@ func rewritePayloadModel(payload []byte, model string) []byte {
 
 // runStreamExecution 在后台把上游 SSE 转发给宿主流。
 func runStreamExecution(streamCtx context.Context, cancelStream context.CancelFunc, prepared preparedExecution) {
-	ctx := httpx.WithCallbackID(streamCtx, prepared.rpc.HostCallbackID)
+	ctx := hostabi.WithCallbackID(streamCtx, prepared.rpc.HostCallbackID)
 	streamID := prepared.rpc.StreamID
 	callbackID := prepared.rpc.HostCallbackID
 
@@ -225,7 +225,7 @@ func prepareExecution(request []byte) (preparedExecution, error) {
 			http.StatusBadRequest)
 	}
 
-	ctx := httpx.WithCallbackID(context.Background(), prepared.rpc.HostCallbackID)
+	ctx := hostabi.WithCallbackID(context.Background(), prepared.rpc.HostCallbackID)
 	credential, vendor, errResolve := resolveVendorCredential(ctx, prepared.rpc.HostCallbackID,
 		prepared.rpc.StorageJSON, prepared.rpc.AuthID, prepared.rpc.AuthAttributes)
 	if errResolve != nil {
@@ -330,7 +330,7 @@ func emitStreamChunk(callbackID, streamID string, payload []byte) error {
 	if strings.TrimSpace(streamID) == "" {
 		return fmt.Errorf("stream id is missing")
 	}
-	_, errCall := callHostScoped(callbackID, pluginabi.MethodHostStreamEmit, map[string]any{
+	_, errCall := hostabi.Call(callbackID, pluginabi.MethodHostStreamEmit, map[string]any{
 		"stream_id": streamID,
 		"payload":   payload,
 	})
@@ -349,7 +349,7 @@ func closeStream(callbackID, streamID, failure string) {
 	if failure != "" {
 		payload["error"] = failure
 	}
-	if _, errCall := callHostScoped(callbackID, pluginabi.MethodHostStreamClose, payload); errCall != nil {
+	if _, errCall := hostabi.Call(callbackID, pluginabi.MethodHostStreamClose, payload); errCall != nil {
 		logger.Debug("stream close failed: %v", errCall)
 	}
 }

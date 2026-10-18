@@ -12,15 +12,14 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/testhost"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
@@ -37,288 +36,41 @@ type abiEnvelope struct {
 // testCallbackID 是测试用的宿主回调 ID。
 const testCallbackID = "test-callback"
 
-// fakeUpstreamResponse 是假宿主对一次出站请求的应答。
-type fakeUpstreamResponse struct {
-	Status int
-	Header map[string][]string
-	Body   string
-}
+// fakeHost 是 internal/testhost.Host 的薄包装：保留既有小写方法名，
+// 避免大规模改写用例；新包/新用例直接使用 testhost 的导出 API。
+type fakeHost struct{ *testhost.Host }
 
-// fakeStream 是一次被模拟的流式响应。
-type fakeStream struct {
-	chunks   []string
-	position int
-	closed   bool
-}
+// fakeUpstreamResponse 是假宿主应答的别名（兼容既有用例）。
+type fakeUpstreamResponse = testhost.UpstreamResponse
 
-// fakeHost 是宿主回调的内存实现。
-type fakeHost struct {
-	mu sync.Mutex
+func newFakeHost() *fakeHost { return &fakeHost{testhost.New()} }
 
-	// calls 记录被调用的宿主方法名（供断言）。
-	calls []string
-	// authFiles 是 host.auth.list 的返回内容。
-	authFiles []core.HostAuth
-	// authJSON 是 auth_index → 凭证 JSON。
-	authJSON map[string]string
-	// upstream 是出站请求的应答函数（按 method + url 匹配）。
-	upstream func(method, url, body string) fakeUpstreamResponse
-
-	streams    map[string]*fakeStream
-	nextStream int
-
-	// 流式转发的记录。
-	emits     []string
-	streamErr []string
-	closed    []string
-}
-
-func newFakeHost() *fakeHost {
-	return &fakeHost{
-		authJSON: map[string]string{},
-		streams:  map[string]*fakeStream{},
-		upstream: func(string, string, string) fakeUpstreamResponse {
-			return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404,"msg":"not stubbed"}`}
-		},
-	}
-}
-
-// call 实现宿主回调接口。
 func (h *fakeHost) call(callbackID, method string, payload any) (json.RawMessage, error) {
-	h.mu.Lock()
-	h.calls = append(h.calls, method)
-	h.mu.Unlock()
-
-	switch method {
-	case pluginabi.MethodHostHTTPDo:
-		return h.handleHTTPDo(payload)
-	case pluginabi.MethodHostHTTPDoStream:
-		return h.handleHTTPDoStream(payload)
-	case pluginabi.MethodHostHTTPStreamRead:
-		return h.handleStreamRead(payload)
-	case pluginabi.MethodHostHTTPStreamClose:
-		return h.handleStreamClose(payload)
-	case pluginabi.MethodHostAuthList:
-		return marshalJSON(map[string]any{"auths": h.snapshotAuthFiles()})
-	case pluginabi.MethodHostAuthGet:
-		return h.handleAuthGet(payload)
-	case pluginabi.MethodHostStreamEmit:
-		return h.handleStreamEmit(payload)
-	case pluginabi.MethodHostStreamClose:
-		return h.handleStreamClosePayload(payload)
-	}
-	return nil, fmt.Errorf("fake host does not implement %s", method)
+	return h.Host.Call(callbackID, method, payload)
 }
 
-func (h *fakeHost) snapshotAuthFiles() []core.HostAuth {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]core.HostAuth, len(h.authFiles))
-	copy(out, h.authFiles)
-	return out
-}
-
-// handleHTTPDo 处理非流式出站请求。
-func (h *fakeHost) handleHTTPDo(payload any) (json.RawMessage, error) {
-	req := decodeFakeRequest(payload)
-	response := h.upstream(req.method, req.url, string(req.body))
-	// 与真实宿主同形：host.http.do 回的是**无 json tag** 的 pluginapi.HTTPResponse。
-	return marshalJSON(map[string]any{
-		"StatusCode": response.Status,
-		"Headers":    response.Header,
-		"Body":       []byte(response.Body),
-	})
-}
-
-// handleHTTPDoStream 处理流式出站请求。
-func (h *fakeHost) handleHTTPDoStream(payload any) (json.RawMessage, error) {
-	req := decodeFakeRequest(payload)
-	response := h.upstream(req.method, req.url, string(req.body))
-
-	h.mu.Lock()
-	h.nextStream++
-	streamID := fmt.Sprintf("stream-%d", h.nextStream)
-	h.streams[streamID] = &fakeStream{chunks: splitChunks(response.Body)}
-	h.mu.Unlock()
-
-	return marshalJSON(map[string]any{
-		"status_code": response.Status,
-		"headers":     response.Header,
-		"stream_id":   streamID,
-	})
-}
-
-// handleStreamRead 返回流的下一个分片。
-func (h *fakeHost) handleStreamRead(payload any) (json.RawMessage, error) {
-	var req struct {
-		StreamID string `json:"stream_id"`
-	}
-	_ = json.Unmarshal(mustMarshal(payload), &req)
-
-	h.mu.Lock()
-	stream, okStream := h.streams[req.StreamID]
-	if !okStream {
-		h.mu.Unlock()
-		return marshalJSON(map[string]any{"done": true})
-	}
-	if stream.position >= len(stream.chunks) {
-		delete(h.streams, req.StreamID)
-		h.mu.Unlock()
-		return marshalJSON(map[string]any{"done": true})
-	}
-	chunk := stream.chunks[stream.position]
-	stream.position++
-	h.mu.Unlock()
-	return marshalJSON(map[string]any{"payload": []byte(chunk)})
-}
-
-// handleStreamClose 关闭上游流。
-func (h *fakeHost) handleStreamClose(payload any) (json.RawMessage, error) {
-	var req struct {
-		StreamID string `json:"stream_id"`
-	}
-	_ = json.Unmarshal(mustMarshal(payload), &req)
-
-	h.mu.Lock()
-	if stream, okStream := h.streams[req.StreamID]; okStream {
-		stream.closed = true
-	}
-	delete(h.streams, req.StreamID)
-	h.mu.Unlock()
-	return marshalJSON(map[string]any{})
-}
-
-// handleAuthGet 按 auth_index 返回凭证 JSON。
-func (h *fakeHost) handleAuthGet(payload any) (json.RawMessage, error) {
-	var req struct {
-		AuthIndex string `json:"auth_index"`
-	}
-	_ = json.Unmarshal(mustMarshal(payload), &req)
-
-	h.mu.Lock()
-	raw, okRaw := h.authJSON[req.AuthIndex]
-	h.mu.Unlock()
-	if !okRaw {
-		return json.RawMessage(`{"auth_index":"` + req.AuthIndex + `","json":null}`), nil
-	}
-	// 真实宿主的 HostAuthGetResponse.JSON 是 json.RawMessage：原样内联，
-	// 不能走 []byte 序列化（那会变成 base64，插件侧解不出来）。
-	return json.RawMessage(`{"auth_index":"` + req.AuthIndex + `","json":` + raw + `}`), nil
-}
-
-// handleStreamEmit 记录一次流分片投递。
-func (h *fakeHost) handleStreamEmit(payload any) (json.RawMessage, error) {
-	var req struct {
-		StreamID string `json:"stream_id"`
-		Payload  []byte `json:"payload"`
-	}
-	_ = json.Unmarshal(mustMarshal(payload), &req)
-
-	h.mu.Lock()
-	h.emits = append(h.emits, string(req.Payload))
-	h.mu.Unlock()
-	return marshalJSON(map[string]any{})
-}
-
-// handleStreamClosePayload 记录一次宿主流关闭。
-func (h *fakeHost) handleStreamClosePayload(payload any) (json.RawMessage, error) {
-	var req struct {
-		StreamID string `json:"stream_id"`
-		Error    string `json:"error"`
-	}
-	_ = json.Unmarshal(mustMarshal(payload), &req)
-
-	h.mu.Lock()
-	h.closed = append(h.closed, req.StreamID)
-	if req.Error != "" {
-		h.streamErr = append(h.streamErr, req.Error)
-	}
-	h.mu.Unlock()
-	return marshalJSON(map[string]any{})
-}
-
-// emittedChunks 返回已投递的流分片。
-func (h *fakeHost) emittedChunks() []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]string, len(h.emits))
-	copy(out, h.emits)
-	return out
-}
-
-// streamErrors 返回流关闭时上报的错误。
-func (h *fakeHost) streamErrors() []string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]string, len(h.streamErr))
-	copy(out, h.streamErr)
-	return out
-}
-
-// callCount 统计某个宿主方法被调用的次数。
-func (h *fakeHost) callCount(method string) int {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	count := 0
-	for _, name := range h.calls {
-		if name == method {
-			count++
-		}
-	}
-	return count
-}
-
-// addAccount 注册一个假账号。
 func (h *fakeHost) addAccount(authIndex, name, credentialJSON string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.authJSON[authIndex] = credentialJSON
-	h.authFiles = append(h.authFiles, core.HostAuth{
-		ID: name, AuthIndex: authIndex, Name: name, Provider: providerKey, Label: name,
-	})
+	h.AddAccount(authIndex, name, credentialJSON)
 }
 
-// setUpstream 设置出站请求的应答。
 func (h *fakeHost) setUpstream(fn func(method, url, body string) fakeUpstreamResponse) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.upstream = fn
+	h.SetUpstream(fn)
 }
 
-// fakeRequest 是解码后的出站请求。
-type fakeRequest struct {
-	method string
-	url    string
-	body   []byte
-}
+func (h *fakeHost) emittedChunks() []string { return h.EmittedChunks() }
 
-// decodeFakeRequest 从载荷里取出请求要素。
-func decodeFakeRequest(payload any) fakeRequest {
-	var fields map[string]json.RawMessage
-	_ = json.Unmarshal(mustMarshal(payload), &fields)
+func (h *fakeHost) streamErrors() []string { return h.StreamErrors() }
 
-	out := fakeRequest{}
-	if raw, okRaw := fields["method"]; okRaw {
-		_ = json.Unmarshal(raw, &out.method)
-	}
-	if raw, okRaw := fields["url"]; okRaw {
-		_ = json.Unmarshal(raw, &out.url)
-	}
-	if raw, okRaw := fields["body"]; okRaw {
-		_ = json.Unmarshal(raw, &out.body)
-	}
-	return out
-}
+func (h *fakeHost) closedStreams() []string { return h.ClosedStreams() }
 
 // installFakeHost 把假宿主接到插件的宿主调用入口上。
 func installFakeHost(t *testing.T) *fakeHost {
 	t.Helper()
 	host := newFakeHost()
-	previous := hostCallScopedImpl
-	hostCallScopedImpl = host.call
+	hostabi.Configure(host.call)
 	resetPluginGlobals(t)
 	t.Cleanup(func() {
-		hostCallScopedImpl = previous
+		hostabi.Configure(nativeHostCallScoped)
 		resetPluginGlobals(t)
 	})
 	return host
@@ -334,10 +86,6 @@ func resetPluginGlobals(t *testing.T) {
 	pluginLifecycleMu.Lock()
 	pluginRegistered = false
 	pluginLifecycleMu.Unlock()
-
-	hostCallMu.Lock()
-	hostCallShuttingDown = false
-	hostCallMu.Unlock()
 
 	stateMu.Lock()
 	stateCache = nil

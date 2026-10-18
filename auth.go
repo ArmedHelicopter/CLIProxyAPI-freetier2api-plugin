@@ -19,7 +19,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -202,7 +202,7 @@ func handleAuthRefresh(request []byte) ([]byte, error) {
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
 		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
-	ctx, cancel := context.WithTimeout(httpx.WithCallbackID(context.Background(), rpc.HostCallbackID), authRefreshHTTPTimeout)
+	ctx, cancel := context.WithTimeout(hostabi.WithCallbackID(context.Background(), rpc.HostCallbackID), authRefreshHTTPTimeout)
 	defer cancel()
 
 	credential, errCredential := credentialForAuth(ctx, rpc.HostCallbackID, rpc.StorageJSON, rpc.AuthID, rpc.Attributes)

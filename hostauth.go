@@ -12,6 +12,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -33,7 +34,7 @@ const pluginAuthName = providerKey
 // 兜底依据：这些凭证文件的文件名仍是 workbuddy-*.json（本插件的命名约定），
 // 按名字也属于本插件，因此一并收下——否则用户的合法账号会在页面上凭空消失。
 func listHostAuths(ctx context.Context, callbackID string) ([]core.HostAuth, error) {
-	raw, errCall := callHostScoped(callbackID, pluginabi.MethodHostAuthList, map[string]any{})
+	raw, errCall := hostabi.Call(callbackID, pluginabi.MethodHostAuthList, map[string]any{})
 	if errCall != nil {
 		return nil, fmt.Errorf("host.auth.list: %w", errCall)
 	}
@@ -129,6 +130,14 @@ func filterPluginAuths(entries []core.HostAuth) []core.HostAuth {
 		out = append(out, entry)
 	}
 	return out
+}
+
+// logHostCallFailure 记录一次宿主回调失败（供降级路径使用）。
+func logHostCallFailure(method string, err error) {
+	if err == nil {
+		return
+	}
+	logger.Debug("host callback %s failed: %v", method, err)
 }
 
 // accountIdentity 返回一个宿主账号条目的**唯一权威身份标识**。
@@ -260,7 +269,7 @@ func getAuthJSONAndPathByIndex(ctx context.Context, callbackID, authIndex string
 	if trimmed == "" {
 		return nil, "", false
 	}
-	raw, errCall := callHostScoped(callbackID, pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: trimmed})
+	raw, errCall := hostabi.Call(callbackID, pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: trimmed})
 	if errCall != nil {
 		logHostCallFailure(pluginabi.MethodHostAuthGet, errCall)
 		return nil, "", false

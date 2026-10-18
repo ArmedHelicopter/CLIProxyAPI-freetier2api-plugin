@@ -11,7 +11,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostabi"
 )
 
 // handleQuotaDescribe 描述本插件的额度能力。
@@ -33,7 +33,7 @@ func handleQuotaFetch(request []byte) ([]byte, error) {
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
 		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
-	ctx := httpx.WithCallbackID(context.Background(), "")
+	ctx := hostabi.WithCallbackID(context.Background(), "")
 	// 宿主的额度路由**不发 StorageJSON**（只发 AuthIndex/AuthID + 属性），
 	// 因此这里必须能按 index 回源，否则会误报「凭证缺失」。
 	credential, vendor, errResolve := resolveVendorCredential(ctx, "", rpc.StorageJSON,
@@ -62,7 +62,7 @@ func handleQuotaReset(request []byte) ([]byte, error) {
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
 		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
-	ctx := httpx.WithCallbackID(context.Background(), "")
+	ctx := hostabi.WithCallbackID(context.Background(), "")
 	credential, vendor, errResolve := resolveVendorCredential(ctx, "", rpc.StorageJSON,
 		core.FirstNonEmpty(rpc.AuthIndex, rpc.AuthID), rpc.Attributes)
 	if errResolve != nil {
