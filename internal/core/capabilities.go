@@ -190,6 +190,77 @@ type ConfigFieldsProvider interface {
 	ConfigFields() []pluginapi.ConfigField
 }
 
+// ── 套餐领取 ────────────────────────────────────────────────────────────────
+//
+// 有些供应商的「领取套餐」需要上游发放的活动套餐，并强制要求人机验证令牌
+// （ZCode 的阿里云无痕验证）。求解器不适合塞进插件进程，因此契约只要求供应
+// 商给出 **SDK 初始化参数**，由管理页在用户浏览器里渲染控件，用户通过后把
+// 令牌回传给插件转发。
+//
+// 三个方法合成一个接口：它们描述的是同一条人工领取链路，总是一起被实现、
+// 一起被调用（预览页要 SDK 参数才能渲染控件，领取要用预览结果选套餐）。
+// 拆成三个小接口只会让调用点多写两次类型断言。
+
+// CaptchaConfig 是人机验证 SDK 的初始化参数。
+//
+// 前端据此渲染控件，拿到令牌后原样回传 VerifyParam；Region 为空表示上游
+// 未下发地域，此时不带 Verify-Region 头。
+type CaptchaConfig struct {
+	Enabled bool   `json:"enabled"`
+	SceneID string `json:"scene_id"`
+	Region  string `json:"region"`
+	Prefix  string `json:"prefix"`
+}
+
+// PlanGrant 是套餐授予的一项额度（通常是某模型的 token 额度）。
+type PlanGrant struct {
+	Model  string  `json:"model"`
+	Units  float64 `json:"units"`
+	Period string  `json:"period,omitempty"`
+}
+
+// PlanInfo 是一个可领取的套餐。
+type PlanInfo struct {
+	PlanID      string      `json:"plan_id"`
+	Name        string      `json:"name"`
+	Description string      `json:"description,omitempty"`
+	Priority    int         `json:"priority,omitempty"`
+	Grants      []PlanGrant `json:"grants,omitempty"`
+	StartsAt    int64       `json:"starts_at,omitempty"`
+	EndsAt      int64       `json:"ends_at,omitempty"`
+}
+
+// ClaimPlanRequest 是一次套餐领取请求。
+//
+// PlanID 为空表示由供应商自行挑选优先级最高的未领套餐；VerifyParam 是用户在
+// 浏览器里完成人机验证后拿到的令牌。
+type ClaimPlanRequest struct {
+	PlanID       string `json:"plan_id"`
+	VerifyParam  string `json:"verify_param"`
+	VerifyRegion string `json:"verify_region,omitempty"`
+}
+
+// ClaimPlanResponse 是领取成功的结果。
+type ClaimPlanResponse struct {
+	PlanID   string `json:"plan_id"`
+	PlanName string `json:"plan_name,omitempty"`
+	StartsAt int64  `json:"starts_at,omitempty"`
+	EndsAt   int64  `json:"ends_at,omitempty"`
+}
+
+// PlanClaimer 由投放活动套餐的供应商实现（当前只有 ZCode 的 Coding Plan）。
+//
+// 未实现时管理页不显示领取入口——不允许对没有套餐概念的供应商发起领取。
+type PlanClaimer interface {
+	// CaptchaConfig 给出人机验证控件的初始化参数。
+	CaptchaConfig(ctx context.Context) (CaptchaConfig, error)
+	// PreviewPlans 返回账号当前可领的套餐（已剔除已持有的）。
+	// 空切片表示没有可领的，页面据此把按钮置灰成「已领取」。
+	PreviewPlans(ctx context.Context, cred *Credential) ([]PlanInfo, error)
+	// ClaimPlan 领取指定套餐；req.PlanID 为空时由供应商自行挑选。
+	ClaimPlan(ctx context.Context, cred *Credential, req ClaimPlanRequest) (ClaimPlanResponse, error)
+}
+
 // RuntimeFieldsProvider 由需要声明管理页可改字段的供应商实现。
 type RuntimeFieldsProvider interface {
 	RuntimeFields() []pluginapi.ConfigField

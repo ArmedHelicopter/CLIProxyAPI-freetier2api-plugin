@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
 )
@@ -36,6 +37,16 @@ type CheckinRecord struct {
 	Streak   int64  `json:"streak,omitempty"`
 	Credit   int64  `json:"credit,omitempty"`
 	Energy   int64  `json:"energy,omitempty"`
+}
+
+// ClaimRecord 是某账号最近一次的套餐领取状态。
+//
+// 内嵌 pluginapi.ClaimStatus 而不是复述它的字段：额度响应与页面展示共用
+// 同一份形状，供应商改字段时这里不用跟着改。
+type ClaimRecord struct {
+	pluginapi.ClaimStatus
+	// CheckedAt 是本次探测时间（RFC3339），页面据此显示「多久前查的」。
+	CheckedAt string `json:"checked_at,omitempty"`
 }
 
 // State 是 state.json 的完整结构。
@@ -81,6 +92,8 @@ type State struct {
 	Checkin map[string]CheckinRecord `json:"checkin,omitempty"`
 	// Tasks 按「uid\x1f任务码」记录任务执行历史。
 	Tasks map[string]TaskRecord `json:"tasks,omitempty"`
+	// Claim 按账号 FileID 记录套餐领取状态（额度查询时顺带刷新）。
+	Claim map[string]ClaimRecord `json:"claim,omitempty"`
 }
 
 // Store 是 state.json 的进程内单例：串行化读改写并缓存快照。
@@ -106,6 +119,7 @@ func New() *State {
 		Version:       Version,
 		Checkin:       map[string]CheckinRecord{},
 		Tasks:         map[string]TaskRecord{},
+		Claim:         map[string]ClaimRecord{},
 		ModelAliases:  map[string]string{},
 		TaskSchedules: map[string][]int{},
 	}
@@ -173,6 +187,9 @@ func normalize(state *State) {
 	if state.Tasks == nil {
 		state.Tasks = map[string]TaskRecord{}
 	}
+	if state.Claim == nil {
+		state.Claim = map[string]ClaimRecord{}
+	}
 	if state.ModelAliases == nil {
 		state.ModelAliases = map[string]string{}
 	}
@@ -221,6 +238,10 @@ func clone(state *State) State {
 	out.Tasks = make(map[string]TaskRecord, len(state.Tasks))
 	for key, value := range state.Tasks {
 		out.Tasks[key] = value
+	}
+	out.Claim = make(map[string]ClaimRecord, len(state.Claim))
+	for key, value := range state.Claim {
+		out.Claim[key] = value
 	}
 	out.ModelAliases = make(map[string]string, len(state.ModelAliases))
 	for key, value := range state.ModelAliases {

@@ -13,6 +13,7 @@ package zcode
 import (
 	"context"
 	"strings"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
@@ -60,6 +61,9 @@ func (v *adapter) AuthMode() string { return "oauth" }
 // Configure 解析供应商专属配置。
 func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
 	v.baseURL = strings.TrimSpace(raw["zcode_base_url"])
+	if interval, errParse := time.ParseDuration(strings.TrimSpace(raw["zcode_claim_min_interval"])); errParse == nil && interval >= 0 {
+		claimMinInterval = interval
+	}
 }
 
 // Match 判断一份凭证是否属于本供应商。

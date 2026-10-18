@@ -3,11 +3,13 @@ package admin
 import (
 	"encoding/json"
 	"net/http"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	accountpkg "freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/state"
 )
 
 // quotaResult 是单个账号的额度结果。
@@ -60,6 +62,9 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	for _, account := range loaded {
 		jobs = append(jobs, job{entry: account.Entry, vendor: account.Vendor, credential: account.Credential})
 	}
+	// 领取状态跟着额度一起刷新，但**批末才落盘**：Mutate 每次都会写一遍
+	// state.json，逐账号写等于把一次「查询额度」放大成 N 次磁盘写。
+	claims := map[string]state.ClaimRecord{}
 	jobResults := accountpkg.RunBatch(jobs, batchConcurrency, func(current job) quotaResult {
 		result := quotaResult{
 			AuthID:     core.FirstNonEmpty(current.entry.ID, current.entry.Name),
@@ -81,6 +86,12 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 			result.Message = errQuota.Error()
 			return result
 		}
+		if quota.Claim != nil {
+			claims[result.UID] = state.ClaimRecord{
+				ClaimStatus: *quota.Claim,
+				CheckedAt:   time.Now().Format(time.RFC3339),
+			}
+		}
 		result.OK = true
 		result.Summary = accountpkg.Summary(quota)
 		result.Remain, result.Total = accountpkg.Totals(quota)
@@ -88,5 +99,12 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 		s.cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
 		return result
 	})
+	if len(claims) > 0 {
+		s.deps.MutateState(func(current *state.State) {
+			for uid, record := range claims {
+				current.Claim[uid] = record
+			}
+		})
+	}
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": append(preResults, jobResults...)})
 }

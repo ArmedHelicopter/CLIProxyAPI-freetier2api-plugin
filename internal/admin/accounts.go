@@ -68,6 +68,9 @@ type accountSummary struct {
 	Checkin         *state.CheckinRecord `json:"checkin,omitempty"`
 	Quota           *quotaResult         `json:"quota,omitempty"`
 	SupportsCheckin bool                 `json:"supports_checkin"`
+	// Claim 是该账号的套餐领取状态；SupportsClaim 为 false 时前端不渲染入口。
+	Claim         *state.ClaimRecord `json:"claim,omitempty"`
+	SupportsClaim bool               `json:"supports_claim"`
 }
 
 func (s *Service) getCachedQuota(keys ...string) *quotaResult {
@@ -115,6 +118,7 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 			Status:          entry.Status,
 			Disabled:        entry.Disabled,
 			SupportsCheckin: core.SupportsCheckin(vendor),
+			SupportsClaim:   supportsClaim(vendor),
 		}
 		var modTime time.Time
 		if !entry.ModTime.IsZero() {
@@ -133,12 +137,22 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 		} else if record, okLegacy := lookupLegacyCheckin(current, credential); okLegacy {
 			summary.Checkin = &record
 		}
+		if record, okRecord := current.Claim[uid]; okRecord {
+			claim := record
+			summary.Claim = &claim
+		}
 		if q := s.getCachedQuota(uid, summary.AuthID, summary.AuthIndex, entry.Name, summary.Label); q != nil {
 			summary.Quota = q
 		}
 		out = append(out, summary)
 	}
 	return out
+}
+
+// supportsClaim 报告该供应商是否提供套餐领取。
+func supportsClaim(vendor core.Vendor) bool {
+	_, okClaimer := core.As[core.PlanClaimer](vendor)
+	return okClaimer
 }
 
 // lookupLegacyCheckin 读取「账号身份迁移前的 UID 键」下的签到记录（只读回退）。

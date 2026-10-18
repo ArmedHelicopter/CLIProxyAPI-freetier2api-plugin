@@ -320,6 +320,14 @@ func billingHeaders(cred *Credential) map[string]string {
 // 返回业务码与响应体（解析失败时业务码为 -1）。网络与鉴权失败统一返回
 // 分类后的上游错误，调用方不必各自判断状态码。
 func billingRequest(ctx context.Context, cred *Credential, method, path string, payload any) (int, map[string]any, error) {
+	return billingRequestWithHeaders(ctx, cred, method, path, payload, nil)
+}
+
+// billingRequestWithHeaders 是 billingRequest 的带附加头变体。
+//
+// 领取套餐要在身份头之外补人机验证码头（CaptchaHeader/CaptchaRegionHeader），
+// 而额度查询不需要——用附加头参数区分两者，避免让每个调用方自己拼头。
+func billingRequestWithHeaders(ctx context.Context, cred *Credential, method, path string, payload any, extra map[string]string) (int, map[string]any, error) {
 	var bodyReader io.Reader
 	if payload != nil {
 		encoded, errMarshal := json.Marshal(payload)
@@ -334,6 +342,9 @@ func billingRequest(ctx context.Context, cred *Credential, method, path string, 
 		return 0, nil, errNew
 	}
 	for key, value := range billingHeaders(cred) {
+		req.Header.Set(key, value)
+	}
+	for key, value := range extra {
 		req.Header.Set(key, value)
 	}
 
@@ -406,14 +417,14 @@ func billingBlockReason(cred *Credential) string {
 func classifyBillingOutcome(code int, body map[string]any) string {
 	serverMsg := core.FirstNonEmpty(core.RawStringField(body, "msg"), core.RawStringField(body, "message"))
 	base := map[int]string{
-		1001: "套餐不存在",
-		1002: "活动已结束或套餐暂不可领取",
-		1003: "该套餐已经领取过",
-		1004: "不符合领取条件",
-		1005: "今日领取名额已用完",
-		3001: "请求参数不全（缺少设备标识）",
-		3007: "验证码校验失败",
-		401:  "请先登录后再领取",
+		codePlanNotFound:    "套餐不存在",
+		codePlanClosed:      "活动已结束或套餐暂不可领取",
+		codePlanClaimed:     "该套餐已经领取过",
+		codePlanNotEligible: "不符合领取条件",
+		codeDailyQuotaUsed:  "今日领取名额已用完",
+		3001:                "请求参数不全（缺少设备标识）",
+		3007:                "验证码校验失败",
+		401:                 "请先登录后再领取",
 	}[code]
 	if base == "" {
 		base = "上游返回业务错误"
@@ -448,10 +459,17 @@ func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchRes
 		response.Summary = append(response.Summary, pluginapi.QuotaMetric{
 			Key: "status", Label: "账号状态", Value: 1, Unit: reason,
 		})
+		// 带上原因：页面据此在按钮上给出说明，而不是显示成「没有可领套餐」。
+		response.Claim = &pluginapi.ClaimStatus{Error: reason}
 		return response, nil
 	}
 
-	fillSubscription(ctx, cred, response)
+	// 一次快照同时供给三处：订阅名、各模型余量、套餐领取状态。
+	// 多出的那一次 preview 请求换来的是「按钮是否置灰」不必另开轮询端点。
+	snapshot := fetchPlanSnapshot(ctx, cred)
+	applySubscription(snapshot, response)
+	response.Claim = claimStatusOf(snapshot)
+
 	metrics, errBalance := fetchBalances(ctx, cred)
 	if errBalance != nil {
 		return nil, errBalance
@@ -460,25 +478,16 @@ func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchRes
 	return response, nil
 }
 
-// fillSubscription 用 billing/current 补充套餐名（失败时保留默认值）。
-func fillSubscription(ctx context.Context, cred *Credential, response *pluginapi.QuotaFetchResponse) {
-	code, body, errRequest := billingRequest(ctx, cred, "GET", PathBillingCurrent, nil)
-	if errRequest != nil || code != codeSuccess {
-		return
-	}
-	plans, _ := dataMap(body)["plans"].([]any)
-	if len(plans) == 0 {
-		return
-	}
-	first, ok := plans[0].(map[string]any)
-	if !ok {
-		return
-	}
-	if name := core.RawStringField(first, "name"); name != "" {
-		response.Subscription.Plan = name
-	}
-	if planID := core.FirstNonEmpty(core.RawStringField(first, "plan_id"), core.RawStringField(first, "planId")); planID != "" {
-		response.Subscription.TierName = planID
+// applySubscription 用已持有的套餐补充订阅名（失败时保留默认值）。
+//
+// 数据来自套餐快照里已经拿到的 billing/current，不额外发请求。
+func applySubscription(snapshot planSnapshot, response *pluginapi.QuotaFetchResponse) {
+	for _, plan := range snapshot.offered {
+		if snapshot.held[plan.PlanID] && plan.Name != "" {
+			response.Subscription.Plan = plan.Name
+			response.Subscription.TierName = plan.PlanID
+			return
+		}
 	}
 }
 

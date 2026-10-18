@@ -204,8 +204,12 @@ const (
 
 	PathBillingCurrent = "/billing/current"
 	PathBillingBalance = "/billing/balance"
-	PathUsage          = "/usage"
-	PathClientConfigs  = "/api/v1/client/configs"
+	// PathBillingPreview 列出上游当前投放的套餐（未过滤已持有）。
+	PathBillingPreview = "/billing/preview"
+	// PathBillingClaim 领取套餐，需要人机验证令牌。
+	PathBillingClaim  = "/billing/claim"
+	PathUsage         = "/usage"
+	PathClientConfigs = "/api/v1/client/configs"
 
 	// ── 客户端指纹 ──────────────────────────────────────────────────────────
 
@@ -247,9 +251,22 @@ const (
 	CaptchaRegionHeader = "X-Aliyun-Captcha-Verify-Region"
 )
 
+// client/configs 拉不到验证码配置时的兜底值（prefix / region / scene_id）。
+//
+// 与参考实现 zcode2api/app/constants.py 的 CAPTCHA_DEFAULTS 同源：这三个值是
+// 官方桌面端现行配置，configs 端点不可用时用它们仍能渲染滑块。
+const (
+	captchaFallbackPrefix = "no8xfe"
+	captchaFallbackRegion = "cn"
+	captchaFallbackScene  = "11xygtvd"
+)
+
 // 本文件解析 ZCode 的供应商专属配置。
 
 // ConfigFields 声明 zcode 专属配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
-	return []pluginapi.ConfigField{{Name: "zcode_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"}}
+	return []pluginapi.ConfigField{
+		{Name: "zcode_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"},
+		{Name: "zcode_claim_min_interval", Type: pluginapi.ConfigFieldTypeString, Description: "两次套餐领取之间的最小间隔（Go 时长，如 15s；0 表示不节流）。"},
+	}
 }

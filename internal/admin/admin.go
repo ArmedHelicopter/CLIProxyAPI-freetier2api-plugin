@@ -102,6 +102,8 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "POST", Path: prefix + "/tasks/auto_all", Description: "对全部账号依次执行一键完成任务。"},
 		{Method: "GET", Path: prefix + "/school/status", Description: "开学季活动状态。"},
 		{Method: "POST", Path: prefix + "/keepalive", Description: "手动执行 token 保活。"},
+		{Method: "POST", Path: prefix + "/plans/preview", Description: "查询账号当前可领套餐与人机验证控件参数。"},
+		{Method: "POST", Path: prefix + "/plans/claim", Description: "提交人机验证令牌并领取套餐。"},
 	}
 	for _, spec := range s.tasks.Catalog().ManualSpecs() {
 		if spec.Route == "" {
@@ -190,6 +192,11 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 		return core.OKEnvelope(s.handleTasksAutoAll(rpc))
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/school/status"):
 		return core.OKEnvelope(s.handleSchoolStatus(rpc))
+
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/plans/preview"):
+		return core.OKEnvelope(s.handlePlansPreview(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/plans/claim"):
+		return core.OKEnvelope(s.handlePlansClaim(rpc))
 	}
 	if method == http.MethodPost {
 		if suffix, okSuffix := managementSuffix(rpc.Path, id.ID); okSuffix {

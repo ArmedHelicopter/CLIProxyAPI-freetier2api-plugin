@@ -93,6 +93,25 @@ progress { width: 160px; height: 8px; }
                         background: transparent; color: var(--fg); text-align: left;
                         cursor: pointer; font-size: 13px; }
 .dropdown-menu button:hover { background: var(--bg); color: var(--accent); }
+
+/* ---- 套餐领取弹窗 ---- */
+.modal { position: fixed; inset: 0; z-index: 60; display: none; align-items: center;
+         justify-content: center; padding: 20px; background: rgba(0,0,0,.45); }
+.modal[hidden] { display: none !important; }
+.modal-box { width: 100%; max-width: 620px; max-height: 86vh; overflow: auto;
+             padding: 20px; background: var(--card); border: 1px solid var(--border);
+             border-radius: 8px; box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+.modal-box h2 { margin-top: 0; }
+.plan { padding: 12px; margin: 10px 0; border: 1px solid var(--border);
+        border-radius: 6px; cursor: pointer; }
+.plan:hover { border-color: var(--accent); }
+.plan.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
+.plan-title { font-weight: 600; }
+.plan-grants { margin-top: 6px; font-size: 13px; color: var(--muted); }
+.claim-captcha { min-height: 68px; margin: 12px 0; display: flex;
+                 align-items: center; justify-content: center; }
+.claim-row { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 </style>
 </head>
 <body>
@@ -152,6 +171,25 @@ progress { width: 160px; height: 8px; }
         </div>
         <div class="hint" id="apiKeyHint">请输入从官网获取的 API Key，保存后自动在 auth 目录创建凭证。</div>
       </div>
+
+  <div class="modal" id="claimModal" style="display:none" hidden>
+    <div class="modal-box">
+      <h2 id="claimTitle">套餐领取</h2>
+      <div id="claimPlans" class="muted">正在查询可领套餐…</div>
+      <div class="claim-captcha" id="claimCaptcha"></div>
+      <button id="claimCaptchaBtn" type="button" hidden></button>
+      <div class="hint" id="claimHint"></div>
+      <details id="claimPasteBox" hidden>
+        <summary>验证码脚本加载失败？改用粘贴验证码参数</summary>
+        <input type="text" id="claimVerifyParam" placeholder="粘贴 captchaVerifyParam"
+               style="width:100%;margin-top:8px">
+      </details>
+      <div class="claim-row">
+        <button class="act primary" id="btnClaimConfirm" type="button" disabled>确认领取</button>
+        <button class="act" id="btnClaimCancel" type="button">取消</button>
+      </div>
+    </div>
+  </div>
 
       <div id="accounts"></div>
     </div>
@@ -599,19 +637,31 @@ progress { width: 160px; height: 8px; }
       row.appendChild(el("td", accountDisplay(account)));
       row.appendChild(cellWith(account.disabled ? pill("已禁用", "err") : pill("正常", "ok")));
 
-      // 签到列：如果供应商本身不支持签到（或国际版无活动），显式标注「无签到活动」，避免被误读成未签到
-      var checkin = account.checkin || {};
-      var supportsCheckin = account.supports_checkin;
-      if (supportsCheckin === undefined) {
-        var v = vendorsById[account.vendor_id];
-        supportsCheckin = v ? v.supports_checkin : (account.realm !== "global");
-      }
-      if (!supportsCheckin) {
-        row.appendChild(el("td", "无签到活动", "muted"));
+      // 签到 / 套餐领取列：支持领取的供应商（如 ZCode）展示套餐领取按钮；其余展示签到或「无签到活动」
+      var claimSpec = claimButtonSpec(account);
+      if (claimSpec) {
+        var claimCell = el("td");
+        var claimBtn = el("button", claimSpec.text, "act" + (claimSpec.disabled ? "" : " primary"));
+        claimBtn.type = "button";
+        claimBtn.disabled = claimSpec.disabled;
+        claimBtn.title = claimSpec.title || "";
+        claimBtn.addEventListener("click", function () { openClaimModal(account); });
+        claimCell.appendChild(claimBtn);
+        row.appendChild(claimCell);
       } else {
-        row.appendChild(el("td", checkin.last_date
-          ? (checkin.last_date + (checkin.streak ? " · 连续 " + checkin.streak + " 天" : ""))
-          : "未签到"));
+        var checkin = account.checkin || {};
+        var supportsCheckin = account.supports_checkin;
+        if (supportsCheckin === undefined) {
+          var v = vendorsById[account.vendor_id];
+          supportsCheckin = v ? v.supports_checkin : (account.realm !== "global");
+        }
+        if (!supportsCheckin) {
+          row.appendChild(el("td", "无签到活动", "muted"));
+        } else {
+          row.appendChild(el("td", checkin.last_date
+            ? (checkin.last_date + (checkin.streak ? " · 连续 " + checkin.streak + " 天" : ""))
+            : "未签到"));
+        }
       }
 
       // 额度列：优先使用账号自带的缓存额度，或多键匹配避免格式差异
@@ -644,7 +694,7 @@ progress { width: 160px; height: 8px; }
       var rt = account.refreshed_at ? new Date(account.refreshed_at).toLocaleString() : "-";
       row.appendChild(el("td", rt, "muted"));
 
-      // 操作列
+      // 操作列（仅保留删除）
       var actionCell = el("td");
       var deleteBtn = el("button", "删除", "act danger");
       deleteBtn.type = "button";
@@ -789,6 +839,212 @@ progress { width: 160px; height: 8px; }
     }).catch(function (err) {
       if (!quiet) banner("err", err.message, 8000);
       throw err;
+    });
+  }
+
+  // ---- 套餐领取 ----
+
+  // claimContext 是当前弹窗的上下文（弹窗同一时刻只有一个账号在办理）。
+  var claimContext = null;
+
+  // claimButtonSpec 依据账号的领取状态给出按钮文案与可用性。
+  //
+  // 状态来自额度查询的附带结果 accounts[].claim：额度查询本来就打
+  // billing/current 与 billing/preview，控制台每次进页面都会刷一次额度，
+  // 所以这里不需要额外的轮询端点。
+  function claimButtonSpec(account) {
+    if (!account.supports_claim) return null;
+    var claim = account.claim || {};
+    if (claim.error) return { text: "套餐领取", disabled: false, title: claim.error };
+    // 未检测过（初次加载）或有待领套餐
+    if (!claim.checked_at || claim.claimable > 0) {
+      return { text: "套餐领取", disabled: false, title: claim.claimable ? (claim.claimable + " 个套餐可领") : "点击查询可领套餐" };
+    }
+    // 已全部领取
+    return { text: "已领取", disabled: true, title: "已领取当前全部套餐" };
+  }
+
+  // openClaimModal 打开领取弹窗并实时拉取可领套餐。
+  function openClaimModal(account) {
+    var modal = document.getElementById("claimModal");
+    var plans = document.getElementById("claimPlans");
+    var captchaBox = document.getElementById("claimCaptcha");
+    var hint = document.getElementById("claimHint");
+    var pasteBox = document.getElementById("claimPasteBox");
+    document.getElementById("claimTitle").textContent = "套餐领取 · " + accountDisplay(account);
+    plans.textContent = "正在查询可领套餐…";
+    captchaBox.textContent = "";
+    hint.textContent = "";
+    pasteBox.hidden = true;
+    document.getElementById("claimVerifyParam").value = "";
+    document.getElementById("btnClaimConfirm").disabled = true;
+
+    // 显式展现弹窗
+    modal.removeAttribute("hidden");
+    modal.hidden = false;
+    modal.style.display = "flex";
+
+    claimContext = { account: account, planId: "", verifyParam: "", captcha: null };
+    api("POST", "/plans/preview", { account_id: account.auth_id || account.auth_index })
+      .then(function (data) {
+        if (!claimContext || claimContext.account !== account) return;
+        if (!data) return;
+        if (!data.ok) {
+          plans.textContent = data.message || "查询失败";
+          return;
+        }
+        if (!data.plans || !data.plans.length) {
+          plans.textContent = "已领取当前全部套餐，暂无新的可领活动。";
+          return;
+        }
+        renderClaimPlans(data.plans);
+        if (data.captcha) {
+          setupClaimCaptcha(data.captcha);
+        } else {
+          document.getElementById("btnClaimConfirm").disabled = false;
+        }
+      })
+      .catch(function (err) {
+        if (!claimContext || claimContext.account !== account) return;
+        plans.textContent = err.message || "查询套餐失败";
+      });
+  }
+
+  // closeClaimModal 关闭弹窗并丢弃上下文（防止下次打开时用上一次的令牌）。
+  function closeClaimModal() {
+    var modal = document.getElementById("claimModal");
+    modal.setAttribute("hidden", "");
+    modal.hidden = true;
+    modal.style.display = "none";
+    document.getElementById("claimCaptcha").textContent = "";
+    claimContext = null;
+  }
+
+  // renderClaimPlans 列出可领套餐，单选，默认选中优先级最高（列表首个）。
+  function renderClaimPlans(plans) {
+    var host = document.getElementById("claimPlans");
+    host.textContent = "";
+    plans.forEach(function (plan, index) {
+      var card = el("div", null, "plan" + (index === 0 ? " selected" : ""));
+      card.appendChild(el("div", plan.name || plan.plan_id, "plan-title"));
+      if (plan.description) card.appendChild(el("div", plan.description, "muted"));
+      if (plan.grants && plan.grants.length) {
+        card.appendChild(el("div", plan.grants.map(function (g) {
+          return g.model + " " + formatGrantUnits(g.units) + (g.period ? "（" + g.period + "）" : "");
+        }).join(" · "), "plan-grants"));
+      }
+      card.addEventListener("click", function () {
+        var all = host.querySelectorAll(".plan");
+        for (var i = 0; i < all.length; i++) all[i].classList.remove("selected");
+        card.classList.add("selected");
+        claimContext.planId = plan.plan_id;
+      });
+      host.appendChild(card);
+      if (index === 0) claimContext.planId = plan.plan_id;
+    });
+  }
+
+  // formatGrantUnits 把 token 额度写成可读形式（12.5万 tokens / 1.2亿 tokens）。
+  function formatGrantUnits(units) {
+    if (!units || units <= 0) return "0";
+    if (units >= 1e8) return trimZero((units / 1e8).toFixed(2)) + "亿 tokens";
+    if (units >= 1e4) return trimZero((units / 1e4).toFixed(1)) + "万 tokens";
+    return Math.round(units) + " tokens";
+  }
+
+  function trimZero(text) {
+    return text.indexOf(".") >= 0 ? text.replace(/0+$/, "").replace(/.$/, "") : text;
+  }
+
+  // setupClaimCaptcha 在页面里渲染阿里云无痕验证控件。
+  //
+  // 先试「无感」验证（startTracelessVerification）：风控判定通过时用户全程无感；
+  // 判定不通过则 SDK 自行弹出滑块，用户拖一次即可。成功后回调给出
+  // captchaVerifyParam，由插件转发给上游。
+  function setupClaimCaptcha(config) {
+    var hint = document.getElementById("claimHint");
+    if (!config.scene_id) {
+      hint.textContent = "上游未下发人机验证参数，无法在页面内完成领取";
+      return;
+    }
+    loadClaimSdk().then(function () {
+      window.AliyunCaptchaConfig = { region: config.region, prefix: config.prefix };
+      window.initAliyunCaptcha({
+        SceneId: config.scene_id,
+        mode: "popup",
+        language: "zh-CN",
+        showErrorTip: false,
+        element: "#claimCaptcha",
+        button: "#claimCaptchaBtn",
+        getInstance: function (inst) {
+          try {
+            if (inst.startTracelessVerification) inst.startTracelessVerification();
+          } catch (e) { /* 无感入口不可用时退回滑块 */ }
+        },
+        success: function (param) {
+          if (!claimContext) return;
+          claimContext.verifyParam = (typeof param === "string" ? param : (param && param.captchaVerifyParam) || "");
+          claimContext.captcha = config;
+          hint.textContent = "✓ 人机验证已通过，请点击确认领取。";
+          document.getElementById("btnClaimConfirm").disabled = false;
+        },
+        fail: function () {
+          hint.textContent = "未通过无感验证，请按提示完成滑块。";
+        },
+        onError: function () {
+          hint.textContent = "人机验证出错，请重试。";
+        }
+      });
+      hint.textContent = "请完成人机验证（多数情况下无感通过）。";
+    }).catch(function (err) {
+      // CDN 不可达时降级成粘贴：总比让用户无路可走好。
+      hint.textContent = err.message + "，可展开下方粘贴验证码参数。";
+      document.getElementById("claimPasteBox").hidden = false;
+    });
+  }
+
+  // loadClaimSdk 懒加载阿里云验证码脚本，只在真的要领时才拉。
+  function loadClaimSdk() {
+    if (typeof window.initAliyunCaptcha === "function") return Promise.resolve();
+    return new Promise(function (resolve, reject) {
+      var s = document.createElement("script");
+      s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
+      s.onload = resolve;
+      s.onerror = function () { reject(new Error("验证码脚本加载失败")); };
+      document.head.appendChild(s);
+    });
+  }
+
+  // submitClaim 提交领取。
+  function submitClaim() {
+    if (!claimContext) return;
+    var pasted = (document.getElementById("claimVerifyParam").value || "").trim();
+    var param = claimContext.verifyParam || pasted;
+    if (!param) {
+      banner("warn", "请先完成人机验证");
+      return;
+    }
+    var btn = document.getElementById("btnClaimConfirm");
+    btn.disabled = true;
+    btn.textContent = "领取中…";
+    api("POST", "/plans/claim", {
+      account_id: claimContext.account.auth_id || claimContext.account.auth_index,
+      plan_id: claimContext.planId,
+      verify_param: param,
+      verify_region: (claimContext.captcha && claimContext.captcha.region) || ""
+    }).then(function (data) {
+      btn.textContent = "确认领取";
+      btn.disabled = false;
+      if (!data) return;
+      banner(data.ok ? "ok" : "err", data.message || (data.ok ? "领取成功" : "领取失败"));
+      if (!data.ok) return;
+      closeClaimModal();
+      // 领取后的额度与「已领取」状态由插件在同一次刷新里写好，重拉一次即可置灰。
+      loadStatus(true).catch(function () { });
+    }).catch(function (err) {
+      btn.textContent = "确认领取";
+      btn.disabled = false;
+      banner("err", err.message);
     });
   }
 
@@ -1333,6 +1589,19 @@ progress { width: 160px; height: 8px; }
   });
 
   // 主「刷新」按钮执行 Token 续期保活，完成后刷新页面状态以展示最新文件修改时间。
+  document.getElementById("btnClaimCancel").addEventListener("click", closeClaimModal);
+  document.getElementById("btnClaimConfirm").addEventListener("click", submitClaim);
+  document.getElementById("claimModal").addEventListener("click", function (event) {
+    if (event.target === this) closeClaimModal();
+  });
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") closeClaimModal();
+  });
+  document.getElementById("claimVerifyParam").addEventListener("input", function () {
+    if (this.value.trim()) {
+      document.getElementById("btnClaimConfirm").disabled = false;
+    }
+  });
   document.getElementById("btnRefresh").addEventListener("click", function () {
     var btn = this;
     btn.disabled = true;

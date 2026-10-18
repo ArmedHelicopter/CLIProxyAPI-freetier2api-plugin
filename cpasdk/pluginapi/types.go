@@ -1639,6 +1639,22 @@ type QuotaFetchResponse struct {
 	Summary            []QuotaMetric      `json:"summary,omitempty"`
 	ServerTimeOffsetMs int64              `json:"serverTimeOffsetMs,omitempty"`
 	Groups             []QuotaGroup       `json:"groups,omitempty"`
+
+	// Claim 是活动套餐的领取状态，仅投放套餐的供应商返回。
+	//
+	// 搭在额度响应里而不是单独端点：额度查询顺带就能拿到，页面刷新额度即刷新
+	// 领取状态，无需额外轮询。
+	Claim *ClaimStatus `json:"claim,omitempty"`
+}
+
+// ClaimStatus 是账号的活动套餐领取状态。
+type ClaimStatus struct {
+	// Available 是上游当前对该账号投放的套餐数。
+	Available int `json:"available"`
+	// Claimable 是其中尚未领取的数量；为 0 时页面把按钮置灰成「已领取」。
+	Claimable int `json:"claimable"`
+	// Error 是本次探测失败的原因（成功时为空）。
+	Error string `json:"error,omitempty"`
 }
 
 // UnmarshalJSON supports both camelCase and snake_case field names.
