@@ -41,6 +41,8 @@ type registration struct {
 }
 
 type registrationCapabilities struct {
+	ResponseBeforeTranslator bool `json:"response_before_translator"`
+
 	ModelProvider         bool     `json:"model_provider"`
 	AuthProvider          bool     `json:"auth_provider"`
 	Executor              bool     `json:"executor"`
@@ -90,6 +92,8 @@ func (a *App) HandleMethod(method string, request []byte) ([]byte, error) {
 		return a.handleExecutorCountTokens(request)
 	case pluginabi.MethodExecutorHTTPRequest:
 		return a.handleExecutorHTTPRequest(request)
+	case pluginabi.MethodResponseNormalizeBefore:
+		return a.handleResponseNormalizeBefore(request)
 
 	case pluginabi.MethodQuotaIdentifier:
 		return core.OKEnvelope(identifierResponse{Identifier: providerKey})
@@ -182,6 +186,8 @@ func (a *App) Registration() registration {
 			ConfigFields:     a.configFields(),
 		},
 		Capabilities: registrationCapabilities{
+			ResponseBeforeTranslator: true,
+
 			ModelProvider:         true,
 			AuthProvider:          true,
 			Executor:              true,

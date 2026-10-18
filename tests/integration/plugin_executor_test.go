@@ -146,9 +146,9 @@ func TestExecutorStreamEmitsNormalizedFrames(t *testing.T) {
 		if strings.Contains(chunk, "session_id") {
 			t.Fatalf("upstream private field leaked to downstream: %s", chunk)
 		}
-		if !strings.HasPrefix(chunk, "data:") {
-			// chat-completions SSE 分片必须符合标准 SSE 规范（带 data: 前缀）。
-			t.Fatalf("chat-completions chunk must have data: prefix, got %q", chunk)
+		if !json.Valid([]byte(chunk)) {
+			// 宿主负责 SSE 信封，executor 只投递裸 JSON。
+			t.Fatalf("chat-completions chunk must be bare JSON, got %q", chunk)
 		}
 	}
 	// 第二帧缺 id，应被续传为第一帧的 id。

@@ -169,9 +169,9 @@ type hostStreamSink struct {
 	cancelStream context.CancelFunc
 }
 
-// Emit 投递一个分片（确保符合 SSE 传输协议：以 data: 开头，以 \n\n 结尾）。
+// Emit 只投递裸数据载荷：宿主的 OpenAI handler 负责 data: 前缀、空行与 [DONE]。
 func (s *hostStreamSink) Emit(payload []byte) error {
-	frame := formatSSEChunk(payload)
+	frame := executorStreamPayload(payload)
 	if len(frame) == 0 {
 		return nil
 	}
@@ -183,8 +183,38 @@ func (s *hostStreamSink) Emit(payload []byte) error {
 	return nil
 }
 
-// formatSSEChunk 确保分片符合标准 SSE 格式（data: <json>\n\n），
-// 满足宿主转换器（如 ConvertOpenAIResponseToClaude）对 data: 前缀的校验要求。
+// executorStreamPayload 把单个供应商分片归一为宿主 executor 接受的裸载荷。
+// SSE 控制行不能当作 data 投递，否则心跳会变成不可解析的 data: : heartbeat。
+func executorStreamPayload(payload []byte) []byte {
+	payload = bytes.TrimSpace(payload)
+	if bytes.HasPrefix(payload, []byte("data:")) {
+		payload = bytes.TrimSpace(payload[len("data:"):])
+	}
+	if len(payload) == 0 || bytes.Equal(payload, []byte("[DONE]")) ||
+		bytes.HasPrefix(payload, []byte(":")) ||
+		bytes.HasPrefix(payload, []byte("event:")) ||
+		bytes.HasPrefix(payload, []byte("id:")) ||
+		bytes.HasPrefix(payload, []byte("retry:")) {
+		return nil
+	}
+	return payload
+}
+
+// handleResponseNormalizeBefore 仅在跨协议流式转换前补上转换器需要的 SSE 信封。
+// 同格式 OpenAI 响应直接交给 handler，不能在 executor 出口提前包装。
+func (a *App) handleResponseNormalizeBefore(request []byte) ([]byte, error) {
+	var req pluginapi.ResponseTransformRequest
+	if errDecode := decodeRequest(request, &req); errDecode != nil {
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+	}
+	body := req.Body
+	if req.Stream && isChatFormat(req.FromFormat) && req.ToFormat != "" && !isChatFormat(req.ToFormat) && json.Valid(bytes.TrimSpace(body)) {
+		body = formatSSEChunk(body)
+	}
+	return core.OKEnvelope(pluginapi.PayloadResponse{Body: body})
+}
+
+// formatSSEChunk 只供转换前适配使用；executor 分片不能调用它。
 func formatSSEChunk(payload []byte) []byte {
 	trimmed := bytes.TrimRight(payload, "\r\n ")
 	if len(trimmed) == 0 {
