@@ -1,4 +1,4 @@
-package tasks
+package workbuddy
 
 // 本文件测试事件链构造与指纹注入。
 //
@@ -6,21 +6,20 @@ package tasks
 // （上报仍返回 200），因此值得用测试把关键字段锁住。
 
 import (
-	"freetier2api-plugin/internal/vendors/workbuddy"
 	"testing"
 	"time"
 )
 
-// testCredential 构造一个测试凭证。
-func testCredential(uid string) *workbuddy.Credential {
-	credential := &workbuddy.Credential{
+// testTaskCredential 构造一个测试凭证。
+func testTaskCredential(uid string) *Credential {
+	credential := &Credential{
 		AccessToken:  "at",
 		RefreshToken: "rt",
 		UID:          uid,
 		Nickname:     "测试账号",
 		Domain:       "www.codebuddy.cn",
 	}
-	credential.SetRealm(workbuddy.RegionCN)
+	credential.SetRealm(RegionCN)
 	return credential
 }
 
@@ -182,7 +181,7 @@ func TestMiniExpertUseEventShape(t *testing.T) {
 
 // TestApplyDesktopFingerprintInjectsCommonFields 验证指纹注入。
 func TestApplyDesktopFingerprintInjectsCommonFields(t *testing.T) {
-	credential := testCredential("uid-1")
+	credential := testTaskCredential("uid-1")
 	events := ApplyDesktopFingerprint(credential, []map[string]any{
 		{"eventCode": "x", "userId": "business-wins"},
 	})
@@ -204,8 +203,8 @@ func TestApplyDesktopFingerprintInjectsCommonFields(t *testing.T) {
 
 // TestFingerprintStability 验证设备指纹的稳定性与隔离性。
 func TestFingerprintStability(t *testing.T) {
-	credentialA := testCredential("uid-a")
-	credentialB := testCredential("uid-b")
+	credentialA := testTaskCredential("uid-a")
+	credentialB := testTaskCredential("uid-b")
 
 	machineA := fingerprint(credentialA, "machine")
 	if machineA != fingerprint(credentialA, "machine") {

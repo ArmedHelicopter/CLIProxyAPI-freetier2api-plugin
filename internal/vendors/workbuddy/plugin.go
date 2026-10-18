@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/core"
 )
 
 var (
@@ -158,30 +157,4 @@ func FormatUnixTime(seconds int64) string {
 		return ""
 	}
 	return time.Unix(seconds, 0).UTC().Format(time.RFC3339)
-}
-
-var (
-	taskSourceMu sync.RWMutex
-	taskSource   func(region Region) []core.Task
-)
-
-// SetTaskSource 注入任务动作清单来源（由根层在注册时调用）。
-//
-// 任务执行需要账户遍历、并发锁与状态记录，属于根层编排职责；这里只取
-// 「本区域暴露哪些任务」给控制台展示。
-func SetTaskSource(source func(region Region) []core.Task) {
-	taskSourceMu.Lock()
-	taskSource = source
-	taskSourceMu.Unlock()
-}
-
-// TaskActions 返回某区域可暴露的任务动作。
-func TaskActions(region Region) []core.Task {
-	taskSourceMu.RLock()
-	source := taskSource
-	taskSourceMu.RUnlock()
-	if source == nil {
-		return nil
-	}
-	return source(region)
 }
