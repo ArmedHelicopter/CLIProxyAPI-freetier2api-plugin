@@ -91,6 +91,8 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	if errModels != nil {
 		return nil, errModels
 	}
+	// 上游只给 ID；上下文/输出/档位等元数据由 models.dev 目录按 ID 合并。
+	enrichWithModelsDev(ctx, models)
 	return v.modelsToPluginAPI(models), nil
 }
 
@@ -114,10 +116,14 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 		logger.Info("opencodezen: model probe failed: %v", errModels)
 		return nil, nil
 	}
+	enrichWithModelsDev(ctx, models)
 	return v.modelsToPluginAPI(models), nil
 }
 
 // modelsToPluginAPI 把上游模型条目转成宿主契约类型。
+//
+// 元数据字段可能已被 models.dev 目录补全（见 modelsdev.go）；仍缺的
+// 上下文/输出上限在这里走通用兜底。
 func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		id := strings.TrimSpace(model.ID)
@@ -136,12 +142,18 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 		if maxOutput == 0 {
 			maxOutput = core.DefaultMaxOutputTokens
 		}
+		description := strings.TrimSpace(model.Description)
+		if description == "" {
+			description = "OpenCode ZEN 上游模型"
+		}
 		return core.ModelDescriptor{
 			ID:                 id,
 			Name:               name,
-			Description:        "OpenCode ZEN 上游模型",
+			Description:        description,
 			ContextLength:      contextWindow,
 			MaxOutputTokens:    maxOutput,
+			Efforts:            model.Efforts,
+			SupportsImages:     model.SupportsImages,
 			SupportsTools:      model.SupportsTools,
 			CanDisableThinking: !model.IsReasoning,
 		}, true

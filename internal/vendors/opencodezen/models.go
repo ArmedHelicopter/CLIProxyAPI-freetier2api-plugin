@@ -2,9 +2,11 @@ package opencodezen
 
 // 本文件实现 OpenCode ZEN 的模型清单获取。
 //
-// ZEN 的模型清单**完全动态**：上游 GET {base}/v1/models 返回可用模型。
-// 上游网关项目没有任何硬编码清单，本插件也不编一份——编出来的清单一旦
-// 与上游不一致，用户会看到调用必失败的模型。
+// ZEN 的模型清单**完全动态**：上游 GET {base}/v1/models 返回可用模型
+// （实测只有 ID，没有元数据），官方展示用的上下文/输出/推理档位来自
+// models.dev 目录，由 modelsdev.go 按 ID 合并。上游网关项目没有任何
+// 硬编码清单，本插件也不编一份——编出来的清单一旦与上游不一致，用户
+// 会看到调用必失败的模型。
 //
 // 代价是探测需要一把有效的 API key。探测失败时返回空清单而不是兜底表：
 // 空清单只会让 /v1/models 少几个条目（页面会提示去刷新），而一份编造的
@@ -32,6 +34,8 @@ type Model struct {
 	ID string
 	// Name 是展示名（上游没给时用 ID）。
 	Name string
+	// Description 是模型描述（来自 models.dev 目录）。
+	Description string
 	// ContextWindow 是上下文窗口（上游给了才有）。
 	ContextWindow int64
 	// MaxOutputTokens 是输出上限（上游给了才有）。
@@ -40,6 +44,10 @@ type Model struct {
 	SupportsTools bool
 	// IsReasoning 报告是否是推理模型。
 	IsReasoning bool
+	// SupportsImages 报告是否支持图片输入（来自 models.dev 目录）。
+	SupportsImages bool
+	// Efforts 是可选的推理档位（来自 models.dev 目录）。
+	Efforts []string
 }
 
 // FetchModels 拉取上游模型清单。

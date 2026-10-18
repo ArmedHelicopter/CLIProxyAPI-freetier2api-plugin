@@ -1,0 +1,224 @@
+package opencodezen
+
+// 本文件实现 OpenCode ZEN 的模型元数据增强。
+//
+// 上游 GET {base}/v1/models 只返回模型 ID（实测无任何元数据字段），而
+// 官方 OpenCode 客户端展示「上下文窗口 / 输出上限 / 推理档位」的数据源
+// 是 models.dev 公开目录（https://models.dev/api.json）：其中 provider
+// "opencode" 的模型 ID 与 ZEN /v1/models 一一对应，且带完整元数据。
+//
+// 策略：
+//   - ZEN /v1/models 仍然决定「哪些模型可用」（动态探测，需要 key）；
+//   - models.dev 只补「长什么样」（元数据，公开、无需认证）；
+//   - 目录拉取失败不影响模型列表：保留原字段，由 adapter 走兜底值。
+//   - 目录按 TTL 缓存：ModelsForAuth 会按凭证逐个触发探测，不打缓存会
+//     让每次凭证刷新都去拉一遍几 MB 的目录。
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"time"
+
+	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/logger"
+)
+
+const (
+	// modelsDevURL 是 models.dev 的公开模型目录。
+	modelsDevURL = "https://models.dev/api.json"
+	// modelsDevTimeout 是目录请求的上限。
+	modelsDevTimeout = 15 * time.Second
+	// modelsDevCacheTTL 是成功结果的缓存时长。
+	modelsDevCacheTTL = time.Hour
+	// modelsDevNegativeTTL 是失败结果的缓存时长：探测按凭证逐个触发，
+	// 短负缓存避免上游抖动时把失败放大成目录接口的请求风暴。
+	modelsDevNegativeTTL = 5 * time.Minute
+	// modelsDevProvider 是目录中对应 ZEN 的 provider ID。
+	modelsDevProvider = "opencode"
+)
+
+// modelsDevEntry 是 models.dev 目录里的单个模型条目。
+type modelsDevEntry struct {
+	Name             string `json:"name"`
+	Description      string `json:"description"`
+	Reasoning        bool   `json:"reasoning"`
+	ToolCall         bool   `json:"tool_call"`
+	ReasoningOptions []struct {
+		Type   string   `json:"type"`
+		Values []string `json:"values"`
+	} `json:"reasoning_options"`
+	Modalities struct {
+		Input []string `json:"input"`
+	} `json:"modalities"`
+	Limit struct {
+		Context int64 `json:"context"`
+		Output  int64 `json:"output"`
+	} `json:"limit"`
+}
+
+// modelsDevCatalog 是 provider 下的模型 ID → 条目表。
+type modelsDevCatalog map[string]modelsDevEntry
+
+// modelsDevCache 是目录的进程内缓存（成功与失败分开计时）。
+var modelsDevCache struct {
+	sync.Mutex
+	catalog    modelsDevCatalog
+	validUntil time.Time
+	failedNext time.Time
+}
+
+// fetchModelsDevCatalog 拉取（或命中缓存）models.dev 目录。
+func fetchModelsDevCatalog(ctx context.Context) (modelsDevCatalog, error) {
+	now := time.Now()
+	modelsDevCache.Lock()
+	if modelsDevCache.catalog != nil && now.Before(modelsDevCache.validUntil) {
+		catalog := modelsDevCache.catalog
+		modelsDevCache.Unlock()
+		return catalog, nil
+	}
+	failing := now.Before(modelsDevCache.failedNext)
+	modelsDevCache.Unlock()
+	if failing {
+		return nil, fmt.Errorf("models.dev catalog recently failed; negative cache")
+	}
+
+	catalog, errFetch := loadModelsDevCatalog(ctx)
+	now = time.Now()
+	modelsDevCache.Lock()
+	if errFetch != nil {
+		modelsDevCache.failedNext = now.Add(modelsDevNegativeTTL)
+		modelsDevCache.Unlock()
+		return nil, errFetch
+	}
+	modelsDevCache.catalog = catalog
+	modelsDevCache.validUntil = now.Add(modelsDevCacheTTL)
+	modelsDevCache.Unlock()
+	return catalog, nil
+}
+
+// loadModelsDevCatalog 发起一次目录请求并解析出 ZEN 对应的 provider。
+func loadModelsDevCatalog(ctx context.Context) (modelsDevCatalog, error) {
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, modelsDevURL, nil)
+	if errReq != nil {
+		return nil, fmt.Errorf("build models.dev request: %w", errReq)
+	}
+	req.Header.Set("Accept", "application/json")
+
+	resp, errDo := hostbridge.Client(ctx, modelsDevTimeout).Do(req)
+	if errDo != nil {
+		return nil, fmt.Errorf("fetch models.dev: %w", errDo)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	if errRead != nil {
+		return nil, fmt.Errorf("read models.dev response: %w", errRead)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("models.dev status %d", resp.StatusCode)
+	}
+
+	return parseModelsDevCatalog(body)
+}
+
+// parseModelsDevCatalog 解析目录响应并取出 ZEN 对应的 provider。
+func parseModelsDevCatalog(body []byte) (modelsDevCatalog, error) {
+	var payload map[string]struct {
+		Models modelsDevCatalog `json:"models"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		return nil, fmt.Errorf("parse models.dev response: %w", errUnmarshal)
+	}
+	provider, okProvider := payload[modelsDevProvider]
+	if !okProvider || len(provider.Models) == 0 {
+		// 目录里还没有 ZEN provider 是可恢复状态：返回空表而不是报错，
+		// 让调用方按「无元数据」继续走兜底。
+		return modelsDevCatalog{}, nil
+	}
+	return provider.Models, nil
+}
+
+// enrichWithModelsDev 用 models.dev 目录补全模型元数据。
+//
+// 只在字段为空时填充（ZEN /v1/models 未来若返回元数据则优先）；目录不可
+// 用时只记一条 info，模型列表本身照常返回。
+func enrichWithModelsDev(ctx context.Context, models []Model) {
+	catalog, errCatalog := fetchModelsDevCatalog(ctx)
+	if errCatalog != nil {
+		logger.Info("opencodezen: models.dev catalog unavailable, keep fallback metadata: %v", errCatalog)
+		return
+	}
+	applyModelsDevCatalog(models, catalog)
+}
+
+// applyModelsDevCatalog 把目录条目合并进模型清单（纯函数，只填空字段）。
+func applyModelsDevCatalog(models []Model, catalog modelsDevCatalog) {
+	for i := range models {
+		entry, okEntry := catalog[models[i].ID]
+		if !okEntry {
+			continue
+		}
+		model := &models[i]
+		if model.ContextWindow == 0 && entry.Limit.Context > 0 {
+			model.ContextWindow = entry.Limit.Context
+		}
+		if model.MaxOutputTokens == 0 && entry.Limit.Output > 0 {
+			model.MaxOutputTokens = entry.Limit.Output
+		}
+		if !model.SupportsTools && entry.ToolCall {
+			model.SupportsTools = true
+		}
+		if !model.IsReasoning && entry.Reasoning {
+			model.IsReasoning = true
+		}
+		if len(model.Efforts) == 0 {
+			model.Efforts = effortsFromModelsDev(entry)
+		}
+		if !model.SupportsImages {
+			model.SupportsImages = hasImageInput(entry.Modalities.Input)
+		}
+		if (model.Name == "" || model.Name == model.ID) && entry.Name != "" {
+			model.Name = entry.Name
+		}
+		if model.Description == "" && entry.Description != "" {
+			model.Description = entry.Description
+		}
+	}
+}
+
+// effortsFromModelsDev 从目录的 reasoning_options 里取 effort 档位。
+//
+// type=effort 的 values 即官方展示的推理档位（如 low/high/max），顺序保留。
+func effortsFromModelsDev(entry modelsDevEntry) []string {
+	var efforts []string
+	seen := make(map[string]bool)
+	for _, option := range entry.ReasoningOptions {
+		if option.Type != "effort" {
+			continue
+		}
+		for _, value := range option.Values {
+			trimmed := strings.TrimSpace(value)
+			if trimmed == "" || seen[trimmed] {
+				continue
+			}
+			seen[trimmed] = true
+			efforts = append(efforts, trimmed)
+		}
+	}
+	return efforts
+}
+
+// hasImageInput 判断目录的输入模态是否含图片。
+func hasImageInput(modalities []string) bool {
+	for _, modality := range modalities {
+		if strings.EqualFold(modality, "image") {
+			return true
+		}
+	}
+	return false
+}

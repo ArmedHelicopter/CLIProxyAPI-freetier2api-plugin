@@ -172,7 +172,17 @@
 | `internal/vendors/codearts/catalog.go` | 内置模型探测与限时福利模型目录 | 区分内置与限时福利模型 |
 | `internal/vendors/codearts/checkin.go` | 限时免费福利套餐领取接口 | 自动领取活动配额 |
 
-## 11. 本插件的许可
+## 11. models.dev（模型元数据目录）
+
+OpenCode ZEN 的上游模型接口只返回模型 ID，本插件展示用的上下文窗口、输出
+上限、推理档位、工具调用等元数据来自 models.dev 公开目录：
+
+- 仓库：https://github.com/anomalyco/models.dev（原 sst/models.dev）
+- 站点：https://models.dev
+- 许可：**MIT**。本插件运行时通过 GET https://models.dev/api.json 读取数据
+  （provider "opencode"），不做任何数据再分发，仅在原仓库许可条款下使用。
+
+## 12. 本插件的许可
 
 **GPL-3.0**。WorkBuddy 部分源自 MIT 的 `workbuddy2api-panel`（可并入 GPL），
 Qoder 部分源自 **GPL-3.0** 的 `qoder2api` / QCCG，因此整体必须以 GPL-3.0 分发。
