@@ -1,11 +1,10 @@
 package main
 
-// 本文件实现 auth provider 能力：识别凭证文件、解析、刷新。
+// 本文件实现 auth provider 能力：
+//   - 凭证识别/解析/刷新与登录分发；
+//   - 续期后的凭证合并写回（宿主热更新 + 磁盘兜底）。
 //
-// 与宿主的契约要点：宿主判断「这个凭证能不能刷新」看的是 Metadata 里的
-// refresh_token（sdk/cliproxy/auth 的 authHasOAuthMetadata）。没有它，
-// /auth-files/refresh 与自动刷新循环都会跳过该账号——OAuth 账号的
-// access token 过期后就永远不会被续期。因此 refresh_token 必须放进 Metadata。
+// 登录协议与续期链路由各供应商实现；根层只做路由、错误分类与状态码映射。
 
 import (
 	"context"

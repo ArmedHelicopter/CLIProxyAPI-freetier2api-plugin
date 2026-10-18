@@ -1,12 +1,10 @@
 package main
 
-// 本文件声明 CPA 插件宿主的 C ABI。
+// 本文件声明 CPA 插件宿主的 C ABI 与宿主回调的 CGO 实现。
 //
-// 宿主在 dlopen 之后调用 cliproxy_plugin_init 传入两个函数表：
-//   - cliproxy_host_api：宿主提供给插件的能力（发起回调、释放缓冲区）；
-//   - cliproxy_plugin_api：插件回填给宿主的能力（方法调用、释放缓冲区、关闭）。
-//
-// 结构体布局必须与宿主 sdk/pluginabi 的实现逐字节一致，否则初始化即崩。
+// 宿主在 dlopen 之后调用 cliproxy_plugin_init 传入两个函数表；
+// 之后的每次 RPC 走 cliproxyPluginCall，插件发起的宿主回调走注释下方
+// 的 nativeHostCallScoped。结构体布局必须与宿主 sdk/pluginabi 逐字节一致。
 
 /*
 #include "bridge.h"
@@ -14,6 +12,8 @@ package main
 import "C"
 
 import (
+	"encoding/json"
+	"fmt"
 	"time"
 	"unsafe"
 
@@ -117,3 +117,49 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 // main 是 c-shared 构建模式的硬性要求：即使产出的是动态库，
 // Go 的 main 包仍必须存在一个 main 函数。它永远不会被调用。
 func main() {}
+
+// nativeHostCallScoped 是宿主回调的真实实现（由 hostabi.Configure 注入）。
+func nativeHostCallScoped(callbackID string, method string, payload any) (json.RawMessage, error) {
+	rawPayload, errMarshal := hostabi.MarshalPayload(callbackID, payload)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("%s: %w", method, errMarshal)
+	}
+	cMethod := C.CString(method)
+	defer C.free(unsafe.Pointer(cMethod))
+
+	var response C.cliproxy_buffer
+	var requestPtr *C.uint8_t
+	if len(rawPayload) > 0 {
+		cPayload := C.CBytes(rawPayload)
+		if cPayload == nil {
+			return nil, fmt.Errorf("%s: allocate host callback payload", method)
+		}
+		defer C.free(cPayload)
+		requestPtr = (*C.uint8_t)(cPayload)
+	}
+
+	callCode := C.call_host_api(cMethod, requestPtr, C.size_t(len(rawPayload)), &response)
+	var rawResponse []byte
+	if response.ptr != nil && response.len > 0 {
+		rawResponse = C.GoBytes(response.ptr, C.int(response.len))
+	}
+	if response.ptr != nil {
+		C.free_host_buffer(response.ptr, response.len)
+	}
+	if len(rawResponse) == 0 {
+		return nil, fmt.Errorf("%s: host callback returned no response, code=%d", method, int(callCode))
+	}
+	result, errDecode := hostabi.DecodeEnvelope(rawResponse)
+	if errDecode != nil {
+		return nil, fmt.Errorf("%s: %w", method, errDecode)
+	}
+	if callCode != 0 {
+		return nil, fmt.Errorf("%s: host callback returned code=%d", method, int(callCode))
+	}
+	return result, nil
+}
+
+// init 注入 CGO 实现：之后 root 与 internal 包统一走 hostabi.Call。
+func init() {
+	hostabi.Configure(nativeHostCallScoped)
+}

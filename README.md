@@ -42,16 +42,15 @@
 根层只做 ABI 翻译与进程级编排，领域规则全部在 internal。
 
 ```
-package main                    纯 ABI 适配层（CGO 入口、注册、能力分发、任务队列）
-  ├─ main.go / cgo_bridge.go      cliproxy_plugin_init 与 RPC 总入口
-  ├─ vendor_register.go           唯一的供应商注册点（composition root）
-  ├─ hostcall.go / hostbridge.go  宿主 RPC 与 core.Host 端口实现
-  ├─ lifecycle.go                 后台循环与在途流的生命周期
+package main                    纯 ABI 适配层（8 个文件）
+  ├─ main.go                      插件身份、RPC 方法分发、注册响应、供应商注册表
+  ├─ cgo.go                       C ABI（cliproxy_plugin_init/call）与宿主回调
+  ├─ host.go                      core.Host 端口、生命周期、管理路由入口
+  ├─ config.go                    全局配置适配 + state.json/机器盐
   ├─ auth.go                      auth provider（解析/登录/刷新/凭证写回）
   ├─ models.go                    model provider（注册、隔离、别名、禁用）
-  ├─ executor.go / quota.go       executor 与 quota provider
-  ├─ taskrun.go / taskcenter.go   通用调度器与任务队列（只认能力接口）
-  └─ management.go                管理路由入口（薄层，实现见 internal/admin）
+  ├─ executor.go                  executor + quota provider
+  └─ tasks.go                     通用调度器 + 任务队列/扫描/一键完成
 
 internal/core                    供应商无关骨架：必需 Vendor 接口 + 可选能力接口
                                  （登录/续期/额度/签到/任务/配置/存储合并…）、

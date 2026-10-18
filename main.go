@@ -2,18 +2,11 @@ package main
 
 // freetier2api —— 把多个免费额度供应商接入 CLIProxyAPI 的原生动态库插件。
 //
-// 插件通过宿主的 cliproxy_plugin_init ABI 加载，一次性声明五类能力：
-// auth provider、model provider、executor、quota provider、management API。
-// 宿主的路由、鉴权、调度、日志与代理全部复用。
+// 本文件包含插件身份、RPC 方法分发、注册响应与供应商注册表（composition root）。
+// C ABI 在 cgo.go；宿主面在 host.go；五类能力分别在 auth/models/executor/tasks。
 //
-// 供应商插桩：宿主 ABI 限制一个插件进程只能声明一个 provider key
-// （auth.identifier 返回单个字符串，注册期调一次永久缓存，且与 auth 文件的
-// type 字段严格相等才认领）。因此本插件用统一 providerKey="freetier"，
-// 供应商靠凭证文件名前缀与文件内的 vendor 字段区分，各自实现 core.Vendor。
-//
-// 分层纪律：
-//   - 本文件与同目录的能力文件属于 ABI 适配层，可以依赖 cpasdk；
-//   - internal/* 是纯逻辑层，不知道宿存在，对配置/宿主的能力一律走函数注入。
+// 供应商插桩：宿主 ABI 只允许一个 provider key，因此统一 providerKey="freetier"，
+// 供应商靠凭证文件名前缀与文件内 vendor 字段区分，各自实现 core.Vendor。
 
 import (
 	"encoding/json"
@@ -24,6 +17,15 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/vendors/cline"
+	"freetier2api-plugin/internal/vendors/codearts"
+	"freetier2api-plugin/internal/vendors/minimaxcode"
+	"freetier2api-plugin/internal/vendors/opencodezen"
+	"freetier2api-plugin/internal/vendors/qoder"
+	"freetier2api-plugin/internal/vendors/trae"
+	"freetier2api-plugin/internal/vendors/traesolo"
+	"freetier2api-plugin/internal/vendors/workbuddy"
+	"freetier2api-plugin/internal/vendors/zcode"
 )
 
 // pluginVersion 是插件版本，会在注册/状态接口里回给宿主。
@@ -306,4 +308,44 @@ func decodeRequest(raw []byte, target any) error {
 		return fmt.Errorf("decode request: %w", errUnmarshal)
 	}
 	return nil
+}
+
+// registerVendors 注册全部供应商实例。
+//
+// 顺序与重构前各 vendor_*.go 的 init 顺序一致：core.Vendors() 的返回顺序
+// 会进入控制台列表与内容嗅探兜底，顺序变化会让 UI 抖动。
+func registerVendors() {
+	for _, vendor := range cline.Instances(workbuddy.DefaultContextWindowFor) {
+		core.RegisterVendor(vendor)
+	}
+	for _, vendor := range codearts.Instances() {
+		core.RegisterVendor(vendor)
+	}
+	for _, vendor := range minimaxcode.Instances() {
+		core.RegisterVendor(vendor)
+	}
+	for _, vendor := range opencodezen.Instances(workbuddy.DefaultContextWindowFor) {
+		core.RegisterVendor(vendor)
+	}
+	for _, vendor := range qoder.Instances() {
+		core.RegisterVendor(vendor)
+	}
+	for _, vendor := range trae.Instances() {
+		core.RegisterVendor(vendor)
+	}
+	for _, vendor := range traesolo.Instances() {
+		core.RegisterVendor(vendor)
+	}
+	for _, vendor := range workbuddy.Instances() {
+		core.RegisterVendor(vendor)
+	}
+	for _, vendor := range zcode.Instances() {
+		core.RegisterVendor(vendor)
+	}
+}
+
+// init 在包初始化期完成注册：宿主的 plugin.register 之前就绪，
+// 因此任何时刻调用 core.ResolveVendor 都能拿到完整清单。
+func init() {
+	registerVendors()
 }

@@ -1,6 +1,10 @@
 package main
 
-// 本文件实现 executor 能力：非流式执行、流式执行、token 计数与出站 HTTP 透传。
+// 本文件实现 executor 与 quota 两类宿主能力：
+//   - executor：非流式/流式执行、token 估算、出站 HTTP 声明；
+//   - quota：额度查询与「签到式重置」。
+//
+// 真正的上游协议调用由各供应商的 Execute/Quota/Checkin 实现完成。
 
 import (
 	"bytes"
@@ -402,4 +406,82 @@ func preparedSupportsImages(prepared preparedExecution) bool {
 		}
 	}
 	return true
+}
+
+// handleQuotaDescribe 描述本插件的额度能力。
+func handleQuotaDescribe(request []byte) ([]byte, error) {
+	return core.OKEnvelope(pluginapi.QuotaDescribeResponse{
+		SupportedProviders: []string{providerKey},
+		DisplayName:        pluginDisplayName,
+		// 本插件的「重置」是执行一次签到（签到会恢复额度），因此支持。
+		SupportsReset: true,
+	})
+}
+
+// handleQuotaFetch 查询某个账号的额度。
+//
+// 取数交给凭证所属的供应商：各家的额度接口与归一方式完全不同
+// （WorkBuddy 是积分余额，Qoder 是套餐用量桶）。
+func handleQuotaFetch(request []byte) ([]byte, error) {
+	var rpc pluginapi.QuotaFetchRequest
+	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+	}
+	ctx := hostabi.WithCallbackID(context.Background(), "")
+	// 宿主的额度路由**不发 StorageJSON**（只发 AuthIndex/AuthID + 属性），
+	// 因此这里必须能按 index 回源，否则会误报「凭证缺失」。
+	credential, vendor, errResolve := resolveVendorCredential(ctx, "", rpc.StorageJSON,
+		core.FirstNonEmpty(rpc.AuthIndex, rpc.AuthID), rpc.Attributes)
+	if errResolve != nil {
+		return nil, errResolve
+	}
+
+	provider, okQuota := core.As[core.QuotaProvider](vendor)
+	if !okQuota {
+		return nil, core.QuotaUnsupported(vendor)
+	}
+	response, errQuota := provider.Quota(ctx, credential)
+	if errQuota != nil {
+		return nil, core.ToPluginError(errQuota)
+	}
+	return core.OKEnvelope(response)
+}
+
+// handleQuotaReset 执行一次签到以恢复额度。
+//
+// 语义由供应商决定：WorkBuddy 的「重置」是签到；不支持签到的供应商
+// （国际版）返回明确的不可用说明，而不是假装成功。
+func handleQuotaReset(request []byte) ([]byte, error) {
+	var rpc pluginapi.QuotaResetRequest
+	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+	}
+	ctx := hostabi.WithCallbackID(context.Background(), "")
+	credential, vendor, errResolve := resolveVendorCredential(ctx, "", rpc.StorageJSON,
+		core.FirstNonEmpty(rpc.AuthIndex, rpc.AuthID), rpc.Attributes)
+	if errResolve != nil {
+		return nil, errResolve
+	}
+	if !core.SupportsCheckin(vendor) {
+		return core.OKEnvelope(pluginapi.QuotaResetResponse{
+			Success: false,
+			Message: "本供应商不提供签到；额度按上游周期自动重置",
+		})
+	}
+	checkin, okCheckin := core.As[core.CheckinProvider](vendor)
+	if !okCheckin {
+		return core.OKEnvelope(pluginapi.QuotaResetResponse{
+			Success: false,
+			Message: "本供应商不提供签到；额度按上游周期自动重置",
+		})
+	}
+
+	result, errCheckin := checkin.Checkin(ctx, credential)
+	if errCheckin != nil {
+		return nil, core.ToPluginError(errCheckin)
+	}
+	if result == nil {
+		return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: false, Message: "签到未返回结果"})
+	}
+	return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: true, Message: result.Message})
 }
