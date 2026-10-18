@@ -1,0 +1,99 @@
+package state
+
+import (
+	"os"
+	"path/filepath"
+	"sync"
+	"testing"
+)
+
+func TestStoreRoundTripPreservesFields(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore()
+	store.Configure(dir)
+	if _, err := store.Load(); err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	enabled := true
+	mode := "append"
+	store.Mutate(func(s *State) {
+		s.AutoCheckin = &enabled
+		s.PromptMode = &mode
+		s.DisabledModels = []string{"vendor:model"}
+		s.ModelAliases = map[string]string{"vendor:model": "alias"}
+		s.Checkin["u1"] = CheckinRecord{LastDate: "2026-10-18", Streak: 3}
+		s.Tasks["u1\x1fchat_5"] = TaskRecord{LastStatus: "done", Credit: 10}
+	})
+
+	reloaded := NewStore()
+	reloaded.Configure(dir)
+	got, err := reloaded.Load()
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got.AutoCheckin == nil || !*got.AutoCheckin || got.PromptMode == nil || *got.PromptMode != mode {
+		t.Fatalf("pointer fields lost: %#v", got)
+	}
+	if len(got.DisabledModels) != 1 || got.ModelAliases["vendor:model"] != "alias" {
+		t.Fatalf("model fields lost: %#v", got)
+	}
+	if got.Checkin["u1"].Streak != 3 || got.Tasks["u1\x1fchat_5"].Credit != 10 {
+		t.Fatalf("records lost: %#v", got)
+	}
+	raw, errRead := os.ReadFile(filepath.Join(dir, "state.json"))
+	if errRead != nil || len(raw) == 0 {
+		t.Fatalf("state file missing: %v", errRead)
+	}
+}
+
+func TestStoreCorruptFileStartsEmpty(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore()
+	store.Configure(dir)
+	got, err := store.Load()
+	if err != nil {
+		t.Fatalf("load corrupt: %v", err)
+	}
+	if got.Checkin == nil || got.Tasks == nil || got.ModelAliases == nil {
+		t.Fatalf("empty state not normalized: %#v", got)
+	}
+}
+
+func TestSnapshotIsDeepCopy(t *testing.T) {
+	store := NewStore()
+	store.Configure(t.TempDir())
+	if _, err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	store.Mutate(func(s *State) {
+		s.DisabledModels = []string{"a"}
+		s.Checkin["u"] = CheckinRecord{Streak: 1}
+	})
+	snap := store.Snapshot()
+	snap.DisabledModels[0] = "changed"
+	snap.Checkin["u"] = CheckinRecord{Streak: 99}
+	if got := store.Snapshot(); got.DisabledModels[0] != "a" || got.Checkin["u"].Streak != 1 {
+		t.Fatalf("snapshot aliases internal state: %#v", got)
+	}
+}
+
+func TestMutateIsConcurrentSafe(t *testing.T) {
+	store := NewStore()
+	store.Configure(t.TempDir())
+	if _, err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			store.Mutate(func(s *State) { s.Tasks["k"] = TaskRecord{LastStatus: "done"} })
+			_ = store.Snapshot()
+		}()
+	}
+	wg.Wait()
+}

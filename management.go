@@ -26,6 +26,7 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/vendors/opencodezen"
 )
 
@@ -1304,7 +1305,7 @@ func handleSettingsRequest(req pluginapi.ManagementRequest) pluginapi.Management
 			changed["auto_checkin"] = *body.AutoCheckin
 		}
 		if at := strings.TrimSpace(body.AutoCheckinAt); at != "" {
-			if _, _, errClock := parseClock(at); errClock == nil {
+			if _, _, errClock := pluginconfig.ParseClock(at); errClock == nil {
 				state.AutoCheckinAt = at
 				changed["auto_checkin_at"] = at
 			}

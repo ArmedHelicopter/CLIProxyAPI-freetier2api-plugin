@@ -87,9 +87,7 @@ func resetPluginGlobals(t *testing.T) {
 	pluginRegistered = false
 	pluginLifecycleMu.Unlock()
 
-	stateMu.Lock()
-	stateCache = nil
-	stateMu.Unlock()
+	stateStore.Reset()
 	reloadDisabledModelCache(nil)
 
 	resetCredentialCache()

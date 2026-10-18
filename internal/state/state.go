@@ -1,0 +1,273 @@
+// Package state 负责插件自己的落盘状态：state.json 的类型化读写。
+//
+// 状态里不保存任何凭证：凭证只存在于宿主的 auth 文件中，所有需要 token
+// 的操作都必须通过 host.auth.get 实时回源。
+//
+// 本包只管「读、改、写、快照」四件事；机器盐、日志目录等有副作用的初始化
+// 留在根层（ABI 适配层）。
+package state
+
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sync"
+
+	"freetier2api-plugin/internal/logger"
+)
+
+// Version 是状态文件结构版本，用于将来迁移。
+const Version = 1
+
+// TaskRecord 是某账号某任务的最近一次执行记录（仅用于展示，不作幂等依据）。
+type TaskRecord struct {
+	LastRunAt   string `json:"last_run_at,omitempty"`
+	LastStatus  string `json:"last_status,omitempty"`
+	LastMessage string `json:"last_message,omitempty"`
+	Credit      int64  `json:"credit,omitempty"`
+	Energy      int64  `json:"energy,omitempty"`
+}
+
+// CheckinRecord 是某账号的签到记录。
+type CheckinRecord struct {
+	LastDate string `json:"last_date,omitempty"`
+	Streak   int64  `json:"streak,omitempty"`
+	Credit   int64  `json:"credit,omitempty"`
+	Energy   int64  `json:"energy,omitempty"`
+}
+
+// CachedModel 是缓存的单条上游模型元数据。
+type CachedModel struct {
+	ID              string   `json:"id"`
+	Name            string   `json:"name,omitempty"`
+	Realm           string   `json:"realm"`
+	ContextLength   int64    `json:"context_length,omitempty"`
+	MaxOutputTokens int64    `json:"max_output_tokens,omitempty"`
+	Efforts         []string `json:"efforts,omitempty"`
+	DefaultEffort   string   `json:"default_effort,omitempty"`
+	SupportsImages  bool     `json:"supports_images,omitempty"`
+	SupportsTool    bool     `json:"supports_tool_call,omitempty"`
+	CanDisableThink bool     `json:"can_disable_thinking,omitempty"`
+	OnlyReasoning   bool     `json:"only_reasoning,omitempty"`
+	Description     string   `json:"description,omitempty"`
+}
+
+// State 是 state.json 的完整结构。
+//
+// 页面设置用指针字段区分「未设置」与「设为 false/空」：
+// 未设置时回落 YAML 配置，设置了就以页面为准。
+type State struct {
+	Version int `json:"version"`
+
+	// AutoCheckin / AutoCheckinAt / AutoTasks 是页面上可改的任务设置。
+	AutoCheckin   *bool   `json:"auto_checkin,omitempty"`
+	AutoCheckinAt string  `json:"auto_checkin_at,omitempty"`
+	AutoTasks     *bool   `json:"auto_tasks,omitempty"`
+	PromptMode    *string `json:"prompt_mode,omitempty"`
+
+	// CheckinHours / TravelHours / ActivityHours / KeepaliveHours / BlackcatHours
+	// 是各定时任务的整点小时列表（0-23）。
+	CheckinHours   []int `json:"checkin_hours,omitempty"`
+	TravelHours    []int `json:"travel_hours,omitempty"`
+	ActivityHours  []int `json:"activity_hours,omitempty"`
+	KeepaliveHours []int `json:"keepalive_hours,omitempty"`
+	BlackcatHours  []int `json:"blackcat_hours,omitempty"`
+
+	// Models 是上游模型清单缓存（按 realm 分桶存于 Realm 字段）。
+	Models []CachedModel `json:"models,omitempty"`
+	// ModelsFetchedAt 是清单缓存时间（RFC3339）。
+	ModelsFetchedAt string `json:"models_fetched_at,omitempty"`
+
+	// DisabledModels 是被禁用的模型 ID（带 cn:/global: 前缀的完整 ID）。
+	DisabledModels []string `json:"disabled_models,omitempty"`
+
+	// ModelAliases 是模型别名表：<vendorID>:<官方模型 ID> → 对外别名。
+	ModelAliases map[string]string `json:"model_aliases,omitempty"`
+
+	// RestartPending 标记「已有模型变更，但宿主的模型注册表尚未刷新」。
+	RestartPending bool `json:"restart_pending,omitempty"`
+
+	// Checkin 按账号 UID 记录签到状态。
+	Checkin map[string]CheckinRecord `json:"checkin,omitempty"`
+	// Tasks 按「uid\x1f任务码」记录任务执行历史。
+	Tasks map[string]TaskRecord `json:"tasks,omitempty"`
+}
+
+// Store 是 state.json 的进程内单例：串行化读改写并缓存快照。
+type Store struct {
+	mu    sync.Mutex
+	dir   string
+	cache *State
+}
+
+// NewStore 创建一个尚未绑定目录的 Store。
+func NewStore() *Store { return &Store{} }
+
+// Configure 绑定状态目录（不读写文件）。
+func (s *Store) Configure(dir string) {
+	s.mu.Lock()
+	s.dir = dir
+	s.mu.Unlock()
+}
+
+// Dir 返回当前状态目录。
+func (s *Store) Dir() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.dir
+}
+
+// New 返回一个补齐 map 的空状态。
+func New() *State {
+	return &State{
+		Version:      Version,
+		Checkin:      map[string]CheckinRecord{},
+		Tasks:        map[string]TaskRecord{},
+		ModelAliases: map[string]string{},
+	}
+}
+
+// Load 从磁盘读取状态。文件缺失或损坏时返回空状态（不致命）。
+//
+// 返回值即缓存本身；调用方只应读用它，修改必须走 Mutate/Snapshot。
+func (s *Store) Load() (*State, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	path := s.pathLocked()
+	raw, errRead := os.ReadFile(path)
+	if errRead != nil {
+		if os.IsNotExist(errRead) {
+			s.cache = New()
+			return s.cache, nil
+		}
+		return nil, fmt.Errorf("read state %s: %w", path, errRead)
+	}
+	var loaded State
+	if errUnmarshal := json.Unmarshal(raw, &loaded); errUnmarshal != nil {
+		// 状态损坏不阻止插件启动：宁可丢掉签到记录，也不要让用户无法使用。
+		logger.Error("state file %s is corrupt, starting with empty state: %v", path, errUnmarshal)
+		s.cache = New()
+		return s.cache, nil
+	}
+	normalize(&loaded)
+	s.cache = &loaded
+	return s.cache, nil
+}
+
+func (s *Store) pathLocked() string {
+	return filepath.Join(s.dir, "state.json")
+}
+
+func normalize(state *State) {
+	state.Version = Version
+	if state.Checkin == nil {
+		state.Checkin = map[string]CheckinRecord{}
+	}
+	if state.Tasks == nil {
+		state.Tasks = map[string]TaskRecord{}
+	}
+	if state.ModelAliases == nil {
+		state.ModelAliases = map[string]string{}
+	}
+}
+
+// Snapshot 返回状态深拷贝，调用方可安全读取。
+func (s *Store) Snapshot() State {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cache == nil {
+		return *New()
+	}
+	return clone(s.cache)
+}
+
+// clone 手工深拷贝 map/slice 与指针字段。
+func clone(state *State) State {
+	out := *state
+	out.Models = append([]CachedModel(nil), state.Models...)
+	out.CheckinHours = append([]int(nil), state.CheckinHours...)
+	out.TravelHours = append([]int(nil), state.TravelHours...)
+	out.ActivityHours = append([]int(nil), state.ActivityHours...)
+	out.KeepaliveHours = append([]int(nil), state.KeepaliveHours...)
+	out.BlackcatHours = append([]int(nil), state.BlackcatHours...)
+	out.DisabledModels = append([]string(nil), state.DisabledModels...)
+	if state.AutoCheckin != nil {
+		enabled := *state.AutoCheckin
+		out.AutoCheckin = &enabled
+	}
+	if state.AutoTasks != nil {
+		enabled := *state.AutoTasks
+		out.AutoTasks = &enabled
+	}
+	if state.PromptMode != nil {
+		mode := *state.PromptMode
+		out.PromptMode = &mode
+	}
+	out.Checkin = make(map[string]CheckinRecord, len(state.Checkin))
+	for key, value := range state.Checkin {
+		out.Checkin[key] = value
+	}
+	out.Tasks = make(map[string]TaskRecord, len(state.Tasks))
+	for key, value := range state.Tasks {
+		out.Tasks[key] = value
+	}
+	out.ModelAliases = make(map[string]string, len(state.ModelAliases))
+	for key, value := range state.ModelAliases {
+		out.ModelAliases[key] = value
+	}
+	return out
+}
+
+// Mutate 在锁内修改状态并立即落盘。
+//
+// 修改函数不应做 IO（它在锁内执行）；落盘失败只记日志，不让调用方失败——
+// 状态写不进去不应该让一次签到或一次对话失败。
+func (s *Store) Mutate(mutate func(*State)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.cache == nil {
+		s.cache = New()
+	}
+	mutate(s.cache)
+	if errSave := s.saveLocked(); errSave != nil {
+		logger.Error("save state failed: %v", errSave)
+	}
+}
+
+// Save 原子写入当前缓存。
+func (s *Store) Save() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saveLocked()
+}
+
+// saveLocked 原子写入状态文件。调用方必须持有 s.mu。
+func (s *Store) saveLocked() error {
+	if s.cache == nil {
+		return nil
+	}
+	s.cache.Version = Version
+	raw, errMarshal := json.MarshalIndent(s.cache, "", "  ")
+	if errMarshal != nil {
+		return fmt.Errorf("marshal state: %w", errMarshal)
+	}
+	path := s.pathLocked()
+	tmp := path + ".tmp"
+	if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+		return fmt.Errorf("write state: %w", errWrite)
+	}
+	if errRename := os.Rename(tmp, path); errRename != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("replace state file: %w", errRename)
+	}
+	return nil
+}
+
+// Reset 清空内存缓存（测试用）。
+func (s *Store) Reset() {
+	s.mu.Lock()
+	s.cache = nil
+	s.mu.Unlock()
+}

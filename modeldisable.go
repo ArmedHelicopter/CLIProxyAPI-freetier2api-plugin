@@ -32,6 +32,27 @@ var (
 	disabledCacheSet = map[string]bool{}
 )
 
+// expandDisabledList 把配置里的禁用项展开成规范键并去重排序。
+//
+// 区域别名（cn:glm-5.2）展开成该区域每家供应商的键，裸名原样保留
+// （表示对所有供应商生效）。结果稳定排序，便于比对与展示。
+func expandDisabledList(items []string) []string {
+	set := make(map[string]bool, len(items)*2)
+	for _, item := range items {
+		for _, key := range expandModelKey(item) {
+			if key != "" {
+				set[key] = true
+			}
+		}
+	}
+	out := make([]string, 0, len(set))
+	for key := range set {
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // mergeDisabledLists 合并两个来源的禁用清单：配置声明 + 状态文件记录。
 //
 // 只做纯计算、不取任何锁：调用方可能已经持有 stateMu（loadState、mutateState
