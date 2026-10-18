@@ -20,53 +20,41 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/loginsession"
 )
 
-// PendingLogin 是一次进行中的登录会话。
+// PendingLogin 是一次进行中的登录会话数据。
+//
+// TTL 与轮询节流由 internal/loginsession 统一管理，这里只保留协议状态。
 type PendingLogin struct {
-	Region    Region
-	State     string
-	CreatedAt time.Time
-	// LastPoll 记录上次向上游轮询的时刻（节流）。
-	LastPoll time.Time
+	Region Region
+	State  string
 }
 
-var (
-	loginStoreMu     sync.Mutex
-	loginStore       = map[string]*PendingLogin{}
-	loginPollMinGap  = loginPollInterval
-	loginStoreLastGC time.Time
-)
-
-// storeLoginSession 记录一次进行中的登录会话（含过期 GC）。
+// StoreLoginSession 登记一次进行中的登录会话（TTL 与节流交给共享登记表）。
 func StoreLoginSession(sessionID string, session *PendingLogin) {
-	loginStoreMu.Lock()
-	gcLoginSessionsLocked()
-	loginStore[sessionID] = session
-	loginStoreMu.Unlock()
+	if session == nil {
+		return
+	}
+	loginsession.Register(VendorIDFor(session.Region), sessionID, LoginSessionTTL, loginPollInterval, session)
 }
 
 // OwnsLoginSession 报告该会话是否由 WorkBuddy 持有且仍有效。
 func OwnsLoginSession(sessionID string) bool {
-	loginStoreMu.Lock()
-	defer loginStoreMu.Unlock()
-	session, okSession := loginStore[sessionID]
-	if okSession && time.Since(session.CreatedAt) > LoginSessionTTL {
-		delete(loginStore, sessionID)
-		return false
+	if _, okOwns := loginsession.Owns(sessionID); okOwns {
+		return true
 	}
-	return okSession
+	// 历史会话 id 以 workbuddy_ 开头；保留兜底以兼容极短的 GC 竞争窗口。
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "workbuddy_")
 }
 
 // RemoveLoginSession 登录成功或终止后清理会话。
 func RemoveLoginSession(sessionID string) {
-	loginStoreMu.Lock()
-	delete(loginStore, sessionID)
-	loginStoreMu.Unlock()
+	loginsession.Delete(sessionID)
 }
 
 // CheckLoginSession 检查登录会话状态与节流。
@@ -74,21 +62,15 @@ func RemoveLoginSession(sessionID string) {
 //   - exists: 会话是否存在且在 TTL 内；
 //   - shouldPoll: 是否已过节流间隔，可以向上游发起 token 请求。
 func CheckLoginSession(sessionID string) (session *PendingLogin, exists bool, shouldPoll bool) {
-	loginStoreMu.Lock()
-	defer loginStoreMu.Unlock()
-	s, okSession := loginStore[sessionID]
-	if !okSession {
+	entry, pollState := loginsession.Poll(sessionID)
+	if pollState == loginsession.PollMissing {
 		return nil, false, false
 	}
-	if time.Since(s.CreatedAt) > LoginSessionTTL {
-		delete(loginStore, sessionID)
+	pending, okPending := entry.Data.(*PendingLogin)
+	if !okPending {
 		return nil, false, false
 	}
-	if time.Since(s.LastPoll) < loginPollMinGap {
-		return s, true, false
-	}
-	s.LastPoll = time.Now()
-	return s, true, true
+	return pending, true, pollState == loginsession.PollReady
 }
 
 // TakeLoginSession 取出登录会话，同时应用节流（兼容旧调用）。
@@ -312,37 +294,13 @@ func DefaultDomainFor(region Region) string {
 	return "www.codebuddy.cn"
 }
 
-// gcLoginSessionsLocked 清理过期的登录会话。调用方必须持有 loginStoreMu。
-func gcLoginSessionsLocked() {
-	// 全量扫描很便宜（会话数是个位数），但没必要每次启动都扫。
-	if time.Since(loginStoreLastGC) < time.Minute {
-		return
-	}
-	loginStoreLastGC = time.Now()
-	for id, session := range loginStore {
-		if time.Since(session.CreatedAt) > LoginSessionTTL {
-			delete(loginStore, id)
-		}
-	}
-}
-
 // ResetLoginStoreForTest 清空登录会话（测试用）。
 //
 // 登录会话是包级的：测试之间不清空会让上一个用例的会话泄漏到下一个，
 // 表现为「随便一个 state 都能命中旧会话」。
 func ResetLoginStoreForTest() {
-	loginStoreMu.Lock()
-	defer loginStoreMu.Unlock()
-	loginStore = map[string]*PendingLogin{}
-	loginStoreLastGC = time.Time{}
+	loginsession.ResetForTest()
 }
 
 // firstNonEmptyString 返回第一个非空字符串。
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
+func firstNonEmptyString(values ...string) string { return core.FirstNonEmpty(values...) }

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 const (
@@ -113,12 +115,7 @@ func ParseTurn(item any) *Turn {
 }
 
 func firstNonEmptyStringOfMap(m map[string]any, keys ...string) string {
-	for _, k := range keys {
-		if s, ok := m[k].(string); ok && strings.TrimSpace(s) != "" {
-			return s
-		}
-	}
-	return ""
+	return core.GetString(m, keys...)
 }
 
 // BuildPrompt 把多轮 OpenAI 对话消息压平为 MiniMax Agent 所需的单个 content 字符串。

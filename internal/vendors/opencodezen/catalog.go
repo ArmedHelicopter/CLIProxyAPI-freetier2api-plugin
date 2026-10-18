@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 )
 
@@ -153,11 +154,4 @@ func boolFrom(values ...*bool) bool {
 }
 
 // firstNonEmpty 返回第一个非空字符串。
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
+func firstNonEmpty(values ...string) string { return core.FirstNonEmpty(values...) }

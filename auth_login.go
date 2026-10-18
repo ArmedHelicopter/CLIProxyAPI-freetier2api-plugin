@@ -62,7 +62,7 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 
 	response, errStart := vendor.LoginStart(ctx, rpc.Metadata)
 	if errStart != nil {
-		return nil, errorToPluginError(errStart)
+		return nil, core.ToPluginError(errStart)
 	}
 	// 供应商标识由根层统一注入，不交给各供应商自己记着。
 	//
@@ -104,7 +104,7 @@ func handleAuthLoginPoll(request []byte) ([]byte, error) {
 
 	response, errPoll := vendor.LoginPoll(ctx, sessionID)
 	if errPoll != nil {
-		return nil, errorToPluginError(errPoll)
+		return nil, core.ToPluginError(errPoll)
 	}
 	return okEnvelope(response)
 }
@@ -152,45 +152,19 @@ func vendorForLogin(metadata map[string]any) (core.Vendor, error) {
 
 // vendorForLoginSession 按登录会话找供应商。
 //
-// 会话是供应商自己建的（状态存在各自的包里），因此这里只能遍历询问。
-// 会话数很少（同时最多一两个登录在进行），遍历代价可忽略。
+// 会话归属由持有会话表的供应商自证（loginSessionOwner 接口）。重构前这里
+// 还有一段「按 session id 前缀猜供应商」的兜底（trae_solo_ / workbuddy_ /
+// copilot_），那是会话登记不统一时的补丁；现在每个持有会话的供应商都实现了
+// 归属查询，猜前缀只会把会话错误路由给别家，因此删除。
 func vendorForLoginSession(sessionID string) (core.Vendor, error) {
-	// 会话存在哪个供应商里由对方的 LoginPoll 自证（会话 id 只在对方的状态表里）。
-	// 首先按供应商主动认领匹配：
 	for _, vendor := range core.Vendors() {
 		if !vendorEnabled(vendor) {
 			continue
 		}
-		if provider, okProvider := vendor.(loginSessionOwner); okProvider && provider.OwnsLoginSession(sessionID) {
+		if owner, okOwner := vendor.(loginSessionOwner); okOwner && owner.OwnsLoginSession(sessionID) {
 			return vendor, nil
 		}
 	}
-	// 备用机制：按 sessionID 的前缀特征路由到对应的供应商，
-	// 防止由于状态清理竞争或时序差异把特定供应商的轮询发给无关的供应商。
-	normSession := strings.ToLower(strings.TrimSpace(sessionID))
-	for _, vendor := range core.Vendors() {
-		if !vendorEnabled(vendor) {
-			continue
-		}
-		vid := strings.ToLower(vendor.ID())
-		vprefix1 := vid + "_"
-		vprefix2 := strings.ReplaceAll(vid, "-", "_") + "_"
-		if strings.HasPrefix(normSession, vprefix1) || strings.HasPrefix(normSession, vprefix2) {
-			return vendor, nil
-		}
-	}
-	// 特殊供应商别名前缀匹配
-	if strings.HasPrefix(normSession, "traesolo_") || strings.HasPrefix(normSession, "trae_solo_") {
-		if v, ok := core.VendorByID("trae-solo"); ok && vendorEnabled(v) {
-			return v, nil
-		}
-	}
-	if strings.HasPrefix(normSession, "workbuddy_") || strings.HasPrefix(normSession, "copilot_") {
-		if v, ok := firstVendorForRegion("cn"); ok {
-			return v, nil
-		}
-	}
-	// 都不认领且无匹配前缀：直接返回会话过期错误，绝不乱调用其他供应商
 	return nil, newPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
 }
 
@@ -218,16 +192,6 @@ func firstVendorForRegion(region string) (core.Vendor, bool) {
 		}
 	}
 	return nil, false
-}
-
-// newLoginSessionID 生成一个随机的登录会话标识。
-//
-// 登录会话是供应商各自持有的，但「随机会话 id」是所有登录链路的公共
-// 基础设施——一个 32 位十六进制随机串，与官方客户端的 messageId 同形。
-// 放在根层而不是某个供应商包里：Cline / WorkBuddy / Qoder 都用到它，
-// 塞进任一家都会让其它家反向依赖那一家。
-func newLoginSessionID() string {
-	return newHexID(16)
 }
 
 // newHexID 生成 n 字节的随机十六进制串（2n 个字符）。

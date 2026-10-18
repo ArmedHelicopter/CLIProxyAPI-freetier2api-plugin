@@ -38,32 +38,30 @@
 `type` 字段严格相等才认领该文件）。因此本插件用统一的 `providerKey = "freetier"`，
 **供应商的区分落在凭证文件名前缀与文件内的 `vendor` 字段上**。
 
-代码分三层：
+代码分三层（依赖方向单向：`main → internal/vendors/* → internal/core`）：
 
 ```
-package main            ABI 适配层：把宿主 RPC 翻译成 Vendor 调用
-  ├─ vendor_workbuddy.go   WorkBuddy 的 core.Vendor 实现（两个区域实例）
-  ├─ vendor_qoder.go       Qoder 的 core.Vendor 实现（两个区域实例）
-  ├─ vendor_opencodezen.go OpenCode ZEN 的 core.Vendor 实现
-  ├─ vendor_cline.go       Cline 的 core.Vendor 实现
-  ├─ vendor_zcode.go       ZCode 的 core.Vendor 实现
-  ├─ vendor_traesolo.go    TRAE SOLO 的 core.Vendor 实现
-  ├─ vendor_trae.go        Trae 的 core.Vendor 实现（国内/国际两个区域实例）
-  ├─ vendor_codearts.go    CodeArts 的 core.Vendor 实现
-  └─ vendor_minimaxcode.go MiniMax Code 的 core.Vendor 实现（国内/国际两个区域实例）
+package main                     纯 ABI 适配层：把宿主 RPC 翻译成 Vendor 调用
+  ├─ vendor_register.go            唯一的供应商注册点（composition root）
+  ├─ hostbridge.go                 把宿主能力注入 core.Host 端口
+  └─ auth*/models*/executor*/…     五类能力处理器（不含任何供应商协议逻辑）
 
-internal/core           供应商无关的骨架：Vendor 接口、供应商注册表、
-                        共享 Credential、模型 ID 协议、信封、错误
+internal/core                    供应商无关的骨架：Vendor 接口、注册表、
+                                 共享 Credential、模型 ID 协议、错误映射
+                                 （core.Host 端口 / BaseVendor / 通用助手）
 
-internal/vendors/<name> 纯协议层：各供应商目录结构严格对齐（catalog.go、
-                        chat.go、checkin.go、credential.go、endpoints.go、
-                        errors.go、login.go、quota.go、refresh.go）。
-                        出站 HTTP 一律经 internal/httpx 走宿主桥。
+internal/loginsession             供应商无关的登录会话登记表（TTL / 轮询节流 / 归属）
+
+internal/vendors/<name>           协议层 + 适配层同包：
+  ├─ adapter.go                     core.Vendor 实现（原名 vendor_<name>.go）
+  ├─ config.go                      解析本供应商的专属配置键
+  └─ catalog/chat/credential/…      纯协议实现（出站 HTTP 一律经 internal/httpx）
 ```
 
-新增一个供应商只需实现 `core.Vendor` 并在 `init` 里注册，**不必改 ABI 适配层的
-任何 switch**——根层的 auth / model / executor / quota / management 五类处理器
-全部经 `core.Vendor` 分发。
+新增一个供应商：在 `internal/vendors/<name>` 写协议实现与 `adapter.go`
+（嵌入 `core.BaseVendor`），在 `vendor_register.go` 加一行 `Instances()`，
+再在 README 的配置表里补一行。根层五类处理器全部经 `core.Vendor` 分发，
+**没有任何 per-vendor switch**。
 
 ### 凭证归属判定
 
@@ -515,6 +513,16 @@ CPA 按客户端 IP 统计管理鉴权失败次数，**未携带密钥的请求�
 - 任一请求返回 401/403 立即停止全部自动刷新与轮询（日志 5s、队列 3s、登录轮询），
   一次打开最多只产生 1 次失败；
 - 手输的密钥同样先探针验证，验证失败后 10 秒内不允许连续重试。
+
+## 行为变更（分层重构）
+
+- **上游错误按供应商分类映射为宿主状态码**：401/403（凭证失效）、402（额度耗尽）、
+  429（限流）与 5xx（上游抖动）会如实上报，宿主据此禁用/冷却账号。
+  重构前除 WorkBuddy 外的供应商错误统一退化为 502 可重试，坏凭证不会被标记失效。
+- **登录会话 id 不再用于猜供应商**：会话归属由持有会话表的供应商自证，
+  删除了按 `trae_solo_` / `workbuddy_` 前缀猜测的兜底路径。
+- 供应商专属配置键（`*_base_url`、WorkBuddy 的 UA/设备字段等）改由各供应商包解析，
+  **键名、默认值与语义保持不变**。
 
 ## 已知限制
 

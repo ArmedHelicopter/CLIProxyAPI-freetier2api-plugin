@@ -67,3 +67,27 @@ func ClassifyCredentialError(err error) error {
 
 // classifyCredentialError 是 ClassifyCredentialError 的包内别名。
 func classifyCredentialError(err error) error { return ClassifyCredentialError(err) }
+
+// MappedStatus 返回已映射的宿主状态码（实现 core.MappedError）。
+func (e *PluginError) MappedStatus() int {
+	if e == nil {
+		return http.StatusBadGateway
+	}
+	return e.HTTPStatus
+}
+
+// MappedRetryable 报告是否可换号重试。
+func (e *PluginError) MappedRetryable() bool {
+	if e == nil {
+		return false
+	}
+	return e.Retryable
+}
+
+// MappedKind 返回错误分类标识。
+func (e *PluginError) MappedKind() string {
+	if e == nil {
+		return "unknown"
+	}
+	return e.Code
+}

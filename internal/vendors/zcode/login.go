@@ -24,12 +24,12 @@ import (
 	"io"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/loginsession"
 )
 
 const (
@@ -43,18 +43,11 @@ const (
 	loginPollInterval = 1500 * time.Millisecond
 )
 
-// pendingLogin 是一次进行中的登录会话。
+// pendingLogin 是一次进行中的登录会话数据（TTL / 节流由 loginsession 统一管理）。
 type pendingLogin struct {
 	FlowID    string
 	PollToken string
-	CreatedAt time.Time
-	LastPoll  time.Time
 }
-
-var loginStore = struct {
-	mu      sync.Mutex
-	pending map[string]*pendingLogin
-}{pending: map[string]*pendingLogin{}}
 
 // LoginStart 发起 OAuth 授权，返回用户需在浏览器打开的链接。
 //
@@ -106,14 +99,10 @@ func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) 
 	effectiveToken := firstNonEmpty(payload.Data.PollToken, pollToken)
 
 	sessionID := "zcode_" + NewHexID(8)
-	loginStore.mu.Lock()
-	gcLoginSessionsLocked()
-	loginStore.pending[sessionID] = &pendingLogin{
+	loginsession.Register(VendorID, sessionID, loginFlowTTL, loginPollInterval, &pendingLogin{
 		FlowID:    payload.Data.FlowID,
 		PollToken: effectiveToken,
-		CreatedAt: time.Now(),
-	}
-	loginStore.mu.Unlock()
+	})
 
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
@@ -125,25 +114,31 @@ func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) 
 
 // LoginPoll 轮询一次授权状态；完成时兑换出完整凭证。
 func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollResponse, error) {
-	session, okSession := peekLoginSession(sessionID)
-	if !okSession {
+	session, pollState := loginsession.Poll(sessionID)
+	if pollState == loginsession.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期，请重新发起登录",
 		}, nil
 	}
 	// 轮询节流：未到间隔就返回 pending，避免面板把上游打满。
-	if time.Since(session.LastPoll) < loginPollInterval {
+	if pollState == loginsession.PollThrottled {
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
-	session.LastPoll = time.Now()
+	pending, okPending := session.Data.(*pendingLogin)
+	if !okPending {
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: "登录会话数据已损坏，请重新发起登录",
+		}, nil
+	}
 
 	req, errNew := http.NewRequestWithContext(ctx, http.MethodGet,
-		ZCodeOrigin+PathOAuthPoll+"/"+session.FlowID, nil)
+		ZCodeOrigin+PathOAuthPoll+"/"+pending.FlowID, nil)
 	if errNew != nil {
 		return nil, fmt.Errorf("create poll request: %w", errNew)
 	}
-	req.Header.Set("Authorization", "Bearer "+session.PollToken)
+	req.Header.Set("Authorization", "Bearer "+pending.PollToken)
 
 	resp, errDo := httpx.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
@@ -174,14 +169,14 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 	// code=3004 是上游明示的会话过期，其余 4xx 视为终态失败。
 	if payload.Code != codeSuccess {
 		if payload.Code == codeSessionExpired {
-			dropLoginSession(sessionID)
+			loginsession.Delete(sessionID)
 			return &pluginapi.AuthLoginPollResponse{
 				Status:  pluginapi.AuthLoginStatusError,
 				Message: "授权会话已过期，请重新发起登录",
 			}, nil
 		}
 		if resp.StatusCode >= 400 {
-			dropLoginSession(sessionID)
+			loginsession.Delete(sessionID)
 			return &pluginapi.AuthLoginPollResponse{
 				Status:  pluginapi.AuthLoginStatusError,
 				Message: fmt.Sprintf("上游拒绝轮询（HTTP %d, code=%d）：%s", resp.StatusCode, payload.Code, payload.Msg),
@@ -189,7 +184,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 		}
 	}
 	if payload.Data.Status == "failed" {
-		dropLoginSession(sessionID)
+		loginsession.Delete(sessionID)
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "授权被拒绝或失败",
@@ -202,7 +197,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 	if jwt == "" {
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
-	dropLoginSession(sessionID)
+	loginsession.Delete(sessionID)
 	cred := &Credential{
 		Vendor:   VendorID,
 		JWTToken: jwt,
@@ -463,43 +458,10 @@ func decryptSecret(ctx context.Context, client *http.Client, bizToken, keyURL, a
 
 // OwnsLoginSession 报告会话是否归属本供应商且仍有效。
 func OwnsLoginSession(sessionID string) bool {
-	trimmed := strings.TrimSpace(sessionID)
-	loginStore.mu.Lock()
-	defer loginStore.mu.Unlock()
-	if _, ok := loginStore.pending[trimmed]; ok {
-		return true
+	if vendorID, okOwns := loginsession.Owns(sessionID); okOwns {
+		return vendorID == VendorID
 	}
-	return strings.HasPrefix(strings.ToLower(trimmed), "zcode_")
-}
-
-// peekLoginSession 取出会话（不移除）——移除只发生在拿到凭证或确认失败时，
-// 这样中途的网络抖动不会让访客白等一次授权。
-func peekLoginSession(sessionID string) (*pendingLogin, bool) {
-	loginStore.mu.Lock()
-	defer loginStore.mu.Unlock()
-	session, ok := loginStore.pending[strings.TrimSpace(sessionID)]
-	if !ok || time.Since(session.CreatedAt) > loginFlowTTL {
-		delete(loginStore.pending, sessionID)
-		return nil, false
-	}
-	return session, true
-}
-
-// dropLoginSession 结束一个登录会话。
-func dropLoginSession(sessionID string) {
-	loginStore.mu.Lock()
-	defer loginStore.mu.Unlock()
-	delete(loginStore.pending, sessionID)
-}
-
-// gcLoginSessionsLocked 清扫过期会话（调用方持锁）。
-func gcLoginSessionsLocked() {
-	now := time.Now()
-	for id, session := range loginStore.pending {
-		if now.Sub(session.CreatedAt) > loginFlowTTL {
-			delete(loginStore.pending, id)
-		}
-	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "zcode_")
 }
 
 // zcodeFileName 生成凭证文件名（邮箱优先，便于辨识账号）。

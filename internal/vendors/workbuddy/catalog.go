@@ -12,6 +12,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // modelCacheEntry 是某个域的模型目录缓存。
@@ -165,14 +167,7 @@ func (e dynModelEntry) toModelInfo() ModelInfo {
 	}
 }
 
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
+func firstNonEmpty(values ...string) string { return core.FirstNonEmpty(values...) }
 
 // normalizeEfforts 去重并保持顺序。
 func normalizeEfforts(raw []string) []string {

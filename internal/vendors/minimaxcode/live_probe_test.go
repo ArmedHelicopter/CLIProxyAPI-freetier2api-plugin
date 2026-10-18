@@ -1,3 +1,5 @@
+//go:build live
+
 package minimaxcode
 
 // 本文件是手动探针测试：MINIMAX_LIVE=1 时才运行，用于观察上游真实行为。

@@ -23,10 +23,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/loginsession"
 	"freetier2api-plugin/internal/vendors/qoder/bridge"
 	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
@@ -47,20 +47,12 @@ const (
 	loginPollInterval = 1200 * time.Millisecond
 )
 
-// pendingLogin 是一次进行中的登录会话。
+// pendingLogin 是一次进行中的登录会话数据（TTL / 节流由 loginsession 统一管理）。
 type pendingLogin struct {
-	state    string
 	nonce    string
 	verifier string
 	region   qoderapi.Region
-	deadline time.Time
-	lastPoll time.Time
 }
-
-var loginStore = struct {
-	mu      sync.Mutex
-	pending map[string]*pendingLogin
-}{pending: map[string]*pendingLogin{}}
 
 // LoginProfile 是账号信息（取不到时保持零值）。
 type LoginProfile struct {
@@ -94,12 +86,10 @@ func LoginStart(ctx context.Context, region qoderapi.Region) (loginURL, state st
 	loginURL = endpoints.DeviceLoginBase + "?" + params.Encode()
 
 	deadline := time.Now().Add(loginFlowTTL)
-	storePending(&pendingLogin{
-		state:    state,
+	loginsession.Register(VendorIDFor(region), state, time.Until(deadline), loginPollInterval, &pendingLogin{
 		nonce:    nonce,
 		verifier: verifier,
 		region:   region,
-		deadline: deadline,
 	})
 	return loginURL, state, deadline, nil
 }
@@ -121,19 +111,18 @@ type LoginPollResult struct {
 // 返回错误表示会话已失效（不存在或超时），调用方应终止轮询；
 // 返回 Pending=true 表示用户还没完成授权，继续轮询即可。
 func LoginPoll(ctx context.Context, state string) (LoginPollResult, error) {
-	entry, okEntry := peekPending(state)
-	if !okEntry {
+	session, pollState := loginsession.Poll(state)
+	if pollState == loginsession.PollMissing {
 		return LoginPollResult{}, fmt.Errorf("登录会话不存在或已过期，请重新发起登录")
 	}
-	if time.Now().After(entry.deadline) {
-		dropPending(state)
-		return LoginPollResult{}, fmt.Errorf("登录超时：10 分钟内未完成授权，请重新发起登录")
-	}
 	// 节流：面板轮询频率高于上游建议（上游客户端是 1 秒一次）。
-	if time.Since(entry.lastPoll) < loginPollInterval {
+	if pollState == loginsession.PollThrottled {
 		return LoginPollResult{Pending: true}, nil
 	}
-	markPolled(entry)
+	entry, okEntry := session.Data.(*pendingLogin)
+	if !okEntry {
+		return LoginPollResult{}, fmt.Errorf("登录会话数据已损坏，请重新发起登录")
+	}
 
 	token, refreshToken, waiting, errPoll := pollDeviceToken(ctx, entry)
 	if errPoll != nil {
@@ -145,7 +134,7 @@ func LoginPoll(ctx context.Context, state string) (LoginPollResult, error) {
 	}
 
 	profile := fetchLoginProfile(ctx, token, entry.region)
-	dropPending(state)
+	loginsession.Delete(state)
 	return LoginPollResult{
 		Token:        token,
 		RefreshToken: refreshToken,
@@ -156,7 +145,7 @@ func LoginPoll(ctx context.Context, state string) (LoginPollResult, error) {
 
 // OwnsLoginSession 报告该会话是否由本供应商创建且仍有效。
 func OwnsLoginSession(sessionID string) bool {
-	_, okEntry := peekPending(sessionID)
+	_, okEntry := loginsession.Owns(sessionID)
 	return okEntry
 }
 
@@ -280,45 +269,6 @@ func LoginAuthID(profile LoginProfile, state string) string {
 		base = "login-" + shortState(state)
 	}
 	return "qoder-" + sanitizeAuthID(base)
-}
-
-// ---- 会话存储 ----
-
-func storePending(entry *pendingLogin) {
-	loginStore.mu.Lock()
-	defer loginStore.mu.Unlock()
-	gcPendingLocked()
-	loginStore.pending[entry.state] = entry
-}
-
-// peekPending 取出会话（不改动轮询时间）。
-func peekPending(state string) (*pendingLogin, bool) {
-	loginStore.mu.Lock()
-	defer loginStore.mu.Unlock()
-	entry, okEntry := loginStore.pending[strings.TrimSpace(state)]
-	return entry, okEntry
-}
-
-func markPolled(entry *pendingLogin) {
-	loginStore.mu.Lock()
-	defer loginStore.mu.Unlock()
-	entry.lastPoll = time.Now()
-}
-
-func dropPending(state string) {
-	loginStore.mu.Lock()
-	defer loginStore.mu.Unlock()
-	delete(loginStore.pending, strings.TrimSpace(state))
-}
-
-// gcPendingLocked 清理过期会话。调用方必须持有锁。
-func gcPendingLocked() {
-	now := time.Now()
-	for state, entry := range loginStore.pending {
-		if now.After(entry.deadline) {
-			delete(loginStore.pending, state)
-		}
-	}
 }
 
 // ---- 工具 ----

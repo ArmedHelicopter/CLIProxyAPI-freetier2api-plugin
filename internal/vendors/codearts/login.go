@@ -18,25 +18,20 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/loginsession"
 )
 
+// pendingLogin 是一次进行中的登录会话数据（TTL 由 loginsession 统一管理）。
 type pendingLogin struct {
 	TicketID       string
 	Secret         string
 	Verifier       string
 	DPoPPrivateKey map[string]string
-	CreatedAt      time.Time
 }
-
-var (
-	loginMu    sync.Mutex
-	loginStore = map[string]*pendingLogin{}
-)
 
 // LoginStart 发起华为云 CodeArts 授权登录。
 func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) {
@@ -60,15 +55,12 @@ func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) 
 	authURL := PortalHost + "/authorize?" + v.Encode()
 	sessionID := "codearts_" + randomHex(8)
 
-	loginMu.Lock()
-	loginStore[sessionID] = &pendingLogin{
+	loginsession.Register(VendorID, sessionID, 15*time.Minute, 0, &pendingLogin{
 		TicketID:       ticketID,
 		Secret:         secret,
 		Verifier:       verifier,
 		DPoPPrivateKey: dpopJWK,
-		CreatedAt:      time.Now(),
-	}
-	loginMu.Unlock()
+	})
 
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  "freetier",
@@ -80,18 +72,22 @@ func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) 
 
 // LoginPoll 轮询华为云 ticket 登录结果。
 func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollResponse, error) {
-	loginMu.Lock()
-	session, ok := loginStore[sessionID]
-	loginMu.Unlock()
-
-	if !ok || time.Since(session.CreatedAt) > 15*time.Minute {
+	session, pollState := loginsession.Poll(sessionID)
+	if pollState == loginsession.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期",
 		}, nil
 	}
+	pending, okPending := session.Data.(*pendingLogin)
+	if !okPending {
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: "登录会话数据已损坏，请重新发起登录",
+		}, nil
+	}
 
-	path := SnapManagerHost + EpLoginTicket + "?ticket_id=" + url.QueryEscape(session.TicketID) + "&secret=" + url.QueryEscape(session.Secret)
+	path := SnapManagerHost + EpLoginTicket + "?ticket_id=" + url.QueryEscape(pending.TicketID) + "&secret=" + url.QueryEscape(pending.Secret)
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
 	if errReq != nil {
 		return nil, errReq
@@ -147,9 +143,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 		}, nil
 	}
 
-	loginMu.Lock()
-	delete(loginStore, sessionID)
-	loginMu.Unlock()
+	loginsession.Delete(sessionID)
 
 	uid := firstNonEmpty(res.UserID, res.UserName, "codearts-user")
 	cred := &Credential{
@@ -161,9 +155,9 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 		SecretAccessKey: sk,
 		SecurityToken:   st,
 		RefreshToken:    res.RefreshToken,
-		CodeVerifier:    session.Verifier,
+		CodeVerifier:    pending.Verifier,
 		ClientID:        ClientID,
-		DPoPPrivateKey:  session.DPoPPrivateKey,
+		DPoPPrivateKey:  pending.DPoPPrivateKey,
 		Label:           "CodeArts-" + uid,
 	}
 
@@ -186,17 +180,10 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 
 // OwnsLoginSession 报告该会话是否属于 CodeArts。
 func OwnsLoginSession(sessionID string) bool {
-	norm := strings.ToLower(strings.TrimSpace(sessionID))
-	if strings.HasPrefix(norm, "codearts_") {
-		return true
+	if vendorID, okOwns := loginsession.Owns(sessionID); okOwns {
+		return vendorID == VendorID
 	}
-	loginMu.Lock()
-	defer loginMu.Unlock()
-	s, ok := loginStore[sessionID]
-	if !ok {
-		return false
-	}
-	return time.Since(s.CreatedAt) <= 15*time.Minute
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "codearts_")
 }
 
 func generatePKCE() (verifier, challenge string) {

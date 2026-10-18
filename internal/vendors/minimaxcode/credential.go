@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // Credential 是归一化后的 MiniMax Code 账号凭证。
@@ -293,58 +295,13 @@ func MergeStorageJSON(original []byte, cred *Credential) ([]byte, error) {
 }
 
 // 辅助字段提取函数
-func firstNonEmpty(strs ...string) string {
-	for _, s := range strs {
-		if trimmed := strings.TrimSpace(s); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
-
-func getString(m map[string]any, keys ...string) string {
-	if m == nil {
-		return ""
-	}
-	for _, k := range keys {
-		if v, ok := m[k]; ok && v != nil {
-			if s, ok := v.(string); ok {
-				if t := strings.TrimSpace(s); t != "" {
-					return t
-				}
-			}
-		}
-	}
-	return ""
-}
-
+func firstNonEmpty(strs ...string) string               { return core.FirstNonEmpty(strs...) }
+func getString(m map[string]any, keys ...string) string { return core.GetString(m, keys...) }
 func getInt(m map[string]any, keys ...string) int {
 	return int(getInt64(m, keys...))
 }
 
-func getInt64(m map[string]any, keys ...string) int64 {
-	if m == nil {
-		return 0
-	}
-	for _, k := range keys {
-		if v, ok := m[k]; ok && v != nil {
-			switch val := v.(type) {
-			case float64:
-				return int64(val)
-			case int64:
-				return val
-			case int:
-				return int64(val)
-			case json.Number:
-				if n, err := val.Int64(); err == nil {
-					return n
-				}
-			}
-		}
-	}
-	return 0
-}
-
+func getInt64(m map[string]any, keys ...string) int64 { return core.GetInt64(m, keys...) }
 func getSubMap(m map[string]any, key string) map[string]any {
 	if m == nil {
 		return nil

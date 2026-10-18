@@ -74,21 +74,14 @@ type pluginConfig struct {
 	// AutoTasks 开启成长任务的每日自动闭环（连登兑换 + 抽奖 + 旅行 + 夜猫子等）。
 	AutoTasks bool
 
-	// ZenBaseURL 覆盖 OpenCode ZEN 的上游基地址（留空用内置默认值）。
+	// 供应商专属配置（base_url 等）不在这里定义字段：
+	// 它们由 core.Configurable 交给各供应商包自己解析（见 Raw）。
+	// 全局键仍保持原有的强类型字段与校验。
+	// Raw 是配置的原始键值表（key → 原文）。
 	//
-	// 上游换域名或用户要走自建网关时不必改代码重编译。
-	ZenBaseURL string
-	// ClineBaseURL 覆盖 Cline 的上游基地址（留空用内置默认值）。
-	ClineBaseURL string
-	// MiniMaxCodeCNBaseURL 覆盖 MiniMax Code 国内版基地址。
-	MiniMaxCodeCNBaseURL string
-	// MiniMaxCodeGlobalBaseURL 覆盖 MiniMax Code 国际版基地址。
-	MiniMaxCodeGlobalBaseURL string
-	// ZCodeBaseURL 覆盖 ZCode 对话上游基地址（留空用内置默认值 api.z.ai）。
-	//
-	// ZCode 的两条通道域名不同（对话走 api.z.ai，计费走 zcode.z.ai），因此这里
-	// 只覆盖对话侧——计费域名不对外暴露覆盖项，避免用户误配导致账号状态错乱。
-	ZCodeBaseURL string
+	// 根层只解释全局键，供应商专属键由各包在 Configure 里自行解析：
+	// 配置键的语义属于协议层，根层不该为每新增一家供应商再加一批字段。
+	Raw map[string]string
 }
 
 const (
@@ -198,6 +191,10 @@ func decodeConfig(raw []byte) (pluginConfig, error) {
 
 // applyConfigLine 把一行 key/value 应用到配置上。
 func applyConfigLine(cfg *pluginConfig, key, value string) error {
+	if cfg.Raw == nil {
+		cfg.Raw = map[string]string{}
+	}
+	cfg.Raw[key] = value
 	switch key {
 	case "enabled_realms":
 		realms, errRealms := parseRealms(value)
@@ -209,16 +206,9 @@ func applyConfigLine(cfg *pluginConfig, key, value string) error {
 		cfg.ExtraModels = splitList(stripInlineList(value))
 	case "disabled_models":
 		cfg.DisabledModels = parseDisabledModels(value)
-	case "zen_base_url":
-		cfg.ZenBaseURL = strings.TrimSpace(value)
-	case "cline_base_url":
-		cfg.ClineBaseURL = strings.TrimSpace(value)
-	case "minimax_code_cn_base_url", "minimax_cn_base_url":
-		cfg.MiniMaxCodeCNBaseURL = strings.TrimSpace(value)
-	case "minimax_code_global_base_url", "minimax_global_base_url":
-		cfg.MiniMaxCodeGlobalBaseURL = strings.TrimSpace(value)
-	case "zcode_base_url":
-		cfg.ZCodeBaseURL = strings.TrimSpace(value)
+	// 供应商专属键（zen_base_url / cline_base_url / minimax_*_base_url /
+	// zcode_base_url / workbuddy 的 UA 与设备字段）不在这里解释：
+	// applyConfigLine 已把全部原始键写入 cfg.Raw，由各供应商的 Configure 解析。
 	case "state_dir":
 		if trimmed := strings.TrimSpace(value); trimmed != "" {
 			cfg.StateDir = trimmed
@@ -528,6 +518,8 @@ func applyConfig(cfg pluginConfig) error {
 	}
 	applyPromptConfig(cfg)
 	storeConfig(cfg)
+	// 供应商专属配置：根层只提供原始键，由各包自己解释。
+	configureVendors(cfg)
 	refreshDisabledModelCache()
 	refreshModelAliasCache()
 	return nil

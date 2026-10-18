@@ -16,6 +16,8 @@ import (
 	"net"
 	"strings"
 	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // 错误类型（透传给客户端的 error.type 字段）
@@ -225,14 +227,7 @@ func NewStreamBusinessError(detail string) *UpstreamError {
 }
 
 // firstNonEmptyValue 返回第一个非空字符串（本地小工具，避免跨包依赖）。
-func firstNonEmptyValue(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
-}
+func firstNonEmptyValue(values ...string) string { return core.FirstNonEmpty(values...) }
 
 // WrapTransportError 传输层错误包装：瞬时类转成带友好消息的 UpstreamError，
 // 非瞬时（如 URL 配置错误）原样返回。

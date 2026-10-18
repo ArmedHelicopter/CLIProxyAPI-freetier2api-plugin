@@ -20,11 +20,7 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/vendors/cline"
-	"freetier2api-plugin/internal/vendors/minimaxcode"
-	"freetier2api-plugin/internal/vendors/opencodezen"
 	"freetier2api-plugin/internal/vendors/workbuddy"
-	"freetier2api-plugin/internal/vendors/zcode"
 )
 
 // staticModelRPCRequest 与宿主的 model.static 请求对齐。
@@ -134,7 +130,7 @@ func staticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
 		all = append(all, applyModelAliases(vendor.ID(), filtered)...)
 	}
 	if len(all) == 0 && firstErr != nil {
-		return nil, errorToPluginError(firstErr)
+		return nil, core.ToPluginError(firstErr)
 	}
 	// 额外模型同样支持别名：逐条按其供应商换对外 ID。
 	for _, extra := range extraModels(loadedConfig()) {
@@ -295,27 +291,6 @@ func defaultMaxOutputFor(modelID string) int64 {
 	return 16384
 }
 
-// baseURLOverride 读取某个供应商的上游基地址覆盖值。
-//
-// 上游换域名或用户要走自建网关时不必改代码重编译。
-func baseURLOverride(vendorID string) string {
-	cfg := loadedConfig()
-	switch vendorID {
-	case opencodezen.VendorID:
-		return cfg.ZenBaseURL
-	case cline.VendorID:
-		return cfg.ClineBaseURL
-	case minimaxcode.VendorIDCN:
-		return cfg.MiniMaxCodeCNBaseURL
-	case minimaxcode.VendorIDGlobal:
-		return cfg.MiniMaxCodeGlobalBaseURL
-	case zcode.VendorID:
-		return cfg.ZCodeBaseURL
-	default:
-		return ""
-	}
-}
-
 // applyModelCatalog 在注册/重配置时预热模型缓存。
 //
 // 灌入上次的状态缓存能让 /v1/models 立刻有内容，不必等首次上游探测完成。
@@ -456,7 +431,7 @@ func refreshModelsFromUpstream(ctx context.Context) (int, error) {
 		total += len(models)
 	}
 	if total == 0 && firstErr != nil {
-		return 0, errorToPluginError(firstErr)
+		return 0, core.ToPluginError(firstErr)
 	}
 	persistModels()
 	return total, nil

@@ -18,8 +18,11 @@ CGO_ENABLED=1 go build -buildmode=c-shared  # 产出 freetier2api.so（约 10 MB
 | `plugin_test.go` | 注册响应契约（含 `executor_model_scope`）、热更新、未知方法、凭证归属判定、**realm 隔离**、静态模型元数据、非流式聚合、流式分帧与错误上报 |
 | `registry_test.go` | 三方源清单格式、插件 ID 与产物名一致、控制台页路由声明、页面静态自包含、能力与实现一致 |
 | `internal/vendors/workbuddy/cb_test.go` | 错误分类 15 级顺序、模型避让的字段边界、重试与状态码映射、等待信息解析、凭证双形态、合并写回、指纹稳定性、缓存键隔离、改写管线各步、工具配对、SSE 聚合与白名单重建、脱敏 |
+| `internal/core/core_test.go` | 归属三级判定、注册表幂等约束、模型键协议、`ParseCredential` 身份兜底、`ToPluginError` 映射、`BaseVendor` 默认行为 |
+| `internal/loginsession/loginsession_test.go` | 会话登记/TTL/轮询节流/归属查询/并发（`-race`） |
+| `vendor_compat_test.go` | 13 个供应商实例的 ID/名称/区域 golden 对比、供应商专属配置键兼容 |
 | `internal/httpx/transport_test.go` | 宿主 HTTP 桥的**双形态键名兼容**、缺状态码的显式报错 |
-| `internal/tasks/tasks_test.go` | 各事件链结构与关键字段、小程序事件形态、指纹注入、夜猫子窗口边界 |
+| `internal/vendors/workbuddy/tasks/tasks_test.go` | 各事件链结构与关键字段、小程序事件形态、指纹注入、夜猫子窗口边界 |
 
 ## 二、关键机制验证（读宿主源码确认）
 

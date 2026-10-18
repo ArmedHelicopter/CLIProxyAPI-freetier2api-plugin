@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -81,7 +82,7 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 
 	response, errExecute := prepared.vendor.Execute(ctx, prepared.credential, prepared.executeRequest())
 	if errExecute != nil {
-		return nil, errorToPluginError(errExecute)
+		return nil, core.ToPluginError(errExecute)
 	}
 	return okEnvelope(response)
 }
@@ -270,58 +271,6 @@ func isChatFormat(format string) bool {
 	return false
 }
 
-// chatMetaFor 从执行请求派生会话头族。
-//
-// 会话键来自请求体（客户端传的会话标识，或由 system+首条 user 派生），
-// 同一次请求内所有重试共用同一组头——上游后台按 X-Conversation-Request-ID 聚合。
-func chatMetaFor(rpc executorRPCRequest) workbuddy.ChatMeta {
-	return chatMetaFromBody(rpc.Payload, rpc.Headers)
-}
-
-// chatMetaForExecuteRequest 从 vendor 适配层的执行请求派生会话头族。
-//
-// 与 chatMetaFor 同源，只是入参形态不同：适配层拿到的是已解好的
-// core.ExecuteRequest，不需要再经 executorRPCRequest。
-func chatMetaForExecuteRequest(req *core.ExecuteRequest) workbuddy.ChatMeta {
-	if req == nil {
-		return workbuddy.ChatMeta{}
-	}
-	return chatMetaFromBody(req.Payload, http.Header(req.Headers))
-}
-
-// chatMetaFromBody 从请求体与请求头派生会话头族。
-//
-// 会话键从请求体里提取（客户端可能指定了 conversation/message id），
-// 缺失时由 turnKey 兜底——上游要求 ConversationRequestID 必发。
-func chatMetaFromBody(body []byte, headers http.Header) workbuddy.ChatMeta {
-	conversationKey := workbuddy.ConversationKey(body)
-	turnKey := workbuddy.TurnKey(body)
-
-	// 入站透传的链路 ID 优先（调用方可能已经建好了链路）。
-	traceID := ""
-	if headers != nil {
-		traceID = strings.TrimSpace(headers.Get("X-Trace-ID"))
-	}
-
-	conversationRequestID := ""
-	switch {
-	case conversationKey != "" && turnKey != "":
-		conversationRequestID = workbuddy.TurnRequestID(conversationKey + ":" + turnKey)
-	case turnKey != "":
-		conversationRequestID = workbuddy.TurnRequestID(turnKey)
-	case conversationKey != "":
-		conversationRequestID = workbuddy.RequestIDForKey(conversationKey)
-	default:
-		conversationRequestID = workbuddy.TurnRequestID("")
-	}
-
-	return workbuddy.ChatMeta{
-		ConversationID:        conversationKey,
-		ConversationRequestID: conversationRequestID,
-		TraceID:               traceID,
-	}
-}
-
 // handleExecutorCountTokens 估算 token 数。
 //
 // 上游没有 token 计数接口，因此这是**保守估算**：宁可高估也不能低估，
@@ -413,9 +362,11 @@ func streamFailureMessage(err error) string {
 	if err == nil {
 		return ""
 	}
-	var upstreamErr *workbuddy.Error
-	if asUpstreamError(err, &upstreamErr) && strings.TrimSpace(upstreamErr.Msg) != "" {
-		return upstreamErr.Msg
+	var detail core.UpstreamDetail
+	if errors.As(err, &detail) {
+		if message := strings.TrimSpace(detail.UpstreamMessage()); message != "" {
+			return message
+		}
 	}
 	return err.Error()
 }

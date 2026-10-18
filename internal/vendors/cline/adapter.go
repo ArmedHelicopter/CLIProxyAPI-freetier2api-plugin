@@ -1,0 +1,335 @@
+package cline
+
+// 本文件把 Cline 适配成 core.Vendor。
+//
+// 与其它供应商的关键差异：
+//   - **有完整登录流程**：WorkOS OAuth 2.0 设备码（RFC 8628），三步换到
+//     Cline 自己的令牌；会话状态存在共享的 loginsession 登记表里；
+//   - **没有区域**：只有一个部署（api.cline.bot），Region() 返回空串；
+//   - **没有额度接口**：上游不提供余额查询，Quota 返回「不支持」；
+//   - **令牌需要 workos: 前缀**：由协议层统一补，适配层不必记。
+
+import (
+	"context"
+	"strings"
+	"time"
+
+	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/logger"
+	"freetier2api-plugin/internal/loginsession"
+)
+
+// adapter 是 core.Vendor 在 Cline 上的实现。
+type adapter struct {
+	core.BaseVendor
+	contextFallback func(string) int64
+}
+
+// pendingLogin 是一次进行中的 Cline 登录（会话数据）。
+type pendingLogin struct {
+	deviceCode string
+}
+
+// Instances 构造 Cline 实例（只有一个，没有区域之分）。
+func Instances(contextFallback func(string) int64) []core.Vendor {
+	if contextFallback == nil {
+		contextFallback = core.DefaultContextWindow
+	}
+	return []core.Vendor{&adapter{
+		BaseVendor: core.BaseVendor{
+			VendorID:                VendorID,
+			VendorName:              VendorName,
+			QuotaUnsupportedMessage: "Cline 上游不提供额度查询接口（额度以订阅页为准）",
+		},
+		contextFallback: contextFallback,
+	}}
+}
+
+// AuthMode 报告本供应商的凭证形态。
+func (v *adapter) AuthMode() string { return "oauth" }
+
+// Configure 解析供应商专属配置。
+func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
+	Configure(settings, raw)
+}
+
+// ---- 凭证 ----
+
+// Match 判断一份凭证是否属于本供应商。
+func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
+	return LooksLikeCredential(raw, fileName, provider)
+}
+
+// Parse 把凭证 JSON 解析成 core.Credential。
+func (v *adapter) Parse(raw []byte, fileName string) (*core.Credential, error) {
+	native, errParse := ParseCredential(raw)
+	if errParse != nil {
+		return nil, errParse
+	}
+	return newCoreCredential(native, fileName), nil
+}
+
+// newCoreCredential 把协议层凭证包装成 core.Credential。
+func newCoreCredential(native *Credential, fileName string) *core.Credential {
+	label := native.Label
+	if label == "" {
+		label = native.Email
+	}
+	if label == "" {
+		label = fileName
+	}
+	return &core.Credential{
+		VendorID:     VendorID,
+		Label:        label,
+		FileID:       strings.TrimSuffix(strings.TrimSpace(fileName), ".json"),
+		Token:        native.AccessToken,
+		RefreshToken: native.RefreshToken,
+		ExpiresAt:    native.ExpiresAt,
+		AuthMode:     "oauth",
+		Native:       native,
+	}
+}
+
+// nativeCredential 取回协议层凭证对象。
+func (v *adapter) nativeCredential(cred *core.Credential) (*Credential, error) {
+	return core.NativeCredential(cred, VendorID, func(c *core.Credential) (*Credential, bool) {
+		native, okNative := c.Native.(*Credential)
+		return native, okNative
+	})
+}
+
+// ---- 模型 ----
+
+// StaticModels 返回 Cline 的模型清单（上游接口无需认证）。
+func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
+	models, errModels := FetchModels(ctx, BaseURLOverride())
+	if errModels != nil {
+		// 探测失败退回内置兜底清单：没有模型注册比注册一份可能过时的
+		// 清单更糟（客户端会看不到任何模型）。
+		logger.Debug("cline: list models failed, using bundled list: %v", errModels)
+		models = BundledClineModels()
+	}
+	return v.modelsToPluginAPI(models), nil
+}
+
+// ModelsForAuth 返回该凭证可用的模型。
+//
+// Cline 的清单是全局的（不按账号区分），因此与 StaticModels 同源。
+func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
+	if cred == nil {
+		return nil, nil
+	}
+	return v.StaticModels(ctx)
+}
+
+// modelsToPluginAPI 把上游模型条目转成宿主契约类型。
+func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
+	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			return core.ModelDescriptor{}, false
+		}
+		name := strings.TrimSpace(model.Name)
+		if name == "" {
+			name = id
+		}
+		contextWindow := model.ContextWindow
+		if contextWindow == 0 {
+			contextWindow = v.contextFallback(id)
+		}
+		maxOutput := model.MaxOutputTokens
+		if maxOutput == 0 {
+			maxOutput = core.DefaultMaxOutputTokens
+		}
+		return core.ModelDescriptor{
+			ID:                 id,
+			Name:               name,
+			Description:        describeModel(model),
+			ContextLength:      contextWindow,
+			MaxOutputTokens:    maxOutput,
+			SupportsTools:      model.SupportsTools,
+			CanDisableThinking: !model.IsReasoning,
+		}, true
+	})
+}
+
+// describeModel 拼接模型说明（标出计费档）。
+//
+// 计费档是用户最关心的信息：免费档可以随便用，订阅档要占套餐额度。
+func describeModel(model Model) string {
+	description := strings.TrimSpace(model.Description)
+	switch model.Cost {
+	case CostFree:
+		description = "[免费] " + description
+	case CostPass:
+		description = "[订阅] " + description
+	}
+	if model.IsReasoning {
+		description += "（推理）"
+	}
+	return description
+}
+
+// ---- 执行 ----
+
+// Execute 执行一次非流式对话。
+func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
+	native, errNative := v.nativeCredential(cred)
+	if errNative != nil {
+		return nil, errNative
+	}
+	payload, errChat := Chat(ctx, BaseURLOverride(), ChatRequest{
+		BearerToken: native.BearerToken(),
+		Body:        req.Payload,
+		Stream:      false,
+	})
+	if errChat != nil {
+		return nil, core.ToPluginError(errChat)
+	}
+	return &pluginapi.ExecutorResponse{
+		Payload: payload,
+		Headers: map[string][]string{"Content-Type": {core.ContentTypeJSON}},
+	}, nil
+}
+
+// ExecuteStream 执行一次流式对话。
+func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest, sink core.StreamSink) error {
+	native, errNative := v.nativeCredential(cred)
+	if errNative != nil {
+		return errNative
+	}
+	resp, errStream := ChatStream(ctx, BaseURLOverride(), ChatRequest{
+		BearerToken: native.BearerToken(),
+		Body:        req.Payload,
+		Stream:      true,
+	})
+	if errStream != nil {
+		return core.ToPluginError(errStream)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	return httpx.ForwardRawSSE(resp.Body, sink.Emit)
+}
+
+// ---- 登录与续期 ----
+
+// LoginStart 发起一次 WorkOS 设备码授权。
+func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	device, errStart := LoginStart(ctx)
+	if errStart != nil {
+		return nil, core.ToPluginError(errStart)
+	}
+	sessionID := "cline_" + loginsession.NewID(16)
+	loginsession.Register(VendorID, sessionID, time.Until(device.ExpiresAt), device.Interval, &pendingLogin{deviceCode: device.DeviceCode})
+	logger.Info("started cline login (user_code=%s)", device.UserCode)
+	return &pluginapi.AuthLoginStartResponse{
+		Provider:  core.ProviderKey,
+		URL:       device.VerificationURI,
+		State:     sessionID,
+		ExpiresAt: device.ExpiresAt,
+		Metadata: map[string]any{
+			core.VendorKey: VendorID,
+			// user_code 必须展示给用户：授权页要求手动输入这串短码
+			// （verification_uri_complete 有时不自动填）。
+			"user_code": device.UserCode,
+		},
+	}, nil
+}
+
+// LoginPoll 轮询一次登录状态。
+func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
+	session, pollState := loginsession.Poll(state)
+	if pollState == loginsession.PollMissing {
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: "登录会话不存在或已过期，请重新发起登录",
+		}, nil
+	}
+	if pollState == loginsession.PollThrottled {
+		// 节流期间：继续保持等待状态，不打上游也不报错。
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusPending,
+			Message: "正在等待用户在浏览器中授权...",
+		}, nil
+	}
+	pending, okPending := session.Data.(*pendingLogin)
+	if !okPending {
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: "登录会话数据已损坏，请重新发起登录",
+		}, nil
+	}
+	credential, errPoll := LoginPoll(ctx, BaseURLOverride(), pending.deviceCode)
+	if errPoll != nil {
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: errPoll.Error(),
+		}, nil
+	}
+	if credential == nil {
+		// 用户还没在浏览器里完成授权，继续等待。
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusPending,
+			Message: "正在等待用户在浏览器中授权...",
+		}, nil
+	}
+
+	loginsession.Delete(strings.TrimSpace(state))
+	storageJSON, errStorage := credential.StorageJSON()
+	if errStorage != nil {
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusError,
+			Message: "构建凭证失败：" + errStorage.Error(),
+		}, nil
+	}
+	coreCredential := newCoreCredential(credential, "")
+	logger.Info("completed cline login for %s", core.FirstNonEmpty(credential.Email, credential.AccountID))
+	return &pluginapi.AuthLoginPollResponse{
+		Status:  pluginapi.AuthLoginStatusSuccess,
+		Message: "登录成功",
+		Auth: pluginapi.AuthData{
+			Provider:    core.ProviderKey,
+			FileName:    core.FileNameFor(VendorID, core.FirstNonEmpty(credential.Email, credential.AccountID, loginsession.NewID(16))),
+			Label:       coreCredential.LabelValue(),
+			StorageJSON: storageJSON,
+		},
+	}, nil
+}
+
+// OwnsLoginSession 报告该会话是否由本供应商创建。
+func (v *adapter) OwnsLoginSession(sessionID string) bool {
+	if vendorID, okOwns := loginsession.Owns(sessionID); okOwns {
+		return vendorID == VendorID
+	}
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "cline_")
+}
+
+// Refresh 校验并刷新凭证。
+func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
+	native, errNative := v.nativeCredential(cred)
+	if errNative != nil {
+		return nil, false, errNative
+	}
+	updated, refreshed, errRefresh := RefreshCredential(ctx, BaseURLOverride(), native)
+	if errRefresh != nil {
+		return nil, false, errRefresh
+	}
+	if refreshed && updated != nil {
+		cred.ApplyTokenRefresh(updated.AccessToken, updated.RefreshToken, updated.ExpiresAt)
+		cred.Native = updated
+	}
+	return cred, refreshed, nil
+}
+
+// MergeStorageJSON 实现 core.StorageMerger：把续期后的令牌合并回原凭证 JSON。
+func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential) ([]byte, error) {
+	native, errNative := v.nativeCredential(credential)
+	if errNative != nil {
+		return original, errNative
+	}
+	return MergeStorageJSON(original, native)
+}
+
+// SupportsLogin 报告本供应商支持登录（默认行为，显式写出便于阅读）。
+func (v *adapter) SupportsLogin() bool { return true }

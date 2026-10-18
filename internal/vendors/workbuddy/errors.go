@@ -484,3 +484,19 @@ func scanBusinessCode(value any, want string) bool {
 	}
 	return false
 }
+
+// UpstreamKind 返回错误分类标识（实现 core.UpstreamError）。
+func (e *Error) UpstreamKind() string {
+	if e == nil {
+		return "unknown"
+	}
+	return e.Kind.String()
+}
+
+// UpstreamMessage 返回上游原始正文（实现 core.UpstreamDetail）。
+func (e *Error) UpstreamMessage() string {
+	if e == nil {
+		return ""
+	}
+	return e.Msg
+}

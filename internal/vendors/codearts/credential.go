@@ -7,6 +7,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 type Credential struct {
@@ -120,56 +122,7 @@ func (c *Credential) StorageJSON() ([]byte, error) {
 	return json.MarshalIndent(m, "", "  ")
 }
 
-func getMap(m map[string]any, key string) map[string]any {
-	if m == nil {
-		return nil
-	}
-	if v, ok := m[key]; ok && v != nil {
-		if sub, ok := v.(map[string]any); ok {
-			return sub
-		}
-	}
-	return nil
-}
-
-func getString(m map[string]any, key string) string {
-	if m == nil {
-		return ""
-	}
-	if v, ok := m[key]; ok && v != nil {
-		if s, ok := v.(string); ok {
-			return strings.TrimSpace(s)
-		}
-	}
-	return ""
-}
-
-func getInt64(m map[string]any, keys ...string) int64 {
-	if m == nil {
-		return 0
-	}
-	for _, key := range keys {
-		if v, ok := m[key]; ok && v != nil {
-			switch n := v.(type) {
-			case float64:
-				return int64(n)
-			case int64:
-				return n
-			case json.Number:
-				if parsed, err := n.Int64(); err == nil {
-					return parsed
-				}
-			}
-		}
-	}
-	return 0
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
-}
+func getMap(m map[string]any, key string) map[string]any { return core.GetMap(m, key) }
+func getString(m map[string]any, key string) string      { return core.GetString(m, key) }
+func getInt64(m map[string]any, keys ...string) int64    { return core.GetInt64(m, keys...) }
+func firstNonEmpty(values ...string) string              { return core.FirstNonEmpty(values...) }

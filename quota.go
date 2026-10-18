@@ -7,13 +7,11 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"net/http"
-	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
 // handleQuotaDescribe 描述本插件的额度能力。
@@ -46,7 +44,7 @@ func handleQuotaFetch(request []byte) ([]byte, error) {
 
 	response, errQuota := vendor.Quota(ctx, credential)
 	if errQuota != nil {
-		return nil, errorToPluginError(errQuota)
+		return nil, core.ToPluginError(errQuota)
 	}
 	return okEnvelope(response)
 }
@@ -75,75 +73,10 @@ func handleQuotaReset(request []byte) ([]byte, error) {
 
 	result, errCheckin := vendor.Checkin(ctx, credential)
 	if errCheckin != nil {
-		return nil, errorToPluginError(errCheckin)
+		return nil, core.ToPluginError(errCheckin)
 	}
 	if result == nil {
 		return okEnvelope(pluginapi.QuotaResetResponse{Success: false, Message: "签到未返回结果"})
 	}
 	return okEnvelope(pluginapi.QuotaResetResponse{Success: true, Message: result.Message})
-}
-
-// buildQuotaResponse 把账号额度转成宿主的归一化额度结构。
-//
-// 结构层次：Summary 放关键数字（宿主的额度卡片直接读它），
-// Groups/Buckets 放明细（展开后看）。
-func buildQuotaResponse(credential *workbuddy.Credential, balance *workbuddy.Balance) pluginapi.QuotaFetchResponse {
-	region := credential.Realm()
-	response := pluginapi.QuotaFetchResponse{
-		Subscription: &pluginapi.QuotaSubscription{
-			Plan:     string(region),
-			TierName: realmDisplayName(region),
-		},
-		Summary: []pluginapi.QuotaMetric{
-			{Key: "credit_remain", Label: "剩余积分", Value: float64(balance.Remain), Format: "number"},
-			{Key: "credit_total", Label: "总额度", Value: float64(balance.Total), Format: "number"},
-		},
-	}
-	if balance.Total > 0 {
-		used := balance.Total - balance.Remain
-		if used < 0 {
-			used = 0
-		}
-		response.Summary = append(response.Summary,
-			pluginapi.QuotaMetric{Key: "credit_used", Label: "已用积分", Value: float64(used), Format: "number"})
-	}
-	if len(balance.Packages) > 0 {
-		buckets := make([]pluginapi.QuotaBucket, 0, len(balance.Packages))
-		for _, pkg := range balance.Packages {
-			fraction := 0.0
-			if pkg.Total > 0 {
-				fraction = float64(pkg.Remain) / float64(pkg.Total)
-			}
-			bucket := pluginapi.QuotaBucket{
-				Window:            pkg.Name,
-				RemainingFraction: fraction,
-				Description:       fmt.Sprintf("%d / %d", pkg.Remain, pkg.Total),
-			}
-			if pkg.ExpireAt > 0 {
-				bucket.ResetTime = formatUnixTime(pkg.ExpireAt)
-			}
-			buckets = append(buckets, bucket)
-		}
-		response.Groups = []pluginapi.QuotaGroup{{
-			DisplayName: "资源包明细",
-			Buckets:     buckets,
-		}}
-	}
-	return response
-}
-
-// realmDisplayName 返回域的展示名。
-func realmDisplayName(region workbuddy.Region) string {
-	if region.IsGlobal() {
-		return "国际版 (WorkBuddy AI)"
-	}
-	return "国内版 (CodeBuddy)"
-}
-
-// formatUnixTime 把 Unix 秒格式化为 RFC3339（无效值返回空串）。
-func formatUnixTime(seconds int64) string {
-	if seconds <= 0 {
-		return ""
-	}
-	return time.Unix(seconds, 0).UTC().Format(time.RFC3339)
 }

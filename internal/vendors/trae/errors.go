@@ -59,3 +59,40 @@ func Classify(status int, body string) error {
 		return &Error{Kind: KindClient, Status: status, Code: payload.Code, Message: msg}
 	}
 }
+
+// HTTPStatus 返回映射给宿主的 HTTP 状态码。
+func (e *Error) HTTPStatus() int {
+	if e == nil {
+		return http.StatusBadGateway
+	}
+	if e.Status >= 400 {
+		return e.Status
+	}
+	switch e.Kind {
+	case KindCredential:
+		return http.StatusUnauthorized
+	case KindRateLimit:
+		return http.StatusTooManyRequests
+	case KindTransient:
+		return http.StatusBadGateway
+	case KindClient:
+		return http.StatusBadRequest
+	}
+	return http.StatusBadGateway
+}
+
+// Retryable 报告宿主是否应换一个凭证重试同一请求。
+func (e *Error) Retryable() bool {
+	if e == nil {
+		return false
+	}
+	return e.Kind != KindCredential && e.Kind != KindClient
+}
+
+// UpstreamKind 返回错误分类标识。
+func (e *Error) UpstreamKind() string {
+	if e == nil || e.Kind == "" {
+		return "unknown"
+	}
+	return string(e.Kind)
+}

@@ -279,23 +279,5 @@ func decodeJWTPayload(segment string) map[string]any {
 	return claims
 }
 
-func getString(m map[string]any, key string) string {
-	if m == nil {
-		return ""
-	}
-	if v, ok := m[key]; ok && v != nil {
-		if s, ok := v.(string); ok {
-			return strings.TrimSpace(s)
-		}
-	}
-	return ""
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, v := range values {
-		if strings.TrimSpace(v) != "" {
-			return strings.TrimSpace(v)
-		}
-	}
-	return ""
-}
+func getString(m map[string]any, key string) string { return core.GetString(m, key) }
+func firstNonEmpty(values ...string) string         { return core.FirstNonEmpty(values...) }

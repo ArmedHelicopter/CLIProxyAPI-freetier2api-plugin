@@ -36,17 +36,6 @@ func RandomHex(n int) string {
 	return hex.EncodeToString(buf)
 }
 
-func oldHexIDInternal() string {
-	buf := make([]byte, 16)
-	if _, errRand := rand.Read(buf); errRand != nil {
-		// crypto/rand 失败极罕见；退回时间派生值也比返回空串安全——
-		// 空 messageID 会让上游的会话聚合失效。
-		sum := sha256.Sum256([]byte(fmt.Sprintf("fallback-%d", nextFallbackSeed())))
-		buf = sum[:16]
-	}
-	return hex.EncodeToString(buf)
-}
-
 var fallbackSeed int64
 
 func nextFallbackSeed() int64 {

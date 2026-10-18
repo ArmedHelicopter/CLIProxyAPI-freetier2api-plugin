@@ -94,16 +94,6 @@ func handleAuthParse(request []byte) ([]byte, error) {
 	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: auth})
 }
 
-// defaultRealmForParse 决定解析无 realm 声明的凭证时使用的兜底域。
-//
-// 两个域都启用时兜底 cn（历史数据以 cn 为主）；只启用一个域时用它。
-func defaultRealmForParse(cfg pluginConfig) workbuddy.Region {
-	if realmEnabled(cfg, string(workbuddy.RegionCN)) {
-		return workbuddy.RegionCN
-	}
-	return workbuddy.RegionGlobal
-}
-
 // buildAuthDataFor 构造宿主契约的凭证记录（供应商无关）。
 //
 // fileName 由调用方决定：
@@ -232,7 +222,7 @@ func handleAuthRefresh(request []byte) ([]byte, error) {
 	if errRefresh != nil {
 		if isCredentialRejected(errRefresh) {
 			logger.Error("auth refresh rejected for %s: %v", rpc.AuthID, errRefresh)
-			return nil, errorToPluginError(errRefresh)
+			return nil, core.ToPluginError(errRefresh)
 		}
 		// 抖动或未知错误：保留原凭证，稍后重试。
 		logger.Debug("auth refresh deferred for %s: %v", rpc.AuthID, errRefresh)
@@ -306,16 +296,19 @@ func refreshedAuthData(rpc authRefreshRPCRequest, storageJSON []byte, credential
 }
 
 // isCredentialRejected 报告错误是否表示凭证真的失效。
+//
+// 判断依据是供应商分类后的 HTTP 状态码（401/403 凭证失效、402 额度耗尽），
+// 因此对全部供应商生效，而不是只认 WorkBuddy 的错误类型。
 func isCredentialRejected(err error) bool {
-	var upstreamErr *workbuddy.Error
-	if !errors.As(err, &upstreamErr) {
+	var upstream core.UpstreamError
+	if !errors.As(err, &upstream) {
 		return false
 	}
-	switch upstreamErr.Kind {
-	case workbuddy.KindSessionDead, workbuddy.KindHardCredit:
+	switch upstream.HTTPStatus() {
+	case http.StatusUnauthorized, http.StatusForbidden, http.StatusPaymentRequired:
 		return true
 	}
-	return upstreamErr.Status == http.StatusUnauthorized || upstreamErr.Status == http.StatusForbidden
+	return false
 }
 
 // credentialCacheEntry 是凭证回源查找的缓存项。
