@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -48,12 +47,6 @@ func pkcePair() (verifier, challenge string, err error) {
 	h := sha256.Sum256([]byte(verifier))
 	challenge = base64.RawURLEncoding.EncodeToString(h[:])
 	return verifier, challenge, nil
-}
-
-func randomHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }
 
 // LoginStart 向 MiniMax 账号服务申请 OAuth2 设备码。
@@ -112,7 +105,7 @@ func LoginStart(ctx context.Context, r Region) (*pluginapi.AuthLoginStartRespons
 		expiresInSec = 300
 	}
 
-	sessionID := "minimaxcode_" + string(r) + "_" + randomHex(8)
+	sessionID := "minimaxcode_" + string(r) + "_" + core.RandomHex(8)
 	expiresAt := time.Now().Add(time.Duration(expiresInSec) * time.Second)
 
 	pending := &PendingLogin{
@@ -289,7 +282,7 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 		}, nil
 	}
 
-	accountIdentifier := firstNonEmpty(cred.UserID, cred.Email, session.UserCode, randomHex(4))
+	accountIdentifier := firstNonEmpty(cred.UserID, cred.Email, session.UserCode, core.RandomHex(4))
 	label := cred.Label
 	if label == "" {
 		label = VendorNameFor(session.Region) + "-" + accountIdentifier

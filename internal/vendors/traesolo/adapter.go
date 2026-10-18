@@ -16,21 +16,17 @@ import (
 
 // adapter 是 core.Vendor 在 TRAE SOLO 上的实现。
 type adapter struct {
-	core.BaseVendor
+	core.Meta
 }
 
 // Instances 构造 TRAE SOLO 实例。
 func Instances() []core.Vendor {
-	return []core.Vendor{&adapter{BaseVendor: core.BaseVendor{
-		VendorID:       VendorID,
-		VendorName:     VendorName,
-		VendorRegion:   "cn",
-		CheckinSupport: SupportsCheckin(),
+	return []core.Vendor{&adapter{Meta: core.Meta{
+		VendorID:     VendorID,
+		VendorName:   VendorName,
+		VendorRegion: "cn",
 	}}}
 }
-
-// SupportsLogin 报告本供应商支持登录。
-func (v *adapter) SupportsLogin() bool { return true }
 
 // ---- 凭证 ----
 
@@ -87,17 +83,6 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	}
 	return modelsToPluginAPI(models), nil
 }
-
-// ModelsForAuth 返回该凭证可用的模型。
-func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
-	native, _ := v.nativeCredential(cred)
-	models, errModels := FetchModels(ctx, native)
-	if errModels != nil {
-		return nil, errModels
-	}
-	return modelsToPluginAPI(models), nil
-}
-
 func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		if strings.TrimSpace(model.ID) == "" {
@@ -224,3 +209,5 @@ func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential)
 	}
 	return MergeStorageJSON(original, native)
 }
+
+func (v *adapter) SupportsCheckin() bool { return SupportsCheckin() }

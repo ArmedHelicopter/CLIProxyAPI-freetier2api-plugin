@@ -13,6 +13,8 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // VendorID 是供应商实例标识。同时是凭证文件名前缀。
@@ -147,24 +149,6 @@ func hasForeignMarker(raw map[string]any) bool {
 	return false
 }
 
-// fileNameMatchesConvention 判断文件名是否符合本协议的命名约定。
-//
-// 约定：opencodezen.json / opencodezen-<id>.json / opencode-zen-<id>.json。
 func fileNameMatchesConvention(fileName string) bool {
-	base := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(fileName), ".json"))
-	if base == "" {
-		return false
-	}
-	if base == VendorID || base == "opencode" || base == "zen" {
-		return true
-	}
-	for _, separator := range []string{"-", "_", "."} {
-		for _, name := range []string{VendorID, "opencode", "zen"} {
-			if strings.HasPrefix(base, name+separator) ||
-				strings.Contains(base, separator+name) {
-				return true
-			}
-		}
-	}
-	return false
+	return core.FileNameMatchesConvention(fileName, VendorID, "opencode", "zen")
 }

@@ -64,18 +64,12 @@ func ParseCredential(raw []byte) (*Credential, error) {
 
 // LooksLikeCredential 判断文件或数据是否属于 TRAE SOLO。
 func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
-	if v := strings.ToLower(getString(raw, "vendor")); v != "" && v != VendorID {
-		return false
+	if decided, claimed := core.VendorFieldVerdict(raw, VendorID); decided {
+		return claimed
 	}
 
-	// 显式声明
-	if strings.EqualFold(getString(raw, "vendor"), VendorID) {
-		return true
-	}
-
-	// 文件名前缀匹配
-	baseName := strings.ToLower(fileName)
-	if strings.HasPrefix(baseName, "traesolo-") || strings.HasPrefix(baseName, "traesolo_") || baseName == "traesolo.json" {
+	// 文件名前缀匹配（约定集中由 core 维护）。
+	if core.FileNameMatchesConvention(fileName, VendorID) {
 		return true
 	}
 

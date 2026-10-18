@@ -338,7 +338,7 @@ func handleModelsList(req pluginapi.ManagementRequest) pluginapi.ManagementRespo
 			VendorID:      vendorID,
 			VendorName:    vendorNameFor(vendorID),
 			Realm:         vendorRegionFor(vendorID),
-			Name:          firstNonEmptyString(extra.DisplayName, extra.Name),
+			Name:          core.FirstNonEmpty(extra.DisplayName, extra.Name),
 			ContextLength: extra.ContextLength,
 		})
 	}
@@ -415,7 +415,7 @@ func consoleModelsFromRegistry(vendor core.Vendor) []consoleModel {
 			VendorID:        vendor.ID(),
 			VendorName:      vendor.Name(),
 			Realm:           vendor.Region(),
-			Name:            firstNonEmptyString(info.DisplayName, info.Name),
+			Name:            core.FirstNonEmpty(info.DisplayName, info.Name),
 			Description:     info.Description,
 			ContextLength:   info.ContextLength,
 			MaxOutputTokens: info.MaxCompletionTokens,
@@ -543,9 +543,9 @@ func listAccountSummaries(ctx context.Context, callbackID string) []accountSumma
 
 	for _, entry := range entries {
 		summary := accountSummary{
-			AuthID:    firstNonEmptyString(entry.ID, entry.Name),
+			AuthID:    core.FirstNonEmpty(entry.ID, entry.Name),
 			AuthIndex: entry.AuthIndex,
-			Label:     firstNonEmptyString(entry.Label, entry.Name, entry.ID),
+			Label:     core.FirstNonEmpty(entry.Label, entry.Name, entry.ID),
 			Status:    entry.Status,
 			Disabled:  entry.Disabled,
 		}
@@ -570,12 +570,12 @@ func listAccountSummaries(ctx context.Context, callbackID string) []accountSumma
 				}
 			}
 			// 按凭证归属解析；解不出时保留宿主给的 provider 作为兜底展示。
-			if credential, okParse := parseVendorCredential(raw, accountIdentity(entry), nil); okParse {
+			if credential, okParse := core.ParseCredential(raw, accountIdentity(entry), nil); okParse {
 				summary.VendorID = credential.VendorIDValue()
 				summary.Realm = credential.RegionValue()
 				if vendor, okVendor := core.VendorByID(summary.VendorID); okVendor {
 					summary.VendorName = vendor.Name()
-					summary.SupportsCheckin = vendor.SupportsCheckin()
+					summary.SupportsCheckin = core.SupportsCheckin(vendor)
 				}
 				if label := credential.LabelValue(); label != "" {
 					summary.Label = label
@@ -722,8 +722,8 @@ func handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.Manag
 			continue
 		}
 		result := accountActionResult{
-			AuthID: firstNonEmptyString(entry.ID, entry.Name),
-			Label:  firstNonEmptyString(entry.Label, entry.Name, entry.ID),
+			AuthID: core.FirstNonEmpty(entry.ID, entry.Name),
+			Label:  core.FirstNonEmpty(entry.Label, entry.Name, entry.ID),
 		}
 		if errDelete := deleteAuthFile(ctx, callbackID, entry); errDelete != nil {
 			result.OK = false
@@ -748,7 +748,7 @@ func deleteAuthFile(ctx context.Context, callbackID string, entry hostAuthEntry)
 	if !okRaw {
 		return fmt.Errorf("读取凭证失败，无法确认归属")
 	}
-	if _, okParse := parseVendorCredential(raw, accountIdentity(entry), nil); !okParse {
+	if _, okParse := core.ParseCredential(raw, accountIdentity(entry), nil); !okParse {
 		return fmt.Errorf("该凭证不属于本插件，拒绝删除")
 	}
 
@@ -903,10 +903,14 @@ func handleCheckinRequest(req pluginapi.ManagementRequest) pluginapi.ManagementR
 
 	results := runForAccounts(ctx, hostCallbackID(req), body.AccountIDs,
 		func(vendor core.Vendor, credential *core.Credential) bool {
-			return vendor.SupportsCheckin()
+			return core.SupportsCheckin(vendor)
 		},
 		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (string, error) {
-			result, errCheckin := vendor.Checkin(ctx, credential)
+			checkin, okCheckin := core.As[core.CheckinProvider](vendor)
+			if !okCheckin {
+				return "", fmt.Errorf("本供应商不提供签到")
+			}
+			result, errCheckin := checkin.Checkin(ctx, credential)
 			if errCheckin != nil {
 				return "", errCheckin
 			}
@@ -1050,15 +1054,15 @@ func handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 			}
 		}
 		if len(raw) == 0 {
-			targetID := firstNonEmptyString(entry.AuthIndex, entry.ID, entry.Name)
+			targetID := core.FirstNonEmpty(entry.AuthIndex, entry.ID, entry.Name)
 			if r, err := fetchAuthJSON(ctx, callbackID, targetID); err == nil && len(r) > 0 {
 				raw = r
 			}
 		}
 		if len(raw) == 0 {
 			preResults = append(preResults, quotaResult{
-				AuthID:  firstNonEmptyString(entry.ID, entry.Name),
-				Label:   firstNonEmptyString(entry.Label, entry.Name, entry.ID),
+				AuthID:  core.FirstNonEmpty(entry.ID, entry.Name),
+				Label:   core.FirstNonEmpty(entry.Label, entry.Name, entry.ID),
 				OK:      false,
 				Message: "凭证读取失败",
 			})
@@ -1069,8 +1073,8 @@ func handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, accountIdentity(entry), nil)
 		if errResolve != nil {
 			preResults = append(preResults, quotaResult{
-				AuthID:  firstNonEmptyString(entry.ID, entry.Name),
-				Label:   firstNonEmptyString(entry.Label, entry.Name, entry.ID),
+				AuthID:  core.FirstNonEmpty(entry.ID, entry.Name),
+				Label:   core.FirstNonEmpty(entry.Label, entry.Name, entry.ID),
 				OK:      false,
 				Message: "凭证解析失败: " + errResolve.Error(),
 			})
@@ -1088,15 +1092,22 @@ func handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 			defer func() { <-semaphore }()
 			current := jobs[slot]
 			result := quotaResult{
-				AuthID:    firstNonEmptyString(current.entry.ID, current.entry.Name),
+				AuthID:    core.FirstNonEmpty(current.entry.ID, current.entry.Name),
 				AuthIndex: current.entry.AuthIndex,
 				Name:      current.entry.Name,
 				UID:       current.credential.FileIDValue(),
-				Label:     firstNonEmptyString(current.credential.LabelValue(), current.entry.Label, current.entry.Name),
+				Label:     core.FirstNonEmpty(current.credential.LabelValue(), current.entry.Label, current.entry.Name),
 				VendorID:  current.vendor.ID(),
 				Realm:     current.credential.RegionValue(),
 			}
-			quota, errQuota := current.vendor.Quota(ctx, current.credential)
+			quotaProvider, okQuota := core.As[core.QuotaProvider](current.vendor)
+			if !okQuota {
+				result.Message = core.QuotaUnsupported(current.vendor).Error()
+				jobResults[slot] = result
+				done <- slot
+				return
+			}
+			quota, errQuota := quotaProvider.Quota(ctx, current.credential)
 			if errQuota != nil {
 				result.Message = errQuota.Error()
 			} else {
@@ -1219,7 +1230,7 @@ func runForAccounts(
 		}
 		uid := credential.FileIDValue()
 		if uid == "" {
-			uid = firstNonEmptyString(entry.ID, entry.Name)
+			uid = core.FirstNonEmpty(entry.ID, entry.Name)
 		}
 		if uid != "" {
 			if seenUID[uid] {
@@ -1247,8 +1258,8 @@ func runForAccounts(
 			defer func() { <-semaphore }()
 			current := jobs[slot]
 			result := accountActionResult{
-				AuthID:   firstNonEmptyString(current.entry.ID, current.entry.Name),
-				Label:    firstNonEmptyString(current.credential.LabelValue(), current.entry.Label),
+				AuthID:   core.FirstNonEmpty(current.entry.ID, current.entry.Name),
+				Label:    core.FirstNonEmpty(current.credential.LabelValue(), current.entry.Label),
 				VendorID: current.vendor.ID(),
 				Realm:    current.credential.RegionValue(),
 			}
@@ -1414,15 +1425,15 @@ func handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.Managemen
 		firstErrMsg    string
 	)
 	for i, j := range jobs {
-		label := firstNonEmptyString(j.credential.LabelValue(), j.entry.Label, j.entry.Name)
+		label := core.FirstNonEmpty(j.credential.LabelValue(), j.entry.Label, j.entry.Name)
 		res := keepaliveResult{
-			AuthID:   firstNonEmptyString(j.entry.ID, j.entry.Name),
+			AuthID:   core.FirstNonEmpty(j.entry.ID, j.entry.Name),
 			Label:    label,
 			VendorID: j.vendor.ID(),
 			Realm:    j.credential.RegionValue(),
 		}
 
-		updated, refreshed, errRefresh := j.vendor.Refresh(ctx, j.credential)
+		updated, refreshed, errRefresh := core.RefreshVendor(j.vendor, ctx, j.credential)
 		if errRefresh != nil {
 			failedCount++
 			res.OK = false
@@ -1506,7 +1517,7 @@ func buildVendorsPayload() map[string]any {
 			ID:              vendor.ID(),
 			Name:            vendor.Name(),
 			Region:          vendor.Region(),
-			SupportsCheckin: vendor.SupportsCheckin(),
+			SupportsCheckin: core.SupportsCheckin(vendor),
 			AuthMode:        vendorAuthMode(vendor),
 			SupportsLogin:   vendorSupportsLogin(vendor),
 		})
@@ -1529,10 +1540,8 @@ func vendorAuthMode(vendor core.Vendor) string {
 // 声明式：见 core.LoginSupport 的说明。未声明的按「支持」处理——
 // 绝大多数供应商都有登录，只有 API key 型（OpenCode ZEN）没有。
 func vendorSupportsLogin(vendor core.Vendor) bool {
-	if support, okSupport := vendor.(core.LoginSupport); okSupport {
-		return support.SupportsLogin()
-	}
-	return true
+	_, okLogin := core.As[core.LoginProvider](vendor)
+	return okLogin
 }
 
 // registeredModelsForVendor 返回某个供应商当前注册给宿主的模型清单。

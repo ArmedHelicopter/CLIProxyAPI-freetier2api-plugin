@@ -12,13 +12,11 @@ package loginsession
 //   - 归属查询（根层按 session id 找供应商，不再猜前缀）。
 
 import (
-	"crypto/rand"
-	"encoding/hex"
-	"fmt"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // Session 是一次进行中的登录会话。
@@ -134,16 +132,7 @@ func Owns(sessionID string) (string, bool) {
 //
 // 随机源不可用时退回基于时间与计数的确定性串：登录会话 id 只影响会话查找的
 // 唯一性，退化的熵在这种场景下可接受——比返回空串让登录链路崩掉好。
-func NewID(n int) string {
-	if n <= 0 {
-		n = 16
-	}
-	buf := make([]byte, n)
-	if _, errRand := rand.Read(buf); errRand != nil {
-		return fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), atomic.AddInt64(&fallbackCounter, 1))
-	}
-	return hex.EncodeToString(buf)
-}
+func NewID(n int) string { return core.RandomHex(n) }
 
 // ResetForTest 清空全部会话（仅测试使用）。
 //

@@ -15,7 +15,6 @@ package opencodezen
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -26,7 +25,7 @@ import (
 
 // adapter 是 core.Vendor 在 OpenCode ZEN 上的实现。
 type adapter struct {
-	core.BaseVendor
+	core.Meta
 	// contextFallback 是模型缺上下文窗口时的兜底（由根层注入，保持原行为）。
 	contextFallback func(string) int64
 }
@@ -39,10 +38,9 @@ func Instances(contextFallback func(string) int64) []core.Vendor {
 		contextFallback = core.DefaultContextWindow
 	}
 	return []core.Vendor{&adapter{
-		BaseVendor: core.BaseVendor{
-			VendorID:                VendorID,
-			VendorName:              VendorName,
-			QuotaUnsupportedMessage: "OpenCode ZEN 上游不提供额度查询接口（额度以订阅页为准）",
+		Meta: core.Meta{
+			VendorID:   VendorID,
+			VendorName: VendorName,
 		},
 		contextFallback: contextFallback,
 	}}
@@ -53,9 +51,6 @@ func Instances(contextFallback func(string) int64) []core.Vendor {
 // 页面据此决定账号列是否脱敏：API key 本身就是凭证，明文渲染进 HTML
 // 等于把它写进浏览器缓存与截图里。
 func (v *adapter) AuthMode() string { return "apikey" }
-
-// SupportsLogin 报告本供应商不支持登录。
-func (v *adapter) SupportsLogin() bool { return false }
 
 // Configure 解析供应商专属配置。
 func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
@@ -210,20 +205,6 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	}
 	defer func() { _ = resp.Body.Close() }()
 	return httpx.ForwardRawSSE(resp.Body, sink.Emit)
-}
-
-// ---- 登录与续期 ----
-
-// LoginStart 报告本供应商不支持登录。
-func (v *adapter) LoginStart(_ context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return nil, core.NewPluginError("login_unsupported",
-		"OpenCode ZEN 不支持登录：请到 OpenCode 官网申请 API key 后，用「添加 API Key」方式添加", http.StatusNotImplemented)
-}
-
-// LoginPoll 报告本供应商不支持登录轮询。
-func (v *adapter) LoginPoll(_ context.Context, _ string) (*pluginapi.AuthLoginPollResponse, error) {
-	return nil, core.NewPluginError("login_unsupported",
-		"OpenCode ZEN 不支持登录", http.StatusNotImplemented)
 }
 
 // Refresh 校验凭证是否仍然可用。

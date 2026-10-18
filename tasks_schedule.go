@@ -11,6 +11,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 	"freetier2api-plugin/internal/vendors/workbuddy/tasks"
@@ -30,10 +31,14 @@ func runCheckinAll(ctx context.Context) {
 	forEachAccount(ctx, "", func(ctx context.Context, account *accountContext) error {
 		// 由供应商自己决定是否提供签到：WorkBuddy 国际版与 Qoder 国际版
 		// 都实测没有签到活动（签到端点 404），这里不硬编码区域判断。
-		if !account.vendor.SupportsCheckin() {
+		if !core.SupportsCheckin(account.vendor) {
 			return nil
 		}
-		result, errCheckin := account.vendor.Checkin(ctx, account.credential)
+		checkin, okCheckin := core.As[core.CheckinProvider](account.vendor)
+		if !okCheckin {
+			return nil
+		}
+		result, errCheckin := checkin.Checkin(ctx, account.credential)
 		if errCheckin != nil {
 			logger.Error("checkin %s: %v", account.label(), errCheckin)
 			return nil

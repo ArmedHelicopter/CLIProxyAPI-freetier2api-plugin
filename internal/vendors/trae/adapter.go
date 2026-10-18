@@ -16,7 +16,7 @@ import (
 
 // adapter 是 core.Vendor 在 Trae 上的实现（每个区域一个实例）。
 type adapter struct {
-	core.BaseVendor
+	core.Meta
 	region Region
 }
 
@@ -38,18 +38,14 @@ func vendorNameFor(region Region) string {
 
 func newInstance(region Region) core.Vendor {
 	return &adapter{
-		BaseVendor: core.BaseVendor{
-			VendorID:       VendorIDFor(region),
-			VendorName:     vendorNameFor(region),
-			VendorRegion:   string(region),
-			CheckinSupport: SupportsCheckin(region),
+		Meta: core.Meta{
+			VendorID:     VendorIDFor(region),
+			VendorName:   vendorNameFor(region),
+			VendorRegion: string(region),
 		},
 		region: region,
 	}
 }
-
-// SupportsLogin 报告本供应商支持登录。
-func (v *adapter) SupportsLogin() bool { return true }
 
 // ---- 凭证 ----
 
@@ -110,12 +106,6 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	}
 	return modelsToPluginAPI(models), nil
 }
-
-// ModelsForAuth 返回该凭证可用的模型。
-func (v *adapter) ModelsForAuth(ctx context.Context, _ *core.Credential) ([]pluginapi.ModelInfo, error) {
-	return v.StaticModels(ctx)
-}
-
 func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		if strings.TrimSpace(model.ID) == "" {
@@ -244,3 +234,5 @@ func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential)
 	}
 	return MergeStorageJSON(original, native)
 }
+
+func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.region) }

@@ -90,7 +90,7 @@ func handleModelForAuth(request []byte) ([]byte, error) {
 		return okEnvelope(pluginapi.ModelResponse{Provider: providerKey})
 	}
 
-	models, errModels := vendor.ModelsForAuth(ctx, credential)
+	models, errModels := core.ModelsFor(vendor, ctx, credential)
 	if errModels != nil {
 		logger.Debug("model.for_auth: probe models for %s failed: %v", vendor.ID(), errModels)
 		return okEnvelope(pluginapi.ModelResponse{Provider: providerKey})
@@ -332,7 +332,7 @@ func probeCredentialForRealm(region workbuddy.Region) *workbuddy.Credential {
 			continue
 		}
 		// 按凭证自身的归属解析，避免用错区域的账号去打探测接口。
-		if vendor, okVendor := parseVendorCredential(stored, entry.Name, nil); okVendor {
+		if vendor, okVendor := core.ParseCredential(stored, entry.Name, nil); okVendor {
 			if vendor.RegionValue() != string(region) {
 				continue
 			}

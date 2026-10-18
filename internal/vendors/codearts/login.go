@@ -8,9 +8,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -21,6 +19,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/loginsession"
 )
@@ -35,9 +34,12 @@ type pendingLogin struct {
 
 // LoginStart 发起华为云 CodeArts 授权登录。
 func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) {
-	ticketID := randomHex(16)
-	secret := randomHex(16)
-	verifier, challenge := generatePKCE()
+	ticketID := core.RandomHex(16)
+	secret := core.RandomHex(16)
+	verifier, challenge, errPKCE := core.NewPKCEPair()
+	if errPKCE != nil {
+		return nil, fmt.Errorf("generate pkce: %w", errPKCE)
+	}
 	dpopJWK, err := generateDPoPJWK()
 	if err != nil {
 		return nil, fmt.Errorf("generate dpop jwk: %w", err)
@@ -53,7 +55,7 @@ func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) 
 	v.Set("redirect_uri", redirectURI)
 
 	authURL := PortalHost + "/authorize?" + v.Encode()
-	sessionID := "codearts_" + randomHex(8)
+	sessionID := "codearts_" + core.RandomHex(8)
 
 	loginsession.Register(VendorID, sessionID, 15*time.Minute, 0, &pendingLogin{
 		TicketID:       ticketID,
@@ -185,16 +187,6 @@ func OwnsLoginSession(sessionID string) bool {
 	}
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "codearts_")
 }
-
-func generatePKCE() (verifier, challenge string) {
-	b := make([]byte, 32)
-	_, _ = rand.Read(b)
-	verifier = base64.RawURLEncoding.EncodeToString(b)
-	sum := sha256.Sum256([]byte(verifier))
-	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
-	return verifier, challenge
-}
-
 func generateDPoPJWK() (map[string]string, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
@@ -213,10 +205,4 @@ func generateDPoPJWK() (map[string]string, error) {
 		"y":   base64.RawURLEncoding.EncodeToString(pad(key.PublicKey.Y, 32)),
 		"d":   base64.RawURLEncoding.EncodeToString(pad(key.D, 32)),
 	}, nil
-}
-
-func randomHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
 }

@@ -325,7 +325,7 @@ func activeVendorSet(ctx context.Context, callbackID string) map[string]bool {
 		if !okRaw || len(raw) == 0 {
 			continue
 		}
-		if credential, okParse := parseVendorCredential(raw, entry.Name, nil); okParse {
+		if credential, okParse := core.ParseCredential(raw, entry.Name, nil); okParse {
 			if id := credential.VendorIDValue(); id != "" {
 				active[id] = true
 			}

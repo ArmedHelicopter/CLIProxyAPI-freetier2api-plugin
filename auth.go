@@ -21,7 +21,6 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
 const (
@@ -36,8 +35,6 @@ const (
 	// 凭证轮换主要由宿主驱动（它会把新 StorageJSON 交给各能力），
 	// 这里的缓存主要服务管理页轮询：30 秒既够用又能及时看到换号。
 	credentialCacheTTL = 30 * time.Second
-	// authParseFileNameHint 是凭证文件名识别提示。
-	authParseFileNameHint = workbuddy.RegisterPathHint
 )
 
 // authParseRPCRequest 与宿主的 auth.parse 请求对齐。
@@ -85,7 +82,7 @@ func handleAuthParse(request []byte) ([]byte, error) {
 	}
 
 	logger.Info("parsed auth %s (vendor=%s)",
-		firstNonEmptyString(credential.LabelValue(), rpc.FileName, rpc.Path), vendor.ID())
+		core.FirstNonEmpty(credential.LabelValue(), rpc.FileName, rpc.Path), vendor.ID())
 
 	auth, errAuth := buildAuthDataFor(vendor, credential, rpc.FileName, rpc.RawJSON)
 	if errAuth != nil {
@@ -218,7 +215,7 @@ func handleAuthRefresh(request []byte) ([]byte, error) {
 			"credential has no resolvable vendor", http.StatusUnauthorized)
 	}
 
-	updated, refreshed, errRefresh := vendor.Refresh(ctx, credential)
+	updated, refreshed, errRefresh := core.RefreshVendor(vendor, ctx, credential)
 	if errRefresh != nil {
 		if isCredentialRejected(errRefresh) {
 			logger.Error("auth refresh rejected for %s: %v", rpc.AuthID, errRefresh)
@@ -334,7 +331,7 @@ var (
 // 因此这里不需要调用方指定供应商，新增供应商也不必改本函数。
 func credentialForAuth(ctx context.Context, callbackID string, storageJSON []byte, authID string, attributes map[string]string) (*core.Credential, error) {
 	if len(storageJSON) > 0 {
-		if credential, okParse := parseVendorCredential(storageJSON, authID, attributes); okParse {
+		if credential, okParse := core.ParseCredential(storageJSON, authID, attributes); okParse {
 			return credential, nil
 		}
 	}
@@ -344,57 +341,13 @@ func credentialForAuth(ctx context.Context, callbackID string, storageJSON []byt
 		}
 		raw, errFetch := fetchAuthJSON(ctx, callbackID, trimmed)
 		if errFetch == nil && len(raw) > 0 {
-			if credential, okParse := parseVendorCredential(raw, trimmed, attributes); okParse {
+			if credential, okParse := core.ParseCredential(raw, trimmed, attributes); okParse {
 				storeCredential(trimmed, credential)
 				return credential, nil
 			}
 		}
 	}
 	return nil, fmt.Errorf("credential is not available for auth %s", authID)
-}
-
-// parseVendorCredential 按归属解析一份凭证；解析失败返回 false。
-//
-// 归属判定用 authID 作为文件名提示（宿主侧的 ID 就是去掉 .json 的文件名），
-// 这样即便凭证缺 vendor 字段也能靠文件名前缀归属。
-func parseVendorCredential(raw []byte, authID string, attributes map[string]string) (*core.Credential, bool) {
-	var payload map[string]any
-	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
-		return nil, false
-	}
-	fileName := strings.TrimSpace(authID)
-	if fileName != "" && !strings.HasSuffix(strings.ToLower(fileName), ".json") {
-		fileName += ".json"
-	}
-	vendor, okVendor := core.ResolveVendor(fileName, attributes["provider"], payload)
-	if !okVendor {
-		return nil, false
-	}
-	credential, errParse := vendor.Parse(raw, fileName)
-	if errParse != nil {
-		return nil, false
-	}
-	// 账号身份由根层兜底：供应商的 Parse 可以设置它，但不设置也不会失去身份。
-	// 放在这里而不是要求各家实现，是因为漏填时没有任何编译期或运行期提示——
-	// 症状只是「签到后仍显示未签到」这类极难定位的错位。详见 core.Credential.FileID。
-	if credential.FileIDValue() == "" {
-		credential.SetFileID(strings.TrimSuffix(fileName, ".json"))
-	}
-	applyAttributeOverrides(credential, attributes)
-	return credential, true
-}
-
-// applyAttributeOverrides 用宿主传来的属性覆盖凭证字段。
-//
-// realm 允许被覆盖（账号可以自带域声明）；token 类字段不允许——
-// 属性里根本不该有它们，若出现也应忽略而不是采信。
-func applyAttributeOverrides(credential *core.Credential, attributes map[string]string) {
-	if credential == nil || len(attributes) == 0 {
-		return
-	}
-	if realm := strings.TrimSpace(attributes["realm"]); realm != "" {
-		credential.SetRegion(realm)
-	}
 }
 
 func cachedCredential(authID string) (*core.Credential, bool) {
@@ -418,16 +371,6 @@ func resetCredentialCache() {
 	credentialCacheMu.Lock()
 	defer credentialCacheMu.Unlock()
 	credentialCache = map[string]credentialCacheEntry{}
-}
-
-// firstNonEmptyString 返回第一个非空字符串。
-func firstNonEmptyString(values ...string) string {
-	for _, value := range values {
-		if trimmed := strings.TrimSpace(value); trimmed != "" {
-			return trimmed
-		}
-	}
-	return ""
 }
 
 // resolveVendorCredential 取回凭证并解析出它所属的供应商。

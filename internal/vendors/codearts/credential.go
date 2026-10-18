@@ -6,7 +6,6 @@ package codearts
 import (
 	"encoding/json"
 	"fmt"
-	"strings"
 
 	"freetier2api-plugin/internal/core"
 )
@@ -73,18 +72,13 @@ func ParseCredential(raw []byte) (*Credential, error) {
 
 // LooksLikeCredential 判断文件或数据是否属于 CodeArts。
 func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
-	if v := strings.ToLower(getString(raw, "vendor")); v != "" && v != VendorID {
-		return false
+	// 显式 vendor 字段优先：声明了别家就绝不认领。
+	if decided, claimed := core.VendorFieldVerdict(raw, VendorID); decided {
+		return claimed
 	}
 
-	// 显式声明
-	if strings.EqualFold(getString(raw, "vendor"), VendorID) {
-		return true
-	}
-
-	// 文件名前缀匹配
-	baseName := strings.ToLower(fileName)
-	if strings.HasPrefix(baseName, "codearts-") || strings.HasPrefix(baseName, "codearts_") || baseName == "codearts.json" {
+	// 文件名前缀匹配（约定集中由 core 维护）。
+	if core.FileNameMatchesConvention(fileName, VendorID) {
 		return true
 	}
 

@@ -23,7 +23,7 @@ import (
 
 // adapter 是 core.Vendor 在 Cline 上的实现。
 type adapter struct {
-	core.BaseVendor
+	core.Meta
 	contextFallback func(string) int64
 }
 
@@ -38,10 +38,9 @@ func Instances(contextFallback func(string) int64) []core.Vendor {
 		contextFallback = core.DefaultContextWindow
 	}
 	return []core.Vendor{&adapter{
-		BaseVendor: core.BaseVendor{
-			VendorID:                VendorID,
-			VendorName:              VendorName,
-			QuotaUnsupportedMessage: "Cline 上游不提供额度查询接口（额度以订阅页为准）",
+		Meta: core.Meta{
+			VendorID:   VendorID,
+			VendorName: VendorName,
 		},
 		contextFallback: contextFallback,
 	}}
@@ -112,16 +111,6 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 		models = BundledClineModels()
 	}
 	return v.modelsToPluginAPI(models), nil
-}
-
-// ModelsForAuth 返回该凭证可用的模型。
-//
-// Cline 的清单是全局的（不按账号区分），因此与 StaticModels 同源。
-func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
-	if cred == nil {
-		return nil, nil
-	}
-	return v.StaticModels(ctx)
 }
 
 // modelsToPluginAPI 把上游模型条目转成宿主契约类型。
@@ -330,6 +319,3 @@ func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential)
 	}
 	return MergeStorageJSON(original, native)
 }
-
-// SupportsLogin 报告本供应商支持登录（默认行为，显式写出便于阅读）。
-func (v *adapter) SupportsLogin() bool { return true }

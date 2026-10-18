@@ -86,17 +86,9 @@ func VendorIDFor(r Region) string {
 func LooksLikeCredential(raw map[string]any, fileName, provider string, targetRegion Region) bool {
 	expectedVendor := VendorIDFor(targetRegion)
 
-	// 1. 显式声明了其它供应商时绝不认领
-	if v := strings.ToLower(getString(raw, "vendor")); v != "" && v != expectedVendor {
-		// 特例：如果只标了 "trae"，按 region 判定
-		if v != "trae" {
-			return false
-		}
-	}
-
-	// 2. 显式命中当前 vendor
-	if strings.EqualFold(getString(raw, "vendor"), expectedVendor) {
-		return true
+	// 1/2. 显式 vendor 字段优先（"trae" 是家族别名，交给区域判定）。
+	if decided, claimed := core.VendorFieldVerdict(raw, expectedVendor, "trae"); decided {
+		return claimed
 	}
 
 	// 3. 文件名前缀

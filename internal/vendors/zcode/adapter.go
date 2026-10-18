@@ -20,12 +20,12 @@ import (
 
 // adapter 是 core.Vendor 在 ZCode 上的实现。
 type adapter struct {
-	core.BaseVendor
+	core.Meta
 }
 
 // Instances 构造 ZCode 实例。
 func Instances() []core.Vendor {
-	return []core.Vendor{&adapter{BaseVendor: core.BaseVendor{
+	return []core.Vendor{&adapter{Meta: core.Meta{
 		VendorID:     VendorID,
 		VendorName:   VendorName,
 		VendorRegion: "global",
@@ -34,9 +34,6 @@ func Instances() []core.Vendor {
 
 // AuthMode 返回凭证形态：oauth。页面据此在「添加账号」时发起登录流程。
 func (v *adapter) AuthMode() string { return "oauth" }
-
-// SupportsLogin 报告本供应商支持登录。
-func (v *adapter) SupportsLogin() bool { return true }
 
 // Configure 解析供应商专属配置。
 func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
@@ -108,12 +105,6 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	}
 	return modelsToPluginAPI(models), nil
 }
-
-// ModelsForAuth 返回该凭证可用的模型。
-func (v *adapter) ModelsForAuth(ctx context.Context, _ *core.Credential) ([]pluginapi.ModelInfo, error) {
-	return v.StaticModels(ctx)
-}
-
 func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		if strings.TrimSpace(model.ID) == "" {

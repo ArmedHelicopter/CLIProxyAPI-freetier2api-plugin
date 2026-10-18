@@ -13,10 +13,6 @@ package qoder
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/sha256"
-	"encoding/base64"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -25,6 +21,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/loginsession"
 	"freetier2api-plugin/internal/vendors/qoder/bridge"
@@ -64,18 +61,12 @@ type LoginProfile struct {
 
 // LoginStart 生成 PKCE 参数与登录 URL，并登记一个待轮询的登录会话。
 func LoginStart(ctx context.Context, region qoderapi.Region) (loginURL, state string, expiresAt time.Time, err error) {
-	verifier, challenge, errPKCE := newPKCEPair()
+	verifier, challenge, errPKCE := core.NewPKCEPair()
 	if errPKCE != nil {
 		return "", "", time.Time{}, errPKCE
 	}
-	nonce, errNonce := randomHex(16)
-	if errNonce != nil {
-		return "", "", time.Time{}, errNonce
-	}
-	state, errState := randomHex(16)
-	if errState != nil {
-		return "", "", time.Time{}, errState
-	}
+	nonce := core.RandomHex(16)
+	state = core.RandomHex(16)
 
 	endpoints := qoderapi.GetEndpoints(region)
 	params := url.Values{}
@@ -269,29 +260,6 @@ func LoginAuthID(profile LoginProfile, state string) string {
 		base = "login-" + shortState(state)
 	}
 	return "qoder-" + sanitizeAuthID(base)
-}
-
-// ---- 工具 ----
-
-// newPKCEPair 生成 PKCE 的 verifier 与 challenge（S256）。
-func newPKCEPair() (verifier, challenge string, err error) {
-	buffer := make([]byte, 32)
-	if _, errRead := rand.Read(buffer); errRead != nil {
-		return "", "", errRead
-	}
-	verifier = base64.RawURLEncoding.EncodeToString(buffer)
-	sum := sha256.Sum256([]byte(verifier))
-	challenge = base64.RawURLEncoding.EncodeToString(sum[:])
-	return verifier, challenge, nil
-}
-
-// randomHex 生成 n 字节的随机十六进制串。
-func randomHex(size int) (string, error) {
-	buffer := make([]byte, size)
-	if _, errRead := rand.Read(buffer); errRead != nil {
-		return "", errRead
-	}
-	return hex.EncodeToString(buffer), nil
 }
 
 // shortState 截断 state 用于日志（完整 state 是凭证材料的一部分）。

@@ -37,12 +37,16 @@ func handleQuotaFetch(request []byte) ([]byte, error) {
 	// 宿主的额度路由**不发 StorageJSON**（只发 AuthIndex/AuthID + 属性），
 	// 因此这里必须能按 index 回源，否则会误报「凭证缺失」。
 	credential, vendor, errResolve := resolveVendorCredential(ctx, "", rpc.StorageJSON,
-		firstNonEmptyString(rpc.AuthIndex, rpc.AuthID), rpc.Attributes)
+		core.FirstNonEmpty(rpc.AuthIndex, rpc.AuthID), rpc.Attributes)
 	if errResolve != nil {
 		return nil, errResolve
 	}
 
-	response, errQuota := vendor.Quota(ctx, credential)
+	provider, okQuota := core.As[core.QuotaProvider](vendor)
+	if !okQuota {
+		return nil, core.QuotaUnsupported(vendor)
+	}
+	response, errQuota := provider.Quota(ctx, credential)
 	if errQuota != nil {
 		return nil, core.ToPluginError(errQuota)
 	}
@@ -60,18 +64,25 @@ func handleQuotaReset(request []byte) ([]byte, error) {
 	}
 	ctx := httpx.WithCallbackID(context.Background(), "")
 	credential, vendor, errResolve := resolveVendorCredential(ctx, "", rpc.StorageJSON,
-		firstNonEmptyString(rpc.AuthIndex, rpc.AuthID), rpc.Attributes)
+		core.FirstNonEmpty(rpc.AuthIndex, rpc.AuthID), rpc.Attributes)
 	if errResolve != nil {
 		return nil, errResolve
 	}
-	if !vendor.SupportsCheckin() {
+	if !core.SupportsCheckin(vendor) {
+		return okEnvelope(pluginapi.QuotaResetResponse{
+			Success: false,
+			Message: "本供应商不提供签到；额度按上游周期自动重置",
+		})
+	}
+	checkin, okCheckin := core.As[core.CheckinProvider](vendor)
+	if !okCheckin {
 		return okEnvelope(pluginapi.QuotaResetResponse{
 			Success: false,
 			Message: "本供应商不提供签到；额度按上游周期自动重置",
 		})
 	}
 
-	result, errCheckin := vendor.Checkin(ctx, credential)
+	result, errCheckin := checkin.Checkin(ctx, credential)
 	if errCheckin != nil {
 		return nil, core.ToPluginError(errCheckin)
 	}

@@ -38,7 +38,7 @@ const (
 
 // adapter 是 core.Vendor 在 Qoder 上的实现。
 type adapter struct {
-	core.BaseVendor
+	core.Meta
 	region qoderapi.Region
 	// bridges 按凭证指纹缓存 cosy 会话（建会话要一次 jobToken 交换，很贵）。
 	bridges sync.Map
@@ -54,11 +54,10 @@ func Instances() []core.Vendor {
 
 func newInstance(region qoderapi.Region) core.Vendor {
 	return &adapter{
-		BaseVendor: core.BaseVendor{
-			VendorID:       VendorIDFor(region),
-			VendorName:     VendorNameFor(region),
-			VendorRegion:   string(region),
-			CheckinSupport: true,
+		Meta: core.Meta{
+			VendorID:     VendorIDFor(region),
+			VendorName:   VendorNameFor(region),
+			VendorRegion: string(region),
 		},
 		region: region,
 	}
@@ -482,3 +481,5 @@ func (r *payloadRecorder) WriteHeader(statusCode int) { r.status = statusCode }
 
 // Payload 返回记录的响应体。
 func (r *payloadRecorder) Payload() []byte { return r.body }
+
+func (v *adapter) SupportsCheckin() bool { return true }

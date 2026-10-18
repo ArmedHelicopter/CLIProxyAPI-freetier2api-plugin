@@ -60,7 +60,11 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(httpx.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
 	defer cancel()
 
-	response, errStart := vendor.LoginStart(ctx, rpc.Metadata)
+	login, okLogin := core.As[core.LoginProvider](vendor)
+	if !okLogin {
+		return nil, core.LoginUnsupported(vendor)
+	}
+	response, errStart := login.LoginStart(ctx, rpc.Metadata)
 	if errStart != nil {
 		return nil, core.ToPluginError(errStart)
 	}
@@ -102,21 +106,15 @@ func handleAuthLoginPoll(request []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(httpx.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
 	defer cancel()
 
-	response, errPoll := vendor.LoginPoll(ctx, sessionID)
+	login, okLogin := core.As[core.LoginProvider](vendor)
+	if !okLogin {
+		return nil, core.LoginUnsupported(vendor)
+	}
+	response, errPoll := login.LoginPoll(ctx, sessionID)
 	if errPoll != nil {
 		return nil, core.ToPluginError(errPoll)
 	}
 	return okEnvelope(response)
-}
-
-// loginSessionOwner 由持有登录会话状态的供应商实现。
-//
-// 会话是供应商自己建的，id 只存在于它的状态表里；根层要判断「这个会话
-// 属于谁」只能问供应商。做成可选接口而不是塞进 core.Vendor：只有需要
-// 多步登录的供应商才关心它，其它实现不必被迫实现一个空方法。
-type loginSessionOwner interface {
-	// OwnsLoginSession 报告该会话是否由本供应商创建且仍有效。
-	OwnsLoginSession(sessionID string) bool
 }
 
 // vendorForLogin 从登录请求的 Metadata 解析目标供应商。
@@ -161,7 +159,7 @@ func vendorForLoginSession(sessionID string) (core.Vendor, error) {
 		if !vendorEnabled(vendor) {
 			continue
 		}
-		if owner, okOwner := vendor.(loginSessionOwner); okOwner && owner.OwnsLoginSession(sessionID) {
+		if owner, okOwner := core.As[core.LoginSessionOwner](vendor); okOwner && owner.OwnsLoginSession(sessionID) {
 			return vendor, nil
 		}
 	}

@@ -22,7 +22,7 @@ func TestCheckinAndDisplayResolveSameIdentity(t *testing.T) {
 	}
 
 	identity := accountIdentity(entry)
-	credential, okParse := parseVendorCredential([]byte(qoderCredential), identity, nil)
+	credential, okParse := core.ParseCredential([]byte(qoderCredential), identity, nil)
 	if !okParse {
 		t.Fatal("qoder credential not parsed")
 	}
@@ -49,7 +49,7 @@ func TestParseVendorCredentialFillsFileID(t *testing.T) {
 	const wbCredential = `{"type":"freetier","vendor":"workbuddycn",
 		"auth":{"accessToken":"at","refreshToken":"rt","realm":"cn"},
 		"account":{"uid":"79fdc1fc-de43-40da-b6f0-fe05d9e4367b"}}`
-	credential, okParse := parseVendorCredential([]byte(wbCredential), "workbuddycn-79fdc1fc.json", nil)
+	credential, okParse := core.ParseCredential([]byte(wbCredential), "workbuddycn-79fdc1fc.json", nil)
 	if !okParse {
 		t.Fatal("workbuddy credential not parsed")
 	}

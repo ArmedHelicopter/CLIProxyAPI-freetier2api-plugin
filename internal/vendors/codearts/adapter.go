@@ -13,20 +13,17 @@ import (
 
 // adapter 是 core.Vendor 在 CodeArts 上的实现。
 type adapter struct {
-	core.BaseVendor
+	core.Meta
 }
 
 // Instances 构造 CodeArts 实例（单一部署，国内区）。
 func Instances() []core.Vendor {
-	return []core.Vendor{&adapter{BaseVendor: core.BaseVendor{
+	return []core.Vendor{&adapter{Meta: core.Meta{
 		VendorID:     VendorID,
 		VendorName:   VendorName,
 		VendorRegion: "cn",
 	}}}
 }
-
-// SupportsLogin 报告本供应商支持登录。
-func (v *adapter) SupportsLogin() bool { return true }
 
 // ---- 凭证 ----
 

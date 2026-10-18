@@ -179,20 +179,14 @@ func MergeStorageJSON(original []byte, updated *Credential) ([]byte, error) {
 // **必须偏严**：宿主会把所有非内建格式的凭证依次喂给插件，误吞别家的会让
 // 宿主用本插件的结构覆盖对方账号。因此只在有明确归属证据时才认领。
 func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
-	// 显式声明了其它供应商时绝不认领。
-	if v := strings.ToLower(getString(raw, "vendor")); v != "" && v != VendorID {
-		return false
-	}
-	// 1) 显式 vendor == "zcode"
-	if strings.EqualFold(getString(raw, "vendor"), VendorID) {
-		return true
+	// 显式 vendor 字段优先：声明了别家就绝不认领。
+	if decided, claimed := core.VendorFieldVerdict(raw, VendorID); decided {
+		return claimed
 	}
 
+	// 文件名前缀匹配（约定集中由 core 维护）。
 	baseName := strings.ToLower(strings.TrimSpace(fileName))
-
-	// 2) 文件名前缀包含 zcode
-	if strings.HasPrefix(baseName, "zcode-") || strings.HasPrefix(baseName, "zcode_") ||
-		strings.EqualFold(baseName, "zcode.json") {
+	if core.FileNameMatchesConvention(fileName, VendorID) {
 		return true
 	}
 

@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 	"freetier2api-plugin/internal/vendors/workbuddy/tasks"
@@ -201,7 +202,7 @@ func pendingGrowthItem(task workbuddy.Task) (taskItem, bool) {
 	return taskItem{
 		Kind:     "growth",
 		Code:     task.Code,
-		Title:    firstNonEmptyString(task.Title, action.Desc, task.Code),
+		Title:    core.FirstNonEmpty(task.Title, action.Desc, task.Code),
 		Current:  task.Current,
 		Target:   task.Target,
 		UsesChat: action.UsesChat,
@@ -732,7 +733,7 @@ func handleTasksAuto(req pluginapi.ManagementRequest) pluginapi.ManagementRespon
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
 	}
-	authID := firstNonEmptyString(body.AuthID, body.UID, body.AccountID)
+	authID := core.FirstNonEmpty(body.AuthID, body.UID, body.AccountID)
 	code := strings.TrimSpace(body.TaskCode)
 
 	ctx, cancel := managementContext(req)

@@ -21,7 +21,7 @@ import (
 
 // adapter 是 core.Vendor 在 WorkBuddy 上的实现。
 type adapter struct {
-	core.BaseVendor
+	core.Meta
 	region Region
 }
 
@@ -35,11 +35,10 @@ func Instances() []core.Vendor {
 
 func newInstance(region Region) core.Vendor {
 	return &adapter{
-		BaseVendor: core.BaseVendor{
-			VendorID:       VendorIDFor(region),
-			VendorName:     VendorNameFor(region),
-			VendorRegion:   string(region),
-			CheckinSupport: !region.IsGlobal(),
+		Meta: core.Meta{
+			VendorID:     VendorIDFor(region),
+			VendorName:   VendorNameFor(region),
+			VendorRegion: string(region),
 		},
 		region: region,
 	}
@@ -393,9 +392,6 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 // OwnsLoginSession 报告该会话是否由本供应商持有且仍有效。
 func (v *adapter) OwnsLoginSession(sessionID string) bool { return OwnsLoginSession(sessionID) }
 
-// SupportsLogin 报告本供应商支持登录。
-func (v *adapter) SupportsLogin() bool { return true }
-
 // Refresh 校验并刷新凭证。
 //
 // refreshed 报告上游是否真的下发了新令牌：false 表示仅校验通过，
@@ -451,3 +447,5 @@ func clientFor(ctx context.Context) (*Client, error) {
 	}
 	return client, nil
 }
+
+func (v *adapter) SupportsCheckin() bool { return !v.region.IsGlobal() }

@@ -12,6 +12,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // VendorID 是供应商实例标识。同时是凭证文件名前缀。
@@ -160,22 +162,6 @@ func hasWorkOSPrefix(raw map[string]any) bool {
 	return false
 }
 
-// fileNameMatchesConvention 判断文件名是否符合本协议的命名约定。
-//
-// 约定：cline.json / cline-<id>.json / cline-login-<id>.json。
 func fileNameMatchesConvention(fileName string) bool {
-	base := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(fileName), ".json"))
-	if base == "" {
-		return false
-	}
-	if base == VendorID {
-		return true
-	}
-	for _, separator := range []string{"-", "_", "."} {
-		if strings.HasPrefix(base, VendorID+separator) ||
-			strings.Contains(base, separator+VendorID) {
-			return true
-		}
-	}
-	return false
+	return core.FileNameMatchesConvention(fileName, VendorID)
 }

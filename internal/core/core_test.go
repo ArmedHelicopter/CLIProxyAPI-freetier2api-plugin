@@ -1,7 +1,7 @@
 package core
 
-// 本文件覆盖 core 的共享契约：归属判定、注册表、模型键协议、错误映射与
-// 通用助手。core 是所有供应商共享的骨架，这些行为出错会影响全部供应商。
+// 本文件覆盖 core 的共享契约：归属判定、注册表、模型键协议、错误映射、
+// 可选能力断言与通用助手。
 
 import (
 	"context"
@@ -12,13 +12,14 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 )
 
-// fakeVendor 是最小可用的 Vendor 实现（只关心归属与解析）。
+// fakeVendor 是最小可用的 Vendor 实现（只实现必需能力）。
 //
 // 内容嗅探按 marker 命中：注册表是全局的，测试之间会累积注册，
 // 一个「恒返回 true」的假供应商会污染后续用例。
 type fakeVendor struct {
-	BaseVendor
+	Meta
 	marker string
+	models []pluginapi.ModelInfo
 }
 
 func (v *fakeVendor) Match(_ string, _ string, raw map[string]any) bool {
@@ -29,36 +30,22 @@ func (v *fakeVendor) Parse(raw []byte, fileName string) (*Credential, error) {
 	return &Credential{VendorID: v.ID(), FileID: fileName, Native: string(raw)}, nil
 }
 
-func (v *fakeVendor) StaticModels(context.Context) ([]pluginapi.ModelInfo, error) { return nil, nil }
-func (v *fakeVendor) ModelsForAuth(context.Context, *Credential) ([]pluginapi.ModelInfo, error) {
-	return nil, nil
+func (v *fakeVendor) StaticModels(context.Context) ([]pluginapi.ModelInfo, error) {
+	return v.models, nil
 }
+
 func (v *fakeVendor) Execute(context.Context, *Credential, *ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
 	return nil, nil
 }
+
 func (v *fakeVendor) ExecuteStream(context.Context, *Credential, *ExecuteRequest, StreamSink) error {
 	return nil
 }
-func (v *fakeVendor) LoginStart(context.Context, map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return nil, nil
-}
-func (v *fakeVendor) LoginPoll(context.Context, string) (*pluginapi.AuthLoginPollResponse, error) {
-	return nil, nil
-}
-func (v *fakeVendor) Refresh(context.Context, *Credential) (*Credential, bool, error) {
-	return nil, false, nil
-}
 
 func TestResolveVendorPrefersVendorField(t *testing.T) {
-	fieldVendor := &fakeVendor{BaseVendor: BaseVendor{VendorID: "testfield"}}
-	sniffVendor := &fakeVendor{
-		BaseVendor: BaseVendor{VendorID: "testsniff"},
-		marker:     "sniff",
-	}
-	RegisterVendor(fieldVendor)
-	RegisterVendor(sniffVendor)
+	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testfield"}})
+	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testsniff"}, marker: "sniff"})
 
-	// vendor 字段是插件自己写的，优先级最高：文件名与内容嗅探都不能翻盘。
 	got, ok := ResolveVendor("whatever.json", "", map[string]any{VendorKey: "testfield"})
 	if !ok || got.ID() != "testfield" {
 		t.Fatalf("vendor field resolution = %v %v, want testfield", got, ok)
@@ -66,15 +53,14 @@ func TestResolveVendorPrefersVendorField(t *testing.T) {
 }
 
 func TestResolveVendorFallsBackToFileNameThenSniff(t *testing.T) {
-	RegisterVendor(&fakeVendor{BaseVendor: BaseVendor{VendorID: "testfile"}})
-	RegisterVendor(&fakeVendor{BaseVendor: BaseVendor{VendorID: "testsniffonly"}, marker: "sniffonly"})
+	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testfile"}})
+	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testsniffonly"}, marker: "sniffonly"})
 
 	got, ok := ResolveVendor("testfile-abc.json", "", map[string]any{})
 	if !ok || got.ID() != "testfile" {
 		t.Fatalf("file name resolution = %v %v, want testfile", got, ok)
 	}
 
-	// 文件名没有任何线索时才走内容嗅探。
 	got, ok = ResolveVendor("acc.json", "", map[string]any{"test_marker": "sniffonly"})
 	if !ok || got.ID() != "testsniffonly" {
 		t.Fatalf("sniff resolution = %v %v, want testsniffonly", got, ok)
@@ -88,13 +74,13 @@ func TestResolveVendorRejectsUnknown(t *testing.T) {
 }
 
 func TestRegisterVendorRejectsDuplicate(t *testing.T) {
-	RegisterVendor(&fakeVendor{BaseVendor: BaseVendor{VendorID: "testdup"}})
+	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testdup"}})
 	defer func() {
 		if recover() == nil {
 			t.Fatal("duplicate vendor registration must panic")
 		}
 	}()
-	RegisterVendor(&fakeVendor{BaseVendor: BaseVendor{VendorID: "testdup"}})
+	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testdup"}})
 }
 
 func TestFileNameForAndSanitize(t *testing.T) {
@@ -107,11 +93,10 @@ func TestFileNameForAndSanitize(t *testing.T) {
 }
 
 func TestSplitModelIDAndModelKey(t *testing.T) {
-	RegisterVendor(&fakeVendor{BaseVendor: BaseVendor{VendorID: "testmodel"}})
+	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testmodel"}})
 	if prefix, bare := SplitModelID("testmodel:glm-5.2"); prefix != "testmodel" || bare != "glm-5.2" {
 		t.Fatalf("SplitModelID = %q %q", prefix, bare)
 	}
-	// 未知前缀不得拆坏真实模型名。
 	if prefix, bare := SplitModelID("gpt-5.5:turbo"); prefix != "" || bare != "gpt-5.5:turbo" {
 		t.Fatalf("unknown prefix must not split: %q %q", prefix, bare)
 	}
@@ -121,9 +106,7 @@ func TestSplitModelIDAndModelKey(t *testing.T) {
 }
 
 func TestParseCredentialFillsFileIDAndAttributes(t *testing.T) {
-	// 用一个故意不设置 FileID 的供应商，验证 core 的兜底。
-	v := &noFileIDVendor{BaseVendor: BaseVendor{VendorID: "testnofileid"}}
-	RegisterVendor(v)
+	RegisterVendor(&noFileIDVendor{Meta: Meta{VendorID: "testnofileid"}})
 
 	credential, ok := ParseCredential([]byte(`{"vendor":"testnofileid"}`), "testnofileid-abc", map[string]string{"realm": "global"})
 	if !ok {
@@ -137,7 +120,7 @@ func TestParseCredentialFillsFileIDAndAttributes(t *testing.T) {
 	}
 }
 
-type noFileIDVendor struct{ BaseVendor }
+type noFileIDVendor struct{ Meta }
 
 func (v *noFileIDVendor) Match(_ string, _ string, raw map[string]any) bool {
 	return GetString(raw, "vendor") == "testnofileid"
@@ -148,23 +131,11 @@ func (v *noFileIDVendor) Parse(_ []byte, _ string) (*Credential, error) {
 func (v *noFileIDVendor) StaticModels(context.Context) ([]pluginapi.ModelInfo, error) {
 	return nil, nil
 }
-func (v *noFileIDVendor) ModelsForAuth(context.Context, *Credential) ([]pluginapi.ModelInfo, error) {
-	return nil, nil
-}
 func (v *noFileIDVendor) Execute(context.Context, *Credential, *ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
 	return nil, nil
 }
 func (v *noFileIDVendor) ExecuteStream(context.Context, *Credential, *ExecuteRequest, StreamSink) error {
 	return nil
-}
-func (v *noFileIDVendor) LoginStart(context.Context, map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return nil, nil
-}
-func (v *noFileIDVendor) LoginPoll(context.Context, string) (*pluginapi.AuthLoginPollResponse, error) {
-	return nil, nil
-}
-func (v *noFileIDVendor) Refresh(context.Context, *Credential) (*Credential, bool, error) {
-	return nil, false, nil
 }
 
 func TestJSONHelpers(t *testing.T) {
@@ -246,22 +217,66 @@ func TestToPluginError(t *testing.T) {
 	}
 }
 
-func TestBaseVendorDefaults(t *testing.T) {
-	v := &BaseVendor{VendorID: "x", VendorName: "X", VendorRegion: "cn"}
-	if v.ID() != "x" || v.Name() != "X" || v.Region() != "cn" || v.ModelPrefix() != "" {
-		t.Fatal("identity defaults wrong")
+// quotaVendor 只实现额度能力，用于验证能力断言。
+type quotaVendor struct{ fakeVendor }
+
+func (v *quotaVendor) Quota(context.Context, *Credential) (*pluginapi.QuotaFetchResponse, error) {
+	return &pluginapi.QuotaFetchResponse{}, nil
+}
+
+func TestCapabilityAssertions(t *testing.T) {
+	plain := &fakeVendor{Meta: Meta{VendorID: "plain"}}
+	if _, okQuota := As[QuotaProvider](plain); okQuota {
+		t.Fatal("plain vendor must not implement quota")
 	}
-	tokens, err := v.CountTokens(context.Background(), nil, &ExecuteRequest{Payload: []byte("123456")})
-	if err != nil || tokens != 2 {
-		t.Fatalf("CountTokens = %d %v", tokens, err)
+	if SupportsCheckin(plain) {
+		t.Fatal("plain vendor must not support checkin")
 	}
-	if _, errQuota := v.Quota(context.Background(), nil); errQuota == nil {
-		t.Fatal("default quota must report unsupported")
+
+	withQuota := &quotaVendor{fakeVendor{Meta: Meta{VendorID: "withquota"}}}
+	if _, okQuota := As[QuotaProvider](withQuota); !okQuota {
+		t.Fatal("quota vendor must implement quota")
 	}
-	if result, errCheckin := v.Checkin(context.Background(), nil); result != nil || errCheckin != nil {
-		t.Fatal("default checkin must be a no-op")
+}
+
+func TestUnsupportedErrors(t *testing.T) {
+	vendor := &fakeVendor{Meta: Meta{VendorID: "x", VendorName: "X"}}
+	quotaErr := QuotaUnsupported(vendor)
+	if pluginErr, okPlugin := quotaErr.(*PluginError); !okPlugin || pluginErr.HTTPStatus != http.StatusNotImplemented {
+		t.Fatalf("quota unsupported = %v", quotaErr)
 	}
-	if v.SupportsCheckin() || len(v.Tasks()) != 0 {
-		t.Fatal("default checkin/tasks must be empty")
+	loginErr := LoginUnsupported(vendor)
+	if pluginErr, okPlugin := loginErr.(*PluginError); !okPlugin || pluginErr.HTTPStatus != http.StatusNotImplemented {
+		t.Fatalf("login unsupported = %v", loginErr)
+	}
+}
+
+func TestEstimateTokens(t *testing.T) {
+	if got := EstimateTokens(nil); got != 0 {
+		t.Fatalf("empty payload = %d", got)
+	}
+	if got := EstimateTokens([]byte("123456")); got != 2 {
+		t.Fatalf("estimate = %d", got)
+	}
+}
+
+func TestModelsForFallbackAndRefreshFallback(t *testing.T) {
+	models := []pluginapi.ModelInfo{{ID: "m1"}}
+	vendor := &fakeVendor{Meta: Meta{VendorID: "fallback"}, models: models}
+
+	// 未实现 ModelsProvider 时回落 StaticModels。
+	got, errModels := ModelsFor(vendor, context.Background(), &Credential{})
+	if errModels != nil || len(got) != 1 {
+		t.Fatalf("ModelsFor fallback = %v %v", got, errModels)
+	}
+	// 空凭证不注册模型。
+	if gotNil, _ := ModelsFor(vendor, context.Background(), nil); gotNil != nil {
+		t.Fatalf("nil credential must yield nil models")
+	}
+	// 未实现 Refresher 视为已校验。
+	cred := &Credential{}
+	updated, refreshed, errRefresh := RefreshVendor(vendor, context.Background(), cred)
+	if errRefresh != nil || refreshed || updated != cred {
+		t.Fatalf("RefreshVendor fallback = %v %v %v", updated, refreshed, errRefresh)
 	}
 }

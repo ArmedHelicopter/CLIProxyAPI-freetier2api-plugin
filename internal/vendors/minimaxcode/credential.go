@@ -184,17 +184,9 @@ func ParseCredential(raw []byte, defaultRegion Region) (*Credential, error) {
 func LooksLikeCredential(raw map[string]any, fileName, provider string, targetRegion Region) bool {
 	expectedVendor := VendorIDFor(targetRegion)
 
-	// 1. 显式声明了其它供应商时绝不认领
-	if v := strings.ToLower(getString(raw, "vendor")); v != "" && v != expectedVendor {
-		// 特例：若只标了 "minimax" 或 "minimaxcode"，按 region 判定
-		if v != "minimax" && v != "minimaxcode" {
-			return false
-		}
-	}
-
-	// 2. 显式命中当前 vendor 字段
-	if strings.EqualFold(getString(raw, "vendor"), expectedVendor) {
-		return true
+	// 1/2. 显式 vendor 字段优先（家族别名交给区域判定）。
+	if decided, claimed := core.VendorFieldVerdict(raw, expectedVendor, "minimax", "minimaxcode"); decided {
+		return claimed
 	}
 
 	// 3. 文件名前缀匹配

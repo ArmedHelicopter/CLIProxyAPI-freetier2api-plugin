@@ -14,10 +14,11 @@ package zcode
 
 import (
 	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"math/big"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // DeviceProfile 是单个账号的设备档案，字段直接映射上游身份头与事件字段。
@@ -268,10 +269,4 @@ func NewUUID() string {
 }
 
 // NewHexID 生成 n 字节的随机十六进制串。
-func NewHexID(n int) string {
-	buf := make([]byte, n)
-	if _, err := rand.Read(buf); err != nil {
-		return strings.Repeat("0", n*2)
-	}
-	return hex.EncodeToString(buf)
-}
+func NewHexID(n int) string { return core.RandomHex(n) }

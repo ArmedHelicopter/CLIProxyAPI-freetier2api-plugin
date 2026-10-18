@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 )
 
@@ -462,16 +463,7 @@ func base62Fixed(n *big.Int, width int) string {
 
 // newRequestID 生成一个请求 ID。
 func newRequestID() string {
-	return "req_" + randomHex(8)
-}
-
-// randomHex 生成 n 字节的十六进制串（2n 个字符）。
-func randomHex(n int) string {
-	buf := make([]byte, n)
-	if _, errRead := rand.Read(buf); errRead != nil {
-		return string(make([]byte, n*2))
-	}
-	return hex.EncodeToString(buf)
+	return "req_" + core.RandomHex(8)
 }
 
 // base62Alphabet 是 Base62 字符集。

@@ -302,7 +302,7 @@ func forEachAccount(ctx context.Context, callbackID string, fn func(context.Cont
 			credential: credential,
 			callbackID: callbackID,
 		}); errRun != nil {
-			logger.Debug("account %s task failed: %v", firstNonEmptyString(entry.Label, entry.Name), errRun)
+			logger.Debug("account %s task failed: %v", core.FirstNonEmpty(entry.Label, entry.Name), errRun)
 		}
 		// 账号间限速：全账号瞬间并发容易被上游风控注意到。
 		if !sleepCtx(ctx, accountGap) {
@@ -327,7 +327,7 @@ func (a *accountContext) uid() string { return a.credential.FileIDValue() }
 
 // label 返回展示名。
 func (a *accountContext) label() string {
-	return firstNonEmptyString(a.credential.LabelValue(), a.entry.Label, a.entry.Name, a.entry.ID)
+	return core.FirstNonEmpty(a.credential.LabelValue(), a.entry.Label, a.entry.Name, a.entry.ID)
 }
 
 // native 取回协议层凭证（任务动作需要它做上游调用）。
