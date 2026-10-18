@@ -19,7 +19,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -108,7 +108,10 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 	if errModels != nil {
 		// 探测失败返回空清单而不是报错：宿主会因为空清单跳过该凭证，
 		// 这正是我们想要的结果（避免用坏 key 打上游）。
-		logger.Debug("opencodezen: model probe failed: %v", errModels)
+		//
+		// 但**必须用 Info 而不是 Debug**：宿主日志默认 info 级别，Debug 会被
+		// 完全吞掉，用户只会看到「模型列表里没有 opencodezen」而无从查起。
+		logger.Info("opencodezen: model probe failed: %v", errModels)
 		return nil, nil
 	}
 	return v.modelsToPluginAPI(models), nil
@@ -185,7 +188,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		return core.ToPluginError(errStream)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return httpx.ForwardRawSSE(resp.Body, sink.Emit)
+	return hostbridge.ForwardRawSSE(resp.Body, sink.Emit)
 }
 
 // probeAPIKey 借一个本供应商的可用凭证取 API key（供模型探测用）。

@@ -12,21 +12,19 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/admin"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/modelconfig"
-	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
 )
 
 type hostBridge struct{ app *App }
 
 func (h *hostBridge) ListAuths(ctx context.Context) ([]core.HostAuth, error) {
-	return hostabi.ListAuths(ctx, "", h.app.registry)
+	return hostbridge.ListAuths(ctx, "", h.app.registry)
 }
 
 func (h *hostBridge) AuthJSON(ctx context.Context, authIndex string) ([]byte, bool) {
-	return hostabi.AuthJSON(ctx, "", authIndex)
+	return hostbridge.AuthJSON(ctx, "", authIndex)
 }
 
 func (h *hostBridge) Settings() core.Settings {
@@ -159,17 +157,13 @@ func (d adminDeps) Identity() admin.Identity {
 	return admin.Identity{ID: pluginID, DisplayName: pluginDisplayName, ProviderKey: providerKey, Version: d.app.version}
 }
 
-func (d adminDeps) Config() pluginconfig.Config { return d.app.Config() }
-func (d adminDeps) State() state.State          { return d.app.SnapshotState() }
+func (d adminDeps) Config() admin.PluginConfig { return d.app.Config() }
+func (d adminDeps) State() state.State         { return d.app.SnapshotState() }
 func (d adminDeps) MutateState(fn func(*state.State)) {
 	d.app.MutateState(fn)
 }
-func (d adminDeps) Model() *modelconfig.Manager { return d.app.models }
+func (d adminDeps) Model() *admin.Catalog       { return d.app.models }
 func (d adminDeps) WorkbuddyPromptMode() string { return d.app.promptModeFor() }
-
-func (d adminDeps) SaveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor, entry core.HostAuth, original []byte, updated *core.Credential, filePath string) {
-	d.app.saveRefreshedCredential(ctx, callbackID, vendor, entry, original, updated, filePath)
-}
 
 func (d adminDeps) RefreshModels(ctx context.Context) (int, error) {
 	return d.app.refreshModelsFromUpstream(ctx)

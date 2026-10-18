@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/qoder/cosy"
 )
@@ -90,7 +90,7 @@ func (c *BearerClient) callGet(ctx context.Context, fullURL string) (map[string]
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
-	resp, err := httpx.Client(ctx, 15*time.Second).Do(req)
+	resp, err := hostbridge.Client(ctx, 15*time.Second).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -130,7 +130,7 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 		return err
 	}
 	// 不设整体 Timeout，改由 context 控制生命周期，避免长流式响应被截断
-	client := httpx.StreamClient(ctx, 0)
+	client := hostbridge.StreamClient(ctx, 0)
 
 	var lastErr error
 	queueWaits := 0

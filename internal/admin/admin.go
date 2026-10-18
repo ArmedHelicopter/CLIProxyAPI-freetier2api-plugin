@@ -14,12 +14,9 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/accounts"
-	"freetier2api-plugin/internal/console"
+	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
-	"freetier2api-plugin/internal/modelconfig"
-	"freetier2api-plugin/internal/pluginconfig"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/state"
 	"freetier2api-plugin/internal/tasks"
 )
@@ -42,13 +39,11 @@ type Identity struct {
 // Deps 是管理接口依赖的根层能力。
 type Deps interface {
 	Identity() Identity
-	Config() pluginconfig.Config
+	Config() PluginConfig
 	State() state.State
 	MutateState(func(*state.State))
-	Model() *modelconfig.Manager
+	Model() *Catalog
 	WorkbuddyPromptMode() string
-	// SaveRefreshedCredential 把续期后的凭证写回宿主与磁盘。
-	SaveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor, entry core.HostAuth, original []byte, updated *core.Credential, filePath string)
 	RefreshModels(ctx context.Context) (int, error)
 	Reconfigure() error
 }
@@ -57,7 +52,7 @@ type Deps interface {
 type Service struct {
 	deps     Deps
 	registry *core.Registry
-	pool     *accounts.Pool
+	pool     *auth.Pool
 	tasks    *tasks.Service
 
 	quotaMu    sync.RWMutex
@@ -65,7 +60,7 @@ type Service struct {
 }
 
 // New 构造管理 Service。
-func New(deps Deps, registry *core.Registry, pool *accounts.Pool, taskService *tasks.Service) *Service {
+func New(deps Deps, registry *core.Registry, pool *auth.Pool, taskService *tasks.Service) *Service {
 	return &Service{
 		deps: deps, registry: registry, pool: pool, tasks: taskService,
 		quotaCache: map[string]quotaResult{},
@@ -136,7 +131,7 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 
 	switch {
 	case method == http.MethodGet && matchesResourcePath(rpc.Path, id.ID, "/console"):
-		return core.OKEnvelope(HTMLResponse(http.StatusOK, []byte(console.Page("/plugins/"+id.ID))))
+		return core.OKEnvelope(HTMLResponse(http.StatusOK, []byte(Page("/plugins/"+id.ID))))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/status"):
 		return core.OKEnvelope(JSONResponse(http.StatusOK, s.buildStatusPayload(rpc)))
@@ -169,7 +164,7 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 		return core.OKEnvelope(s.modelAliasHandler(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/models/refresh"):
-		ctx, cancel := hostabi.ManagementContext(rpc, requestTimeout)
+		ctx, cancel := hostbridge.ManagementContext(rpc, requestTimeout)
 		defer cancel()
 		count, errRefresh := s.deps.RefreshModels(ctx)
 		if errRefresh != nil {
@@ -306,5 +301,5 @@ func queryInt64(query map[string][]string, key string, fallback int64) int64 {
 
 // hostActiveVendors 返回有凭证的供应商集合。
 func (s *Service) hostActiveVendors(ctx context.Context, callbackID string) map[string]bool {
-	return hostabi.ActiveVendorSet(ctx, callbackID, s.registry)
+	return hostbridge.ActiveVendorSet(ctx, callbackID, s.registry)
 }

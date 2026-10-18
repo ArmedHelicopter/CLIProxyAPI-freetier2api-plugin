@@ -20,7 +20,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // modelsHTTPTimeout 是模型清单请求的上限。
@@ -54,7 +54,7 @@ func FetchModels(ctx context.Context, baseURL, apiKey string) ([]Model, error) {
 	}
 	ApplyModelsHeaders(req, apiKey)
 
-	resp, errDo := httpx.Client(ctx, modelsHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, modelsHTTPTimeout).Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("fetch models: %w", errDo)
 	}

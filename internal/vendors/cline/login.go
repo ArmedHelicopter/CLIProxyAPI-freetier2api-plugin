@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // 本文件实现 Cline 的登录流程（WorkOS OAuth 2.0 设备码，RFC 8628）。
@@ -78,7 +78,7 @@ func LoginStart(ctx context.Context) (*DeviceAuth, error) {
 	}
 	ApplyFormHeaders(req)
 
-	resp, errDo := httpx.Client(ctx, loginHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
 		return nil, &Error{Msg: "device auth: " + errDo.Error(), Kind: KindTransient}
 	}
@@ -142,7 +142,7 @@ func LoginPoll(ctx context.Context, baseURL string, deviceCode string) (*Credent
 	}
 	ApplyFormHeaders(req)
 
-	resp, errDo := httpx.Client(ctx, loginHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
 		return nil, &Error{Msg: "login poll: " + errDo.Error(), Kind: KindTransient}
 	}
@@ -202,7 +202,7 @@ func registerWithCline(ctx context.Context, baseURL, workosAccess, workosRefresh
 	}
 	ApplyJSONHeaders(req)
 
-	resp, errDo := httpx.Client(ctx, loginHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
 		return nil, &Error{Msg: "register: " + errDo.Error(), Kind: KindTransient}
 	}
@@ -343,7 +343,7 @@ func RefreshCredential(ctx context.Context, baseURL string, cred *Credential) (*
 	}
 	ApplyJSONHeaders(req)
 
-	resp, errDo := httpx.Client(ctx, refreshHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, refreshHTTPTimeout).Do(req)
 	if errDo != nil {
 		return nil, false, &Error{Msg: "refresh: " + errDo.Error(), Kind: KindTransient}
 	}
@@ -444,19 +444,4 @@ func millisToSeconds(value int64) int64 {
 		return value
 	}
 	return value / 1000
-}
-
-// NeedsRefresh 报告凭证是否该续期了（提前 60 秒）。
-func NeedsRefresh(cred *Credential, now time.Time) bool {
-	if cred == nil {
-		return true
-	}
-	if cred.AccessToken == "" {
-		return true
-	}
-	if cred.ExpiresAt == 0 {
-		// 过期时间未知：不主动续期，交给上游 401 触发。
-		return false
-	}
-	return now.Add(60*time.Second).Unix() >= cred.ExpiresAt
 }

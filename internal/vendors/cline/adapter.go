@@ -4,7 +4,7 @@ package cline
 //
 // 与其它供应商的关键差异：
 //   - **有完整登录流程**：WorkOS OAuth 2.0 设备码（RFC 8628），三步换到
-//     Cline 自己的令牌；会话状态存在共享的 loginsession 登记表里；
+//     Cline 自己的令牌；会话状态存在共享的 auth.SessionRegistry 里；
 //   - **没有区域**：只有一个部署（api.cline.bot），Region() 返回空串；
 //   - **没有额度接口**：上游不提供余额查询，Quota 返回「不支持」；
 //   - **令牌需要 workos: 前缀**：由协议层统一补，适配层不必记。
@@ -16,9 +16,8 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/loginsession"
 )
 
 // adapter 是 core.Vendor 在 Cline 上的实现。
@@ -193,7 +192,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		return core.ToPluginError(errStream)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return httpx.ForwardRawSSE(resp.Body, sink.Emit)
+	return hostbridge.ForwardRawSSE(resp.Body, sink.Emit)
 }
 
 // ---- 登录与续期 ----
@@ -204,7 +203,7 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 	if errStart != nil {
 		return nil, core.ToPluginError(errStart)
 	}
-	sessionID := "cline_" + loginsession.NewID(16)
+	sessionID := "cline_" + core.RandomHex(16)
 	v.Env.Logins.Register(VendorID, sessionID, time.Until(device.ExpiresAt), device.Interval, &pendingLogin{deviceCode: device.DeviceCode})
 	logger.Info("started cline login (user_code=%s)", device.UserCode)
 	return &pluginapi.AuthLoginStartResponse{
@@ -224,13 +223,13 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 // LoginPoll 轮询一次登录状态。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
 	session, pollState := v.Env.Logins.Poll(state)
-	if pollState == loginsession.PollMissing {
+	if pollState == core.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期，请重新发起登录",
 		}, nil
 	}
-	if pollState == loginsession.PollThrottled {
+	if pollState == core.PollThrottled {
 		// 节流期间：继续保持等待状态，不打上游也不报错。
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
@@ -274,7 +273,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 		Message: "登录成功",
 		Auth: pluginapi.AuthData{
 			Provider:    core.ProviderKey,
-			FileName:    core.FileNameFor(VendorID, core.FirstNonEmpty(credential.Email, credential.AccountID, loginsession.NewID(16))),
+			FileName:    core.FileNameFor(VendorID, core.FirstNonEmpty(credential.Email, credential.AccountID, core.RandomHex(16))),
 			Label:       label,
 			StorageJSON: storageJSON,
 		},

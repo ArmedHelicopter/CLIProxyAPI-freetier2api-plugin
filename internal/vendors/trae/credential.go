@@ -14,7 +14,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // 本文件实现 Trae 家族凭证的解析、特征识别与存储。
@@ -196,7 +196,7 @@ func Checkin(ctx context.Context, cred *Credential, cfg Config) (*CheckinResult,
 	req.Header.Set("X-Device-Brand", cfg.DeviceBrand)
 	req.Header.Set("X-Device-Type", "windows")
 
-	client := httpx.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("trae checkin request failed: %w", errDo)
@@ -270,7 +270,7 @@ func FetchQuota(ctx context.Context, cred *Credential, cfg Config) (*pluginapi.Q
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", cfg.clientUA())
 
-	client := httpx.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("trae quota request failed: %w", errDo)

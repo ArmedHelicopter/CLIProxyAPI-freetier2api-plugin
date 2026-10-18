@@ -20,7 +20,6 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/upstream"
 )
 
 // errEmptyStream 表示上游流里没有任何有效数据帧。
@@ -367,7 +366,7 @@ func Aggregate(body io.Reader) ([]byte, error) {
 			continue
 		}
 		if isErrorFrame(payload) {
-			return nil, fmt.Errorf("upstream error: %s", upstream.Truncate(payload, 512))
+			return nil, fmt.Errorf("upstream error: %s", core.Truncate(payload, 512))
 		}
 		validEvents++
 

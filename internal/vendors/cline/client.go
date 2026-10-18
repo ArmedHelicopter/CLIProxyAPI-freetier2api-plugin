@@ -12,7 +12,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // 本文件实现 Cline 的 chat-completions 转发。
@@ -89,9 +89,9 @@ func doChat(ctx context.Context, baseURL string, req ChatRequest, body []byte, t
 
 	var client *http.Client
 	if timeout > 0 {
-		client = httpx.Client(ctx, timeout)
+		client = hostbridge.Client(ctx, timeout)
 	} else {
-		client = httpx.StreamClient(ctx, 0)
+		client = hostbridge.StreamClient(ctx, 0)
 	}
 	resp, errDo := client.Do(httpReq)
 	if errDo != nil {

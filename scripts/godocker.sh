@@ -18,6 +18,11 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # GOCACHE/GOMODCACHE 落在宿主挂载卷外的匿名卷里，避免与宿主的 GOPATH 冲突，
 # 同时让容器内的编译缓存跨次运行复用（否则每次都要重新编译全部依赖）。
+# GOOS/GOARCH 仅在显式设置时透传（交叉编译）；未设置时沿用容器内默认值。
+CROSS=""
+[ -n "${GOOS:-}" ] && CROSS="$CROSS -e GOOS=$GOOS"
+[ -n "${GOARCH:-}" ] && CROSS="$CROSS -e GOARCH=$GOARCH"
+
 exec docker run --rm \
   -v "$ROOT":/w \
   -v freetier-gocache:/gocache \
@@ -25,4 +30,5 @@ exec docker run --rm \
   -e GOCACHE=/gocache \
   -e CGO_ENABLED=1 \
   -e GOFLAGS=-buildvcs=false \
+  $CROSS \
   "$IMAGE" go "$@"

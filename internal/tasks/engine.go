@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"freetier2api-plugin/internal/accounts"
+	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/state"
@@ -167,18 +167,14 @@ func (s *Service) effectiveSettings() map[string]any {
 // forEachAccount 遍历本插件名下可用的账号。
 func (s *Service) forEachAccount(ctx context.Context, callbackID string, fn func(context.Context, *accountContext) error) {
 	cfg := s.deps.Config()
-	accounts, failures := s.deps.Pool().Load(ctx, callbackID, accounts.Options{
-		RealmEnabled: func(region string) bool { return core.RealmEnabled(cfg.EnabledRealms, region) },
+	accounts, failures := s.deps.Pool().Load(ctx, callbackID, auth.Options{
+		EnabledRealms: cfg.EnabledRealms,
 	})
 	for _, failure := range failures {
 		logger.Debug("skip account %s: %s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
 	}
 	for _, account := range accounts {
-		if errRun := fn(ctx, &accountContext{
-			entry:      account.Entry,
-			vendor:     account.Vendor,
-			credential: account.Credential,
-		}); errRun != nil {
+		if errRun := fn(ctx, newAccountContext(account)); errRun != nil {
 			logger.Debug("account %s task failed: %v", core.FirstNonEmpty(account.Entry.Label, account.Entry.Name), errRun)
 		}
 		if !core.SleepContext(ctx, accountGap) {
@@ -188,10 +184,26 @@ func (s *Service) forEachAccount(ctx context.Context, callbackID string, fn func
 }
 
 // accountContext 是遍历中单个账号的上下文。
+//
+// 除了身份与凭证，还带上原始 JSON 与来源文件路径：凭证续期后要靠这两样
+// 才能把新凭证合并回宿主与磁盘（见 keepalive.go）。
 type accountContext struct {
 	entry      core.HostAuth
 	vendor     core.Vendor
 	credential *core.Credential
+	rawJSON    []byte
+	filePath   string
+}
+
+// newAccountContext 把账号池条目转成遍历上下文。
+func newAccountContext(item auth.Account) *accountContext {
+	if item.FilePath != "" {
+		item.Credential.SetFilePath(item.FilePath)
+	}
+	return &accountContext{
+		entry: item.Entry, vendor: item.Vendor, credential: item.Credential,
+		rawJSON: item.RawJSON, filePath: item.FilePath,
+	}
 }
 
 func (a *accountContext) uid() string { return a.credential.FileIDValue() }
@@ -247,10 +259,24 @@ func (s *Service) runCheckinAll(ctx context.Context) {
 }
 
 // runScheduledFamily 遍历账号，把任务族交给供应商的可选实现。
+//
+// keepalive 是唯一的例外：它不需要供应商写代码，只需实现 core.Refresher
+// 刷新 token，写回由引擎统一做（见 keepalive.go）。这样「合并 → 写宿主 →
+// 落盘」只有一份实现，供应商包也不必依赖 internal/hostbridge。
 func (s *Service) runScheduledFamily(ctx context.Context, kind string) {
 	logger.Info("%s: starting for all accounts", kind)
 	count := 0
 	s.forEachAccount(ctx, "", func(ctx context.Context, account *accountContext) error {
+		if kind == core.TaskKindKeepalive {
+			result := s.keepaliveOne(ctx, "", account)
+			if !result.OK {
+				logger.Error("%s %s: %s", kind, account.label(), result.Message)
+				return nil
+			}
+			logger.Info("%s %s: %s", kind, account.label(), result.Message)
+			count++
+			return nil
+		}
 		runner, okRunner := core.As[core.ScheduledRunner](account.vendor)
 		if !okRunner {
 			return nil
@@ -340,7 +366,7 @@ func (s accountScan) MarshalJSON() ([]byte, error) {
 // scanAllAccounts 并发扫描每个账号的待办任务。
 func (s *Service) scanAllAccounts(ctx context.Context, callbackID string) []accountScan {
 	loaded := s.collectAccounts(ctx, callbackID)
-	scans := accounts.RunBatch(loaded, queueMaxConcurrency, func(account *accountContext) accountScan {
+	scans := auth.RunBatch(loaded, queueMaxConcurrency, func(account *accountContext) accountScan {
 		return s.scanOneAccount(ctx, account)
 	})
 	sort.Slice(scans, func(i, j int) bool { return scans[i].Label < scans[j].Label })
@@ -493,7 +519,7 @@ func (s *Service) runQueueItems(callbackID string, concurrency int, seq int64) {
 		jobs = append(jobs, queueJob{account: account, indices: grouped[uid]})
 	}
 
-	accounts.RunBatch(jobs, concurrency, func(job queueJob) struct{} {
+	auth.RunBatch(jobs, concurrency, func(job queueJob) struct{} {
 		target := job.account
 		if !s.tryLockAccount(target.uid()) {
 			s.markQueueItems(job.indices, "skipped", "该账号有其它任务动作在执行", 0, 0)
@@ -668,7 +694,7 @@ func (s *Service) findAccount(ctx context.Context, callbackID, identifier string
 // activityStatusForAccounts 返回各账号的活动任务状态（供管理页展示）。
 func (s *Service) activityStatusForAccounts(ctx context.Context, callbackID string) []map[string]any {
 	loaded := s.collectAccounts(ctx, callbackID)
-	out := accounts.RunBatch(loaded, queueMaxConcurrency, func(target *accountContext) map[string]any {
+	out := auth.RunBatch(loaded, queueMaxConcurrency, func(target *accountContext) map[string]any {
 		entry := map[string]any{
 			"uid":   target.uid(),
 			"label": target.label(),

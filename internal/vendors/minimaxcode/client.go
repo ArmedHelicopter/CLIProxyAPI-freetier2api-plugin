@@ -15,7 +15,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // Target 是一次签名的 MiniMax 上游请求。
@@ -276,7 +276,7 @@ func doRequest(ctx context.Context, cred *Credential, target Target, origin stri
 		return nil, fmt.Errorf("create request: %w", errNew)
 	}
 	req.Header = buildHeaders(cred, target, origin)
-	return httpx.Client(ctx, timeout).Do(req)
+	return hostbridge.Client(ctx, timeout).Do(req)
 }
 
 // fetchUserInfo 获取当前账号 realUserID 和展示标识。

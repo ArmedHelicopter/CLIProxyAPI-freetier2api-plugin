@@ -19,8 +19,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/loginsession"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 type pendingLogin struct {
@@ -73,7 +72,7 @@ func LoginStart(ctx context.Context, logins core.LoginSessions) (*pluginapi.Auth
 // LoginPoll 轮询华为云 ticket 登录结果。
 func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string) (*pluginapi.AuthLoginPollResponse, error) {
 	session, pollState := logins.Poll(sessionID)
-	if pollState == loginsession.PollMissing {
+	if pollState == core.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期",
@@ -95,7 +94,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 	req.Header.Set("plugin-name", "snap_AIIDE")
 	req.Header.Set("plugin-version", "5.2.0")
 
-	client := httpx.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("poll login ticket failed: %w", errDo)
@@ -232,7 +231,7 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("DPoP", proof)
 
-	client := httpx.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, false, fmt.Errorf("refresh token request failed: %w", errDo)
@@ -275,26 +274,20 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 
 // MergeStorageJSON 合并续期凭证。
 func MergeStorageJSON(original []byte, updated *Credential) ([]byte, error) {
-	if len(original) == 0 {
-		return updated.StorageJSON()
+	if updated == nil {
+		return original, nil
 	}
-
-	var m map[string]any
-	if err := json.Unmarshal(original, &m); err != nil {
-		return updated.StorageJSON()
-	}
-
-	m["access_key_id"] = updated.AccessKeyID
-	m["secret_access_key"] = updated.SecretAccessKey
-	m["security_token"] = updated.SecurityToken
-	if updated.RefreshToken != "" {
-		m["refresh_token"] = updated.RefreshToken
-	}
-	if updated.Expiration != "" {
-		m["expiration"] = updated.Expiration
-	}
-
-	return json.MarshalIndent(m, "", "  ")
+	return core.MergeCredentialJSON(original, updated.StorageJSON, func(m map[string]any) {
+		m["access_key_id"] = updated.AccessKeyID
+		m["secret_access_key"] = updated.SecretAccessKey
+		m["security_token"] = updated.SecurityToken
+		if updated.RefreshToken != "" {
+			m["refresh_token"] = updated.RefreshToken
+		}
+		if updated.Expiration != "" {
+			m["expiration"] = updated.Expiration
+		}
+	})
 }
 
 func buildDPoPProof(jwk map[string]string, htu string) (string, error) {

@@ -2,7 +2,7 @@ package app
 
 // 本文件负责全局配置与落盘状态的 App 级入口。
 //
-// 配置解析/校验在 internal/pluginconfig，state.json 的读写/快照在
+// 配置解析/校验在 internal/admin，state.json 的读写/快照在
 // internal/state；App 持有实例，不再使用包级全局。
 
 import (
@@ -14,20 +14,20 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/admin"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/modelconfig"
-	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
+	"freetier2api-plugin/internal/tasks"
 )
 
-type pluginConfig = pluginconfig.Config
+type pluginConfig = admin.PluginConfig
 
 type pluginState = state.State
 
-func defaultPluginConfig() pluginConfig { return pluginconfig.Default() }
+func defaultPluginConfig() pluginConfig { return admin.DefaultPluginConfig() }
 
-func defaultStateDir() string { return pluginconfig.DefaultStateDir() }
+func defaultStateDir() string { return admin.DefaultStateDir() }
 
 // Config 返回当前生效的配置副本。
 func (a *App) Config() pluginConfig {
@@ -40,7 +40,7 @@ func (a *App) Config() pluginConfig {
 func (a *App) storeConfig(cfg pluginConfig) { a.cfg.Store(&cfg) }
 
 func (a *App) decodeConfig(raw []byte) (pluginConfig, error) {
-	cfg, errDecode := pluginconfig.Decode(raw, defaultPluginConfig())
+	cfg, errDecode := admin.DecodePluginConfig(raw, defaultPluginConfig())
 	if errDecode != nil {
 		return cfg, errDecode
 	}
@@ -75,7 +75,7 @@ func (a *App) ApplyConfig(cfg pluginConfig) error {
 	}
 	a.machineSalt = salt
 	a.storeConfig(cfg)
-	a.models.Configure(modelconfig.Settings{
+	a.models.Configure(admin.ModelSettings{
 		EnabledRealms:    cfg.EnabledRealms,
 		ExtraModels:      cfg.ExtraModels,
 		DisabledModels:   cfg.DisabledModels,
@@ -98,7 +98,7 @@ func ensureStateDir(cfg pluginConfig) error {
 }
 
 func saltFilePath(cfg pluginConfig) string {
-	return filepath.Join(cfg.StateDir, pluginconfig.SaltFileName)
+	return filepath.Join(cfg.StateDir, admin.SaltFileName)
 }
 
 func (a *App) loadState(cfg pluginConfig) (*pluginState, error) {
@@ -140,3 +140,16 @@ func (a *App) ensureMachineSalt(cfg pluginConfig) (string, error) {
 }
 
 func (a *App) nowRFC3339() string { return a.now().Format(time.RFC3339) }
+
+// taskConfig 把全局配置投影成任务引擎需要的最小形状。
+//
+// 投影而不是直接传 admin.PluginConfig，是为了让 internal/tasks 不必依赖
+// 管理接口包（仓库分层守卫禁止 tasks → admin）。
+func taskConfig(cfg admin.PluginConfig) tasks.Config {
+	return tasks.Config{
+		EnabledRealms: cfg.EnabledRealms,
+		AutoCheckin:   cfg.AutoCheckin,
+		AutoCheckinAt: cfg.AutoCheckinAt,
+		AutoTasks:     cfg.AutoTasks,
+	}
+}

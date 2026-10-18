@@ -5,9 +5,9 @@ import (
 	"net/http"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	accountpkg "freetier2api-plugin/internal/accounts"
+	accountpkg "freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // quotaResult 是单个账号的额度结果。
@@ -33,14 +33,14 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
 	}
-	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
-	callbackID := hostabi.RequestCallbackID(req)
+	callbackID := hostbridge.RequestCallbackID(req)
 
 	cfg := s.deps.Config()
 	loaded, failures := s.pool.Load(ctx, callbackID, accountpkg.Options{
-		Targets:      body.AccountIDs,
-		RealmEnabled: func(region string) bool { return core.RealmEnabled(cfg.EnabledRealms, region) },
+		Targets:       body.AccountIDs,
+		EnabledRealms: cfg.EnabledRealms,
 	})
 	type job struct {
 		entry      core.HostAuth

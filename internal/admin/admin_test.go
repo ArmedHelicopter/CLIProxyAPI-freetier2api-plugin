@@ -3,15 +3,14 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/accounts"
+	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/modelconfig"
-	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
 	"freetier2api-plugin/internal/tasks"
 )
@@ -19,23 +18,21 @@ import (
 type stubDeps struct {
 	store    *state.Store
 	registry *core.Registry
-	manager  *modelconfig.Manager
+	manager  *Catalog
 }
 
 func (s stubDeps) Identity() Identity {
 	return Identity{ID: "freetier2api", DisplayName: "FreeTier 2API", ProviderKey: "freetier", Version: "test"}
 }
-func (s stubDeps) Config() pluginconfig.Config { return pluginconfig.Default() }
-func (s stubDeps) State() state.State          { return s.store.Snapshot() }
+func (s stubDeps) Config() PluginConfig { return DefaultPluginConfig() }
+func (s stubDeps) State() state.State   { return s.store.Snapshot() }
 func (s stubDeps) MutateState(fn func(*state.State)) {
 	s.store.Mutate(fn)
 }
-func (s stubDeps) Model() *modelconfig.Manager { return s.manager }
+func (s stubDeps) Model() *Catalog             { return s.manager }
 func (s stubDeps) WorkbuddyPromptMode() string { return "passthrough" }
 func (s stubDeps) ResolveCredential(context.Context, string, []byte, string, map[string]string) (*core.Credential, core.Vendor, error) {
 	return nil, nil, context.Canceled
-}
-func (s stubDeps) SaveRefreshedCredential(context.Context, string, core.Vendor, core.HostAuth, []byte, *core.Credential, string) {
 }
 func (s stubDeps) RefreshModels(context.Context) (int, error) { return 0, nil }
 func (s stubDeps) Reconfigure() error                         { return nil }
@@ -48,13 +45,13 @@ func newStubDeps(t *testing.T) stubDeps {
 		t.Fatal(err)
 	}
 	registry := core.NewRegistry()
-	return stubDeps{store: store, registry: registry, manager: modelconfig.New(store, registry)}
+	return stubDeps{store: store, registry: registry, manager: NewCatalog(store, registry)}
 }
 
 func newService(t *testing.T) *Service {
 	t.Helper()
 	deps := newStubDeps(t)
-	pool := accounts.NewPool(deps.registry, deps.ResolveCredential)
+	pool := auth.NewPool(deps.registry, deps.ResolveCredential)
 	return New(deps, deps.registry, pool, tasks.New(stubTaskDeps{deps: deps, pool: pool}))
 }
 
@@ -109,13 +106,69 @@ func TestHandleStatusAndUnknownRoute(t *testing.T) {
 
 type stubTaskDeps struct {
 	deps stubDeps
-	pool *accounts.Pool
+	pool *auth.Pool
 }
 
-func (s stubTaskDeps) Registry() *core.Registry               { return s.deps.registry }
-func (s stubTaskDeps) Pool() *accounts.Pool                   { return s.pool }
-func (s stubTaskDeps) Config() pluginconfig.Config            { return s.deps.Config() }
+func (s stubTaskDeps) Registry() *core.Registry { return s.deps.registry }
+func (s stubTaskDeps) Pool() *auth.Pool         { return s.pool }
+
+// Config 把全局配置投影成任务引擎的最小形状（与组合根 taskConfig 同构）。
+func (s stubTaskDeps) Config() tasks.Config {
+	cfg := s.deps.Config()
+	return tasks.Config{
+		EnabledRealms: cfg.EnabledRealms, AutoCheckin: cfg.AutoCheckin,
+		AutoCheckinAt: cfg.AutoCheckinAt, AutoTasks: cfg.AutoTasks,
+	}
+}
+
+func (s stubTaskDeps) SaveRefreshedCredential(context.Context, string, core.Vendor, core.HostAuth, []byte, *core.Credential, string) {
+}
 func (s stubTaskDeps) State() state.State                     { return s.deps.State() }
 func (s stubTaskDeps) MutateState(fn func(*state.State))      { s.deps.MutateState(fn) }
 func (s stubTaskDeps) Now() time.Time                         { return time.Now() }
 func (s stubTaskDeps) RuntimeFields() []pluginapi.ConfigField { return nil }
+
+// TestSettingsPayloadKeysMatchConsole 锁死「后端字段名 ↔ 页面字段名」的一致性。
+//
+// 真实事故：后端把 prompt_mode 改名为 workbuddy_prompt_mode（GET /status 的
+// 响应键与 POST /settings 的请求键都改了），页面没跟着改，于是——
+//   - 摘要行显示「提示词 -」；
+//   - 下拉框永远回落 passthrough，看不出真实配置；
+//   - 点「保存设置」发的是 prompt_mode，后端直接忽略，改动**根本存不进去**。
+//
+// 编译期已经保证 Go 侧一致，但 HTML 是字符串，编译器看不见。这里用测试把
+// settingsUpdateRequest 的每个 json tag 钉到页面上，防止再次漂移。
+func TestSettingsPayloadKeysMatchConsole(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+
+	// 兼容旧版页面/脚本的固定字段：后端仍接受，但当前页面不再发送。
+	deprecated := map[string]bool{
+		"checkin_hours": true, "travel_hours": true, "activity_hours": true,
+		"keepalive_hours": true, "blackcat_hours": true,
+	}
+
+	var req settingsUpdateRequest
+	typ := reflect.TypeOf(req)
+	for i := 0; i < typ.NumField(); i++ {
+		field := typ.Field(i)
+		jsonTag := strings.Split(field.Tag.Get("json"), ",")[0]
+		if jsonTag == "" || jsonTag == "-" || deprecated[jsonTag] {
+			continue
+		}
+		if !strings.Contains(page, jsonTag) {
+			t.Errorf("POST /settings 的字段 %q（%s）在控制台页面里没有出现，页面改动不会被后端接收",
+				jsonTag, field.Name)
+		}
+	}
+
+	// 反向：页面读取的 /status 键必须在后端载荷里真实存在。
+	for _, key := range []string{"workbuddy_prompt_mode", "version", "settings"} {
+		if !strings.Contains(page, key) {
+			t.Errorf("页面读取的 /status 键 %q 未出现在页面上", key)
+		}
+	}
+	// 旧键名不得复活：后端已不再返回 prompt_mode。
+	if strings.Contains(page, "status.prompt_mode") {
+		t.Error("页面仍在读 status.prompt_mode，但后端返回的是 workbuddy_prompt_mode")
+	}
+}

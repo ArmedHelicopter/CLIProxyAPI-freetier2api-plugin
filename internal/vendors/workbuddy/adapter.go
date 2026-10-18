@@ -16,8 +16,6 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/loginsession"
-	"freetier2api-plugin/internal/state"
 )
 
 // adapter 是 core.Vendor 在 WorkBuddy 上的实现。
@@ -105,6 +103,24 @@ func (v *adapter) defaultRegionForParse() Region {
 		return RegionCN
 	}
 	return RegionGlobal
+}
+
+// ---- 续期 ----
+
+// Refresh 实现 core.Refresher：用 refresh token 换新的 access token。
+//
+// 「刷新」与「写回」刻意分开：刷新是供应商协议（这里），写回是宿主与磁盘的
+// 事务（由 internal/tasks 的保活编排统一做）。这样供应商不必认识宿主，
+// 也避免了每个供应商各写一份 merge + host.auth.save + 落盘。
+func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return nil, false, errNative
+	}
+	if errRefresh := v.client(ctx).RefreshToken(native); errRefresh != nil {
+		return nil, false, errRefresh
+	}
+	return cred, true, nil
 }
 
 // ---- 模型 ----
@@ -276,7 +292,7 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 	if errStart != nil {
 		return nil, errStart
 	}
-	sessionID := "workbuddy_" + string(v.region) + "_" + loginsession.NewID(16)
+	sessionID := "workbuddy_" + string(v.region) + "_" + core.RandomHex(16)
 	StoreLoginSession(v.Env.Logins, sessionID, &PendingLogin{
 		Region: v.region,
 		State:  state,
@@ -352,7 +368,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 		Status: pluginapi.AuthLoginStatusSuccess,
 		Auth: pluginapi.AuthData{
 			Provider:    core.ProviderKey,
-			FileName:    core.FileNameFor(v.ID(), core.FirstNonEmpty(credential.UID, loginsession.NewID(16))),
+			FileName:    core.FileNameFor(v.ID(), core.FirstNonEmpty(credential.UID, core.RandomHex(16))),
 			Label:       core.FirstNonEmpty(credential.NicknameValue(), credential.UIDValue()),
 			StorageJSON: storageJSON,
 		},
@@ -385,8 +401,8 @@ func (v *adapter) client(ctx context.Context) *Client {
 func (v *adapter) SupportsCheckin() bool { return !v.region.IsGlobal() }
 
 // LoadModelCache 实现 core.ModelCacheLoader：只加载本实例的缓存。
-func (v *adapter) LoadModelCache(cached []state.CachedModel) {
-	filtered := make([]state.CachedModel, 0, len(cached))
+func (v *adapter) LoadModelCache(cached []core.CachedModel) {
+	filtered := make([]core.CachedModel, 0, len(cached))
 	for _, item := range cached {
 		vendorID := strings.TrimSpace(item.VendorID)
 		if vendorID == "" {

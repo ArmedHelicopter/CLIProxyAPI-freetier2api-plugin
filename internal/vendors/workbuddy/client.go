@@ -12,14 +12,13 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/upstream"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // 本文件是 CodeBuddy 协议的客户端核心：请求发送、统一信封处理、凭证刷新、
 // 设备指纹派生与出站 HTTP 客户端构造。
 //
-// 所有出站请求都经宿主 HTTP 桥（internal/httpx），因此宿主的代理、
+// 所有出站请求都经宿主 HTTP 桥（internal/hostbridge），因此宿主的代理、
 // 账号级代理与请求日志对这些请求同样生效。
 
 const (
@@ -122,12 +121,12 @@ func (c *Client) enabledRealm(region Region) bool {
 
 // shortClient 返回短 RPC 客户端。
 func (c *Client) shortClient() *http.Client {
-	return httpx.Client(c.opts.Context, shortTimeout)
+	return hostbridge.Client(c.opts.Context, shortTimeout)
 }
 
 // refreshClient 返回凭证刷新客户端。
 func (c *Client) refreshClient() *http.Client {
-	return httpx.Client(c.opts.Context, refreshTimeout)
+	return hostbridge.Client(c.opts.Context, refreshTimeout)
 }
 
 // chatClient 返回对话客户端。
@@ -141,7 +140,7 @@ func (c *Client) chatClient(headerTimeout time.Duration) *http.Client {
 	// 宿主桥不支持 ResponseHeaderTimeout（由宿主侧决定），
 	// 这里用 context 超时表达首字节上限：httpx 的 transport 会把
 	// 请求 context 传给 host.http.do_stream。
-	return httpx.StreamClient(c.opts.Context, 0)
+	return hostbridge.StreamClient(c.opts.Context, 0)
 }
 
 // apiEnvelope 是上游的统一响应信封。
@@ -193,7 +192,7 @@ func unwrapEnvelope(status int, body string, header http.Header) (json.RawMessag
 	var envelope apiEnvelope
 	if errUnmarshal := json.Unmarshal([]byte(body), &envelope); errUnmarshal != nil {
 		// 响应不是 JSON：说明上游返回了非预期内容（HTML 错误页等）。
-		return nil, &Error{Kind: KindClient, Status: status, Msg: upstream.Truncate(body, 512)}
+		return nil, &Error{Kind: KindClient, Status: status, Msg: core.Truncate(body, 512)}
 	}
 	if envelope.Code != 0 {
 		return nil, enrichClassifyError(status, body, header)

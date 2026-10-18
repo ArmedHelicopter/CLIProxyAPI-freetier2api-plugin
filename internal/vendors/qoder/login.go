@@ -11,9 +11,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/loginsession"
-	"freetier2api-plugin/internal/upstream"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/vendors/qoder/bridge"
 	"freetier2api-plugin/internal/vendors/qoder/cosy"
 	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
@@ -46,7 +44,7 @@ const (
 	loginPollInterval = 1200 * time.Millisecond
 )
 
-// pendingLogin 是一次进行中的登录会话数据（TTL / 节流由 loginsession 统一管理）。
+// pendingLogin 是一次进行中的登录会话数据（TTL / 节流由 auth 会话表统一管理）。
 type pendingLogin struct {
 	nonce    string
 	verifier string
@@ -105,11 +103,11 @@ type LoginPollResult struct {
 // 返回 Pending=true 表示用户还没完成授权，继续轮询即可。
 func LoginPoll(ctx context.Context, logins core.LoginSessions, state string) (LoginPollResult, error) {
 	session, pollState := logins.Poll(state)
-	if pollState == loginsession.PollMissing {
+	if pollState == core.PollMissing {
 		return LoginPollResult{}, fmt.Errorf("登录会话不存在或已过期，请重新发起登录")
 	}
 	// 节流：面板轮询频率高于上游建议（上游客户端是 1 秒一次）。
-	if pollState == loginsession.PollThrottled {
+	if pollState == core.PollThrottled {
 		return LoginPollResult{Pending: true}, nil
 	}
 	entry, okEntry := session.Data.(*pendingLogin)
@@ -153,7 +151,7 @@ func pollDeviceToken(ctx context.Context, entry *pendingLogin) (token, refreshTo
 	if errRequest != nil {
 		return "", "", false, errRequest
 	}
-	resp, errDo := httpx.Client(ctx, loginHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
 		return "", "", false, errDo
 	}
@@ -294,7 +292,7 @@ func sanitizeAuthID(value string) string {
 
 // summarizeBody 截断响应正文用于错误信息。
 func summarizeBody(body []byte) string {
-	return upstream.Truncate(string(body), 200)
+	return core.Truncate(string(body), 200)
 }
 
 // 编译期确认 bridge 的凭证解析在本包可用（登录落盘要用它解回 token）。

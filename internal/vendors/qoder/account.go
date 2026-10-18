@@ -11,8 +11,8 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/upstream"
+	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/vendors/qoder/bridge"
 	"freetier2api-plugin/internal/vendors/qoder/cosy"
 	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
@@ -96,7 +96,7 @@ func httpGetBearerJSON(ctx context.Context, endpoint, token string) (map[string]
 		return nil, NewError("invalid_request", errRequest.Error(), http.StatusBadRequest)
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, errDo := httpx.Client(ctx, quotaHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, quotaHTTPTimeout).Do(req)
 	if errDo != nil {
 		return nil, NewError("qoder_upstream_transient", errDo.Error(), http.StatusBadGateway)
 	}
@@ -111,7 +111,7 @@ func httpGetBearerJSON(ctx context.Context, endpoint, token string) (map[string]
 			status = http.StatusUnauthorized
 		}
 		return nil, NewError("qoder_upstream_error",
-			fmt.Sprintf("额度接口返回 HTTP %d: %s", resp.StatusCode, upstream.Truncate(string(body), 300)), status)
+			fmt.Sprintf("额度接口返回 HTTP %d: %s", resp.StatusCode, core.Truncate(string(body), 300)), status)
 	}
 	var result map[string]any
 	if errUnmarshal := json.Unmarshal(body, &result); errUnmarshal != nil {
@@ -348,12 +348,12 @@ func checkinBearer(token string) string {
 func campaignsCheckin(ctx context.Context, region qoderapi.Region, bearer string, result *CheckinResult) *CheckinResult {
 	status, body, raw := doCheckinRequest(ctx, region, http.MethodGet, "/sash/api/v1/me/campaigns", bearer, nil)
 	if status != http.StatusOK {
-		result.Message = fmt.Sprintf("查询活动失败 HTTP %d: %s", status, upstream.Truncate(raw, 300))
+		result.Message = fmt.Sprintf("查询活动失败 HTTP %d: %s", status, core.Truncate(raw, 300))
 		return result
 	}
 	list, okList := body.(map[string]any)
 	if !okList {
-		result.Message = fmt.Sprintf("活动列表格式异常: %s", upstream.Truncate(raw, 300))
+		result.Message = fmt.Sprintf("活动列表格式异常: %s", core.Truncate(raw, 300))
 		return result
 	}
 	campaigns := parseCampaigns(list["campaigns"])
@@ -406,13 +406,13 @@ func campaignsCheckin(ctx context.Context, region qoderapi.Region, bearer string
 	claimPath := fmt.Sprintf("/sash/api/v1/me/campaigns/%s/claim", target.CampaignID)
 	status, body, raw = doCheckinRequest(ctx, region, http.MethodPost, claimPath, bearer, nil)
 	if status != http.StatusOK {
-		result.Message = fmt.Sprintf("领取失败 HTTP %d: %s", status, upstream.Truncate(raw, 300))
+		result.Message = fmt.Sprintf("领取失败 HTTP %d: %s", status, core.Truncate(raw, 300))
 		return result
 	}
 	var claim claimResponse
 	encoded, _ := json.Marshal(body)
 	if json.Unmarshal(encoded, &claim) != nil {
-		result.Message = fmt.Sprintf("领取响应格式异常: %s", upstream.Truncate(raw, 300))
+		result.Message = fmt.Sprintf("领取响应格式异常: %s", core.Truncate(raw, 300))
 		return result
 	}
 	switch claim.Status {
@@ -531,7 +531,7 @@ func doCheckinRequest(ctx context.Context, region qoderapi.Region, method, path,
 			req.ContentLength = 0
 		}
 	}
-	resp, errDo := httpx.Client(ctx, checkinHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, checkinHTTPTimeout).Do(req)
 	if errDo != nil {
 		return 0, nil, fmt.Sprintf("do request: %v", errDo)
 	}

@@ -38,9 +38,6 @@ type CheckinRecord struct {
 	Energy   int64  `json:"energy,omitempty"`
 }
 
-// CachedModel 是缓存的单条上游模型元数据（定义在 core，避免 core 反向依赖 state）。
-type CachedModel = core.CachedModel
-
 // State 是 state.json 的完整结构。
 //
 // 页面设置用指针字段区分「未设置」与「设为 false/空」：
@@ -67,7 +64,7 @@ type State struct {
 	BlackcatHours  []int `json:"blackcat_hours,omitempty"`
 
 	// Models 是上游模型清单缓存（按 realm 分桶存于 Realm 字段）。
-	Models []CachedModel `json:"models,omitempty"`
+	Models []core.CachedModel `json:"models,omitempty"`
 	// ModelsFetchedAt 是清单缓存时间（RFC3339）。
 	ModelsFetchedAt string `json:"models_fetched_at,omitempty"`
 
@@ -194,7 +191,7 @@ func (s *Store) Snapshot() State {
 // clone 手工深拷贝 map/slice 与指针字段。
 func clone(state *State) State {
 	out := *state
-	out.Models = append([]CachedModel(nil), state.Models...)
+	out.Models = append([]core.CachedModel(nil), state.Models...)
 	out.TaskSchedules = make(map[string][]int, len(state.TaskSchedules))
 	for kind, hours := range state.TaskSchedules {
 		out.TaskSchedules[kind] = append([]int(nil), hours...)

@@ -16,10 +16,7 @@ import (
 	"strings"
 	"time"
 
-	"freetier2api-plugin/cpasdk/pluginabi"
-	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -1607,8 +1604,6 @@ func (v *adapter) RunScheduled(ctx context.Context, cred *core.Credential, kind 
 			return "", errReport
 		}
 		return checkActivityStreak(ctx, client, native), nil
-	case core.TaskKindKeepalive:
-		return "", refreshAndSaveCredential(ctx, client, cred, native)
 	case TaskKindTravel:
 		return RunTravel(ctx, client, native), nil
 	case TaskKindBlackcat:
@@ -1634,28 +1629,6 @@ func checkActivityStreak(ctx context.Context, client *Client, credential *Creden
 		return ""
 	}
 	return fmt.Sprintf("连登天数 %d", streak.Days)
-}
-
-// refreshAndSaveCredential 保活：刷新 token 并写回宿主与磁盘。
-func refreshAndSaveCredential(ctx context.Context, client *Client, cred *core.Credential, native *Credential) error {
-	if errRefresh := client.RefreshToken(native); errRefresh != nil {
-		return errRefresh
-	}
-	callbackID := hostabi.CallbackID(ctx)
-	raw, okRaw := hostabi.AuthJSON(ctx, callbackID, cred.FileIDValue())
-	if okRaw {
-		if updated, errMerge := MergeStorageJSON(raw, native); errMerge == nil {
-			if _, errSave := hostabi.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
-				Name: cred.FileIDValue(), JSON: updated,
-			}); errSave != nil {
-				logger.Debug("keepalive: host.auth.save failed: %v", errSave)
-			}
-		}
-	}
-	if errSave := SaveCredentialFile(cred.FilePath, native); errSave != nil {
-		logger.Debug("keepalive: save credential failed: %v", errSave)
-	}
-	return nil
 }
 
 // ---- 动作实现 ----

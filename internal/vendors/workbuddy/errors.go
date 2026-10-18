@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/upstream"
 )
 
 // 本文件实现上游错误分类。
@@ -22,41 +21,41 @@ import (
 // 判定顺序是有语义的，不能重排（见 Classify 的注释）。
 
 // Kind 是错误类别。
-type Kind = upstream.Kind
+type Kind = core.FailureKind
 
 const (
 	// KindNone 表示成功。
-	KindNone Kind = upstream.KindNone
+	KindNone Kind = core.FailureKindNone
 	// KindHardCredit 余额耗尽（402 或余额关键词）→ 长冷却到次日。
-	KindHardCredit = upstream.KindHardCredit
+	KindHardCredit = core.FailureKindHardCredit
 	// KindSoftRate 限流（429）→ 短冷却，指数退避。
-	KindSoftRate = upstream.KindSoftRate
+	KindSoftRate = core.FailureKindSoftRate
 	// KindSessionDead 会话失效（12153）→ 禁用，需重新登录。
-	KindSessionDead = upstream.KindSessionDead
+	KindSessionDead = core.FailureKindSessionDead
 	// KindNotFound 上游偶发 404 → 固定短冷却，不累计熔断。
-	KindNotFound = upstream.KindNotFound
+	KindNotFound = core.FailureKindNotFound
 	// KindServer 上游 5xx → 计入熔断。
-	KindServer = upstream.KindServer
+	KindServer = core.FailureKindServer
 	// KindContentBlocked 内容策略拦截 → 不罚账号，可降级重试。
-	KindContentBlocked = upstream.KindContentBlocked
+	KindContentBlocked = core.FailureKindContentBlocked
 	// KindBadParams 参数非法 → 不罚账号，但仍换号重试。
-	KindBadParams = upstream.KindBadParams
+	KindBadParams = core.FailureKindBadParams
 	// KindAccountFault 账号级故障（request illegal / trial 未激活）→ 冷却轮换。
-	KindAccountFault = upstream.KindAccountFault
+	KindAccountFault = core.FailureKindAccountFault
 	// KindModelBlocked 该后端无此模型（11102）→ 按（账号, 模型）避让。
-	KindModelBlocked = upstream.KindModelBlocked
+	KindModelBlocked = core.FailureKindModelBlocked
 	// KindWAFBlock 上游 WAF 拦截（403 非业务信封）→ 账号软冷却。
-	KindWAFBlock = upstream.KindWAFBlock
+	KindWAFBlock = core.FailureKindWAFBlock
 	// KindPromptTooLong 上下文超限（11115）→ 请求级，不罚号不轮转。
-	KindPromptTooLong = upstream.KindPromptTooLong
+	KindPromptTooLong = core.FailureKindPromptTooLong
 	// KindImageInvalid 图片无效 → 请求级，不罚号不轮转。
-	KindImageInvalid = upstream.KindImageInvalid
+	KindImageInvalid = core.FailureKindImageInvalid
 	// KindClient 其他 4xx / 业务错误。
-	KindClient = upstream.KindClient
+	KindClient = core.FailureKindClient
 )
 
 // Error 是带分类的上游错误。
-type Error = upstream.Error
+type Error = core.Failure
 
 // 关键词表。
 //

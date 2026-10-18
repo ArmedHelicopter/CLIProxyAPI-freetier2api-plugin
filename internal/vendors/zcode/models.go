@@ -16,7 +16,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // Model 是一个可用模型的元数据。
@@ -65,7 +65,7 @@ func FetchModels(ctx context.Context) ([]Model, error) {
 	}
 	req.Header.Set("User-Agent", UserAgent)
 
-	resp, errDo := httpx.Client(ctx, 15*time.Second).Do(req)
+	resp, errDo := hostbridge.Client(ctx, 15*time.Second).Do(req)
 	if errDo != nil {
 		return fallbackModels(), nil
 	}

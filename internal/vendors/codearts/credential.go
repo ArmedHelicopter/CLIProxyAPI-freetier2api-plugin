@@ -11,7 +11,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 type CheckinResult struct {
@@ -37,7 +37,7 @@ func Checkin(ctx context.Context, cred *Credential) (*CheckinResult, error) {
 	req.Header.Set("Content-Type", "application/json")
 	signHuaweiRequest(req, []byte("{}"), cred)
 
-	client := httpx.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("codearts claim benefit failed: %w", errDo)

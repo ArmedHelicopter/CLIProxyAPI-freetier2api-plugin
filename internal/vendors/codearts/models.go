@@ -6,11 +6,10 @@ package codearts
 import (
 	"context"
 	"encoding/json"
+	"freetier2api-plugin/internal/hostbridge"
 	"io"
 	"net/http"
 	"time"
-
-	"freetier2api-plugin/internal/httpx"
 )
 
 type Model struct {
@@ -78,7 +77,7 @@ func FetchModels(ctx context.Context, cred *Credential) ([]Model, error) {
 	req.Header.Set("Agent-Type", "PromptCenter")
 	signHuaweiRequest(req, nil, cred)
 
-	client := httpx.Client(ctx, 15*time.Second)
+	client := hostbridge.Client(ctx, 15*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return DefaultModels(), nil

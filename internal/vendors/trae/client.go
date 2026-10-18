@@ -6,12 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"freetier2api-plugin/internal/hostbridge"
 	"io"
 	"net/http"
 	"strings"
 	"time"
-
-	"freetier2api-plugin/internal/httpx"
 )
 
 // 本文件实现 Trae 对话转发：请求体改写、头装配与 SSE 事件转换。
@@ -286,7 +285,7 @@ func doTraeRequest(ctx context.Context, baseURL string, req ChatRequest) (io.Rea
 	}
 	ApplyTraeHeaders(httpReq, req.Credential, cfg, true)
 
-	client := httpx.Client(ctx, 300*time.Second)
+	client := hostbridge.Client(ctx, 300*time.Second)
 	resp, errDo := client.Do(httpReq)
 	if errDo != nil {
 		return nil, "", fmt.Errorf("trae chat request failed: %w", errDo)

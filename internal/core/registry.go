@@ -2,7 +2,7 @@ package core
 
 // 本文件提供显式的供应商注册表。
 //
-// Registry 由组合根构造并注入到 modelconfig/admin/tasks/accounts/供应商，
+// Registry 由组合根构造并注入到 app / admin / tasks / auth 与各供应商，
 // 不再使用包级全局注册表：这样同一个进程里的多个 App 实例彼此隔离，
 // 测试也不需要 ResetForTest。
 

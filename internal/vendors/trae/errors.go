@@ -7,21 +7,20 @@ import (
 	"strings"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/upstream"
 )
 
 // 本文件实现 Trae 家族的上游错误分类。：解析 Trae 家族上游错误码。
 
-type ErrorKind = upstream.Kind
+type ErrorKind = core.FailureKind
 
 const (
-	KindCredential = upstream.KindCredential
-	KindRateLimit  = upstream.KindRateLimit
-	KindTransient  = upstream.KindTransient
-	KindClient     = upstream.KindClient
+	KindCredential = core.FailureKindCredential
+	KindRateLimit  = core.FailureKindRateLimit
+	KindTransient  = core.FailureKindTransient
+	KindClient     = core.FailureKindClient
 )
 
-type Error = upstream.Error
+type Error = core.Failure
 
 func Classify(status int, body string) error {
 	var payload struct {

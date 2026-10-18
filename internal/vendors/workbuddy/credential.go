@@ -254,26 +254,6 @@ func (c *Credential) DeviceTokenValue() string {
 	return c.DeviceToken
 }
 
-// NeedsRefresh 报告 access token 是否即将过期（或已过期）。
-//
-// 没有过期时间（0）时保守地认为需要刷新：这种情况通常来自手写凭证，
-// 刷一次就能拿到真实的 expiresAt。
-func (c *Credential) NeedsRefresh(withinSeconds int64, nowUnix int64) bool {
-	if c == nil {
-		return true
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if strings.TrimSpace(c.RefreshToken) == "" {
-		// 没有 refresh token 就刷不了，交给上游返回 401。
-		return false
-	}
-	if c.ExpiresAt <= 0 {
-		return true
-	}
-	return nowUnix+withinSeconds >= c.ExpiresAt
-}
-
 // ApplyTokenRefresh 写回刷新结果。
 //
 // 采用「两段式快照校验」：调用方在发起网络请求前取快照，拿到响应后在本方法里

@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/state"
 )
 
 // modelCacheEntry 是某个域的模型目录缓存。
@@ -328,9 +327,9 @@ const defaultContextWindow int64 = 1000000
 
 // LoadCachedModelsFromState 用 state.json 里的缓存预热模型目录。
 //
-// 状态结构由 internal/state 定义，根层只负责把快照传进来，
+// 缓存结构由 core 定义（state 只是它的落盘容器），这里只负责按区域预热，
 // 不再在这里重复一遍 WorkBuddy 的字段映射。
-func (r *runtime) loadCachedModelsFromState(cached []state.CachedModel) {
+func (r *runtime) loadCachedModelsFromState(cached []core.CachedModel) {
 	byRegion := map[Region][]ModelInfo{}
 	for _, item := range cached {
 		if strings.TrimSpace(item.ID) == "" {

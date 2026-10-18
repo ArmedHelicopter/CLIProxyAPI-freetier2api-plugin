@@ -12,9 +12,8 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/upstream"
 	"freetier2api-plugin/internal/vendors/qoder/cosy"
 	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
@@ -62,7 +61,7 @@ func FetchUserInfoWithToken(ctx context.Context, token string, region qoderapi.R
 		return nil, err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
-	resp, err := httpx.Client(ctx, 15*time.Second).Do(req)
+	resp, err := hostbridge.Client(ctx, 15*time.Second).Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -74,7 +73,7 @@ func FetchUserInfoWithToken(ctx context.Context, token string, region qoderapi.R
 	}
 	// DEBUG 用途排查原始 userinfo 响应结构：降为 Debug 级并截断至 500 字节，
 	// 默认日志级别不再落盘用户名/组织等 PII，保留低级别排查能力
-	logger.Debug("userinfo raw (%d bytes): %s", len(raw), upstream.Truncate(string(raw), 500))
+	logger.Debug("userinfo raw (%d bytes): %s", len(raw), core.Truncate(string(raw), 500))
 	return result, nil
 }
 

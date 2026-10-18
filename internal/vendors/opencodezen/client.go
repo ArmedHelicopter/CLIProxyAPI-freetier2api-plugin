@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -18,7 +19,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // 本文件实现 OpenCode ZEN 的 chat-completions 转发。
@@ -91,9 +92,9 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest) (*http.Res
 	if errReq != nil {
 		return nil, fmt.Errorf("build chat stream request: %w", errReq)
 	}
-	ApplyChatHeaders(httpReq, req.APIKey, newSessionID(), newRequestID())
+	ApplyChatHeaders(httpReq, req.APIKey, sessionIDFor(body), newRequestID())
 
-	resp, errDo := httpx.StreamClient(ctx, 0).Do(httpReq)
+	resp, errDo := hostbridge.StreamClient(ctx, 0).Do(httpReq)
 	if errDo != nil {
 		return nil, &Error{Msg: "chat stream: " + errDo.Error(), Kind: KindTransient}
 	}
@@ -117,9 +118,9 @@ func doChat(ctx context.Context, baseURL string, req ChatRequest) (*http.Respons
 	if errReq != nil {
 		return nil, fmt.Errorf("build chat request: %w", errReq)
 	}
-	ApplyChatHeaders(httpReq, req.APIKey, newSessionID(), newRequestID())
+	ApplyChatHeaders(httpReq, req.APIKey, sessionIDFor(body), newRequestID())
 
-	resp, errDo := httpx.Client(ctx, chatHTTPTimeout).Do(httpReq)
+	resp, errDo := hostbridge.Client(ctx, chatHTTPTimeout).Do(httpReq)
 	if errDo != nil {
 		return nil, &Error{Msg: "chat: " + errDo.Error(), Kind: KindTransient}
 	}
@@ -423,18 +424,91 @@ func cloneToolCall(src map[string]any) map[string]any {
 	return dst
 }
 
+// canonicalSessionPattern 匹配 OpenCode 官方的 session 形态：
+// "ses_" + 12 位小写十六进制 + 14 位 Base62。
 var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
 
-// newSessionID 生成一个符合上游 OpenCode 官方规范的 Canonical Session ID。
-// 格式为：ses_ + 12位小写十六进制 + 14位 Base62 字符。
-func newSessionID() string {
+// descendingTimePartPattern 匹配官方客户端 Identifier.descending() 铸造的
+// 时间部分：48 位值 ~(ts_ms<<12|counter) 的十六进制。按位取反会把低 12 位
+// 置成 0xFFF-counter，因此真实时间部分以 f[c-f] 收尾。
+//
+// **这一段是免费层的硬门槛**：形态对但用随机十六进制填时间部分，上游照样
+// 403 FreeTierError——它校验的是编码方式而不只是长度。
+var descendingTimePartPattern = regexp.MustCompile(`^[0-9a-f]{9}f[c-f][0-9a-f]$`)
+
+// sessionIDFor 由请求体派生本次请求的 session ID。
+//
+// 同一段对话（首条 user 消息相同）会得到同一个 session，既通过免费层的
+// 编码校验，也保住上游的 prompt cache 亲和性；派生不出信号时退回随机。
+func sessionIDFor(body []byte) string {
+	return canonicalSessionID(conversationSeed(body))
+}
+
+// canonicalSessionID 把任意信号确定性地重编码成官方 session 形态。
+// 已经是官方铸造（形态与时间部分编码都对）的信号原样保留，以免破坏亲和性。
+func canonicalSessionID(signal string) string {
+	if canonicalSessionPattern.MatchString(signal) &&
+		descendingTimePartPattern.MatchString(signal[4:16]) {
+		return signal
+	}
+	sum := sha256.Sum256([]byte("ses\x00" + signal))
+	timePart := descendingTimePart(sum[:6])
+	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
+	return "ses_" + timePart + randomPart
+}
+
+// conversationSeed 取首条 user 消息的序列化内容作为会话种子。
+//
+// 用「开头」而不是整段历史：多轮对话越聊越长，用全文做种子会让同一段对话
+// 每轮都换一个 session，prompt cache 永远命中不了。
+func conversationSeed(body []byte) string {
+	var payload struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+		PreviousResponseID string `json:"previous_response_id"`
+	}
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		return randomSessionSignal()
+	}
+	for _, message := range payload.Messages {
+		if message.Role != "user" || message.Content == nil {
+			continue
+		}
+		encoded, errMarshal := json.Marshal(message.Content)
+		if errMarshal == nil && string(encoded) != "null" {
+			return string(encoded)
+		}
+	}
+	if trimmed := strings.TrimSpace(payload.PreviousResponseID); trimmed != "" {
+		return trimmed
+	}
+	return randomSessionSignal()
+}
+
+// randomSessionSignal 在请求体给不出任何信号时提供一次性种子。
+func randomSessionSignal() string {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
-		return "ses_00000000000000000000000000"
+		// crypto/rand 失败时仍要产出合法 session；此处只影响缓存亲和性。
+		return "fallback"
 	}
-	timePart := hex.EncodeToString(buf[:6])
-	randomPart := base62Fixed(new(big.Int).SetBytes(buf[6:16]), 14)
-	return "ses_" + timePart + randomPart
+	return hex.EncodeToString(buf)
+}
+
+// descendingTimePart 把六个哈希字节渲染成官方 Identifier.descending() 的
+// 布局：36 位时间戳顶到 48 位字的高位，OR 上计数器 1，再按位取反，
+// 于是低 12 位读作 ffe。
+func descendingTimePart(hash []byte) string {
+	current := (uint64(hash[0])<<28 | uint64(hash[1])<<20 | uint64(hash[2])<<12 |
+		uint64(hash[3])<<4 | uint64(hash[4])>>4) << 12
+	current |= 1
+	inverted := ^current & 0xFFFFFFFFFFFF
+	return hex.EncodeToString([]byte{
+		byte(inverted >> 40), byte(inverted >> 32), byte(inverted >> 24),
+		byte(inverted >> 16), byte(inverted >> 8), byte(inverted),
+	})
 }
 
 func base62Fixed(n *big.Int, width int) string {

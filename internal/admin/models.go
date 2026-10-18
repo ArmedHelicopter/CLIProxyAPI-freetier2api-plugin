@@ -9,9 +9,8 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/modelconfig"
 )
 
 // consoleModel 是控制台页展示用的模型条目。
@@ -38,9 +37,9 @@ type consoleModel struct {
 }
 
 func (s *Service) handleModelsList(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
-	callbackID := hostabi.RequestCallbackID(req)
+	callbackID := hostbridge.RequestCallbackID(req)
 	cfg := s.deps.Config()
 	manager := s.deps.Model()
 	models := make([]consoleModel, 0, 128)
@@ -90,7 +89,7 @@ func (s *Service) handleModelsList(req pluginapi.ManagementRequest) pluginapi.Ma
 	return JSONResponse(http.StatusOK, payload)
 }
 
-func (s *Service) consoleModelsForVendor(manager *modelconfig.Manager, vendor core.Vendor) []consoleModel {
+func (s *Service) consoleModelsForVendor(manager *Catalog, vendor core.Vendor) []consoleModel {
 	if provider, okProvider := core.As[core.ConsoleModelProvider](vendor); okProvider {
 		return s.consoleModelsFromProvider(vendor, provider.ConsoleModels())
 	}

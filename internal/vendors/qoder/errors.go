@@ -8,31 +8,31 @@ import (
 	"net/http"
 	"strings"
 
-	"freetier2api-plugin/internal/upstream"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/vendors/qoder/bridge"
 )
 
 // PluginError 是 Qoder 的上游错误（与其它供应商共用同一类型）。
-type PluginError = upstream.Error
+type PluginError = core.Failure
 
 // NewError 构造一个 Qoder 插件错误。
 func NewError(code, message string, status int) *PluginError {
-	kind := upstream.ClassifyStatus(status)
+	kind := core.ClassifyStatus(status)
 	switch {
 	case strings.Contains(code, "credential"):
-		kind = upstream.KindCredential
+		kind = core.FailureKindCredential
 	case strings.Contains(code, "busy"):
-		kind = upstream.KindBusy
+		kind = core.FailureKindBusy
 	case strings.Contains(code, "transient"):
-		kind = upstream.KindTransient
+		kind = core.FailureKindTransient
 	}
-	retryable := kind == upstream.KindTransient && strings.Contains(code, "transient")
-	return &upstream.Error{
+	retryable := kind == core.FailureKindTransient && strings.Contains(code, "transient")
+	return &core.Failure{
 		Kind:              kind,
 		Status:            status,
 		Code:              code,
 		Msg:               message,
-		RetryableOverride: upstream.Bool(retryable),
+		RetryableOverride: core.Bool(retryable),
 	}
 }
 

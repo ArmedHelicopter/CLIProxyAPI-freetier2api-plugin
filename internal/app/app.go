@@ -12,12 +12,9 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/accounts"
 	"freetier2api-plugin/internal/admin"
+	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/loginsession"
-	"freetier2api-plugin/internal/modelconfig"
-	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
 	"freetier2api-plugin/internal/tasks"
 )
@@ -42,11 +39,11 @@ type App struct {
 
 	host     core.Host
 	registry *core.Registry
-	logins   *loginsession.Registry
+	logins   *auth.SessionRegistry
 
-	cfg    atomic.Pointer[pluginconfig.Config]
+	cfg    atomic.Pointer[admin.PluginConfig]
 	store  *state.Store
-	models *modelconfig.Manager
+	models *admin.Catalog
 
 	machineSalt string
 
@@ -66,7 +63,7 @@ type App struct {
 	nextStreamKey  uint64
 	pluginStreamID uint64
 
-	pool  *accounts.Pool
+	pool  *auth.Pool
 	tasks *tasks.Service
 	admin *admin.Service
 }
@@ -85,7 +82,7 @@ func New(opts Options) (*App, error) {
 		version:         version,
 		now:             now,
 		registry:        core.NewRegistry(),
-		logins:          loginsession.NewRegistry(),
+		logins:          auth.NewSessionRegistry(),
 		store:           state.NewStore(),
 		credentialCache: map[string]credentialCacheEntry{},
 		streamCancels:   map[uint64]context.CancelFunc{},
@@ -106,13 +103,13 @@ func New(opts Options) (*App, error) {
 			}
 		}
 	}
-	a.models = modelconfig.New(a.store, a.registry)
-	a.pool = accounts.NewPool(a.registry, a.resolveVendorCredential)
+	a.models = admin.NewCatalog(a.store, a.registry)
+	a.pool = auth.NewPool(a.registry, a.resolveVendorCredential)
 	a.tasks = tasks.New(taskDeps{app: a})
 	a.admin = admin.New(adminDeps{app: a}, a.registry, a.pool, a.tasks)
 	defaults := defaultPluginConfig()
 	a.storeConfig(defaults)
-	a.models.Configure(modelconfig.Settings{
+	a.models.Configure(admin.ModelSettings{
 		EnabledRealms:    defaults.EnabledRealms,
 		ExtraModels:      defaults.ExtraModels,
 		DisabledModels:   defaults.DisabledModels,
@@ -137,15 +134,21 @@ func (a *App) Version() string { return a.version }
 func (a *App) Registry() *core.Registry { return a.registry }
 
 // Model 返回模型管理器。
-func (a *App) Model() *modelconfig.Manager { return a.models }
+func (a *App) Model() *admin.Catalog { return a.models }
 
 // taskDeps 实现 tasks.Deps。
 type taskDeps struct{ app *App }
 
 func (d taskDeps) Registry() *core.Registry               { return d.app.registry }
-func (d taskDeps) Pool() *accounts.Pool                   { return d.app.pool }
-func (d taskDeps) Config() pluginconfig.Config            { return d.app.Config() }
+func (d taskDeps) Pool() *auth.Pool                       { return d.app.pool }
+func (d taskDeps) Config() tasks.Config                   { return taskConfig(d.app.Config()) }
 func (d taskDeps) State() state.State                     { return d.app.SnapshotState() }
 func (d taskDeps) MutateState(fn func(*state.State))      { d.app.MutateState(fn) }
 func (d taskDeps) Now() time.Time                         { return d.app.now() }
 func (d taskDeps) RuntimeFields() []pluginapi.ConfigField { return d.app.runtimeFields() }
+
+// SaveRefreshedCredential 复用组合根里的凭证写回实现（merge → host.auth.save → 落盘）。
+func (d taskDeps) SaveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor,
+	entry core.HostAuth, original []byte, updated *core.Credential, filePath string) {
+	d.app.saveRefreshedCredential(ctx, callbackID, vendor, entry, original, updated, filePath)
+}

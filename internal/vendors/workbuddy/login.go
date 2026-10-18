@@ -23,13 +23,12 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/loginsession"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // PendingLogin 是一次进行中的登录会话数据。
 //
-// TTL 与轮询节流由 internal/loginsession 统一管理，这里只保留协议状态。
+// TTL 与轮询节流由 internal/auth 的会话表统一管理，这里只保留协议状态。
 type PendingLogin struct {
 	Region Region
 	State  string
@@ -63,14 +62,14 @@ func RemoveLoginSession(logins core.LoginSessions, sessionID string) {
 //   - shouldPoll: 是否已过节流间隔，可以向上游发起 token 请求。
 func CheckLoginSession(logins core.LoginSessions, sessionID string) (session *PendingLogin, exists bool, shouldPoll bool) {
 	entry, pollState := logins.Poll(sessionID)
-	if pollState == loginsession.PollMissing {
+	if pollState == core.PollMissing {
 		return nil, false, false
 	}
 	pending, okPending := entry.Data.(*PendingLogin)
 	if !okPending {
 		return nil, false, false
 	}
-	return pending, true, pollState == loginsession.PollReady
+	return pending, true, pollState == core.PollReady
 }
 
 // loginAccount 是登录流程取到的账号信息。
@@ -178,7 +177,7 @@ func FetchLoginAccount(ctx context.Context, region Region, state, accessToken st
 
 // doLoginRequest 发起一次登录相关请求并解开信封。
 func doLoginRequest(req *http.Request) (json.RawMessage, error) {
-	client := httpx.Client(req.Context(), loginHTTPTimeout)
+	client := hostbridge.Client(req.Context(), loginHTTPTimeout)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("login request: %w", errDo)

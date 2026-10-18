@@ -30,7 +30,7 @@ type Stream struct {
 	closed   bool
 }
 
-// Host 是宿主回调的内存实现（实现 hostabi.Caller 的签名）。
+// Host 是宿主回调的内存实现（实现 hostbridge.Caller 的签名）。
 type Host struct {
 	mu sync.Mutex
 
@@ -63,7 +63,7 @@ func New() *Host {
 	}
 }
 
-// Call 实现 hostabi.Caller。
+// Call 实现 hostbridge.Caller。
 func (h *Host) Call(callbackID, method string, payload any) (json.RawMessage, error) {
 	h.mu.Lock()
 	h.calls = append(h.calls, method)

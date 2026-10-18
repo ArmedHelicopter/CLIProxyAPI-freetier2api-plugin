@@ -4,8 +4,8 @@
  * cgo 在遇到 //export 时会把 preamble 复制到多个生成文件里，
  * 若 preamble 里带函数定义会导致重复符号（multiple definition）链接失败。
  */
-#ifndef WORKBUDDY2API_BRIDGE_H
-#define WORKBUDDY2API_BRIDGE_H
+#ifndef CLIPROXY_BRIDGE_H
+#define CLIPROXY_BRIDGE_H
 
 #include <stdint.h>
 #include <stddef.h>
@@ -48,4 +48,4 @@ void clear_host_api(void);
 int call_host_api(const char* method, const uint8_t* request, size_t request_len, cliproxy_buffer* response);
 void free_host_buffer(void* ptr, size_t len);
 
-#endif /* WORKBUDDY2API_BRIDGE_H */
+#endif /* CLIPROXY_BRIDGE_H */

@@ -148,7 +148,7 @@ const (
 	PollReady
 )
 
-// LoginSessions 是登录会话登记表接口；实现由 internal/loginsession 提供。
+// LoginSessions 是登录会话登记表接口；实现由 internal/auth.SessionRegistry 提供。
 type LoginSession struct {
 	VendorID string
 	Data     any

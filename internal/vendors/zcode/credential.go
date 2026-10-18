@@ -15,7 +15,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // ZCode 凭证的解析、特征识别与脱敏。
@@ -150,38 +150,40 @@ func MergeStorageJSON(original []byte, updated *Credential) ([]byte, error) {
 	if updated == nil {
 		return original, nil
 	}
-	var existing map[string]any
-	if len(original) > 0 {
-		if errUnmarshal := json.Unmarshal(original, &existing); errUnmarshal != nil || existing == nil {
-			existing = map[string]any{}
+	// type / vendor 无条件写：归属判定依赖这两个键，即使用户从别处拷来的
+	// 旧凭证缺了它们，合并结果也必须补上。
+	setFields := func(m map[string]any) {
+		m["type"] = "freetier"
+		m["vendor"] = VendorID
+		if updated.APIKey != "" {
+			m["api_key"] = updated.APIKey
 		}
-	} else {
-		existing = map[string]any{}
+		if updated.JWTToken != "" {
+			m["jwt_token"] = updated.JWTToken
+		}
+		if updated.Email != "" {
+			m["email"] = updated.Email
+		}
+		if updated.UserID != "" {
+			m["user_id"] = updated.UserID
+		}
+		if updated.AuthMode != "" {
+			m["auth_mode"] = updated.AuthMode
+		}
+		if updated.Label != "" {
+			m["label"] = updated.Label
+		}
+		if updated.Profile.DeviceMID != "" {
+			m["profile"] = updated.Profile
+		}
 	}
-	existing["type"] = "freetier"
-	existing["vendor"] = VendorID
-	if updated.APIKey != "" {
-		existing["api_key"] = updated.APIKey
-	}
-	if updated.JWTToken != "" {
-		existing["jwt_token"] = updated.JWTToken
-	}
-	if updated.Email != "" {
-		existing["email"] = updated.Email
-	}
-	if updated.UserID != "" {
-		existing["user_id"] = updated.UserID
-	}
-	if updated.AuthMode != "" {
-		existing["auth_mode"] = updated.AuthMode
-	}
-	if updated.Label != "" {
-		existing["label"] = updated.Label
-	}
-	if updated.Profile.DeviceMID != "" {
-		existing["profile"] = updated.Profile
-	}
-	return json.MarshalIndent(existing, "", "  ")
+	// fresh 与 apply 共用 setFields：原文件缺失或损坏时，产出的对象与
+	// 「合并成功」时字段完全一致，type/vendor 一定在场。
+	return core.MergeCredentialJSON(original, func() ([]byte, error) {
+		fresh := map[string]any{}
+		setFields(fresh)
+		return json.MarshalIndent(fresh, "", "  ")
+	}, setFields)
 }
 
 // LooksLikeCredential 判断文件或数据是否属于 ZCode。
@@ -335,7 +337,7 @@ func billingRequest(ctx context.Context, cred *Credential, method, path string, 
 		req.Header.Set(key, value)
 	}
 
-	resp, errDo := httpx.Client(ctx, billingHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, billingHTTPTimeout).Do(req)
 	if errDo != nil {
 		return 0, nil, transientErr("计费请求失败: " + errDo.Error())
 	}

@@ -20,8 +20,8 @@ import (
 	"strings"
 	"testing"
 
+	"freetier2api-plugin/internal/admin"
 	"freetier2api-plugin/internal/app"
-	"freetier2api-plugin/internal/console"
 	"freetier2api-plugin/internal/core"
 )
 
@@ -107,7 +107,7 @@ func TestPluginIDMatchesLibraryName(t *testing.T) {
 func TestConsolePagePathsAreDeclared(t *testing.T) {
 	installFakeHost(t)
 	setupTestPlugin(t)
-	page := console.Page(app.ManagementRoutePrefix)
+	page := admin.Page(app.ManagementRoutePrefix)
 
 	declared := map[string]bool{}
 	for _, route := range testApp.ManagementRegistration().Routes {

@@ -43,17 +43,23 @@
 ```
 package main / cgo        C ABI 入口
   └─ internal/app         组合根与 ABI 适配（生命周期、RPC 分发、五类能力）
-       ├─ internal/admin    管理 HTTP 路由与响应
+       ├─ internal/admin    管理接口：HTTP 路由/响应 + 全局配置 + 模型目录 + 控制台页
        ├─ internal/tasks    供应商无关的任务目录、排程、队列与执行引擎
-       ├─ internal/accounts 账号枚举/去重/批量执行 + 额度格式化
+       ├─ internal/auth     账号枚举/去重/批量执行/额度格式化 + 登录会话登记
        └─ internal/vendors/* 各供应商协议与适配层
-            └─ internal/core 供应商无关契约（Vendor、能力接口、注册表、凭证）
+            └─ internal/core 供应商无关契约（Vendor、能力接口、注册表、凭证、错误分类）
 ```
 
-`internal/core` 不 import 任何上层包或具体供应商；`internal/tasks` 只依赖
-`core`/`accounts`/`state`/`pluginconfig`，不 import `vendors`/`admin`；
-只有 `internal/app/vendors.go` 可以 import 具体供应商。`tests/architecture_test.go`
-用静态 import 图守住这三条边界。
+**供应商包只允许依赖 `core`（契约）+ `hostbridge`（宿主通信）+ `logger`（日志）**，
+多一个都不行。这条 allowlist 由 `tests/architecture_test.go` 静态守住，它挡住
+vendor 反向依赖 `auth`/`state`/`tasks`/`admin` 的所有可能——例如某个供应商为了
+发一次宿主 RPC 或换一个随机 ID 就去 import 应用层包。
+
+其余分层：`core` 只依赖标准库；`state` 依赖 `core`/`logger`；`hostbridge` 依赖
+`core`/`logger`；`auth` 依赖 `core`/`hostbridge`；`tasks` 依赖 `core`/`auth`/
+`state`/`logger`；`admin` 依赖 `core`/`auth`/`tasks`/`state`/`hostbridge`；
+`app` 在最上，且只有 `internal/app/vendors.go` 可以 import 具体供应商。
+新增内部包必须同步登记到 `layerRules` / `internalPackages`，否则测试直接失败。
 
 ```
 package main                        C ABI 入口（main.go / cgo.go）
@@ -61,25 +67,30 @@ internal/app                        组合根与 ABI 适配
   ├─ main.go                        插件身份、RPC 方法分发、注册响应
   ├─ host.go                        core.Host 端口、生命周期、供应商配置下发
   ├─ config.go                      全局配置适配 + state.json/机器盐
-  ├─ auth.go                        auth provider（解析/登录/刷新/凭证写回）
+  ├─ authprovider.go                auth provider（解析/登录/刷新/凭证写回）
   ├─ models.go                      model provider（注册、隔离、别名、禁用）
   ├─ executor.go                    executor + quota provider
   └─ vendors.go                     BuiltinFactories()：唯一的供应商清单
 internal/core                       供应商无关骨架：Vendor 接口 + 可选能力接口
                                     （登录/续期/额度/签到/任务/配置/存储合并…）、
-                                    注册表、凭证、模型 ID 协议、任务契约、错误映射
-internal/admin                     管理接口（accounts/models/quota/settings/vendors/tasks）
-internal/tasks                     任务目录、排程、队列、执行引擎与任务 API
-internal/accounts                  账号枚举/去重/批量执行 + 额度格式化
-internal/upstream                  共享上游错误分类与宿主状态码映射
-internal/modelconfig               模型禁用集合、别名、额外模型、同名合并与静态缓存
-internal/pluginconfig              全局配置解析/校验（供应商专属键保留在 Raw）
-internal/state                     state.json 的类型化读写与并发快照
-internal/hostabi                   宿主 RPC 封装（调用、准入、回调 ID、管理请求上下文）
-internal/httpx                     出站 HTTP 桥（宿主代理/日志）与 SSE 转发
-internal/loginsession              登录会话登记（TTL / 轮询节流 / 归属）
-internal/logger                    内存日志环与文件落盘
-internal/console                   内嵌控制台页面（console.html + go:embed）
+                                    注册表、凭证、模型 ID 协议、任务契约、
+                                    上游错误分类（FailureKind/Failure）、
+                                    凭证 JSON 合并骨架（MergeCredentialJSON）与共享 helper
+internal/admin                       管理接口（传输层 + 配置 + 模型目录 + 控制台页）
+  ├─ admin.go                       服务构造、路由声明与总分发
+  ├─ config.go                      全局配置解析/校验（供应商专属键保留在 Raw）
+  ├─ catalog.go                     模型目录：静态缓存、别名、禁用、同名合并、刷新
+  ├─ console.go / console.html      内嵌控制台页面（go:embed）
+  └─ accounts/models/quota/settings/tasks/vendors/keepalive.go   各管理接口处理
+internal/auth                        账号枚举/去重/批量执行 + 额度格式化
+                                    + 登录会话登记（SessionRegistry）
+internal/tasks                       任务目录、排程、队列、执行引擎、任务 API 与保活编排
+internal/state                       state.json 的类型化读写与并发快照
+internal/hostbridge                 与宿主通信的唯一入口
+  ├─ rpc.go / auth.go / management.go  宿主回调、凭证枚举、管理请求上下文、并发准入
+  ├─ http.go                          出站 HTTP 桥（宿主代理/日志）：Client / StreamClient
+  └─ sse.go                           原始 SSE 转发
+internal/logger                      内存日志环与文件落盘
 tests/architecture_test.go         分层与测试布局静态守卫
 tests/integration                  跨包集成测试（假宿主）
 tests/e2e                          完整 ABI 端到端
@@ -162,9 +173,11 @@ internal/vendors/<name>            协议层 + 适配层同包，统一文件职
 | `tests/testhost/` | 共享假宿主 |
 | `tests/architecture_test.go` | 分层、import 方向与测试布局的静态守卫 |
 
-`tests/architecture_test.go` 会拒绝：供应商互相 import、`internal/app/vendors.go`
-之外的 app 文件 import 具体供应商、`internal/tasks` import `vendors`/`admin`、
-`internal/core` import 上层包，以及 `tests/` 根下出现集成测试文件。
+`tests/architecture_test.go` 用静态 import 图守住分层，并拒绝：供应商互相 import、
+`internal/app/vendors.go` 之外的 app 文件 import 具体供应商、`internal/core` import
+任何内部包、`admin`/`tasks`/`auth` 之间的同层依赖，以及 `tests/` 根下出现集成测试文件。
+新增内部包必须同步登记到 `layerRules` 与 `internalPackages`，否则测试直接失败——
+这样「多了一个包却没定边界」不会静默进入依赖图。
 
 本机没有 Go 工具链时用 Docker：
 
@@ -172,7 +185,7 @@ internal/vendors/<name>            协议层 + 适配层同包，统一文件职
 ./scripts/godocker.sh vet ./...
 ./scripts/godocker.sh test ./... -count=1 -timeout 300s
 ./scripts/godocker.sh test -race ./internal/core ./internal/state \
-  ./internal/loginsession ./internal/accounts ./internal/tasks -count=1
+  ./internal/auth ./internal/tasks ./internal/admin -count=1
 CGO_ENABLED=1 go build -buildmode=c-shared -o dist/freetier2api.so .
 ```
 
@@ -184,12 +197,15 @@ CGO_ENABLED=1 go build -buildmode=c-shared -o dist/freetier2api.so .
 | `tests/integration/{auth,identity,vendor_compat}_test.go` | 供应商归属矩阵、身份跨路径稳定、13 个实例的 ID/名称/区域 golden |
 | `tests/integration/app_isolation_test.go` | 两个 App 的注册表/状态/登录会话/供应商配置互不可见 |
 | `internal/core/core_test.go` | 归属三级判定、注册表幂等约束、模型键协议、错误映射、共享 helper |
-| `internal/loginsession/loginsession_test.go` | 会话登记/TTL/轮询节流/归属查询/并发（`-race`） |
-| `internal/tasks/{schedule,engine}_test.go` | 任务目录、排程时间、队列聚合与供应商无关的任务契约 |
+| `internal/core/credential_json_test.go` | 凭证 JSON 合并骨架：空/损坏/null/数组退回整体替换，正常路径保留无关字段 |
+| `internal/auth/session_test.go` | 会话登记/TTL/轮询节流/归属查询/并发（`-race`） |
+| `internal/auth/{pool,batch,quota}_test.go` | 账号枚举去重、批量并发顺序、额度摘要格式化 |
+| `internal/tasks/{schedule,engine}_test.go` | 任务目录、排程时间、队列聚合、保活编排与供应商无关的任务契约 |
 | `internal/vendors/workbuddy/{errors,payload,credential,sse,sanitize}_test.go` | 错误分类顺序、请求体改写、凭证双形态、SSE 聚合、指纹脱敏 |
-| `internal/httpx/transport_test.go` | 宿主 HTTP 桥双形态键名兼容、缺状态码显式报错 |
+| `internal/hostbridge/http_test.go` | 宿主 HTTP 桥双形态键名兼容、缺状态码显式报错 |
 | `internal/admin/admin_test.go` | 管理路由声明、任务路由分发、未知路由 404 |
-| `internal/{pluginconfig,state,modelconfig,console,logger}` | 列表写法、快照/损坏回退/并发、别名唯一性、控制台密钥闸门、日志环边界 |
+| `tests/architecture_test.go` | 供应商互不 import、分层边界、内部包白名单、测试布局 |
+| `internal/admin/{config,catalog,console}_test.go` | 配置列表解析、快照/损坏回退/并发、别名唯一性、控制台密钥闸门与折叠区 |
 
 实况验证（需真实 CPA 与账号）：
 
@@ -210,16 +226,19 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 
 ## 构建
 
-需要一个 C 编译器（cgo）与 Go 1.22+。本仓库的 `build.sh` 经 Docker 构建
-（本机可没有 Go 工具链）：
+需要一个 C 编译器（cgo）与 Go 1.22+。本仓库的 `scripts/build.sh` 经 Docker
+构建（本机可没有 Go 工具链），它复用 `scripts/godocker.sh` 的容器参数：
 
 ```bash
-./build.sh          # 先跑 go test ./...，再产出 dist/freetier2api.<ext>
+./scripts/build.sh   # 先跑 go test ./...，再产出 dist/freetier2api.<ext>
 ```
 
 > **必须用 glibc 镜像构建**：宿主 CPA 镜像是 Debian(glibc)，用 alpine(musl)
 > 构建出的 `.so` 会以 `libc.musl-aarch64.so.1: cannot open shared object file`
-> 加载失败。`build.sh` 已固定用 `golang:1.24`（Debian 版，自带 gcc）。
+> 加载失败。`godocker.sh` 已固定用 `golang:1.24`（Debian 版，自带 gcc）。
+>
+> 交叉编译时 `GOOS`/`GOARCH` 会被透传进容器，例如
+> `GOOS=windows GOARCH=amd64 ./scripts/build.sh`。
 
 产物按平台命名：Linux `freetier2api.so`、macOS `freetier2api.dylib`、Windows `freetier2api.dll`。
 
@@ -692,7 +711,7 @@ plugins:
 
 本插件是 cgo 构建的 c-shared 动态库，libc 必须与宿主一致。alpine（musl）产物在
 Debian（glibc）宿主上会报 `libc.musl-*.so.1: cannot open shared object file`。
-请用 `golang:1.24`（Debian）或与宿主同族的镜像构建；`build.sh` 已固定。
+请用 `golang:1.24`（Debian）或与宿主同族的镜像构建；`scripts/godocker.sh` 已固定。
 
 ### 控制台页与封禁
 

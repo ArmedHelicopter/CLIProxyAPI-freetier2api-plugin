@@ -16,7 +16,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // PendingLogin 记录进行中的 OAuth 设备码授权会话。
@@ -67,7 +67,7 @@ func LoginStart(ctx context.Context, logins core.LoginSessions, r Region) (*plug
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, errDo := httpx.Client(ctx, 30*time.Second).Do(req)
+	resp, errDo := hostbridge.Client(ctx, 30*time.Second).Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("request device code: %w", errDo)
 	}
@@ -168,7 +168,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, errDo := httpx.Client(ctx, 30*time.Second).Do(req)
+	resp, errDo := hostbridge.Client(ctx, 30*time.Second).Do(req)
 	if errDo != nil {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
@@ -312,7 +312,7 @@ func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride st
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 
-	resp, errDo := httpx.Client(ctx, 20*time.Second).Do(req)
+	resp, errDo := hostbridge.Client(ctx, 20*time.Second).Do(req)
 	if errDo != nil {
 		return nil, false, fmt.Errorf("refresh request failed: %w", errDo)
 	}

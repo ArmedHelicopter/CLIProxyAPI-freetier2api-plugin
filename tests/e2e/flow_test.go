@@ -9,14 +9,14 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/internal/app"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/tests/testhost"
 )
 
 func TestPluginABIFlow(t *testing.T) {
 	host := testhost.New()
-	hostabi.Configure(host.Call)
-	t.Cleanup(func() { hostabi.Configure(nil) })
+	hostbridge.Configure(host.Call)
+	t.Cleanup(func() { hostbridge.Configure(nil) })
 
 	instance, errNew := app.New(app.Options{Version: "test", Factories: app.BuiltinFactories()})
 	if errNew != nil {

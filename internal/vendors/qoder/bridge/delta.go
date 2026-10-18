@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strconv"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/upstream"
 	"freetier2api-plugin/internal/vendors/qoder/cosy"
 )
 
@@ -130,5 +130,5 @@ func envelopeDetail(wrapper map[string]interface{}) string {
 		return body
 	}
 	b, _ := json.Marshal(wrapper)
-	return upstream.Truncate(string(b), 400)
+	return core.Truncate(string(b), 400)
 }

@@ -4,12 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"freetier2api-plugin/internal/hostbridge"
 	"io"
 	"net/http"
 	"strings"
 	"time"
-
-	"freetier2api-plugin/internal/httpx"
 )
 
 // ExchangeJobToken 将 PAT 或 refresh token 转换为 job token。
@@ -69,7 +68,7 @@ func ExchangeJobToken(ctx context.Context, token, machineId, machineToken, machi
 	req.Header.Set("cosy-machineid", machineId)
 	req.Header.Set("user-agent", "Go-http-client/2.0")
 
-	resp, err := httpx.Client(ctx, 15*time.Second).Do(req)
+	resp, err := hostbridge.Client(ctx, 15*time.Second).Do(req)
 	if err != nil {
 		return nil, err
 	}

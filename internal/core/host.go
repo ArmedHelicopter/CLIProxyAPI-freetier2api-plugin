@@ -5,7 +5,7 @@ package core
 //
 // 为什么需要它：internal/vendors/* 必须对宿存在无感知（不能 import package main），
 // 但它们确实需要三样东西——列宿主凭证、按 auth_index 取凭证 JSON、读全局配置。
-// 依赖方向由根层在 init 里注入实现来保证（与 internal/httpx.Configure 同一风格）。
+// 依赖方向由根层在 init 里注入实现来保证（与 internal/hostbridge.Configure 同一风格）。
 //
 // 注入前端口为 nil，所有包装函数都返回零值而不是 panic：单元测试与
 // 「插件还没注册」这两个场景都会走这条路。

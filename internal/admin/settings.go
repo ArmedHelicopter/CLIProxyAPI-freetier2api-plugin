@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
 	"freetier2api-plugin/internal/tasks"
 )
@@ -38,7 +37,7 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 			changed["auto_checkin"] = *body.AutoCheckin
 		}
 		if at := strings.TrimSpace(body.AutoCheckinAt); at != "" {
-			if _, _, errClock := pluginconfig.ParseClock(at); errClock == nil {
+			if _, _, errClock := ParseClock(at); errClock == nil {
 				current.AutoCheckinAt = at
 				changed["auto_checkin_at"] = at
 			}

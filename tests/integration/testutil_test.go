@@ -17,7 +17,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/app"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 	"freetier2api-plugin/tests/testhost"
 )
@@ -68,8 +68,8 @@ var testApp *app.App
 func installFakeHost(t *testing.T) *fakeHost {
 	t.Helper()
 	host := newFakeHost()
-	hostabi.Configure(host.call)
-	t.Cleanup(func() { hostabi.Configure(nil) })
+	hostbridge.Configure(host.call)
+	t.Cleanup(func() { hostbridge.Configure(nil) })
 	return host
 }
 

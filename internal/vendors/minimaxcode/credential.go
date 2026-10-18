@@ -258,37 +258,33 @@ func (c *Credential) StorageJSON() ([]byte, error) {
 
 // MergeStorageJSON 合并刷新后的令牌，保留用户自定义字段。
 func MergeStorageJSON(original []byte, cred *Credential) ([]byte, error) {
-	if len(original) == 0 {
-		return cred.StorageJSON()
+	if cred == nil {
+		return original, nil
 	}
-	var m map[string]any
-	if err := json.Unmarshal(original, &m); err != nil {
-		return cred.StorageJSON()
-	}
-
-	m["access_token"] = cred.AccessToken
-	m["refresh_token"] = cred.RefreshToken
-	m["expires_at"] = cred.ExpiresAt
-	if cred.UserID != "" {
-		m["user_id"] = cred.UserID
-	}
-	if cred.AgentID != "" {
-		m["agent_id"] = cred.AgentID
-	}
-	if cred.DeviceID != "" {
-		m["device_id"] = cred.DeviceID
-	}
-	if cred.UUID != "" {
-		m["uuid"] = cred.UUID
-	}
-	if cred.Email != "" && core.GetString(m, "email") == "" {
-		m["email"] = cred.Email
-	}
-	if cred.Label != "" && core.GetString(m, "label") == "" {
-		m["label"] = cred.Label
-	}
-
-	return json.MarshalIndent(m, "", "  ")
+	return core.MergeCredentialJSON(original, cred.StorageJSON, func(m map[string]any) {
+		m["access_token"] = cred.AccessToken
+		m["refresh_token"] = cred.RefreshToken
+		m["expires_at"] = cred.ExpiresAt
+		if cred.UserID != "" {
+			m["user_id"] = cred.UserID
+		}
+		if cred.AgentID != "" {
+			m["agent_id"] = cred.AgentID
+		}
+		if cred.DeviceID != "" {
+			m["device_id"] = cred.DeviceID
+		}
+		if cred.UUID != "" {
+			m["uuid"] = cred.UUID
+		}
+		// email / label 只在原文件缺失时补，不覆盖用户自己写的值。
+		if cred.Email != "" && core.GetString(m, "email") == "" {
+			m["email"] = cred.Email
+		}
+		if cred.Label != "" && core.GetString(m, "label") == "" {
+			m["label"] = cred.Label
+		}
+	})
 }
 func getInt(m map[string]any, keys ...string) int {
 	return int(core.GetInt64(m, keys...))

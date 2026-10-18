@@ -16,7 +16,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -566,7 +566,7 @@ func exchangeTraeToken(ctx context.Context, authHost, clientID, refreshToken str
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "Trae/1.0.0")
 
-	client := httpx.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return "", "", 0, errDo
@@ -663,7 +663,7 @@ func RefreshCredential(ctx context.Context, cred *Credential, cfg Config) (*Cred
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", cfg.clientUA())
 
-	client := httpx.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, false, fmt.Errorf("trae refresh token request failed: %w", errDo)
@@ -712,32 +712,26 @@ func RefreshCredential(ctx context.Context, cred *Credential, cfg Config) (*Cred
 }
 
 func MergeStorageJSON(original []byte, updated *Credential) ([]byte, error) {
-	if len(original) == 0 {
-		return updated.StorageJSON()
+	if updated == nil {
+		return original, nil
 	}
-
-	var m map[string]any
-	if err := json.Unmarshal(original, &m); err != nil {
-		return updated.StorageJSON()
-	}
-
-	m["access_token"] = updated.AccessToken
-	if updated.RefreshToken != "" {
-		m["refresh_token"] = updated.RefreshToken
-	}
-	if updated.ExpiresAt > 0 {
-		m["expires_at"] = updated.ExpiresAt
-	}
-
-	if authObj, ok := m["auth"].(map[string]any); ok {
-		authObj["accessToken"] = updated.AccessToken
+	return core.MergeCredentialJSON(original, updated.StorageJSON, func(m map[string]any) {
+		m["access_token"] = updated.AccessToken
 		if updated.RefreshToken != "" {
-			authObj["refreshToken"] = updated.RefreshToken
+			m["refresh_token"] = updated.RefreshToken
 		}
 		if updated.ExpiresAt > 0 {
-			authObj["expiresAt"] = updated.ExpiresAt
+			m["expires_at"] = updated.ExpiresAt
 		}
-	}
-
-	return json.MarshalIndent(m, "", "  ")
+		// TRAE SOLO 的凭证可能是嵌套 {auth:{...}} 结构，两处都要写。
+		if authObj, ok := m["auth"].(map[string]any); ok {
+			authObj["accessToken"] = updated.AccessToken
+			if updated.RefreshToken != "" {
+				authObj["refreshToken"] = updated.RefreshToken
+			}
+			if updated.ExpiresAt > 0 {
+				authObj["expiresAt"] = updated.ExpiresAt
+			}
+		}
+	})
 }

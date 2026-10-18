@@ -49,7 +49,7 @@ jobs:
         run: go test ./... -count=1 -timeout 300s
 
       - name: race tests
-        run: go test -race ./internal/core ./internal/state ./internal/loginsession ./internal/accounts ./internal/tasks -count=1
+        run: go test -race ./internal/core ./internal/state ./internal/auth ./internal/tasks ./internal/admin -count=1
 
       - name: 编译 live 探针
         run: go test -tags live ./tests/live -run '^$' -count=1

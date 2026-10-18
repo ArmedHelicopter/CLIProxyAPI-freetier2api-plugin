@@ -28,8 +28,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/loginsession"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 const (
@@ -43,7 +42,7 @@ const (
 	loginPollInterval = 1500 * time.Millisecond
 )
 
-// pendingLogin 是一次进行中的登录会话数据（TTL / 节流由 loginsession 统一管理）。
+// pendingLogin 是一次进行中的登录会话数据（TTL / 节流由 auth 会话表统一管理）。
 type pendingLogin struct {
 	FlowID    string
 	PollToken string
@@ -66,7 +65,7 @@ func LoginStart(ctx context.Context, logins core.LoginSessions) (*pluginapi.Auth
 	req.Header.Set("Authorization", "Bearer "+pollToken)
 	req.Header.Set("Content-Type", "application/json")
 
-	resp, errDo := httpx.Client(ctx, loginHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
 		return nil, fmt.Errorf("oauth init request failed: %w", errDo)
 	}
@@ -115,14 +114,14 @@ func LoginStart(ctx context.Context, logins core.LoginSessions) (*pluginapi.Auth
 // LoginPoll 轮询一次授权状态；完成时兑换出完整凭证。
 func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string) (*pluginapi.AuthLoginPollResponse, error) {
 	session, pollState := logins.Poll(sessionID)
-	if pollState == loginsession.PollMissing {
+	if pollState == core.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期，请重新发起登录",
 		}, nil
 	}
 	// 轮询节流：未到间隔就返回 pending，避免面板把上游打满。
-	if pollState == loginsession.PollThrottled {
+	if pollState == core.PollThrottled {
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
 	pending, okPending := session.Data.(*pendingLogin)
@@ -140,7 +139,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 	}
 	req.Header.Set("Authorization", "Bearer "+pending.PollToken)
 
-	resp, errDo := httpx.Client(ctx, loginHTTPTimeout).Do(req)
+	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
 		// 网络抖动不判死：保留会话，下次轮询再试。
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
@@ -253,7 +252,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 // name="zcode-api-key" 的 Key → copy 接口解密出 secretKey，拼成
 // "<apiKey>.<secretKey>"（智谱 API Key 形态）。
 func ExchangeAPIKey(ctx context.Context, accessToken string) (string, error) {
-	client := httpx.Client(ctx, loginHTTPTimeout)
+	client := hostbridge.Client(ctx, loginHTTPTimeout)
 
 	bizToken, errBiz := exchangeBizToken(ctx, client, accessToken)
 	if errBiz != nil {

@@ -18,7 +18,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/vendors/minimaxcode"
 )
 
@@ -45,7 +45,7 @@ func liveCredential(t *testing.T) *minimaxcode.Credential {
 
 func configureDirectHost(t *testing.T) {
 	t.Helper()
-	hostabi.Configure(func(callbackID, method string, payload any) (json.RawMessage, error) {
+	hostbridge.Configure(func(callbackID, method string, payload any) (json.RawMessage, error) {
 		if method != pluginabi.MethodHostHTTPDo {
 			return nil, fmt.Errorf("probe host: unsupported method %s", method)
 		}
@@ -87,7 +87,7 @@ func configureDirectHost(t *testing.T) {
 		}
 		return json.Marshal(map[string]any{"StatusCode": resp.StatusCode, "Headers": resp.Header, "Body": respBody})
 	})
-	t.Cleanup(func() { hostabi.Configure(nil) })
+	t.Cleanup(func() { hostbridge.Configure(nil) })
 }
 
 func runStreamProbe(t *testing.T, cred *minimaxcode.Credential, payload []byte) (text string, chunks int) {

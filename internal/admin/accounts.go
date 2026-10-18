@@ -12,9 +12,9 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/accounts"
+	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/state"
 )
@@ -28,10 +28,10 @@ func (s *Service) StatusPayload(req pluginapi.ManagementRequest) map[string]any 
 func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string]any {
 	cfg := s.deps.Config()
 	current := s.deps.State()
-	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
 
-	accounts := s.listAccountSummaries(ctx, hostabi.RequestCallbackID(req))
+	accounts := s.listAccountSummaries(ctx, hostbridge.RequestCallbackID(req))
 	modelCounts := map[string]int{}
 	for _, model := range current.Models {
 		modelCounts[model.Realm]++
@@ -96,7 +96,7 @@ func (s *Service) cacheQuotaResult(q quotaResult, keys ...string) {
 
 func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
 	current := s.deps.State()
-	loaded, failures := s.pool.Load(ctx, callbackID, accounts.Options{IncludeDisabled: true})
+	loaded, failures := s.pool.Load(ctx, callbackID, auth.Options{IncludeDisabled: true})
 	for _, failure := range failures {
 		logger.Debug("skip account %s: %s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
 	}
@@ -170,11 +170,11 @@ func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pl
 	if len(body.AccountIDs) == 0 {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "account_ids 不能为空"})
 	}
-	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
-	callbackID := hostabi.RequestCallbackID(req)
+	callbackID := hostbridge.RequestCallbackID(req)
 
-	entries, errList := hostabi.ListAuths(ctx, callbackID, s.registry)
+	entries, errList := hostbridge.ListAuths(ctx, callbackID, s.registry)
 	if errList != nil {
 		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "error": "读取账号列表失败：" + errList.Error()})
 	}
@@ -207,11 +207,11 @@ func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pl
 }
 
 func (s *Service) deleteAuthFile(ctx context.Context, callbackID string, entry core.HostAuth) error {
-	raw, filePath, okRaw := hostabi.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
+	raw, filePath, okRaw := hostbridge.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
 	if !okRaw {
 		return fmt.Errorf("读取凭证失败，无法确认归属")
 	}
-	if _, okParse := s.registry.ParseCredential(raw, hostabi.AccountIdentity(entry), nil); !okParse {
+	if _, okParse := s.registry.ParseCredential(raw, hostbridge.AccountIdentity(entry), nil); !okParse {
 		return fmt.Errorf("该凭证不属于本插件，拒绝删除")
 	}
 	targetPath := strings.TrimSpace(filePath)
@@ -301,10 +301,10 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 		seed = core.RandomHex(8)
 	}
 	fileName := core.FileNameFor(vendor.ID(), seed)
-	callbackID := hostabi.RequestCallbackID(req)
+	callbackID := hostbridge.RequestCallbackID(req)
 
 	saved := false
-	if _, errSave := hostabi.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
+	if _, errSave := hostbridge.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
 		Name: fileName, JSON: rawJSON,
 	}); errSave == nil {
 		saved = true
@@ -344,9 +344,9 @@ func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginap
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
 	}
-	ctx, cancel := hostabi.ManagementContext(req, requestTimeout)
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
-	results := s.runForAccounts(ctx, hostabi.RequestCallbackID(req), body.AccountIDs,
+	results := s.runForAccounts(ctx, hostbridge.RequestCallbackID(req), body.AccountIDs,
 		func(vendor core.Vendor, _ *core.Credential) bool { return core.SupportsCheckin(vendor) },
 		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (string, error) {
 			checkin, okCheckin := core.As[core.CheckinProvider](vendor)
@@ -383,10 +383,10 @@ func (s *Service) runForAccounts(
 	action func(context.Context, core.Vendor, *core.Credential) (string, error),
 ) []accountActionResult {
 	cfg := s.deps.Config()
-	loaded, failures := s.pool.Load(ctx, callbackID, accounts.Options{
-		Targets:      targets,
-		RealmEnabled: func(region string) bool { return core.RealmEnabled(cfg.EnabledRealms, region) },
-		Filter: func(account accounts.Account) bool {
+	loaded, failures := s.pool.Load(ctx, callbackID, auth.Options{
+		Targets:       targets,
+		EnabledRealms: cfg.EnabledRealms,
+		Filter: func(account auth.Account) bool {
 			return filter == nil || filter(account.Vendor, account.Credential)
 		},
 	})
@@ -398,7 +398,7 @@ func (s *Service) runForAccounts(
 			OK:     false, Message: failure.Message,
 		})
 	}
-	jobResults := accounts.RunBatch(loaded, batchConcurrency, func(current accounts.Account) accountActionResult {
+	jobResults := auth.RunBatch(loaded, batchConcurrency, func(current auth.Account) accountActionResult {
 		result := accountActionResult{
 			AuthID:   core.FirstNonEmpty(current.Entry.ID, current.Entry.Name),
 			Label:    core.FirstNonEmpty(current.Credential.LabelValue(), current.Entry.Label),

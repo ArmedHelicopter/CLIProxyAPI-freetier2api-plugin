@@ -201,7 +201,7 @@ func (c *Credential) ApplyTokenRefresh(token, refreshToken string, expiresAt int
 
 // CachedModel 是缓存的单条上游模型元数据。
 //
-// 定义在 core 而不是 state：供应商与 modelconfig 都使用它，
+// 定义在 core 而不是 state：供应商与模型目录（admin.Catalog）都使用它，
 // 这样 core 不需要反向依赖持久化层。
 type CachedModel struct {
 	VendorID        string   `json:"vendor_id,omitempty"`

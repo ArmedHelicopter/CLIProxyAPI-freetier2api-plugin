@@ -7,14 +7,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"freetier2api-plugin/internal/hostbridge"
 	"io"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
 	"time"
-
-	"freetier2api-plugin/internal/httpx"
 )
 
 type ChatRequest struct {
@@ -93,7 +92,7 @@ func doCodeArtsRequest(ctx context.Context, baseURL string, req ChatRequest) (*h
 		timeout = 300 * time.Second
 	}
 
-	client := httpx.Client(ctx, timeout)
+	client := hostbridge.Client(ctx, timeout)
 	resp, errCall := client.Do(httpReq)
 	if errCall != nil {
 		return nil, fmt.Errorf("codearts request failed: %w", errCall)

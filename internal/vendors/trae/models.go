@@ -5,11 +5,10 @@ package trae
 import (
 	"context"
 	"encoding/json"
+	"freetier2api-plugin/internal/hostbridge"
 	"io"
 	"net/http"
 	"time"
-
-	"freetier2api-plugin/internal/httpx"
 )
 
 type Model struct {
@@ -63,7 +62,7 @@ func FetchModels(ctx context.Context, cred *Credential, cfg Config) ([]Model, er
 	}
 	ApplyTraeHeaders(req, cred, cfg, false)
 
-	client := httpx.Client(ctx, 15*time.Second)
+	client := hostbridge.Client(ctx, 15*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return fallback, nil

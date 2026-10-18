@@ -21,8 +21,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/httpx"
-	"freetier2api-plugin/internal/upstream"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // ChatRequest 是一次对话转发的输入。
@@ -40,7 +39,7 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 		return nil, errBuild
 	}
 
-	resp, errDo := httpx.Client(ctx, chatHTTPTimeout).Do(httpReq)
+	resp, errDo := hostbridge.Client(ctx, chatHTTPTimeout).Do(httpReq)
 	if errDo != nil {
 		return nil, transientErr("zcode chat request failed: " + errDo.Error())
 	}
@@ -68,7 +67,7 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk fu
 	}
 
 	// 流式响应总时长不可预期，超时交给上游空闲控制。
-	resp, errDo := httpx.StreamClient(ctx, 0).Do(httpReq)
+	resp, errDo := hostbridge.StreamClient(ctx, 0).Do(httpReq)
 	if errDo != nil {
 		return transientErr("zcode stream request failed: " + errDo.Error())
 	}
@@ -822,9 +821,9 @@ const chatHTTPTimeout = 10 * time.Minute
 //
 // 与 Classify 产出的业务错误的区别：Status 为 0，HTTPStatus() 因此回落到
 // KindServer 的 502——宿主会换号重试，但不会因为一次半截响应把凭证标记为坏。
-// 复用 upstream.Error 是刻意的：core.ToPluginError 通过 core.UpstreamError
+// 复用 core.Failure 是刻意的：core.ToPluginError 通过 core.UpstreamError
 // 识别这套分类词汇表，
 // 自建类型会被降级成通用 502 并丢失全部语义（见 errors.go 的说明）。
-func transientErr(msg string) *upstream.Error {
-	return &upstream.Error{Kind: upstream.KindServer, Status: 0, Msg: msg}
+func transientErr(msg string) *core.Failure {
+	return &core.Failure{Kind: core.FailureKindServer, Status: 0, Msg: msg}
 }

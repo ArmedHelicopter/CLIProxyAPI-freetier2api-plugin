@@ -19,7 +19,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // cliproxy_plugin_init 由宿主在加载动态库后调用一次。
@@ -97,7 +97,7 @@ const (
 func cliproxyPluginShutdown() {
 	pluginApp.StopBackgroundWork()
 	pluginApp.WaitPluginStreams(shutdownWaitTimeout)
-	hostabi.WaitForShutdown(shutdownDiagnosticInterval)
+	hostbridge.WaitForShutdown(shutdownDiagnosticInterval)
 	C.clear_host_api()
 }
 
@@ -118,9 +118,9 @@ func writeResponse(response *C.cliproxy_buffer, raw []byte) {
 // Go 的 main 包仍必须存在一个 main 函数。它永远不会被调用。
 func main() {}
 
-// nativeHostCallScoped 是宿主回调的真实实现（由 hostabi.Configure 注入）。
+// nativeHostCallScoped 是宿主回调的真实实现（由 hostbridge.Configure 注入）。
 func nativeHostCallScoped(callbackID string, method string, payload any) (json.RawMessage, error) {
-	rawPayload, errMarshal := hostabi.MarshalPayload(callbackID, payload)
+	rawPayload, errMarshal := hostbridge.MarshalPayload(callbackID, payload)
 	if errMarshal != nil {
 		return nil, fmt.Errorf("%s: %w", method, errMarshal)
 	}
@@ -149,7 +149,7 @@ func nativeHostCallScoped(callbackID string, method string, payload any) (json.R
 	if len(rawResponse) == 0 {
 		return nil, fmt.Errorf("%s: host callback returned no response, code=%d", method, int(callCode))
 	}
-	result, errDecode := hostabi.DecodeEnvelope(rawResponse)
+	result, errDecode := hostbridge.DecodeEnvelope(rawResponse)
 	if errDecode != nil {
 		return nil, fmt.Errorf("%s: %w", method, errDecode)
 	}
@@ -159,7 +159,7 @@ func nativeHostCallScoped(callbackID string, method string, payload any) (json.R
 	return result, nil
 }
 
-// init 注入 CGO 实现：之后 root 与 internal 包统一走 hostabi.Call。
+// init 注入 CGO 实现：之后 root 与 internal 包统一走 hostbridge.Call。
 func init() {
-	hostabi.Configure(nativeHostCallScoped)
+	hostbridge.Configure(nativeHostCallScoped)
 }

@@ -11,7 +11,7 @@ import (
 	"testing"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
+	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/vendors/minimaxcode"
 	"freetier2api-plugin/tests/testhost"
 )
@@ -43,9 +43,9 @@ func installFakeUpstream(t *testing.T, sseBody string) {
 		}
 		return testhost.UpstreamResponse{Status: 404, Body: `{"code":404,"msg":"not stubbed"}`}
 	})
-	hostabi.Configure(host.Call)
+	hostbridge.Configure(host.Call)
 	t.Cleanup(func() {
-		hostabi.Configure(nil)
+		hostbridge.Configure(nil)
 	})
 }
 
