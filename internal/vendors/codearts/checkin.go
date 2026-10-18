@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 )
 
@@ -61,7 +62,7 @@ func Checkin(ctx context.Context, cred *Credential) (*CheckinResult, error) {
 	if payload.ErrorCode == "InferHub.4004.201" || resp.StatusCode == http.StatusBadRequest {
 		return &CheckinResult{
 			Already: true,
-			Message: firstNonEmpty(payload.Message, "今日福利已领取或无需重复领取"),
+			Message: core.FirstNonEmpty(payload.Message, "今日福利已领取或无需重复领取"),
 		}, nil
 	}
 

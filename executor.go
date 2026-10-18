@@ -83,7 +83,7 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 	if errExecute != nil {
 		return nil, core.ToPluginError(errExecute)
 	}
-	return okEnvelope(response)
+	return core.OKEnvelope(response)
 }
 
 // handleExecutorExecuteStream 执行一次流式对话。
@@ -97,7 +97,7 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 		return nil, errPrepare
 	}
 	if strings.TrimSpace(prepared.rpc.StreamID) == "" {
-		return nil, newPluginError("invalid_request", "stream_id is required for streaming execution", http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", "stream_id is required for streaming execution", http.StatusBadRequest)
 	}
 
 	// 头部必须同步返回：宿主用它们构造下游响应。
@@ -112,7 +112,7 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 		runStreamExecution(streamCtx, cancelStream, prepared)
 	}()
 
-	return okEnvelope(rpcExecutorStreamResponse{Headers: streamHeaders})
+	return core.OKEnvelope(rpcExecutorStreamResponse{Headers: streamHeaders})
 }
 
 // rewritePayloadModel 把请求体里的 model 字段改写成官方 ID。
@@ -209,18 +209,18 @@ func (s *hostStreamSink) Close(errMsg string) error { return nil }
 func prepareExecution(request []byte) (preparedExecution, error) {
 	var prepared preparedExecution
 	if errDecode := decodeRequest(request, &prepared.rpc); errDecode != nil {
-		return prepared, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return prepared, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 
 	// 本插件只声明 chat-completions。宿主若送来其它格式，说明双方声明不一致，
 	// 明确报错比静默按错误格式处理更容易定位。
 	if format := strings.TrimSpace(prepared.rpc.Format); format != "" && !isChatFormat(format) {
-		return prepared, newPluginError("unsupported_format",
+		return prepared, core.NewPluginError("unsupported_format",
 			fmt.Sprintf("unsupported protocol format %q (this plugin only handles %s)", format, formatChatCompletions),
 			http.StatusBadRequest)
 	}
 	if format := strings.TrimSpace(prepared.rpc.SourceFormat); format != "" && !isChatFormat(format) {
-		return prepared, newPluginError("unsupported_format",
+		return prepared, core.NewPluginError("unsupported_format",
 			fmt.Sprintf("unsupported source format %q (this plugin only handles %s)", format, formatChatCompletions),
 			http.StatusBadRequest)
 	}
@@ -237,7 +237,7 @@ func prepareExecution(request []byte) (preparedExecution, error) {
 	// 模型带的供应商前缀优先；无前缀时就用裸名（宿主按 EqualFold 合并同名模型）。
 	_, bareModel := core.SplitModelID(prepared.rpc.Model)
 	if strings.TrimSpace(bareModel) == "" {
-		return prepared, newPluginError("invalid_request", "model is required", http.StatusBadRequest)
+		return prepared, core.NewPluginError("invalid_request", "model is required", http.StatusBadRequest)
 	}
 
 	// 客户端请求的是别名时还原成上游官方 ID：禁用校验与出站都用官方 ID，
@@ -248,14 +248,14 @@ func prepareExecution(request []byte) (preparedExecution, error) {
 	// 检查模型是否已被插件配置禁用（禁用键是 vendor:model，跨供应商互不影响）。
 	// 用官方 ID 判定：管理页展示与写入的禁用键都是官方 ID，别名只是对外名字。
 	if isModelDisabled(vendor.ID(), prepared.model) {
-		return prepared, newPluginError("model_disabled",
+		return prepared, core.NewPluginError("model_disabled",
 			fmt.Sprintf("model %q is disabled by plugin configuration", prepared.rpc.Model),
 			http.StatusBadRequest)
 	}
 
 	// 供应商所在的区域被配置关闭时直接拒绝（而不是让请求打到错误的上游域名）。
 	if !realmEnabled(loadedConfig(), vendor.Region()) {
-		return prepared, newPluginError("vendor_disabled",
+		return prepared, core.NewPluginError("vendor_disabled",
 			fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
 	}
 	return prepared, nil
@@ -278,7 +278,7 @@ func isChatFormat(format string) bool {
 func handleExecutorCountTokens(request []byte) ([]byte, error) {
 	var rpc executorRPCRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	estimate := estimateTokens(rpc.OriginalRequest, rpc.Payload)
 	payload, errMarshal := json.Marshal(map[string]any{
@@ -290,7 +290,7 @@ func handleExecutorCountTokens(request []byte) ([]byte, error) {
 	if errMarshal != nil {
 		return nil, fmt.Errorf("marshal token estimate: %w", errMarshal)
 	}
-	return okEnvelope(pluginapi.ExecutorResponse{
+	return core.OKEnvelope(pluginapi.ExecutorResponse{
 		Payload: payload,
 		Headers: http.Header{"Content-Type": []string{jsonContentType}},
 	})
@@ -320,7 +320,7 @@ func estimateTokens(payloads ...[]byte) int {
 // 本插件不需要这个能力（所有出站都由插件主动发起并经宿主的 HTTP 桥），
 // 但既然声明了 executor 就必须实现。返回"不支持"比返回错误的成功更诚实。
 func handleExecutorHTTPRequest(request []byte) ([]byte, error) {
-	return nil, newPluginError("unsupported_operation",
+	return nil, core.NewPluginError("unsupported_operation",
 		"this plugin does not proxy executor HTTP requests; outbound calls go through the host HTTP bridge",
 		http.StatusNotImplemented)
 }

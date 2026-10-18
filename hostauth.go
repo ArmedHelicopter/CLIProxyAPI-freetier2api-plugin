@@ -8,31 +8,12 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
 )
-
-// hostAuthEntry 是宿主凭证列表里的一条。
-//
-// 字段与 pluginapi.HostAuthFileEntry 对齐。
-type hostAuthEntry struct {
-	ID          string    `json:"id"`
-	AuthIndex   string    `json:"auth_index"`
-	Name        string    `json:"name"`
-	Provider    string    `json:"provider"`
-	Label       string    `json:"label"`
-	Status      string    `json:"status"`
-	Disabled    bool      `json:"disabled"`
-	Unavailable bool      `json:"unavailable"`
-	RuntimeOnly bool      `json:"runtime_only"`
-	Path        string    `json:"path,omitempty"`
-	ModTime     time.Time `json:"modtime,omitempty"`
-	UpdatedAt   time.Time `json:"updated_at,omitempty"`
-}
 
 // pluginAuthName 是本插件凭证在宿主里的类型名（对应宿主 auth 记录的 Type）。
 const pluginAuthName = providerKey
@@ -51,19 +32,19 @@ const pluginAuthName = providerKey
 //
 // 兜底依据：这些凭证文件的文件名仍是 workbuddy-*.json（本插件的命名约定），
 // 按名字也属于本插件，因此一并收下——否则用户的合法账号会在页面上凭空消失。
-func listHostAuths(ctx context.Context, callbackID string) ([]hostAuthEntry, error) {
+func listHostAuths(ctx context.Context, callbackID string) ([]core.HostAuth, error) {
 	raw, errCall := callHostScoped(callbackID, pluginabi.MethodHostAuthList, map[string]any{})
 	if errCall != nil {
 		return nil, fmt.Errorf("host.auth.list: %w", errCall)
 	}
 	// 宿主可能返回数组，也可能返回带包装的对象；两种都接受。
-	var entries []hostAuthEntry
+	var entries []core.HostAuth
 	if errUnmarshal := json.Unmarshal(raw, &entries); errUnmarshal == nil {
 		return filterPluginAuths(entries), nil
 	}
 	var wrapper struct {
-		Auths []hostAuthEntry `json:"auths"`
-		Files []hostAuthEntry `json:"files"`
+		Auths []core.HostAuth `json:"auths"`
+		Files []core.HostAuth `json:"files"`
 	}
 	if errUnmarshal := json.Unmarshal(raw, &wrapper); errUnmarshal != nil {
 		return nil, fmt.Errorf("decode host.auth.list: %w", errUnmarshal)
@@ -75,7 +56,7 @@ func listHostAuths(ctx context.Context, callbackID string) ([]hostAuthEntry, err
 }
 
 // mergeAuthsAndFiles 合并宿主 Auths 与 Files，避免同一凭证出现重复条目。
-func mergeAuthsAndFiles(auths, files []hostAuthEntry) []hostAuthEntry {
+func mergeAuthsAndFiles(auths, files []core.HostAuth) []core.HostAuth {
 	if len(files) == 0 {
 		return auths
 	}
@@ -83,7 +64,7 @@ func mergeAuthsAndFiles(auths, files []hostAuthEntry) []hostAuthEntry {
 		return files
 	}
 
-	out := make([]hostAuthEntry, len(auths))
+	out := make([]core.HostAuth, len(auths))
 	copy(out, auths)
 	authIdxByName := make(map[string]int, len(auths))
 	for i, a := range out {
@@ -117,8 +98,8 @@ func mergeAuthsAndFiles(auths, files []hostAuthEntry) []hostAuthEntry {
 //     凭证。只看 provider 会让这些账号从页面上消失，而用户无从知道原因。
 //
 // 两层都不会误吞别家凭证：别家的文件名不含 workbuddy。
-func filterPluginAuths(entries []hostAuthEntry) []hostAuthEntry {
-	out := make([]hostAuthEntry, 0, len(entries))
+func filterPluginAuths(entries []core.HostAuth) []core.HostAuth {
+	out := make([]core.HostAuth, 0, len(entries))
 	indexByKey := make(map[string]int)
 
 	for _, entry := range entries {
@@ -163,7 +144,7 @@ func filterPluginAuths(entries []hostAuthEntry) []hostAuthEntry {
 //
 // 取值优先级：Name（磁盘文件名，登录落盘时生成，可读且稳定）→ ID（宿主
 // 稳定标识，运行时账号没有 Name）→ AuthIndex（最后兜底，仅保证非空）。
-func accountIdentity(entry hostAuthEntry) string {
+func accountIdentity(entry core.HostAuth) string {
 	for _, candidate := range []string{entry.Name, entry.ID, entry.AuthIndex} {
 		if trimmed := strings.TrimSuffix(strings.TrimSpace(candidate), ".json"); trimmed != "" {
 			return trimmed
@@ -182,7 +163,7 @@ func normalizeAuthKey(raw string) string {
 	return s
 }
 
-func mergeHostAuthEntry(target *hostAuthEntry, source hostAuthEntry) {
+func mergeHostAuthEntry(target *core.HostAuth, source core.HostAuth) {
 	if target.AuthIndex == "" && source.AuthIndex != "" {
 		target.AuthIndex = source.AuthIndex
 	}

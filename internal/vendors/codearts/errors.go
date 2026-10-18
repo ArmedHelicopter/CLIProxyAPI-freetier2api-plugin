@@ -5,6 +5,7 @@ package codearts
 import (
 	"encoding/json"
 	"fmt"
+	"freetier2api-plugin/internal/core"
 	"net/http"
 	"strings"
 )
@@ -41,8 +42,8 @@ func Classify(status int, body string) error {
 	}
 	_ = json.Unmarshal([]byte(body), &payload)
 
-	msg := firstNonEmpty(payload.ErrorMessage, payload.Message, payload.Error, body)
-	code := firstNonEmpty(payload.ErrorCode, payload.Error)
+	msg := core.FirstNonEmpty(payload.ErrorMessage, payload.Message, payload.Error, body)
+	code := core.FirstNonEmpty(payload.ErrorCode, payload.Error)
 
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden || strings.Contains(code, "ExpiredToken") || strings.Contains(code, "InvalidToken"):

@@ -16,7 +16,7 @@ import (
 
 // handleQuotaDescribe 描述本插件的额度能力。
 func handleQuotaDescribe(request []byte) ([]byte, error) {
-	return okEnvelope(pluginapi.QuotaDescribeResponse{
+	return core.OKEnvelope(pluginapi.QuotaDescribeResponse{
 		SupportedProviders: []string{providerKey},
 		DisplayName:        pluginDisplayName,
 		// 本插件的「重置」是执行一次签到（签到会恢复额度），因此支持。
@@ -31,7 +31,7 @@ func handleQuotaDescribe(request []byte) ([]byte, error) {
 func handleQuotaFetch(request []byte) ([]byte, error) {
 	var rpc pluginapi.QuotaFetchRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	ctx := httpx.WithCallbackID(context.Background(), "")
 	// 宿主的额度路由**不发 StorageJSON**（只发 AuthIndex/AuthID + 属性），
@@ -50,7 +50,7 @@ func handleQuotaFetch(request []byte) ([]byte, error) {
 	if errQuota != nil {
 		return nil, core.ToPluginError(errQuota)
 	}
-	return okEnvelope(response)
+	return core.OKEnvelope(response)
 }
 
 // handleQuotaReset 执行一次签到以恢复额度。
@@ -60,7 +60,7 @@ func handleQuotaFetch(request []byte) ([]byte, error) {
 func handleQuotaReset(request []byte) ([]byte, error) {
 	var rpc pluginapi.QuotaResetRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	ctx := httpx.WithCallbackID(context.Background(), "")
 	credential, vendor, errResolve := resolveVendorCredential(ctx, "", rpc.StorageJSON,
@@ -69,14 +69,14 @@ func handleQuotaReset(request []byte) ([]byte, error) {
 		return nil, errResolve
 	}
 	if !core.SupportsCheckin(vendor) {
-		return okEnvelope(pluginapi.QuotaResetResponse{
+		return core.OKEnvelope(pluginapi.QuotaResetResponse{
 			Success: false,
 			Message: "本供应商不提供签到；额度按上游周期自动重置",
 		})
 	}
 	checkin, okCheckin := core.As[core.CheckinProvider](vendor)
 	if !okCheckin {
-		return okEnvelope(pluginapi.QuotaResetResponse{
+		return core.OKEnvelope(pluginapi.QuotaResetResponse{
 			Success: false,
 			Message: "本供应商不提供签到；额度按上游周期自动重置",
 		})
@@ -87,7 +87,7 @@ func handleQuotaReset(request []byte) ([]byte, error) {
 		return nil, core.ToPluginError(errCheckin)
 	}
 	if result == nil {
-		return okEnvelope(pluginapi.QuotaResetResponse{Success: false, Message: "签到未返回结果"})
+		return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: false, Message: "签到未返回结果"})
 	}
-	return okEnvelope(pluginapi.QuotaResetResponse{Success: true, Message: result.Message})
+	return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: true, Message: result.Message})
 }

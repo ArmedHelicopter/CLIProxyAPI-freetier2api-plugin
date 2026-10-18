@@ -61,13 +61,13 @@ func ParseCredential(raw []byte) (*Credential, error) {
 	}
 
 	c := &Credential{
-		Vendor:   firstNonEmpty(getString(m, "vendor"), VendorID),
-		APIKey:   firstNonEmpty(getString(m, "api_key"), getString(m, "apiKey")),
-		JWTToken: firstNonEmpty(getString(m, "jwt_token"), getString(m, "jwtToken")),
-		Email:    strings.ToLower(getString(m, "email")),
-		UserID:   getString(m, "user_id"),
-		Label:    getString(m, "label"),
-		AuthMode: getString(m, "auth_mode"),
+		Vendor:   core.FirstNonEmpty(core.GetString(m, "vendor"), VendorID),
+		APIKey:   core.FirstNonEmpty(core.GetString(m, "api_key"), core.GetString(m, "apiKey")),
+		JWTToken: core.FirstNonEmpty(core.GetString(m, "jwt_token"), core.GetString(m, "jwtToken")),
+		Email:    strings.ToLower(core.GetString(m, "email")),
+		UserID:   core.GetString(m, "user_id"),
+		Label:    core.GetString(m, "label"),
+		AuthMode: core.GetString(m, "auth_mode"),
 	}
 
 	c.Profile = parseProfile(m)
@@ -92,16 +92,16 @@ func parseProfile(m map[string]any) DeviceProfile {
 		}
 	}
 	return DeviceProfile{
-		Platform:  getString(nested, "platform"),
-		Arch:      getString(nested, "arch"),
-		OSVersion: firstNonEmpty(getString(nested, "os_version"), getString(nested, "osVersion")),
-		Language:  getString(nested, "language"),
-		Timezone:  getString(nested, "timezone"),
-		Screen:    getString(nested, "screen"),
-		DeviceMID: firstNonEmpty(
-			getString(nested, "device_mid"),
-			getString(nested, "deviceMid"),
-			getString(m, "device_mid"),
+		Platform:  core.GetString(nested, "platform"),
+		Arch:      core.GetString(nested, "arch"),
+		OSVersion: core.FirstNonEmpty(core.GetString(nested, "os_version"), core.GetString(nested, "osVersion")),
+		Language:  core.GetString(nested, "language"),
+		Timezone:  core.GetString(nested, "timezone"),
+		Screen:    core.GetString(nested, "screen"),
+		DeviceMID: core.FirstNonEmpty(
+			core.GetString(nested, "device_mid"),
+			core.GetString(nested, "deviceMid"),
+			core.GetString(m, "device_mid"),
 		),
 	}
 }
@@ -111,7 +111,7 @@ func (c *Credential) StorageJSON() ([]byte, error) {
 	m := map[string]any{
 		"type":      "freetier",
 		"vendor":    VendorID,
-		"auth_mode": firstNonEmpty(c.AuthMode, "apikey"),
+		"auth_mode": core.FirstNonEmpty(c.AuthMode, "apikey"),
 	}
 	if c.APIKey != "" {
 		m["api_key"] = c.APIKey
@@ -193,18 +193,18 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
 	// 3) 带 ZCode 专有痕迹：档案键或 auth_mode 标记。
 	//    这两个键都不会出现在其它供应商的凭证里，是强特征。
 	if _, ok := raw["profile"]; ok {
-		if getString(raw, "device_mid") != "" || getString(raw, "jwt_token") != "" {
+		if core.GetString(raw, "device_mid") != "" || core.GetString(raw, "jwt_token") != "" {
 			return true
 		}
 	}
 
 	// 4) 同时带 jwt_token 与 api_key（本插件 ZCode 的双凭证形态）。
-	if getString(raw, "jwt_token") != "" && getString(raw, "api_key") != "" {
+	if core.GetString(raw, "jwt_token") != "" && core.GetString(raw, "api_key") != "" {
 		return true
 	}
 
 	// 5) 智谱/Z.AI API Key 形态（xxx.xxx）+ 文件名含 zcode/zai
-	key := firstNonEmpty(getString(raw, "api_key"), getString(raw, "apiKey"))
+	key := core.FirstNonEmpty(core.GetString(raw, "api_key"), core.GetString(raw, "apiKey"))
 	if key != "" && strings.Count(key, ".") == 1 &&
 		(strings.Contains(baseName, "zcode") || strings.Contains(baseName, "zai")) {
 		return true
@@ -272,6 +272,3 @@ func decodeJWTPayload(segment string) map[string]any {
 	}
 	return claims
 }
-
-func getString(m map[string]any, key string) string { return core.GetString(m, key) }
-func firstNonEmpty(values ...string) string         { return core.FirstNonEmpty(values...) }

@@ -87,7 +87,7 @@ func Checkin(ctx context.Context, cred *Credential, baseURLOverride string) (*co
 	}
 
 	claimResult := getInt(coreMap, "claim_result", "result")
-	points := getInt64(coreMap, "points")
+	points := core.GetInt64(coreMap, "points")
 
 	// claim_result == 2 表示幂等命中（今日已领取过）
 	if claimResult == 2 {

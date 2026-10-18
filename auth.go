@@ -59,26 +59,26 @@ type authRefreshRPCRequest struct {
 func handleAuthParse(request []byte) ([]byte, error) {
 	var rpc authParseRPCRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	if len(rpc.RawJSON) == 0 {
-		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
+		return core.OKEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
 
 	var raw map[string]any
 	if errUnmarshal := json.Unmarshal(rpc.RawJSON, &raw); errUnmarshal != nil {
 		// 非 JSON 的凭证文件不归本插件处理。
-		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
+		return core.OKEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
 
 	vendor, okVendor := core.ResolveVendor(rpc.FileName, rpc.Provider, raw)
 	if !okVendor {
-		return okEnvelope(pluginapi.AuthParseResponse{Handled: false})
+		return core.OKEnvelope(pluginapi.AuthParseResponse{Handled: false})
 	}
 
 	credential, errCredential := vendor.Parse(rpc.RawJSON, rpc.FileName)
 	if errCredential != nil {
-		return nil, newPluginError("credential_invalid", errCredential.Error(), http.StatusUnprocessableEntity)
+		return nil, core.NewPluginError("credential_invalid", errCredential.Error(), http.StatusUnprocessableEntity)
 	}
 
 	logger.Info("parsed auth %s (vendor=%s)",
@@ -88,7 +88,7 @@ func handleAuthParse(request []byte) ([]byte, error) {
 	if errAuth != nil {
 		return nil, errAuth
 	}
-	return okEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: auth})
+	return core.OKEnvelope(pluginapi.AuthParseResponse{Handled: true, Auth: auth})
 }
 
 // buildAuthDataFor 构造宿主契约的凭证记录（供应商无关）。
@@ -200,18 +200,18 @@ func credentialAttributes(credential *core.Credential, vendorID string) map[stri
 func handleAuthRefresh(request []byte) ([]byte, error) {
 	var rpc authRefreshRPCRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	ctx, cancel := context.WithTimeout(httpx.WithCallbackID(context.Background(), rpc.HostCallbackID), authRefreshHTTPTimeout)
 	defer cancel()
 
 	credential, errCredential := credentialForAuth(ctx, rpc.HostCallbackID, rpc.StorageJSON, rpc.AuthID, rpc.Attributes)
 	if errCredential != nil {
-		return nil, newPluginError("credential_missing", errCredential.Error(), http.StatusUnauthorized)
+		return nil, core.NewPluginError("credential_missing", errCredential.Error(), http.StatusUnauthorized)
 	}
 	vendor, okVendor := core.VendorByID(credential.VendorIDValue())
 	if !okVendor {
-		return nil, newPluginError("credential_missing",
+		return nil, core.NewPluginError("credential_missing",
 			"credential has no resolvable vendor", http.StatusUnauthorized)
 	}
 
@@ -227,7 +227,7 @@ func handleAuthRefresh(request []byte) ([]byte, error) {
 		if errData != nil {
 			return nil, errData
 		}
-		return okEnvelope(pluginapi.AuthRefreshResponse{
+		return core.OKEnvelope(pluginapi.AuthRefreshResponse{
 			Auth:             auth,
 			NextRefreshAfter: time.Now().Add(authRefreshRetryAfter),
 		})
@@ -246,7 +246,7 @@ func handleAuthRefresh(request []byte) ([]byte, error) {
 	if errData != nil {
 		return nil, errData
 	}
-	return okEnvelope(pluginapi.AuthRefreshResponse{
+	return core.OKEnvelope(pluginapi.AuthRefreshResponse{
 		Auth:             auth,
 		NextRefreshAfter: time.Now().Add(authRefreshInterval),
 	})
@@ -380,11 +380,11 @@ func resetCredentialCache() {
 func resolveVendorCredential(ctx context.Context, callbackID string, storageJSON []byte, authID string, attributes map[string]string) (*core.Credential, core.Vendor, error) {
 	credential, errCredential := credentialForAuth(ctx, callbackID, storageJSON, authID, attributes)
 	if errCredential != nil {
-		return nil, nil, newPluginError("credential_missing", errCredential.Error(), http.StatusUnauthorized)
+		return nil, nil, core.NewPluginError("credential_missing", errCredential.Error(), http.StatusUnauthorized)
 	}
 	vendor, okVendor := core.VendorByID(credential.VendorIDValue())
 	if !okVendor {
-		return nil, nil, newPluginError("credential_missing",
+		return nil, nil, core.NewPluginError("credential_missing",
 			"credential has no resolvable vendor", http.StatusUnauthorized)
 	}
 	return credential, vendor, nil

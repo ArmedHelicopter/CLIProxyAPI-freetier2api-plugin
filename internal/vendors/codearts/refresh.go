@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 )
 
@@ -37,7 +38,7 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
-	form.Set("client_id", firstNonEmpty(cred.ClientID, ClientID))
+	form.Set("client_id", core.FirstNonEmpty(cred.ClientID, ClientID))
 	form.Set("refresh_token", cred.RefreshToken)
 
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))

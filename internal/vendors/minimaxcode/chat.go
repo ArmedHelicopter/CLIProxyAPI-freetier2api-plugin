@@ -563,7 +563,7 @@ func doMessageRequest(ctx context.Context, cred *Credential, req *core.ExecuteRe
 
 func extractUpstreamError(payload map[string]any) string {
 	if errObj, ok := payload["error"].(map[string]any); ok {
-		if msg := getString(errObj, "message"); msg != "" {
+		if msg := core.GetString(errObj, "message"); msg != "" {
 			return msg
 		}
 	}
@@ -572,15 +572,15 @@ func extractUpstreamError(payload map[string]any) string {
 	}
 	for _, key := range []string{"base_resp", "statusInfo"} {
 		if node, ok := payload[key].(map[string]any); ok {
-			code := getInt64(node, "status_code", "code")
+			code := core.GetInt64(node, "status_code", "code")
 			if code != 0 {
-				msg := firstNonEmpty(getString(node, "status_msg"), getString(node, "message"))
+				msg := core.FirstNonEmpty(core.GetString(node, "status_msg"), core.GetString(node, "message"))
 				return fmt.Sprintf("status %d: %s", code, msg)
 			}
 		}
 	}
 	for _, key := range []string{"error_msg", "error_message", "err_msg", "status_msg"} {
-		if msg := getString(payload, key); msg != "" && !strings.EqualFold(msg, "success") && !strings.EqualFold(msg, "ok") {
+		if msg := core.GetString(payload, key); msg != "" && !strings.EqualFold(msg, "success") && !strings.EqualFold(msg, "ok") {
 			return msg
 		}
 	}

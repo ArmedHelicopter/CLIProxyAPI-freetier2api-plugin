@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 )
 
@@ -294,17 +295,17 @@ func fetchUserInfo(ctx context.Context, cred *Credential, baseURLOverride string
 		return "", "", "", errDec
 	}
 
-	core := raw
+	profile := raw
 	if data, ok := raw["data"].(map[string]any); ok {
-		core = data
+		profile = data
 	}
-	if ui, ok := core["userInfo"].(map[string]any); ok {
-		core = ui
+	if ui, ok := profile["userInfo"].(map[string]any); ok {
+		profile = ui
 	}
 
-	realUserID := getString(core, "realUserID", "real_user_id", "userID", "user_id")
-	accName := getString(core, "name", "username")
-	accEmail := getString(core, "email", "phone")
+	realUserID := core.GetString(profile, "realUserID", "real_user_id", "userID", "user_id")
+	accName := core.GetString(profile, "name", "username")
+	accEmail := core.GetString(profile, "email", "phone")
 
 	if realUserID != "" {
 		cred.UserID = realUserID
@@ -339,17 +340,17 @@ func fetchAgents(ctx context.Context, cred *Credential, baseURLOverride string) 
 	}
 
 	var agents []AgentInfo
-	core := raw
+	profile := raw
 	if data, ok := raw["data"].(map[string]any); ok {
-		core = data
+		profile = data
 	}
-	if rawAgents, ok := core["agents"].([]any); ok {
+	if rawAgents, ok := profile["agents"].([]any); ok {
 		for _, a := range rawAgents {
 			if am, ok := a.(map[string]any); ok {
 				agents = append(agents, AgentInfo{
-					ID:            getString(am, "name", "id"),
-					Role:          getString(am, "agent_role", "role"),
-					RootSessionID: getString(am, "root_session_id"),
+					ID:            core.GetString(am, "name", "id"),
+					Role:          core.GetString(am, "agent_role", "role"),
+					RootSessionID: core.GetString(am, "root_session_id"),
 				})
 			}
 		}

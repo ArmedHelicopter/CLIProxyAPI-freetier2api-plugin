@@ -14,6 +14,7 @@ import (
 	"context"
 	"errors"
 	"sync"
+	"time"
 )
 
 // ErrHostNotConfigured 表示宿主端口尚未注入。
@@ -21,16 +22,18 @@ var ErrHostNotConfigured = errors.New("core: host port is not configured")
 
 // HostAuth 是宿主凭证列表里的一条（中立形态，字段与 host.auth.list 对齐）。
 type HostAuth struct {
-	ID          string `json:"id"`
-	AuthIndex   string `json:"auth_index"`
-	Name        string `json:"name"`
-	Provider    string `json:"provider"`
-	Label       string `json:"label"`
-	Status      string `json:"status"`
-	Disabled    bool   `json:"disabled"`
-	Unavailable bool   `json:"unavailable"`
-	RuntimeOnly bool   `json:"runtime_only"`
-	Path        string `json:"path,omitempty"`
+	ID          string    `json:"id"`
+	AuthIndex   string    `json:"auth_index"`
+	Name        string    `json:"name"`
+	Provider    string    `json:"provider"`
+	Label       string    `json:"label"`
+	Status      string    `json:"status"`
+	Disabled    bool      `json:"disabled"`
+	Unavailable bool      `json:"unavailable"`
+	RuntimeOnly bool      `json:"runtime_only"`
+	Path        string    `json:"path,omitempty"`
+	ModTime     time.Time `json:"modtime,omitempty"`
+	UpdatedAt   time.Time `json:"updated_at,omitempty"`
 }
 
 // Settings 是供应商无关的全局配置快照（只读）。

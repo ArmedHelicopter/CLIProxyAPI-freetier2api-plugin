@@ -20,8 +20,19 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
+
+// abiEnvelope 是插件响应信封（测试用；生产侧已统一到 core）。
+type abiEnvelope struct {
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
 
 // testCallbackID 是测试用的宿主回调 ID。
 const testCallbackID = "test-callback"
@@ -47,7 +58,7 @@ type fakeHost struct {
 	// calls 记录被调用的宿主方法名（供断言）。
 	calls []string
 	// authFiles 是 host.auth.list 的返回内容。
-	authFiles []hostAuthEntry
+	authFiles []core.HostAuth
 	// authJSON 是 auth_index → 凭证 JSON。
 	authJSON map[string]string
 	// upstream 是出站请求的应答函数（按 method + url 匹配）。
@@ -99,10 +110,10 @@ func (h *fakeHost) call(callbackID, method string, payload any) (json.RawMessage
 	return nil, fmt.Errorf("fake host does not implement %s", method)
 }
 
-func (h *fakeHost) snapshotAuthFiles() []hostAuthEntry {
+func (h *fakeHost) snapshotAuthFiles() []core.HostAuth {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	out := make([]hostAuthEntry, len(h.authFiles))
+	out := make([]core.HostAuth, len(h.authFiles))
 	copy(out, h.authFiles)
 	return out
 }
@@ -262,7 +273,7 @@ func (h *fakeHost) addAccount(authIndex, name, credentialJSON string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.authJSON[authIndex] = credentialJSON
-	h.authFiles = append(h.authFiles, hostAuthEntry{
+	h.authFiles = append(h.authFiles, core.HostAuth{
 		ID: name, AuthIndex: authIndex, Name: name, Provider: providerKey, Label: name,
 	})
 }

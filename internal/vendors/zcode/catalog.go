@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 )
 
@@ -113,7 +114,7 @@ func parseConfigModels(body []byte) []Model {
 		}
 		models = append(models, Model{
 			ID:             id,
-			Name:           firstNonEmpty(item.Name, id),
+			Name:           core.FirstNonEmpty(item.Name, id),
 			Description:    item.Description,
 			ContextWindow:  item.ContextWindow,
 			MaxTokens:      item.MaxCompletionTokens,

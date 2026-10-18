@@ -316,7 +316,7 @@ const accountGap = 800 * time.Millisecond
 
 // accountContext 是遍历中单个账号的上下文。
 type accountContext struct {
-	entry      hostAuthEntry
+	entry      core.HostAuth
 	vendor     core.Vendor
 	credential *core.Credential
 	callbackID string

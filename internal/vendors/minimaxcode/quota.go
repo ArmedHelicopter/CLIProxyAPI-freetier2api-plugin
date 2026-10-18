@@ -45,7 +45,7 @@ func FetchQuota(ctx context.Context, cred *Credential, baseURLOverride string) (
 		coreMap = data
 	}
 
-	planName := getString(coreMap, "plan_name")
+	planName := core.GetString(coreMap, "plan_name")
 	if planName == "" {
 		planName = "MiniMax Code"
 	}

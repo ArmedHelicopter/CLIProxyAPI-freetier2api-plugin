@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 )
 
@@ -117,7 +118,7 @@ func LoginStart(ctx context.Context) (*DeviceAuth, error) {
 	return &DeviceAuth{
 		DeviceCode:              strings.TrimSpace(payload.DeviceCode),
 		UserCode:                strings.TrimSpace(payload.UserCode),
-		VerificationURI:         firstNonEmpty(payload.VerificationURIComplete, payload.VerificationURI),
+		VerificationURI:         core.FirstNonEmpty(payload.VerificationURIComplete, payload.VerificationURI),
 		VerificationURIComplete: strings.TrimSpace(payload.VerificationURIComplete),
 		Interval:                interval,
 		ExpiresAt:               time.Now().Add(ttl),
@@ -172,7 +173,7 @@ func LoginPoll(ctx context.Context, baseURL string, deviceCode string) (*Credent
 	case "":
 		// 没有错误：继续看令牌。
 	default:
-		message := firstNonEmpty(payload.ErrorDescription, payload.Error)
+		message := core.FirstNonEmpty(payload.ErrorDescription, payload.Error)
 		return nil, fmt.Errorf("设备授权失败：%s", message)
 	}
 
@@ -242,7 +243,7 @@ func registerWithCline(ctx context.Context, baseURL, workosAccess, workosRefresh
 	if payload.Data.UserInfo != nil {
 		cred.Email = strings.TrimSpace(payload.Data.UserInfo.Email)
 	}
-	cred.Label = firstNonEmpty(cred.Email, cred.AccountID)
+	cred.Label = core.FirstNonEmpty(cred.Email, cred.AccountID)
 	return cred, nil
 }
 

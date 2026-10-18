@@ -39,22 +39,22 @@ func ParseCredential(raw []byte) (*Credential, error) {
 	}
 
 	c := &Credential{
-		Vendor:          firstNonEmpty(getString(m, "vendor"), VendorID),
-		UserID:          firstNonEmpty(getString(m, "user_id"), getString(m, "userId")),
-		UserName:        firstNonEmpty(getString(m, "user_name"), getString(m, "userName")),
-		DomainID:        firstNonEmpty(getString(m, "domain_id"), getString(m, "domainId")),
-		AccessKeyID:     firstNonEmpty(getString(m, "access_key_id"), getString(m, "accessKeyId"), getString(m, "ak")),
-		SecretAccessKey: firstNonEmpty(getString(m, "secret_access_key"), getString(m, "secretAccessKey"), getString(m, "sk")),
-		SecurityToken:   firstNonEmpty(getString(m, "security_token"), getString(m, "securityToken"), getString(m, "cloud_dragon_token")),
-		RefreshToken:    firstNonEmpty(getString(m, "refresh_token"), getString(m, "refreshToken")),
-		CodeVerifier:    firstNonEmpty(getString(m, "code_verifier"), getString(m, "codeVerifier")),
-		ClientID:        firstNonEmpty(getString(m, "client_id"), getString(m, "clientId"), ClientID),
-		Expiration:      getString(m, "expiration"),
-		ExpiresAt:       getInt64(m, "expires_at", "expiresAt"),
-		Label:           getString(m, "label"),
+		Vendor:          core.FirstNonEmpty(core.GetString(m, "vendor"), VendorID),
+		UserID:          core.FirstNonEmpty(core.GetString(m, "user_id"), core.GetString(m, "userId")),
+		UserName:        core.FirstNonEmpty(core.GetString(m, "user_name"), core.GetString(m, "userName")),
+		DomainID:        core.FirstNonEmpty(core.GetString(m, "domain_id"), core.GetString(m, "domainId")),
+		AccessKeyID:     core.FirstNonEmpty(core.GetString(m, "access_key_id"), core.GetString(m, "accessKeyId"), core.GetString(m, "ak")),
+		SecretAccessKey: core.FirstNonEmpty(core.GetString(m, "secret_access_key"), core.GetString(m, "secretAccessKey"), core.GetString(m, "sk")),
+		SecurityToken:   core.FirstNonEmpty(core.GetString(m, "security_token"), core.GetString(m, "securityToken"), core.GetString(m, "cloud_dragon_token")),
+		RefreshToken:    core.FirstNonEmpty(core.GetString(m, "refresh_token"), core.GetString(m, "refreshToken")),
+		CodeVerifier:    core.FirstNonEmpty(core.GetString(m, "code_verifier"), core.GetString(m, "codeVerifier")),
+		ClientID:        core.FirstNonEmpty(core.GetString(m, "client_id"), core.GetString(m, "clientId"), ClientID),
+		Expiration:      core.GetString(m, "expiration"),
+		ExpiresAt:       core.GetInt64(m, "expires_at", "expiresAt"),
+		Label:           core.GetString(m, "label"),
 	}
 
-	if jwkObj := getMap(m, "dpop_private_key"); jwkObj != nil {
+	if jwkObj := core.GetMap(m, "dpop_private_key"); jwkObj != nil {
 		c.DPoPPrivateKey = make(map[string]string)
 		for k, v := range jwkObj {
 			if s, ok := v.(string); ok {
@@ -83,7 +83,7 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
 	}
 
 	// 特征字段匹配：华为云 AK/SK + SecurityToken 或 DPoP
-	if (getString(raw, "access_key_id") != "" && getString(raw, "secret_access_key") != "") || getMap(raw, "dpop_private_key") != nil {
+	if (core.GetString(raw, "access_key_id") != "" && core.GetString(raw, "secret_access_key") != "") || core.GetMap(raw, "dpop_private_key") != nil {
 		return true
 	}
 
@@ -115,8 +115,3 @@ func (c *Credential) StorageJSON() ([]byte, error) {
 	}
 	return json.MarshalIndent(m, "", "  ")
 }
-
-func getMap(m map[string]any, key string) map[string]any { return core.GetMap(m, key) }
-func getString(m map[string]any, key string) string      { return core.GetString(m, key) }
-func getInt64(m map[string]any, keys ...string) int64    { return core.GetInt64(m, keys...) }
-func firstNonEmpty(values ...string) string              { return core.FirstNonEmpty(values...) }

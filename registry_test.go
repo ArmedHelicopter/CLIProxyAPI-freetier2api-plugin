@@ -21,6 +21,7 @@ import (
 	"testing"
 
 	"freetier2api-plugin/internal/console"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
@@ -342,7 +343,7 @@ func TestListHostAuthsClaimsHijackedCredentials(t *testing.T) {
 	}
 
 	// provider 被抢走（qoder）但文件名是本插件的：仍要列出来。
-	entries := filterPluginAuths([]hostAuthEntry{
+	entries := filterPluginAuths([]core.HostAuth{
 		{Name: "workbuddy-79fdc1fc-de43-40da-b6f0-fe05d9e4367b.json", Provider: "qoder", AuthIndex: "1"},
 		{Name: "workbuddy-110693a0-d32d-4d81-8a0a-7a3445069f96.json", Provider: "workbuddy", AuthIndex: "2"},
 		{Name: "qoder-login-f34c07f7.json", Provider: "qoder", AuthIndex: "3"},

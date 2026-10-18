@@ -107,15 +107,11 @@ func ParseTurn(item any) *Turn {
 		turn.ToolCallID, _ = m["tool_call_id"].(string)
 		turn.ToolName, _ = m["name"].(string)
 		if turn.ToolName == "" {
-			turn.ToolName = firstNonEmptyStringOfMap(m, "tool_name")
+			turn.ToolName = core.GetString(m, "tool_name")
 		}
 	}
 
 	return turn
-}
-
-func firstNonEmptyStringOfMap(m map[string]any, keys ...string) string {
-	return core.GetString(m, keys...)
 }
 
 // BuildPrompt 把多轮 OpenAI 对话消息压平为 MiniMax Agent 所需的单个 content 字符串。

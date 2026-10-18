@@ -4,6 +4,7 @@ package workbuddy
 
 import (
 	"fmt"
+	"freetier2api-plugin/internal/core"
 	"io"
 	"net/http"
 	"strings"
@@ -88,7 +89,7 @@ func (c *Client) ChatStream(req ChatRequest) (io.ReadCloser, error) {
 
 	// 改写管线：加 stream、归一字段、注入思维链、脱敏。
 	conversationKey := ConversationKey(req.Body)
-	cacheKey := buildCacheKey(req.Credential.UIDValue(), firstNonEmpty(conversationKey, req.Meta.ConversationRequestID))
+	cacheKey := buildCacheKey(req.Credential.UIDValue(), core.FirstNonEmpty(conversationKey, req.Meta.ConversationRequestID))
 	defaultEfforts, supportedEfforts := effortTables()
 	prepared := PrepareBody(req.Body, PrepareOptions{
 		Model:            model,

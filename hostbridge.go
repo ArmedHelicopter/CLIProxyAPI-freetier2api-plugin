@@ -16,26 +16,7 @@ type hostBridge struct{}
 
 // ListAuths 复用根层的凭证枚举（含「被前置插件抢走但仍按文件名归属」的兜底）。
 func (hostBridge) ListAuths(ctx context.Context) ([]core.HostAuth, error) {
-	entries, errList := listHostAuths(ctx, "")
-	if errList != nil {
-		return nil, errList
-	}
-	out := make([]core.HostAuth, 0, len(entries))
-	for _, entry := range entries {
-		out = append(out, core.HostAuth{
-			ID:          entry.ID,
-			AuthIndex:   entry.AuthIndex,
-			Name:        entry.Name,
-			Provider:    entry.Provider,
-			Label:       entry.Label,
-			Status:      entry.Status,
-			Disabled:    entry.Disabled,
-			Unavailable: entry.Unavailable,
-			RuntimeOnly: entry.RuntimeOnly,
-			Path:        entry.Path,
-		})
-	}
-	return out, nil
+	return listHostAuths(ctx, "")
 }
 
 // AuthJSON 复用根层的 host.auth.get 封装。

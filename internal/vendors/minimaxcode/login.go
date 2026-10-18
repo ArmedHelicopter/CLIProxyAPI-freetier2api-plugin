@@ -84,15 +84,15 @@ func LoginStart(ctx context.Context, r Region) (*pluginapi.AuthLoginStartRespons
 		return nil, fmt.Errorf("decode device code response: %w", errDec)
 	}
 
-	deviceCode := getString(payload, "device_code")
-	userCode := getString(payload, "user_code")
+	deviceCode := core.GetString(payload, "device_code")
+	userCode := core.GetString(payload, "user_code")
 	if deviceCode == "" {
 		return nil, fmt.Errorf("device code response missing device_code: %v", payload)
 	}
 
-	verifyURL := firstNonEmpty(
-		getString(payload, "verification_uri_complete"),
-		getString(payload, "verification_uri"),
+	verifyURL := core.FirstNonEmpty(
+		core.GetString(payload, "verification_uri_complete"),
+		core.GetString(payload, "verification_uri"),
 		fmt.Sprintf("%s/oauth-authorize?user_code=%s", accountHost, userCode),
 	)
 
@@ -197,7 +197,7 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 	rawBytes, _ := io.ReadAll(resp.Body)
 	_ = json.Unmarshal(rawBytes, &payload)
 
-	errCode := getString(payload, "error")
+	errCode := core.GetString(payload, "error")
 	switch errCode {
 	case "authorization_pending":
 		return &pluginapi.AuthLoginPollResponse{
@@ -234,14 +234,14 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 		pendingMu.Lock()
 		delete(pendingSessions, cleanState)
 		pendingMu.Unlock()
-		errDesc := firstNonEmpty(getString(payload, "error_description"), errCode, fmt.Sprintf("HTTP %d", resp.StatusCode))
+		errDesc := core.FirstNonEmpty(core.GetString(payload, "error_description"), errCode, fmt.Sprintf("HTTP %d", resp.StatusCode))
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "授权失败：" + errDesc,
 		}, nil
 	}
 
-	accessToken := getString(payload, "access_token", "accessToken")
+	accessToken := core.GetString(payload, "access_token", "accessToken")
 	if accessToken == "" {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
@@ -254,8 +254,8 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 	delete(pendingSessions, cleanState)
 	pendingMu.Unlock()
 
-	refreshToken := getString(payload, "refresh_token", "refreshToken")
-	expiresIn := getInt64(payload, "expires_in", "expiresIn")
+	refreshToken := core.GetString(payload, "refresh_token", "refreshToken")
+	expiresIn := core.GetInt64(payload, "expires_in", "expiresIn")
 	if expiresIn <= 0 {
 		expiresIn = 3600
 	}
@@ -282,7 +282,7 @@ func LoginPoll(ctx context.Context, state string, baseURLOverride string) (*plug
 		}, nil
 	}
 
-	accountIdentifier := firstNonEmpty(cred.UserID, cred.Email, session.UserCode, core.RandomHex(4))
+	accountIdentifier := core.FirstNonEmpty(cred.UserID, cred.Email, session.UserCode, core.RandomHex(4))
 	label := cred.Label
 	if label == "" {
 		label = VendorNameFor(session.Region) + "-" + accountIdentifier

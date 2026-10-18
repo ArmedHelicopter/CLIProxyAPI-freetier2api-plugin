@@ -563,7 +563,7 @@ func TestManagementAutoAllRouteDispatched(t *testing.T) {
 	if err != nil {
 		t.Fatalf("handleMethod error: %v", err)
 	}
-	var env envelope
+	var env abiEnvelope
 	_ = json.Unmarshal(raw, &env)
 	var resp pluginapi.ManagementResponse
 	_ = json.Unmarshal(env.Result, &resp)

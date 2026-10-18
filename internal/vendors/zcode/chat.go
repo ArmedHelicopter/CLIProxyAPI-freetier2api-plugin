@@ -20,6 +20,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
@@ -144,7 +145,7 @@ func emitCollapsedCompletion(completion []byte, model string, onChunk func([]byt
 			}
 		}
 	}
-	reason := firstNonEmpty(resp.Choices[0].FinishReason, "stop")
+	reason := core.FirstNonEmpty(resp.Choices[0].FinishReason, "stop")
 	return onChunk(converter.chunk(map[string]any{}, &reason))
 }
 
@@ -341,7 +342,7 @@ func assistantBlocks(content any, rawToolCalls any) []any {
 		}
 		blocks = append(blocks, map[string]any{
 			"type":  "tool_use",
-			"id":    firstNonEmpty(stringField(call, "id"), "toolu_"+NewHexID(12)),
+			"id":    core.FirstNonEmpty(stringField(call, "id"), "toolu_"+NewHexID(12)),
 			"name":  name,
 			"input": parseToolArguments(fn["arguments"]),
 		})
@@ -479,7 +480,7 @@ func applyPlanBodyTransforms(body map[string]any, model string, cred *Credential
 	}
 	applyStartPlanSystem(body, model)
 	applyCacheControl(body)
-	if userID := firstNonEmpty(cred.UserID, UserIDFromJWT(cred.JWTToken)); userID != "" {
+	if userID := core.FirstNonEmpty(cred.UserID, UserIDFromJWT(cred.JWTToken)); userID != "" {
 		metadata, _ := body["metadata"].(map[string]any)
 		if metadata == nil {
 			metadata = map[string]any{}
@@ -533,10 +534,10 @@ func anthropicToOpenAICompletion(raw []byte, model string) ([]byte, error) {
 	}
 
 	out := map[string]any{
-		"id":      firstNonEmpty(resp.ID, "chatcmpl-"+NewHexID(12)),
+		"id":      core.FirstNonEmpty(resp.ID, "chatcmpl-"+NewHexID(12)),
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
-		"model":   firstNonEmpty(resp.Model, model),
+		"model":   core.FirstNonEmpty(resp.Model, model),
 		"choices": []any{map[string]any{
 			"index":         0,
 			"message":       message,
@@ -558,7 +559,7 @@ func buildToolCall(id, name string, rawInput json.RawMessage) map[string]any {
 		input = string(rawInput)
 	}
 	return map[string]any{
-		"id":   firstNonEmpty(id, "toolu_"+NewHexID(12)),
+		"id":   core.FirstNonEmpty(id, "toolu_"+NewHexID(12)),
 		"type": "function",
 		"function": map[string]any{
 			"name":      name,
@@ -666,7 +667,7 @@ func (c *streamConverter) feed(event map[string]any, onChunk func([]byte) error)
 
 	case "error":
 		errObj, _ := event["error"].(map[string]any)
-		return fmt.Errorf("上游流式错误: %s", firstNonEmpty(stringField(errObj, "message"), "unknown"))
+		return fmt.Errorf("上游流式错误: %s", core.FirstNonEmpty(stringField(errObj, "message"), "unknown"))
 	}
 	return nil
 }

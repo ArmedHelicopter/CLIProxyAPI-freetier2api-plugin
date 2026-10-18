@@ -116,7 +116,7 @@ func RequestLoginState(ctx context.Context, region Region) (state, authURL strin
 		return "", "", fmt.Errorf("decode login state: %w", errUnmarshal)
 	}
 	state = strings.TrimSpace(payload.State)
-	authURL = firstNonEmptyString(payload.URL, payload.AuthURL, payload.LoginURL)
+	authURL = core.FirstNonEmpty(payload.URL, payload.AuthURL, payload.LoginURL)
 	if state == "" || authURL == "" {
 		return "", "", fmt.Errorf("login state response is incomplete")
 	}
@@ -301,6 +301,3 @@ func DefaultDomainFor(region Region) string {
 func ResetLoginStoreForTest() {
 	loginsession.ResetForTest()
 }
-
-// firstNonEmptyString 返回第一个非空字符串。
-func firstNonEmptyString(values ...string) string { return core.FirstNonEmpty(values...) }

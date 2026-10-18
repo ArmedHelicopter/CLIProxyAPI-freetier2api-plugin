@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
@@ -46,7 +47,7 @@ func Classify(status int, body string) *workbuddy.Error {
 	}
 	_ = json.Unmarshal([]byte(body), &payload)
 
-	msg := firstNonEmpty(payload.Msg, payload.Error.Message, textPreview(body))
+	msg := core.FirstNonEmpty(payload.Msg, payload.Error.Message, textPreview(body))
 	lower := strings.ToLower(body)
 
 	switch {
@@ -71,7 +72,7 @@ func Classify(status int, body string) *workbuddy.Error {
 		return &workbuddy.Error{
 			Kind:   workbuddy.KindSessionDead,
 			Status: status,
-			Msg:    firstNonEmpty(msg, "凭证失效"),
+			Msg:    core.FirstNonEmpty(msg, "凭证失效"),
 		}
 
 	// 4) 额度耗尽
@@ -79,7 +80,7 @@ func Classify(status int, body string) *workbuddy.Error {
 		return &workbuddy.Error{
 			Kind:   workbuddy.KindHardCredit,
 			Status: pickStatus(status, http.StatusPaymentRequired),
-			Msg:    firstNonEmpty(msg, "额度已用完"),
+			Msg:    core.FirstNonEmpty(msg, "额度已用完"),
 		}
 
 	// 5) 限流
@@ -87,7 +88,7 @@ func Classify(status int, body string) *workbuddy.Error {
 		return &workbuddy.Error{
 			Kind:   workbuddy.KindSoftRate,
 			Status: status,
-			Msg:    firstNonEmpty(msg, "上游限流"),
+			Msg:    core.FirstNonEmpty(msg, "上游限流"),
 		}
 
 	// 6) 该后端无此模型（按账号×模型避让）
@@ -95,7 +96,7 @@ func Classify(status int, body string) *workbuddy.Error {
 		return &workbuddy.Error{
 			Kind:   workbuddy.KindModelBlocked,
 			Status: status,
-			Msg:    firstNonEmpty(msg, "该账号套餐不包含此模型"),
+			Msg:    core.FirstNonEmpty(msg, "该账号套餐不包含此模型"),
 		}
 
 	// 7) 参数非法（max_tokens 越界等）：换号无意义
@@ -103,7 +104,7 @@ func Classify(status int, body string) *workbuddy.Error {
 		return &workbuddy.Error{
 			Kind:   workbuddy.KindBadParams,
 			Status: status,
-			Msg:    firstNonEmpty(msg, "请求参数被上游拒绝"),
+			Msg:    core.FirstNonEmpty(msg, "请求参数被上游拒绝"),
 		}
 
 	// 8) 上游 5xx

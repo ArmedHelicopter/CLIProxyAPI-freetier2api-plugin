@@ -81,7 +81,7 @@ func managementRegistration() pluginapi.ManagementRegistrationResponse {
 func handleManagement(request []byte) ([]byte, error) {
 	var rpc pluginapi.ManagementRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	method := strings.ToUpper(strings.TrimSpace(rpc.Method))
 	if method == "" {
@@ -90,85 +90,85 @@ func handleManagement(request []byte) ([]byte, error) {
 
 	switch {
 	case method == http.MethodGet && matchesResourcePath(rpc.Path, "/console"):
-		return okEnvelope(htmlResponse(http.StatusOK, []byte(console.Page(managementRoutePrefix))))
+		return core.OKEnvelope(htmlResponse(http.StatusOK, []byte(console.Page(managementRoutePrefix))))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, "/status"):
-		return okEnvelope(jsonResponse(http.StatusOK, buildStatusPayload(rpc)))
+		return core.OKEnvelope(jsonResponse(http.StatusOK, buildStatusPayload(rpc)))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, "/vendors"):
-		return okEnvelope(jsonResponse(http.StatusOK, buildVendorsPayload()))
+		return core.OKEnvelope(jsonResponse(http.StatusOK, buildVendorsPayload()))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, "/logs"):
-		return okEnvelope(jsonResponse(http.StatusOK, buildLogsPayload(rpc)))
+		return core.OKEnvelope(jsonResponse(http.StatusOK, buildLogsPayload(rpc)))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/checkin"):
-		return okEnvelope(handleCheckinRequest(rpc))
+		return core.OKEnvelope(handleCheckinRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/quotas"):
-		return okEnvelope(handleQuotasRequest(rpc))
+		return core.OKEnvelope(handleQuotasRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/accounts/delete"):
-		return okEnvelope(handleAccountDeleteRequest(rpc))
+		return core.OKEnvelope(handleAccountDeleteRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/accounts/add"):
-		return okEnvelope(handleAccountAddRequest(rpc))
+		return core.OKEnvelope(handleAccountAddRequest(rpc))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, "/models"):
-		return okEnvelope(handleModelsList(rpc))
+		return core.OKEnvelope(handleModelsList(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/models/toggle"):
-		return okEnvelope(handleModelsToggle(rpc))
+		return core.OKEnvelope(handleModelsToggle(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/models/alias"):
-		return okEnvelope(handleModelAlias(rpc))
+		return core.OKEnvelope(handleModelAlias(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/models/refresh"):
 		ctx, cancel := managementContext(rpc)
 		defer cancel()
 		count, errRefresh := refreshModelsFromUpstream(ctx)
 		if errRefresh != nil {
-			return okEnvelope(errorResponse(errRefresh))
+			return core.OKEnvelope(errorResponse(errRefresh))
 		}
-		return okEnvelope(jsonResponse(http.StatusOK, map[string]any{"ok": true, "models": count}))
+		return core.OKEnvelope(jsonResponse(http.StatusOK, map[string]any{"ok": true, "models": count}))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/settings"):
-		return okEnvelope(handleSettingsRequest(rpc))
+		return core.OKEnvelope(handleSettingsRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/tasks/scan"):
-		return okEnvelope(handleTasksScan(rpc))
+		return core.OKEnvelope(handleTasksScan(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/tasks/run"):
-		return okEnvelope(handleTasksRun(rpc))
+		return core.OKEnvelope(handleTasksRun(rpc))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, "/tasks/queue"):
-		return okEnvelope(jsonResponse(http.StatusOK, taskQueueSnapshot()))
+		return core.OKEnvelope(jsonResponse(http.StatusOK, taskQueueSnapshot()))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/tasks/auto_all"):
-		return okEnvelope(handleTasksAutoAll(rpc))
+		return core.OKEnvelope(handleTasksAutoAll(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/tasks/auto"):
-		return okEnvelope(handleTasksAuto(rpc))
+		return core.OKEnvelope(handleTasksAuto(rpc))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, "/school/status"):
-		return okEnvelope(handleSchoolStatus(rpc))
+		return core.OKEnvelope(handleSchoolStatus(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/school/run"):
-		return okEnvelope(handleScheduledRun(rpc, "school"))
+		return core.OKEnvelope(handleScheduledRun(rpc, "school"))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/travel"):
-		return okEnvelope(handleScheduledRun(rpc, "travel"))
+		return core.OKEnvelope(handleScheduledRun(rpc, "travel"))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/activity"):
-		return okEnvelope(handleScheduledRun(rpc, "activity"))
+		return core.OKEnvelope(handleScheduledRun(rpc, "activity"))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/keepalive"):
-		return okEnvelope(handleKeepaliveRequest(rpc))
+		return core.OKEnvelope(handleKeepaliveRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, "/blackcat"):
-		return okEnvelope(handleScheduledRun(rpc, "blackcat"))
+		return core.OKEnvelope(handleScheduledRun(rpc, "blackcat"))
 	}
 
-	return okEnvelope(jsonResponse(http.StatusNotFound, map[string]any{
+	return core.OKEnvelope(jsonResponse(http.StatusNotFound, map[string]any{
 		"error": "not found", "path": rpc.Path, "method": method,
 	}))
 }
@@ -257,7 +257,7 @@ func errorResponse(err error) pluginapi.ManagementResponse {
 	if err != nil {
 		message = err.Error()
 	}
-	if pluginErr, okPlugin := err.(*pluginError); okPlugin {
+	if pluginErr, okPlugin := err.(*core.PluginError); okPlugin {
 		message = pluginErr.Message
 		if pluginErr.HTTPStatus > 0 {
 			status = pluginErr.HTTPStatus
@@ -739,7 +739,7 @@ func handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.Manag
 }
 
 // deleteAuthFile 删除一个账号的凭证文件。
-func deleteAuthFile(ctx context.Context, callbackID string, entry hostAuthEntry) error {
+func deleteAuthFile(ctx context.Context, callbackID string, entry core.HostAuth) error {
 	// 先解析凭证，确认它确实归本插件——避免误删别家插件的凭证文件。
 	raw, filePath, okRaw := getAuthJSONAndPathByIndex(ctx, callbackID, entry.AuthIndex)
 	if !okRaw {
@@ -1017,7 +1017,7 @@ func handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 	}
 
 	type job struct {
-		entry      hostAuthEntry
+		entry      core.HostAuth
 		vendor     core.Vendor
 		credential *core.Credential
 	}
@@ -1195,7 +1195,7 @@ func runForAccounts(
 
 	cfg := loadedConfig()
 	type job struct {
-		entry      hostAuthEntry
+		entry      core.HostAuth
 		vendor     core.Vendor
 		credential *core.Credential
 	}
@@ -1383,7 +1383,7 @@ func handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.Managemen
 	}
 
 	type job struct {
-		entry      hostAuthEntry
+		entry      core.HostAuth
 		vendor     core.Vendor
 		credential *core.Credential
 		rawJSON    []byte
@@ -1585,7 +1585,7 @@ func cachedStaticModels() map[string][]pluginapi.ModelInfo {
 //     表现为「明明续期了却还报凭证失效」）；
 //   - 直接写文件兜住 host.auth.save 不可用的场景（如宿主未提供该能力）。
 func saveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor,
-	entry hostAuthEntry, original []byte, updated *core.Credential, filePath string) {
+	entry core.HostAuth, original []byte, updated *core.Credential, filePath string) {
 	payload, okPayload := refreshedStorageJSON(vendor, original, updated)
 	if okPayload {
 		if _, errSave := callHostScoped(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{

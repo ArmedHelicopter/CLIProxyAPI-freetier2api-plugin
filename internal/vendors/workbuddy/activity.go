@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"freetier2api-plugin/internal/core"
 	"net/http"
 	"net/url"
 	"strings"
@@ -226,7 +227,7 @@ func (c *Client) TravelStatus(ctx context.Context, cred *Credential) (*TravelSta
 		return nil, fmt.Errorf("decode travel status: %w", errUnmarshal)
 	}
 	return &TravelStatus{
-		State:             firstNonEmpty(payload.State, payload.Status),
+		State:             core.FirstNonEmpty(payload.State, payload.Status),
 		RecordID:          payload.RecordID,
 		DailyLimitReached: payload.DailyLimitReached,
 	}, nil

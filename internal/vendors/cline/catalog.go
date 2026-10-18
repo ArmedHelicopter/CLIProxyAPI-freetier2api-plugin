@@ -123,7 +123,7 @@ func parseModels(body []byte) ([]Model, error) {
 			seen[id] = true
 			model := Model{
 				ID:              id,
-				Name:            firstNonEmpty(entry.DisplayName, entry.Name, id),
+				Name:            core.FirstNonEmpty(entry.DisplayName, entry.Name, id),
 				Description:     strings.TrimSpace(entry.Description),
 				ContextWindow:   entry.ContextWindow,
 				MaxOutputTokens: firstNonZero(entry.MaxOutput, entry.MaxTokens),
@@ -184,9 +184,6 @@ func BundledClineModels() []Model {
 		{ID: "cline-pass/qwen3.8-max", Name: "Qwen3.8 Max", Cost: CostPass, ContextWindow: 200000, MaxOutputTokens: 16384, SupportsTools: true},
 	}
 }
-
-// firstNonEmpty 返回第一个非空字符串。
-func firstNonEmpty(values ...string) string { return core.FirstNonEmpty(values...) }
 
 // firstNonZero 返回第一个非零数值。
 func firstNonZero(values ...int64) int64 {

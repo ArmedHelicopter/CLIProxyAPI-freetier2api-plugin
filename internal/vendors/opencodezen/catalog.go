@@ -130,7 +130,7 @@ func parseModels(body []byte) ([]Model, error) {
 		if maxOutput == 0 {
 			maxOutput = entry.MaxTokens
 		}
-		name := firstNonEmpty(entry.DisplayName, entry.Name, id)
+		name := core.FirstNonEmpty(entry.DisplayName, entry.Name, id)
 		out = append(out, Model{
 			ID:              id,
 			Name:            name,
@@ -152,6 +152,3 @@ func boolFrom(values ...*bool) bool {
 	}
 	return false
 }
-
-// firstNonEmpty 返回第一个非空字符串。
-func firstNonEmpty(values ...string) string { return core.FirstNonEmpty(values...) }

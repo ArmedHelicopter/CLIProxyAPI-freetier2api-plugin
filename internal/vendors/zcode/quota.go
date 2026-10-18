@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 )
 
 // FetchQuota 查询 ZCode 账号的套餐与余量。
@@ -60,7 +61,7 @@ func fillSubscription(ctx context.Context, cred *Credential, response *pluginapi
 	if name := stringField(first, "name"); name != "" {
 		response.Subscription.Plan = name
 	}
-	if planID := firstNonEmpty(stringField(first, "plan_id"), stringField(first, "planId")); planID != "" {
+	if planID := core.FirstNonEmpty(stringField(first, "plan_id"), stringField(first, "planId")); planID != "" {
 		response.Subscription.TierName = planID
 	}
 }
@@ -86,7 +87,7 @@ func fetchBalances(ctx context.Context, cred *Credential) ([]pluginapi.QuotaMetr
 		if !ok {
 			continue
 		}
-		name := firstNonEmpty(stringField(entry, "show_name"), stringField(entry, "model"))
+		name := core.FirstNonEmpty(stringField(entry, "show_name"), stringField(entry, "model"))
 		if name == "" {
 			continue
 		}

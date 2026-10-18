@@ -13,6 +13,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"freetier2api-plugin/internal/core"
 	"net/http"
 	"net/url"
 	"strings"
@@ -69,8 +70,8 @@ type growthTaskEntry struct {
 // toTask 把原始条目归一化。
 func (e growthTaskEntry) toTask() Task {
 	task := Task{
-		Code:         firstNonEmpty(e.TaskCode, e.TaskCodeAlt),
-		Title:        firstNonEmpty(e.Title, e.TitleAlt),
+		Code:         core.FirstNonEmpty(e.TaskCode, e.TaskCodeAlt),
+		Title:        core.FirstNonEmpty(e.Title, e.TitleAlt),
 		Claimed:      e.Claimed,
 		Locked:       e.Locked,
 		AcceptStatus: strings.TrimSpace(e.AcceptStatus),

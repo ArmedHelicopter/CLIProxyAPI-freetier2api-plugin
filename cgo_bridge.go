@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
+	"freetier2api-plugin/internal/core"
 )
 
 // cliproxy_plugin_init 由宿主在加载动态库后调用一次。
@@ -47,7 +48,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 		response.len = 0
 	}
 	if method == nil {
-		writeResponse(response, errorEnvelope("invalid_method", "method is required"))
+		writeResponse(response, core.ErrorEnvelope("invalid_method", "method is required"))
 		return 1
 	}
 	var requestBytes []byte
@@ -56,7 +57,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
 	if errHandle != nil {
-		writeResponse(response, errorEnvelopeFromError(errHandle))
+		writeResponse(response, core.ErrorEnvelopeFromError(errHandle))
 		return 1
 	}
 	writeResponse(response, raw)

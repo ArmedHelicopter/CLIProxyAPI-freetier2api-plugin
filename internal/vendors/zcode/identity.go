@@ -141,7 +141,7 @@ func NewDeviceProfile() DeviceProfile {
 func (p *DeviceProfile) ensure() {
 	if p.Platform == "" && p.Arch == "" && p.OSVersion == "" && p.Screen == "" {
 		fresh := NewDeviceProfile()
-		fresh.DeviceMID = firstNonEmpty(p.DeviceMID, fresh.DeviceMID)
+		fresh.DeviceMID = core.FirstNonEmpty(p.DeviceMID, fresh.DeviceMID)
 		*p = fresh
 		return
 	}

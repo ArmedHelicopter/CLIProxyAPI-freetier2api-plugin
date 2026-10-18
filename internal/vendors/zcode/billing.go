@@ -18,6 +18,7 @@ import (
 	"strings"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 )
 
@@ -132,7 +133,7 @@ func billingBlockReason(cred *Credential) string {
 
 // classifyBillingOutcome 把计费族的业务失败码翻成可读文案。
 func classifyBillingOutcome(code int, body map[string]any) string {
-	serverMsg := firstNonEmpty(stringField(body, "msg"), stringField(body, "message"))
+	serverMsg := core.FirstNonEmpty(stringField(body, "msg"), stringField(body, "message"))
 	base := map[int]string{
 		1001: "套餐不存在",
 		1002: "活动已结束或套餐暂不可领取",

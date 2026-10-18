@@ -87,10 +87,10 @@ func ParseCredential(raw []byte, defaultRegion Region) (*Credential, error) {
 	}
 	accountObj := getSubMap(m, "account")
 
-	regionStr := strings.ToLower(firstNonEmpty(
-		getString(m, "region"),
-		getString(m, "realm"),
-		getString(m, "_edition"),
+	regionStr := strings.ToLower(core.FirstNonEmpty(
+		core.GetString(m, "region"),
+		core.GetString(m, "realm"),
+		core.GetString(m, "_edition"),
 		string(defaultRegion),
 	))
 	r := RegionCN
@@ -98,26 +98,26 @@ func ParseCredential(raw []byte, defaultRegion Region) (*Credential, error) {
 		r = RegionGlobal
 	}
 
-	token := firstNonEmpty(
-		getString(authObj, "access_token"),
-		getString(authObj, "accessToken"),
-		getString(authObj, "token"),
-		getString(authObj, "bearer"),
-		getString(m, "token"),
+	token := core.FirstNonEmpty(
+		core.GetString(authObj, "access_token"),
+		core.GetString(authObj, "accessToken"),
+		core.GetString(authObj, "token"),
+		core.GetString(authObj, "bearer"),
+		core.GetString(m, "token"),
 	)
-	refreshToken := firstNonEmpty(
-		getString(authObj, "refresh_token"),
-		getString(authObj, "refreshToken"),
-		getString(m, "refresh_token"),
+	refreshToken := core.FirstNonEmpty(
+		core.GetString(authObj, "refresh_token"),
+		core.GetString(authObj, "refreshToken"),
+		core.GetString(m, "refresh_token"),
 	)
 
 	if token == "" && refreshToken == "" {
 		return nil, fmt.Errorf("minimax credential missing token or refresh_token")
 	}
 
-	authMode := strings.ToLower(firstNonEmpty(
-		getString(m, "auth_mode"),
-		getString(authObj, "auth_mode"),
+	authMode := strings.ToLower(core.FirstNonEmpty(
+		core.GetString(m, "auth_mode"),
+		core.GetString(authObj, "auth_mode"),
 	))
 	if authMode == "" {
 		if refreshToken != "" {
@@ -137,43 +137,43 @@ func ParseCredential(raw []byte, defaultRegion Region) (*Credential, error) {
 	}
 
 	cred := &Credential{
-		Vendor:       firstNonEmpty(getString(m, "vendor"), VendorIDFor(r)),
+		Vendor:       core.FirstNonEmpty(core.GetString(m, "vendor"), VendorIDFor(r)),
 		Region:       r,
 		AccessToken:  token,
 		RefreshToken: refreshToken,
-		ExpiresAt:    getInt64(authObj, "expires_at", "expiresAt", "TokenExpireAt"),
-		UserID: firstNonEmpty(
-			getString(authObj, "user_id"),
-			getString(accountObj, "user_id"),
-			getString(m, "user_id"),
-			getString(m, "realUserID"),
-			getString(m, "real_user_id"),
-			getString(m, "uid"),
+		ExpiresAt:    core.GetInt64(authObj, "expires_at", "expiresAt", "TokenExpireAt"),
+		UserID: core.FirstNonEmpty(
+			core.GetString(authObj, "user_id"),
+			core.GetString(accountObj, "user_id"),
+			core.GetString(m, "user_id"),
+			core.GetString(m, "realUserID"),
+			core.GetString(m, "real_user_id"),
+			core.GetString(m, "uid"),
 		),
-		AgentID: firstNonEmpty(
-			getString(authObj, "agent_id"),
-			getString(m, "agent_id"),
-			getString(m, "agentId"),
+		AgentID: core.FirstNonEmpty(
+			core.GetString(authObj, "agent_id"),
+			core.GetString(m, "agent_id"),
+			core.GetString(m, "agentId"),
 		),
-		DeviceID: firstNonEmpty(
-			getString(authObj, "device_id"),
-			getString(m, "device_id"),
-			getString(m, "deviceId"),
+		DeviceID: core.FirstNonEmpty(
+			core.GetString(authObj, "device_id"),
+			core.GetString(m, "device_id"),
+			core.GetString(m, "deviceId"),
 		),
-		UUID: firstNonEmpty(
-			getString(authObj, "uuid"),
-			getString(m, "uuid"),
+		UUID: core.FirstNonEmpty(
+			core.GetString(authObj, "uuid"),
+			core.GetString(m, "uuid"),
 		),
 		ScreenWidth:  screenWidth,
 		ScreenHeight: screenHeight,
-		Email: firstNonEmpty(
-			getString(accountObj, "email"),
-			getString(m, "email"),
-			getString(m, "identifier"),
+		Email: core.FirstNonEmpty(
+			core.GetString(accountObj, "email"),
+			core.GetString(m, "email"),
+			core.GetString(m, "identifier"),
 		),
-		Label:    firstNonEmpty(getString(m, "label"), getString(m, "name")),
+		Label:    core.FirstNonEmpty(core.GetString(m, "label"), core.GetString(m, "name")),
 		AuthMode: authMode,
-		BaseURL:  getString(m, "base_url"),
+		BaseURL:  core.GetString(m, "base_url"),
 	}
 
 	cred.EnsureIdentifiers()
@@ -204,13 +204,13 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string, targetRe
 	}
 
 	// 4. 特征字段识别
-	hasAgentID := getString(raw, "agent_id") != "" || getString(raw, "agentId") != ""
-	hasRealUserID := getString(raw, "realUserID") != "" || getString(raw, "real_user_id") != ""
-	hasMinimaxSignature := strings.Contains(strings.ToLower(getString(raw, "app_id")), "3001") ||
-		strings.Contains(strings.ToLower(getString(raw, "client_id")), "mcode-public")
+	hasAgentID := core.GetString(raw, "agent_id") != "" || core.GetString(raw, "agentId") != ""
+	hasRealUserID := core.GetString(raw, "realUserID") != "" || core.GetString(raw, "real_user_id") != ""
+	hasMinimaxSignature := strings.Contains(strings.ToLower(core.GetString(raw, "app_id")), "3001") ||
+		strings.Contains(strings.ToLower(core.GetString(raw, "client_id")), "mcode-public")
 
 	if hasAgentID || hasRealUserID || hasMinimaxSignature {
-		r := strings.ToLower(firstNonEmpty(getString(raw, "region"), getString(raw, "realm")))
+		r := strings.ToLower(core.FirstNonEmpty(core.GetString(raw, "region"), core.GetString(raw, "realm")))
 		if targetRegion == RegionGlobal && (r == "global" || r == "en" || r == "io") {
 			return true
 		}
@@ -276,24 +276,18 @@ func MergeStorageJSON(original []byte, cred *Credential) ([]byte, error) {
 	if cred.UUID != "" {
 		m["uuid"] = cred.UUID
 	}
-	if cred.Email != "" && getString(m, "email") == "" {
+	if cred.Email != "" && core.GetString(m, "email") == "" {
 		m["email"] = cred.Email
 	}
-	if cred.Label != "" && getString(m, "label") == "" {
+	if cred.Label != "" && core.GetString(m, "label") == "" {
 		m["label"] = cred.Label
 	}
 
 	return json.MarshalIndent(m, "", "  ")
 }
-
-// 辅助字段提取函数
-func firstNonEmpty(strs ...string) string               { return core.FirstNonEmpty(strs...) }
-func getString(m map[string]any, keys ...string) string { return core.GetString(m, keys...) }
 func getInt(m map[string]any, keys ...string) int {
-	return int(getInt64(m, keys...))
+	return int(core.GetInt64(m, keys...))
 }
-
-func getInt64(m map[string]any, keys ...string) int64 { return core.GetInt64(m, keys...) }
 func getSubMap(m map[string]any, key string) map[string]any {
 	if m == nil {
 		return nil

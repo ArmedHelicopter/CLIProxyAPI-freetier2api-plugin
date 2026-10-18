@@ -96,7 +96,7 @@ func LoginStart(ctx context.Context) (*pluginapi.AuthLoginStartResponse, error) 
 		return nil, fmt.Errorf("OAuth 初始化返回的流程数据不完整")
 	}
 	// 服务端下发的 poll_token 优先（新协议）；未下发则沿用本地随机值。
-	effectiveToken := firstNonEmpty(payload.Data.PollToken, pollToken)
+	effectiveToken := core.FirstNonEmpty(payload.Data.PollToken, pollToken)
 
 	sessionID := "zcode_" + NewHexID(8)
 	loginsession.Register(VendorID, sessionID, loginFlowTTL, loginPollInterval, &pendingLogin{
@@ -193,7 +193,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 
 	// 判定依据是「拿到 JWT」而不是 status 字符串：上游给 token 即代表授权完成，
 	// 死等某个特定 status 值会让会话一直停在 pending 直到超时。
-	jwt := firstNonEmpty(payload.Data.Token, payload.Data.ZCodeJWTToken)
+	jwt := core.FirstNonEmpty(payload.Data.Token, payload.Data.ZCodeJWTToken)
 	if jwt == "" {
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
@@ -211,7 +211,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 	// 兑换失败不阻断登录——JWT 仍可用于额度查询与套餐领取。
 	apiWarning := ""
 	// access_token 可能在 data 顶层或 data.zai 下，两处都收。
-	accessToken := firstNonEmpty(payload.Data.Zai.AccessToken, payload.Data.AccessToken)
+	accessToken := core.FirstNonEmpty(payload.Data.Zai.AccessToken, payload.Data.AccessToken)
 	if accessToken != "" {
 		apiKey, errExchange := ExchangeAPIKey(ctx, accessToken)
 		if errExchange != nil {
@@ -223,7 +223,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 		apiWarning = "（上游未返回 access_token，未能兑换 API Key，该账号暂不能用于对话）"
 	}
 
-	cred.Label = firstNonEmpty(cred.Email, "ZCode-"+MaskedKey(firstNonEmpty(cred.APIKey, cred.JWTToken)))
+	cred.Label = core.FirstNonEmpty(cred.Email, "ZCode-"+MaskedKey(core.FirstNonEmpty(cred.APIKey, cred.JWTToken)))
 
 	storage, errJSON := cred.StorageJSON()
 	if errJSON != nil {
@@ -306,7 +306,7 @@ func exchangeBizToken(ctx context.Context, client *http.Client, accessToken stri
 	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
 		return "", fmt.Errorf("解析 z/login 响应失败：%w", errUnmarshal)
 	}
-	token := firstNonEmpty(payload.Data.AccessToken, payload.Data.AccessTokenAlt)
+	token := core.FirstNonEmpty(payload.Data.AccessToken, payload.Data.AccessTokenAlt)
 	if token == "" {
 		return "", fmt.Errorf("z/login 响应不含业务凭证")
 	}
@@ -466,7 +466,7 @@ func OwnsLoginSession(sessionID string) bool {
 
 // zcodeFileName 生成凭证文件名（邮箱优先，便于辨识账号）。
 func zcodeFileName(cred *Credential) string {
-	seed := firstNonEmpty(cred.Email, MaskedKey(firstNonEmpty(cred.APIKey, cred.JWTToken)))
+	seed := core.FirstNonEmpty(cred.Email, MaskedKey(core.FirstNonEmpty(cred.APIKey, cred.JWTToken)))
 	return fileNameFor(seed)
 }
 

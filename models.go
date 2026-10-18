@@ -42,28 +42,28 @@ type authModelRPCRequest struct {
 func handleModelStatic(request []byte) ([]byte, error) {
 	var rpc staticModelRPCRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	ctx := httpx.WithCallbackID(context.Background(), rpc.HostCallbackID)
 	models, errModels := staticModels(ctx)
 	if errModels != nil {
 		return nil, errModels
 	}
-	return okEnvelope(pluginapi.ModelResponse{Provider: providerKey, Models: models})
+	return core.OKEnvelope(pluginapi.ModelResponse{Provider: providerKey, Models: models})
 }
 
 // handleModelRegister 处理宿主的 model.register 契约（ModelRegistrar）。
 func handleModelRegister(request []byte) ([]byte, error) {
 	var rpc staticModelRPCRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	ctx := httpx.WithCallbackID(context.Background(), rpc.HostCallbackID)
 	models, errModels := staticModels(ctx)
 	if errModels != nil {
 		return nil, errModels
 	}
-	return okEnvelope(pluginapi.ModelRegistrationResponse{Provider: providerKey, Models: models})
+	return core.OKEnvelope(pluginapi.ModelRegistrationResponse{Provider: providerKey, Models: models})
 }
 
 // handleModelForAuth 返回某个凭证可用的模型清单。
@@ -73,7 +73,7 @@ func handleModelRegister(request []byte) ([]byte, error) {
 func handleModelForAuth(request []byte) ([]byte, error) {
 	var rpc authModelRPCRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	ctx := httpx.WithCallbackID(context.Background(), rpc.HostCallbackID)
 
@@ -83,19 +83,19 @@ func handleModelForAuth(request []byte) ([]byte, error) {
 		// 取不到凭证时返回空清单而不是报错：宿主会因为空清单而不再路由到
 		// 这个凭证，这正是我们想要的结果（避免用坏凭证打上游）。
 		logger.Debug("model.for_auth: no credential for %s: %v", rpc.AuthID, errResolve)
-		return okEnvelope(pluginapi.ModelResponse{Provider: providerKey})
+		return core.OKEnvelope(pluginapi.ModelResponse{Provider: providerKey})
 	}
 	if !realmEnabled(loadedConfig(), vendor.Region()) {
 		// 供应商所在的区域被配置关闭：同样返回空清单，让宿主自然跳过该账号。
-		return okEnvelope(pluginapi.ModelResponse{Provider: providerKey})
+		return core.OKEnvelope(pluginapi.ModelResponse{Provider: providerKey})
 	}
 
 	models, errModels := core.ModelsFor(vendor, ctx, credential)
 	if errModels != nil {
 		logger.Debug("model.for_auth: probe models for %s failed: %v", vendor.ID(), errModels)
-		return okEnvelope(pluginapi.ModelResponse{Provider: providerKey})
+		return core.OKEnvelope(pluginapi.ModelResponse{Provider: providerKey})
 	}
-	return okEnvelope(pluginapi.ModelResponse{
+	return core.OKEnvelope(pluginapi.ModelResponse{
 		Provider: providerKey,
 		Models:   applyModelAliases(vendor.ID(), filterDisabledModelsForVendor(vendor.ID(), models)),
 	})

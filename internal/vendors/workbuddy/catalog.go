@@ -156,7 +156,7 @@ func (e dynModelEntry) toModelInfo() ModelInfo {
 		ContextWindow:      e.MaxInputTokens,
 		MaxTokens:          e.MaxOutputTokens,
 		Efforts:            normalizeEfforts(e.Reasoning.SupportedEfforts),
-		DefaultEffort:      firstNonEmpty(e.Reasoning.DefaultEffort, e.Reasoning.Effort),
+		DefaultEffort:      core.FirstNonEmpty(e.Reasoning.DefaultEffort, e.Reasoning.Effort),
 		Credits:            strings.TrimSpace(e.Credits),
 		SupportsImages:     e.SupportsImages,
 		SupportsToolCall:   e.SupportsTool,
@@ -166,8 +166,6 @@ func (e dynModelEntry) toModelInfo() ModelInfo {
 		IsDefault:          e.IsDefault,
 	}
 }
-
-func firstNonEmpty(values ...string) string { return core.FirstNonEmpty(values...) }
 
 // normalizeEfforts 去重并保持顺序。
 func normalizeEfforts(raw []string) []string {

@@ -134,9 +134,9 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 		return nil, fmt.Errorf("decode ticket response: %w", err)
 	}
 
-	ak := firstNonEmpty(res.Credentials.AccessKeyID, res.Credential.Access)
-	sk := firstNonEmpty(res.Credentials.SecretAccessKey, res.Credential.Secret)
-	st := firstNonEmpty(res.Credentials.SecurityToken, res.Credential.SecurityToken)
+	ak := core.FirstNonEmpty(res.Credentials.AccessKeyID, res.Credential.Access)
+	sk := core.FirstNonEmpty(res.Credentials.SecretAccessKey, res.Credential.Secret)
+	st := core.FirstNonEmpty(res.Credentials.SecurityToken, res.Credential.SecurityToken)
 
 	if ak == "" || sk == "" {
 		return &pluginapi.AuthLoginPollResponse{
@@ -147,7 +147,7 @@ func LoginPoll(ctx context.Context, sessionID string) (*pluginapi.AuthLoginPollR
 
 	loginsession.Delete(sessionID)
 
-	uid := firstNonEmpty(res.UserID, res.UserName, "codearts-user")
+	uid := core.FirstNonEmpty(res.UserID, res.UserName, "codearts-user")
 	cred := &Credential{
 		Vendor:          VendorID,
 		UserID:          res.UserID,

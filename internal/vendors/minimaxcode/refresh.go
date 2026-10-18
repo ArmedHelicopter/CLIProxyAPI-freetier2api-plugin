@@ -50,22 +50,22 @@ func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride st
 		return nil, false, fmt.Errorf("decode refresh response (HTTP %d): %w", resp.StatusCode, errDec)
 	}
 
-	if resp.StatusCode >= 400 || getString(payload, "error") != "" {
-		errDesc := firstNonEmpty(
-			getString(payload, "error_description"),
-			getString(payload, "error"),
+	if resp.StatusCode >= 400 || core.GetString(payload, "error") != "" {
+		errDesc := core.FirstNonEmpty(
+			core.GetString(payload, "error_description"),
+			core.GetString(payload, "error"),
 			fmt.Sprintf("HTTP %d", resp.StatusCode),
 		)
 		return nil, false, fmt.Errorf("minimax refresh token rejected: %s", errDesc)
 	}
 
-	accessToken := getString(payload, "access_token", "accessToken")
+	accessToken := core.GetString(payload, "access_token", "accessToken")
 	if accessToken == "" {
 		return nil, false, fmt.Errorf("minimax refresh response missing access_token")
 	}
 
-	newRefreshToken := getString(payload, "refresh_token", "refreshToken")
-	expiresIn := getInt64(payload, "expires_in", "expiresIn")
+	newRefreshToken := core.GetString(payload, "refresh_token", "refreshToken")
+	expiresIn := core.GetInt64(payload, "expires_in", "expiresIn")
 	if expiresIn <= 0 {
 		expiresIn = 3600
 	}

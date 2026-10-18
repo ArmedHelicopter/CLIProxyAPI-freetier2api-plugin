@@ -23,6 +23,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/workbuddy"
@@ -124,7 +125,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodPluginQuiesce:
 		// 宿主要求停止接收新工作：停掉后台循环即可，在途请求由宿主等待。
 		stopBackgroundWork()
-		return okEnvelope(struct{}{})
+		return core.OKEnvelope(struct{}{})
 
 	case pluginabi.MethodModelRegister:
 		return handleModelRegister(request)
@@ -134,7 +135,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleModelForAuth(request)
 
 	case pluginabi.MethodAuthIdentifier:
-		return okEnvelope(identifierResponse{Identifier: providerKey})
+		return core.OKEnvelope(identifierResponse{Identifier: providerKey})
 	case pluginabi.MethodAuthParse:
 		return handleAuthParse(request)
 	case pluginabi.MethodAuthLoginStart:
@@ -145,7 +146,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleAuthRefresh(request)
 
 	case pluginabi.MethodExecutorIdentifier:
-		return okEnvelope(identifierResponse{Identifier: providerKey})
+		return core.OKEnvelope(identifierResponse{Identifier: providerKey})
 	case pluginabi.MethodExecutorExecute:
 		return handleExecutorExecute(request)
 	case pluginabi.MethodExecutorExecuteStream:
@@ -156,7 +157,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleExecutorHTTPRequest(request)
 
 	case pluginabi.MethodQuotaIdentifier:
-		return okEnvelope(identifierResponse{Identifier: providerKey})
+		return core.OKEnvelope(identifierResponse{Identifier: providerKey})
 	case pluginabi.MethodQuotaDescribe:
 		return handleQuotaDescribe(request)
 	case pluginabi.MethodQuotaFetch:
@@ -165,13 +166,13 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleQuotaReset(request)
 
 	case pluginabi.MethodManagementRegister:
-		return okEnvelope(managementRegistration())
+		return core.OKEnvelope(managementRegistration())
 	case pluginabi.MethodManagementHandle:
 		return handleManagement(request)
 
 	default:
 		// 未知方法以信封形式报错，而不是让上层 panic。
-		return errorEnvelope("unknown_method", "unknown method: "+method), nil
+		return core.ErrorEnvelope("unknown_method", "unknown method: "+method), nil
 	}
 }
 
@@ -201,7 +202,7 @@ func handlePluginRegister(request []byte) ([]byte, error) {
 	}
 	logger.Info("registered: realms=%v state_dir=%s prompt=%s",
 		cfg.EnabledRealms, cfg.StateDir, cfg.PromptMode)
-	return okEnvelope(pluginRegistration())
+	return core.OKEnvelope(pluginRegistration())
 }
 
 // handlePluginReconfigure 配置热更新。
@@ -227,7 +228,7 @@ func handlePluginReconfigure(request []byte) ([]byte, error) {
 	}
 	applyModelCatalog(cfg)
 	logger.Info("reconfigured: realms=%v state_dir=%s", cfg.EnabledRealms, cfg.StateDir)
-	return okEnvelope(pluginRegistration())
+	return core.OKEnvelope(pluginRegistration())
 }
 
 // configYAMLFrom 从生命周期请求里取出配置 YAML。

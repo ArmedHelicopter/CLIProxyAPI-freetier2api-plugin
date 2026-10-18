@@ -11,7 +11,7 @@ import (
 
 // 模拟宿主对同一条账号记录给出的三种标识（真实取值形态）。
 func TestAccountIdentityIsStableAcrossPaths(t *testing.T) {
-	entries := []hostAuthEntry{
+	entries := []core.HostAuth{
 		// 有文件名的常规账号（Qoder / ZCode / WorkBuddy 都是这种）。
 		{ID: "qodercn-nick1456600333", Name: "qodercn-nick1456600333.json", AuthIndex: "019fa299-3d61-7192-b903-0145508e658c"},
 		{ID: "zcode-ac90---6IY9", Name: "zcode-ac90---6IY9.json", AuthIndex: "a1b2c3d4"},
@@ -35,15 +35,15 @@ func TestAccountIdentityIsStableAcrossPaths(t *testing.T) {
 
 // 运行时账号没有 Name（宿主内建 provider），必须回落到 ID。
 func TestAccountIdentityFallsBackToID(t *testing.T) {
-	if got := accountIdentity(hostAuthEntry{ID: "runtime-1", AuthIndex: "idx"}); got != "runtime-1" {
+	if got := accountIdentity(core.HostAuth{ID: "runtime-1", AuthIndex: "idx"}); got != "runtime-1" {
 		t.Fatalf("got %q, want runtime-1", got)
 	}
 	// 三者皆空时返回空串，由调用方决定处置（而不是凭空造一个身份）。
-	if got := accountIdentity(hostAuthEntry{}); got != "" {
+	if got := accountIdentity(core.HostAuth{}); got != "" {
 		t.Fatalf("got %q, want empty", got)
 	}
 	// .json 后缀必须剥掉，否则与凭证解析时的文件名不一致。
-	if got := accountIdentity(hostAuthEntry{Name: "cline-me@x.com.json"}); got != "cline-me@x.com" {
+	if got := accountIdentity(core.HostAuth{Name: "cline-me@x.com.json"}); got != "cline-me@x.com" {
 		t.Fatalf("got %q, want cline-me@x.com", got)
 	}
 }
@@ -57,7 +57,7 @@ func TestCheckinAndDisplayResolveSameIdentity(t *testing.T) {
 	// Qoder 凭证（UID 取自文件名）——这正是出问题的形态。
 	const qoderCredential = `{"type":"freetier","vendor":"qodercn","region":"cn",
 		"device_token":"dt-abc","refresh_token":"drt-xyz","label":"nick"}`
-	entry := hostAuthEntry{
+	entry := core.HostAuth{
 		ID:        "qodercn-nick1456600333",
 		Name:      "qodercn-nick1456600333.json",
 		AuthIndex: "019fa299-3d61-7192-b903-0145508e658c",

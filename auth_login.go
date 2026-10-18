@@ -50,7 +50,7 @@ type loginPollRPCRequest struct {
 func handleAuthLoginStart(request []byte) ([]byte, error) {
 	var rpc loginStartRPCRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	vendor, errVendor := vendorForLogin(rpc.Metadata)
 	if errVendor != nil {
@@ -83,7 +83,7 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 		response.Metadata["region"] = vendor.Region()
 	}
 	logger.Info("started login (vendor=%s)", vendor.ID())
-	return okEnvelope(response)
+	return core.OKEnvelope(response)
 }
 
 // handleAuthLoginPoll 轮询一次登录状态。
@@ -92,11 +92,11 @@ func handleAuthLoginStart(request []byte) ([]byte, error) {
 func handleAuthLoginPoll(request []byte) ([]byte, error) {
 	var rpc loginPollRPCRequest
 	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
-		return nil, newPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
 	}
 	sessionID := strings.TrimSpace(rpc.State)
 	if sessionID == "" {
-		return nil, newPluginError("invalid_request", "login state is required", http.StatusBadRequest)
+		return nil, core.NewPluginError("invalid_request", "login state is required", http.StatusBadRequest)
 	}
 	vendor, errVendor := vendorForLoginSession(sessionID)
 	if errVendor != nil {
@@ -114,7 +114,7 @@ func handleAuthLoginPoll(request []byte) ([]byte, error) {
 	if errPoll != nil {
 		return nil, core.ToPluginError(errPoll)
 	}
-	return okEnvelope(response)
+	return core.OKEnvelope(response)
 }
 
 // vendorForLogin 从登录请求的 Metadata 解析目标供应商。
@@ -126,11 +126,11 @@ func vendorForLogin(metadata map[string]any) (core.Vendor, error) {
 		if rawVendor, okVendor := metadata[core.VendorKey].(string); okVendor {
 			vendor, okLookup := core.VendorByID(rawVendor)
 			if !okLookup {
-				return nil, newPluginError("invalid_request",
+				return nil, core.NewPluginError("invalid_request",
 					fmt.Sprintf("unknown vendor %q", rawVendor), http.StatusBadRequest)
 			}
 			if !vendorEnabled(vendor) {
-				return nil, newPluginError("vendor_disabled",
+				return nil, core.NewPluginError("vendor_disabled",
 					fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
 			}
 			return vendor, nil
@@ -145,7 +145,7 @@ func vendorForLogin(metadata map[string]any) (core.Vendor, error) {
 	if vendor, okDefault := firstEnabledVendor(); okDefault {
 		return vendor, nil
 	}
-	return nil, newPluginError("vendor_disabled", "no vendor is enabled by plugin configuration", http.StatusBadRequest)
+	return nil, core.NewPluginError("vendor_disabled", "no vendor is enabled by plugin configuration", http.StatusBadRequest)
 }
 
 // vendorForLoginSession 按登录会话找供应商。
@@ -163,7 +163,7 @@ func vendorForLoginSession(sessionID string) (core.Vendor, error) {
 			return vendor, nil
 		}
 	}
-	return nil, newPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
+	return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
 }
 
 // vendorEnabled 报告供应商的区域是否被配置启用。

@@ -132,3 +132,28 @@ func logHostCallFailure(method string, err error) {
 	}
 	logger.Debug("host callback %s failed: %v", method, err)
 }
+
+// hostEnvelope 是宿主回调返回的信封（与插件响应信封同形）。
+type hostEnvelope struct {
+	OK     bool            `json:"ok"`
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  *struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	} `json:"error,omitempty"`
+}
+
+// decodeEnvelopeResult 解开宿主回调返回的信封，取出 result 部分。
+func decodeEnvelopeResult(raw []byte) (json.RawMessage, error) {
+	var env hostEnvelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode envelope: %w", errUnmarshal)
+	}
+	if !env.OK {
+		if env.Error != nil {
+			return nil, fmt.Errorf("%s: %s", env.Error.Code, env.Error.Message)
+		}
+		return nil, fmt.Errorf("host callback failed")
+	}
+	return append(json.RawMessage(nil), env.Result...), nil
+}
