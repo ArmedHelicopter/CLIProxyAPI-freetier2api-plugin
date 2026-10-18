@@ -46,9 +46,12 @@ package main                     纯 ABI 适配层：把宿主 RPC 翻译成 Ven
   ├─ hostbridge.go                 把宿主能力注入 core.Host 端口
   └─ auth*/models*/executor*/…     五类能力处理器（不含任何供应商协议逻辑）
 
-internal/core                    供应商无关的骨架：Vendor 接口、注册表、
-                                 共享 Credential、模型 ID 协议、错误映射
-                                 （core.Host 端口 / BaseVendor / 通用助手）
+internal/core                    供应商无关的骨架：必需的 Vendor 接口 +
+                                 可选能力接口（登录/额度/签到/任务/配置…）、
+                                 注册表、共享 Credential、模型 ID 协议、错误映射
+                                 （core.Meta / core.Host / 通用助手）
+
+internal/console                 内嵌控制台页面（console.html + go:embed）
 
 internal/loginsession             供应商无关的登录会话登记表（TTL / 轮询节流 / 归属）
 
@@ -59,9 +62,10 @@ internal/vendors/<name>           协议层 + 适配层同包：
 ```
 
 新增一个供应商：在 `internal/vendors/<name>` 写协议实现与 `adapter.go`
-（嵌入 `core.BaseVendor`），在 `vendor_register.go` 加一行 `Instances()`，
-再在 README 的配置表里补一行。根层五类处理器全部经 `core.Vendor` 分发，
-**没有任何 per-vendor switch**。
+（嵌入 `core.Meta`），只实现自己支持的能力接口（登录/额度/签到/任务等），
+在 `vendor_register.go` 加一行 `Instances()`，再在 README 的配置表里补一行。
+**不支持的能力不实现、不建文件**；根层五类处理器全部经 `core.Vendor` 与
+能力断言分发，没有任何 per-vendor switch。
 
 ### 凭证归属判定
 

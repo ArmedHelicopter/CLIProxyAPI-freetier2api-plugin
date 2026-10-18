@@ -17,7 +17,6 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
 const (
@@ -65,7 +64,7 @@ func (p preparedExecution) executeRequest() *core.ExecuteRequest {
 		Model:    p.model,
 		Payload:  payload,
 		Headers:  p.rpc.Headers,
-		ClientIP: workbuddy.ExtractClientIP(p.rpc.Headers),
+		ClientIP: core.ExtractClientIP(p.rpc.Headers),
 		Stream:   p.rpc.Stream,
 	}
 }
@@ -376,7 +375,7 @@ func gatewayHint(code string, prepared preparedExecution) string {
 	trimmed := strings.TrimSpace(code)
 	switch trimmed {
 	case "11133":
-		if workbuddy.HasImagePart(prepared.rpc.Payload) && !preparedSupportsImages(prepared) {
+		if core.HasImagePart(prepared.rpc.Payload) && !preparedSupportsImages(prepared) {
 			return "model " + prepared.model + " does not support images; pick one with image support from /v1/models"
 		}
 		return "request parameters were rejected by the model provider; check message format and model capabilities"
@@ -397,9 +396,9 @@ func gatewayHint(code string, prepared preparedExecution) string {
 // 查上游模型缓存；查不到时保守返回 true（放行总比误拒好——上游会对
 // 不支持的模型给出明确错误，而误拒会让正常请求直接失败）。
 func preparedSupportsImages(prepared preparedExecution) bool {
-	for _, model := range workbuddy.CachedModels()[workbuddy.NormalizeRegion(prepared.vendor.Region())] {
-		if model.ID == prepared.model {
-			return model.SupportsImages
+	for _, model := range registeredModelsForVendor(prepared.vendor.ID()) {
+		if strings.EqualFold(model.ID, prepared.model) {
+			return modelSupportsImages(model)
 		}
 	}
 	return true

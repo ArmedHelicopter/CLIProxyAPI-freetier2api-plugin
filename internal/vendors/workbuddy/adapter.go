@@ -449,3 +449,24 @@ func clientFor(ctx context.Context) (*Client, error) {
 }
 
 func (v *adapter) SupportsCheckin() bool { return !v.region.IsGlobal() }
+
+// ConsoleModels 返回控制台模型页需要的展示明细（含积分倍率）。
+func (v *adapter) ConsoleModels() []core.ConsoleModel {
+	cached := CachedModels()[NormalizeRegion(string(v.region))]
+	out := make([]core.ConsoleModel, 0, len(cached))
+	for _, model := range cached {
+		out = append(out, core.ConsoleModel{
+			ID:              model.ID,
+			Name:            model.Name,
+			Description:     model.Description,
+			ContextLength:   model.ContextWindow,
+			MaxOutputTokens: model.MaxTokens,
+			Efforts:         model.Efforts,
+			DefaultEffort:   model.DefaultEffort,
+			SupportsImages:  model.SupportsImages,
+			SupportsTools:   model.SupportsToolCall,
+			Credits:         model.Credits,
+		})
+	}
+	return out
+}

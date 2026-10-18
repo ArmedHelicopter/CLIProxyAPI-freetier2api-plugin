@@ -22,11 +22,11 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/console"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/opencodezen"
-	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
 const (
@@ -90,7 +90,7 @@ func handleManagement(request []byte) ([]byte, error) {
 
 	switch {
 	case method == http.MethodGet && matchesResourcePath(rpc.Path, "/console"):
-		return okEnvelope(htmlResponse(http.StatusOK, []byte(consolePageHTML(managementRoutePrefix))))
+		return okEnvelope(htmlResponse(http.StatusOK, []byte(console.Page(managementRoutePrefix))))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, "/status"):
 		return okEnvelope(jsonResponse(http.StatusOK, buildStatusPayload(rpc)))
@@ -366,40 +366,37 @@ func handleModelsList(req pluginapi.ManagementRequest) pluginapi.ManagementRespo
 
 // consoleModelsForVendor 取某个供应商的模型清单（供控制台页展示）。
 //
-// 走协议层各自的缓存：WorkBuddy 的缓存按区域存（含上下文窗口与推理档位），
-// Qoder 的清单需要按凭证向上游拉（有内置兜底）。取不到时返回空——
-// 页面少显示几个模型比让整个模型页报错好。
+// 供应商可通过 core.ConsoleModelProvider 提供更完整的明细（如积分倍率）；
+// 未提供时从已注册的模型清单回读，不主动打上游。
 func consoleModelsForVendor(vendor core.Vendor) []consoleModel {
-	switch vendor.ID() {
-	case workbuddy.VendorIDCN, workbuddy.VendorIDGlobal:
-		region := workbuddy.NormalizeRegion(vendor.Region())
-		cached := workbuddy.CachedModels()[region]
-		out := make([]consoleModel, 0, len(cached))
-		for _, model := range cached {
-			out = append(out, consoleModel{
-				ID:              model.ID,
-				ScopeID:         core.ModelKeyFor(vendor.ID(), model.ID),
-				VendorID:        vendor.ID(),
-				VendorName:      vendor.Name(),
-				Realm:           vendor.Region(),
-				Name:            model.Name,
-				Description:     model.Description,
-				ContextLength:   model.ContextWindow,
-				MaxOutputTokens: model.MaxTokens,
-				Efforts:         model.Efforts,
-				DefaultEffort:   model.DefaultEffort,
-				SupportsImages:  model.SupportsImages,
-				SupportsTools:   model.SupportsToolCall,
-				Credits:         model.Credits,
-			})
-		}
-		return out
-	default:
-		// 其它供应商（Qoder）：从刚注册的模型清单回读。
-		// 这里不主动打上游——管理页的「读取模型清单」应当是轻量操作，
-		// 真正的上游探测由「从上游刷新」按钮触发。
-		return consoleModelsFromRegistry(vendor)
+	if provider, okProvider := core.As[core.ConsoleModelProvider](vendor); okProvider {
+		return consoleModelsFromProvider(vendor, provider.ConsoleModels())
 	}
+	return consoleModelsFromRegistry(vendor)
+}
+
+// consoleModelsFromProvider 把供应商提供的明细映射成页面模型。
+func consoleModelsFromProvider(vendor core.Vendor, models []core.ConsoleModel) []consoleModel {
+	out := make([]consoleModel, 0, len(models))
+	for _, model := range models {
+		out = append(out, consoleModel{
+			ID:              model.ID,
+			ScopeID:         core.ModelKeyFor(vendor.ID(), model.ID),
+			VendorID:        vendor.ID(),
+			VendorName:      vendor.Name(),
+			Realm:           vendor.Region(),
+			Name:            model.Name,
+			Description:     model.Description,
+			ContextLength:   model.ContextLength,
+			MaxOutputTokens: model.MaxOutputTokens,
+			Efforts:         model.Efforts,
+			DefaultEffort:   model.DefaultEffort,
+			SupportsImages:  model.SupportsImages,
+			SupportsTools:   model.SupportsTools,
+			Credits:         model.Credits,
+		})
+	}
+	return out
 }
 
 // consoleModelsFromRegistry 从插件注册表里已有的模型清单回读某个供应商的模型。

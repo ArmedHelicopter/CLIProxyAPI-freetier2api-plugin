@@ -104,6 +104,7 @@ func TestVendorCapabilities(t *testing.T) {
 		merge      bool
 		configure  bool
 		loginOwner bool
+		console    bool
 		authMode   string
 	}
 	cases := map[string]want{
@@ -117,8 +118,8 @@ func TestVendorCapabilities(t *testing.T) {
 		"traecn":            {login: true, refresh: true, quota: true, checkin: true, merge: true, loginOwner: true},
 		"traeglobal":        {login: true, refresh: true, quota: true, checkin: true, merge: true, loginOwner: true},
 		"traesolo":          {login: true, refresh: true, quota: true, checkin: true, merge: true, loginOwner: true},
-		"workbuddycn":       {login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, loginOwner: true},
-		"workbuddyglobal":   {login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, loginOwner: true},
+		"workbuddycn":       {login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, loginOwner: true, console: true},
+		"workbuddyglobal":   {login: true, refresh: true, quota: true, checkin: true, tasks: true, models: true, merge: true, loginOwner: true, console: true},
 		"zcode":             {login: true, refresh: true, quota: true, merge: true, configure: true, loginOwner: true, authMode: "oauth"},
 	}
 	for _, vendor := range core.Vendors() {
@@ -135,6 +136,7 @@ func TestVendorCapabilities(t *testing.T) {
 		_, hasMerge := core.As[core.StorageMerger](vendor)
 		_, hasConfigure := core.As[core.Configurable](vendor)
 		_, hasOwner := core.As[core.LoginSessionOwner](vendor)
+		_, hasConsole := core.As[core.ConsoleModelProvider](vendor)
 		authMode := ""
 		if reporter, okReporter := core.As[core.AuthModeReporter](vendor); okReporter {
 			authMode = reporter.AuthMode()
@@ -142,7 +144,7 @@ func TestVendorCapabilities(t *testing.T) {
 		got := want{
 			login: hasLogin, refresh: hasRefresh, quota: hasQuota, checkin: hasCheckin,
 			tasks: hasTasks, models: hasModels, merge: hasMerge, configure: hasConfigure,
-			loginOwner: hasOwner, authMode: authMode,
+			loginOwner: hasOwner, console: hasConsole, authMode: authMode,
 		}
 		if got != expected {
 			t.Fatalf("vendor %s capabilities = %+v, want %+v", vendor.ID(), got, expected)

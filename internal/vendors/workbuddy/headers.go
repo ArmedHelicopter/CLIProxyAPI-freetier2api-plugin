@@ -9,6 +9,8 @@ package workbuddy
 import (
 	"net/http"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // ChatMeta 是与单次对话关联的会话头族。
@@ -323,15 +325,4 @@ func v3ConfigDomain(cred *Credential) string {
 //
 // 只在 PassthroughIP 开启时使用；透传客户端 IP 会给上游提供额外的关联信息，
 // 因此默认关闭。
-func ExtractClientIP(header http.Header) string {
-	if header == nil {
-		return ""
-	}
-	if forwarded := strings.TrimSpace(header.Get("X-Forwarded-For")); forwarded != "" {
-		if idx := strings.IndexByte(forwarded, ','); idx >= 0 {
-			forwarded = forwarded[:idx]
-		}
-		return strings.TrimSpace(forwarded)
-	}
-	return strings.TrimSpace(header.Get("X-Real-IP"))
-}
+func ExtractClientIP(header http.Header) string { return core.ExtractClientIP(header) }

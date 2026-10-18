@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"math/big"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // NewHexID 生成 32 位十六进制随机 ID（与官方客户端的 messageId 形态一致）。
@@ -196,33 +198,4 @@ func TurnRequestID(key string) string {
 //
 // 用于错误提示：上游对「模型不支持图片」与「图片请求本身有问题」
 // 返回的码很近，区分它们才能给出有用的提示。
-func HasImagePart(body []byte) bool {
-	payload := decodeBodyMap(body)
-	if payload == nil {
-		return false
-	}
-	messages, okMessages := payload["messages"].([]any)
-	if !okMessages {
-		return false
-	}
-	for _, item := range messages {
-		message, okMessage := item.(map[string]any)
-		if !okMessage {
-			continue
-		}
-		parts, okParts := message["content"].([]any)
-		if !okParts {
-			continue
-		}
-		for _, part := range parts {
-			partMap, okPartMap := part.(map[string]any)
-			if !okPartMap {
-				continue
-			}
-			if partType, okType := partMap["type"].(string); okType && partType == "image_url" {
-				return true
-			}
-		}
-	}
-	return false
-}
+func HasImagePart(body []byte) bool { return core.HasImagePart(body) }

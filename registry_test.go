@@ -20,6 +20,7 @@ import (
 	"strings"
 	"testing"
 
+	"freetier2api-plugin/internal/console"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
 
@@ -105,7 +106,7 @@ func TestPluginIDMatchesLibraryName(t *testing.T) {
 //
 // 页面引用了未声明的路由会表现为「点了没反应」，而宿主不会报错。
 func TestConsolePagePathsAreDeclared(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 
 	declared := map[string]bool{}
 	for _, route := range managementRegistration().Routes {
@@ -142,7 +143,7 @@ func TestConsolePagePathsAreDeclared(t *testing.T) {
 // 密钥由公开值派生，所以同源页面能解出来。这里断言页面确实实现了这套算法
 // （算法细节若与面板不一致，用户会看到 401 且原因极难定位）。
 func TestConsolePageDecodesPanelKey(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 
 	// 混淆格式与快照字段必须与面板一致。
 	for _, literal := range []string{
@@ -199,7 +200,7 @@ func TestConsolePageDecodesPanelKey(t *testing.T) {
 //  2. 有密钥 → 只发一个探针，成功才加载首屏，且首屏串行；
 //  3. 任一 401/403 → 立刻停掉全部自动刷新与轮询定时器。
 func TestConsolePageNeverCallsWithoutKey(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 
 	// 1) api() 闸门：未认证/已失效不出网，没有密钥也不出网。
 	for _, literal := range []string{
@@ -254,7 +255,7 @@ func TestConsolePageNeverCallsWithoutKey(t *testing.T) {
 // 之间的 RPC 格式，不会到达前端。若页面再剥一层 "result"，所有业务字段都会
 // 变成 undefined——表现就是「接口 200 但界面全空」，且极难定位。
 func TestConsolePageDoesNotUnwrapHostBody(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 
 	// 注意用正则精确匹配：字符串包含 "data.result" 也会命中 "data.results"（合法字段）。
 	if unwrapRe.MatchString(page) {
@@ -283,7 +284,7 @@ func TestConsolePageDoesNotUnwrapHostBody(t *testing.T) {
 //
 // 页面必须走这两个端点（而不是插件自己的路由），否则「添加账号」不可用。
 func TestConsolePageWiresHostOAuthLogin(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 
 	for _, literal := range []string{
 		"/freetier-auth-url", // 与 providerKey 拼接，宿主按此匹配 auth provider
@@ -402,7 +403,7 @@ func TestManagementResponseUsesHostWireFormat(t *testing.T) {
 //
 // 标签页会把额度、模型、任务藏起来，管理页应当一眼看全。
 func TestConsolePageIsSingleScrollLayout(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 
 	// 不应再有导航与视图切换。
 	for _, forbidden := range []string{"<nav>", "data-view=", "switchView", `id="view-accounts" hidden`} {
@@ -446,7 +447,7 @@ func TestConsolePageIsSingleScrollLayout(t *testing.T) {
 //
 // 逐账号一个按钮在账号多时既难用也容易误点；统一成「全部账号依次执行」。
 func TestConsolePageHasBulkTaskButton(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 
 	if !strings.Contains(page, `id="btnAutoAll"`) {
 		t.Fatal("console page must expose a bulk task button")
@@ -465,7 +466,7 @@ func TestConsolePageHasBulkTaskButton(t *testing.T) {
 // CPA 按客户端 IP 统计管理鉴权失败次数，连续失败会封禁该 IP
 // （连正确密钥也会被拒），因此必须停。
 func TestConsolePageStopsPollingOnAuthFailure(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 	if !strings.Contains(page, "haltOnAuthFailure") {
 		t.Fatal("console page must stop polling on auth failure to avoid an IP ban")
 	}
@@ -478,7 +479,7 @@ func TestConsolePageStopsPollingOnAuthFailure(t *testing.T) {
 //
 // 资源页不做管理鉴权，因此页面本身绝不能带账号或令牌。
 func TestConsolePageIsStaticAndSelfContained(t *testing.T) {
-	page := consolePageHTML(managementRoutePrefix)
+	page := console.Page(managementRoutePrefix)
 
 	for _, forbidden := range []string{"accessToken", "refreshToken", "device_token", "Authorization: Bearer sk-"} {
 		if strings.Contains(page, forbidden) {
