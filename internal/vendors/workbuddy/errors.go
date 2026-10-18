@@ -20,42 +20,21 @@ import (
 //
 // 判定顺序是有语义的，不能重排（见 Classify 的注释）。
 
-// Kind 是错误类别。
-type Kind = core.FailureKind
-
-const (
-	// KindNone 表示成功。
-	KindNone Kind = core.FailureKindNone
-	// KindHardCredit 余额耗尽（402 或余额关键词）→ 长冷却到次日。
-	KindHardCredit = core.FailureKindHardCredit
-	// KindSoftRate 限流（429）→ 短冷却，指数退避。
-	KindSoftRate = core.FailureKindSoftRate
-	// KindSessionDead 会话失效（12153）→ 禁用，需重新登录。
-	KindSessionDead = core.FailureKindSessionDead
-	// KindNotFound 上游偶发 404 → 固定短冷却，不累计熔断。
-	KindNotFound = core.FailureKindNotFound
-	// KindServer 上游 5xx → 计入熔断。
-	KindServer = core.FailureKindServer
-	// KindContentBlocked 内容策略拦截 → 不罚账号，可降级重试。
-	KindContentBlocked = core.FailureKindContentBlocked
-	// KindBadParams 参数非法 → 不罚账号，但仍换号重试。
-	KindBadParams = core.FailureKindBadParams
-	// KindAccountFault 账号级故障（request illegal / trial 未激活）→ 冷却轮换。
-	KindAccountFault = core.FailureKindAccountFault
-	// KindModelBlocked 该后端无此模型（11102）→ 按（账号, 模型）避让。
-	KindModelBlocked = core.FailureKindModelBlocked
-	// KindWAFBlock 上游 WAF 拦截（403 非业务信封）→ 账号软冷却。
-	KindWAFBlock = core.FailureKindWAFBlock
-	// KindPromptTooLong 上下文超限（11115）→ 请求级，不罚号不轮转。
-	KindPromptTooLong = core.FailureKindPromptTooLong
-	// KindImageInvalid 图片无效 → 请求级，不罚号不轮转。
-	KindImageInvalid = core.FailureKindImageInvalid
-	// KindClient 其他 4xx / 业务错误。
-	KindClient = core.FailureKindClient
-)
-
-// Error 是带分类的上游错误。
-type Error = core.Failure
+// 本供应商使用的错误类别（与 core.FailureKind 一一对应）：
+//   - none：表示成功。
+//   - hard_credit：余额耗尽（402 或余额关键词）→ 长冷却到次日。
+//   - soft_rate：限流（429）→ 短冷却，指数退避。
+//   - session_dead：会话失效（12153）→ 禁用，需重新登录。
+//   - not_found：上游偶发 404 → 固定短冷却，不累计熔断。
+//   - server：上游 5xx → 计入熔断。
+//   - content_blocked：内容策略拦截 → 不罚账号，可降级重试。
+//   - bad_params：参数非法 → 不罚账号，但仍换号重试。
+//   - account_fault：账号级故障（request illegal / trial 未激活）→ 冷却轮换。
+//   - model_blocked：该后端无此模型（11102）→ 按（账号, 模型）避让。
+//   - waf_block：上游 WAF 拦截（403 非业务信封）→ 账号软冷却。
+//   - prompt_too_long：上下文超限（11115）→ 请求级，不罚号不轮转。
+//   - image_invalid：图片无效 → 请求级，不罚号不轮转。
+//   - client：其他 4xx / 业务错误。
 
 // 关键词表。
 //
@@ -120,76 +99,76 @@ var (
 //   - 11115（上下文超限）必须早于 404/5xx/WAF/内容策略：它是请求级错误，
 //     罚账号是错的；
 //   - accountFault 必须早于 429：账号被封的措辞里也可能带限流字样。
-func Classify(status int, body string) *Error {
+func Classify(status int, body string) *core.Failure {
 	lower := strings.ToLower(body)
 
 	// 0) 模型级避让：只比对独立字段，绝不做整段文本子串匹配——
 	// 否则 "11102" 撞在 requestId 上会误避让一个可用模型。
 	if isModelBlocked(status, body) {
-		return &Error{Kind: KindModelBlocked, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindModelBlocked, Status: status, Msg: body}
 	}
 	// 1) 余额耗尽（明确的 402）。
 	if status == http.StatusPaymentRequired {
-		return &Error{Kind: KindHardCredit, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindHardCredit, Status: status, Msg: body}
 	}
 	// 2) 会话失效。
 	if core.ContainsAny(lower, sessionDeadMarkers) {
-		return &Error{Kind: KindSessionDead, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindSessionDead, Status: status, Msg: body}
 	}
 	// 3) 账号级故障（注意：不能按 11140 判定——该 code 也承载模型级限流文案）。
 	if core.ContainsAny(lower, accountFaultMarkers) {
-		return &Error{Kind: KindAccountFault, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindAccountFault, Status: status, Msg: body}
 	}
 	// 4) 429 + 业务码 14018 表示余额真的耗尽。
 	if status == http.StatusTooManyRequests && hasBusinessCode(body, "14018") {
-		return &Error{Kind: KindHardCredit, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindHardCredit, Status: status, Msg: body}
 	}
 	// 5) 普通限流。
 	if status == http.StatusTooManyRequests {
-		return &Error{Kind: KindSoftRate, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindSoftRate, Status: status, Msg: body}
 	}
 	// 6) 余额关键词（在 429 之后）。
 	if core.ContainsAny(lower, hardMarkers) {
-		return &Error{Kind: KindHardCredit, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindHardCredit, Status: status, Msg: body}
 	}
 	// 7) 限流关键词。
 	if core.ContainsAny(lower, softRateMarkers) {
-		return &Error{Kind: KindSoftRate, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindSoftRate, Status: status, Msg: body}
 	}
 	// 8) 上下文超限（请求级）。
 	if (status == http.StatusBadRequest || status == http.StatusNotFound || status == http.StatusRequestEntityTooLarge) &&
 		core.ContainsAny(body, promptTooLongMarkers) {
-		return &Error{Kind: KindPromptTooLong, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindPromptTooLong, Status: status, Msg: body}
 	}
 	// 9) 偶发 404。
 	if status == http.StatusNotFound {
-		return &Error{Kind: KindNotFound, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindNotFound, Status: status, Msg: body}
 	}
 	// 10) 上游故障。
 	if status >= 500 {
-		return &Error{Kind: KindServer, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindServer, Status: status, Msg: body}
 	}
 	// 11) WAF 拦截：403 且没有业务信封（说明不是上游业务返回的）。
 	if IsWAFBlocked(status, body) {
-		return &Error{Kind: KindWAFBlock, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindWAFBlock, Status: status, Msg: body}
 	}
 	// 12) 图片无效。
 	if status == http.StatusBadRequest && (codeMarker(lower, "11135") || core.ContainsAny(lower, invalidImageMarkers)) {
-		return &Error{Kind: KindImageInvalid, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindImageInvalid, Status: status, Msg: body}
 	}
 	// 13) 内容策略拦截。
 	if status >= 400 && core.ContainsAny(lower, contentBlockedMarkers) {
-		return &Error{Kind: KindContentBlocked, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindContentBlocked, Status: status, Msg: body}
 	}
 	// 14) 参数非法。
 	if status >= 400 && (strings.Contains(lower, badParamsMarkerMsg) || strings.Contains(body, badParamsMarkerCode)) {
-		return &Error{Kind: KindBadParams, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindBadParams, Status: status, Msg: body}
 	}
 	// 15) 其他 4xx。
 	if status >= 400 {
-		return &Error{Kind: KindClient, Status: status, Msg: body}
+		return &core.Failure{Kind: core.FailureKindClient, Status: status, Msg: body}
 	}
-	return &Error{Kind: KindNone, Status: status, Msg: body}
+	return &core.Failure{Kind: core.FailureKindNone, Status: status, Msg: body}
 }
 
 // isModelBlocked 判断是否为「该后端无此模型」（11102）。

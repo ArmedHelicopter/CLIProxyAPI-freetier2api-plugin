@@ -177,13 +177,6 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 	}, nil
 }
 
-// OwnsLoginSession 报告该会话是否属于 CodeArts。
-func OwnsLoginSession(logins core.LoginSessions, sessionID string) bool {
-	if vendorID, okOwns := logins.Owns(sessionID); okOwns {
-		return vendorID == VendorID
-	}
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "codearts_")
-}
 func generateDPoPJWK() (map[string]string, error) {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

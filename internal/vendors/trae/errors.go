@@ -9,20 +9,10 @@ import (
 	"freetier2api-plugin/internal/core"
 )
 
-// 本文件实现 Trae 家族的上游错误分类。：解析 Trae 家族上游错误码。
+// 本文件实现 Trae 家族的上游错误分类：解析 Trae 家族上游错误码与业务码。
 
-type ErrorKind = core.FailureKind
-
-const (
-	KindCredential = core.FailureKindCredential
-	KindRateLimit  = core.FailureKindRateLimit
-	KindTransient  = core.FailureKindTransient
-	KindClient     = core.FailureKindClient
-)
-
-type Error = core.Failure
-
-func Classify(status int, body string) error {
+// Classify 把 Trae 上游响应分类成共享的上游错误。
+func Classify(status int, body string) *core.Failure {
 	var payload struct {
 		Code    int    `json:"code"`
 		Message string `json:"message"`
@@ -38,15 +28,15 @@ func Classify(status int, body string) error {
 
 	switch {
 	case status == http.StatusUnauthorized || payload.Code == 4001 || payload.Code == 4008:
-		return &Error{Kind: KindCredential, Status: status, Code: code, Msg: msg}
+		return &core.Failure{Kind: core.FailureKindCredential, Status: status, Code: code, Msg: msg}
 	case payload.Code == 1005 || strings.Contains(strings.ToLower(msg), "credit") || strings.Contains(msg, "积分不足"):
-		return &Error{Kind: KindCredential, Status: status, Code: "1005", Msg: "账号积分不足"}
+		return &core.Failure{Kind: core.FailureKindCredential, Status: status, Code: "1005", Msg: "账号积分不足"}
 	case status == http.StatusTooManyRequests || payload.Code == 429 || payload.Code == 9074:
-		return &Error{Kind: KindRateLimit, Status: status, Code: code, Msg: msg}
+		return &core.Failure{Kind: core.FailureKindRateLimit, Status: status, Code: code, Msg: msg}
 	case status >= 500:
-		return &Error{Kind: KindTransient, Status: status, Code: code, Msg: msg}
+		return &core.Failure{Kind: core.FailureKindTransient, Status: status, Code: code, Msg: msg}
 	default:
-		return &Error{Kind: KindClient, Status: status, Code: code, Msg: msg}
+		return &core.Failure{Kind: core.FailureKindClient, Status: status, Code: code, Msg: msg}
 	}
 }
 

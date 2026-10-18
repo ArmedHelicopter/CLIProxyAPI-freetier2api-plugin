@@ -191,8 +191,4 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 	return LoginPoll(ctx, state, v.sessions)
 }
 
-func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	return OwnsLoginSession(v.sessions, sessionID, v.ID())
-}
-
 func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.config) }

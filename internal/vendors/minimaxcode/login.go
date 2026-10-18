@@ -274,18 +274,6 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 	}, nil
 }
 
-// OwnsLoginSession 检查 sessionID 是否属于本 MiniMax Code 供应商实例。
-func OwnsLoginSession(logins core.LoginSessions, sessionID string, r Region) bool {
-	prefix := "minimaxcode_" + string(r) + "_"
-	if strings.HasPrefix(strings.ToLower(sessionID), prefix) {
-		return true
-	}
-	if vendorID, okOwns := logins.Owns(sessionID); okOwns {
-		return vendorID == VendorIDFor(r)
-	}
-	return false
-}
-
 // RefreshCredential 使用 refresh_token 刷新 MiniMax OAuth 访问令牌。
 func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride string) (*Credential, bool, error) {
 	if cred == nil {

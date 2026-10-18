@@ -1,5 +1,14 @@
 package zcode
 
+import (
+	"context"
+	"strings"
+	"time"
+
+	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
+)
+
 // 本文件把 ZCode 适配成 core.Vendor。
 //
 // 凭证形态是 oauth：账号由控制台发起 OAuth 登录产生（一次拿到 Coding Plan
@@ -9,15 +18,6 @@ package zcode
 // 通道选择：对话只走 API Key 通道（api.z.ai，免人机验证码）。Plan 通道
 // （Bearer JWT）被上游强制要求 X-Aliyun-Captcha-Verify-Param，而本插件不内置
 // 浏览器验证码求解。JWT 仍保留，供额度查询与套餐领取使用。
-
-import (
-	"context"
-	"strings"
-	"time"
-
-	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/core"
-)
 
 // adapter 是 core.Vendor 在 ZCode 上的实现。
 type adapter struct {
@@ -159,36 +159,10 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 	return LoginPoll(ctx, v.Env.Logins, state)
 }
 
-// OwnsLoginSession 报告该会话是否由本供应商创建。
-func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	return OwnsLoginSession(v.Env.Logins, sessionID)
-}
-
-// Refresh 校验凭证。
-//
-// ZCode 没有 refresh_token 流程（JWT 与 API Key 都不支持续期），因此这里只做
-// 本地校验并返回 refreshed=false——不触发无意义的写盘。
-func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
-	native, errNative := v.Native(cred)
-	if errNative != nil {
-		return nil, false, errNative
+// ConfigFields 声明 zcode 专属配置。
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{
+		{Name: "zcode_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"},
+		{Name: "zcode_claim_min_interval", Type: pluginapi.ConfigFieldTypeString, Description: "两次套餐领取之间的最小间隔（Go 时长，如 15s；0 表示不节流）。"},
 	}
-	if errValidate := ValidateCredential(ctx, native); errValidate != nil {
-		return nil, false, errValidate
-	}
-	return cred, false, nil
-}
-
-// ValidateCredential 校验凭证形态与上游可用性。
-//
-// 只做本地形态校验，不产生上游流量：宿主会在每次刷新时调用本方法，
-// 让它去打上游等于把额度查询变成了周期性的风控信号。
-func ValidateCredential(ctx context.Context, cred *Credential) error {
-	if cred == nil {
-		return transientErr("zcode credential is nil")
-	}
-	if strings.TrimSpace(cred.APIKey) == "" && strings.TrimSpace(cred.JWTToken) == "" {
-		return transientErr("zcode credential missing both api_key and jwt_token")
-	}
-	return nil
 }

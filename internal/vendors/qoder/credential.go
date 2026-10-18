@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
 
 // 供应商实例标识。同时是凭证文件名前缀。
@@ -26,20 +25,20 @@ const (
 	protocolName = "qoder"
 )
 
-// qoderapi.Region / qoderapi.RegionCN / qoderapi.RegionGlobal / qoderapi.NormalizeRegion 定义在 endpoints.go
+// Region / RegionCN / RegionGlobal / NormalizeRegion 定义在 endpoints.go
 // ——它们同时服务端点表，属于协议层的基础设施。
 
 // VendorIDFor 返回该区域对应的供应商标识。
-func VendorIDFor(region qoderapi.Region) string {
-	if region == qoderapi.RegionCN {
+func VendorIDFor(region Region) string {
+	if region == RegionCN {
 		return VendorIDCN
 	}
 	return VendorIDGlobal
 }
 
 // VendorNameFor 返回该区域的展示名。
-func VendorNameFor(region qoderapi.Region) string {
-	if region == qoderapi.RegionCN {
+func VendorNameFor(region Region) string {
+	if region == RegionCN {
 		return "Qoder 国内版"
 	}
 	return "Qoder 国际版"
@@ -61,7 +60,7 @@ type Credential struct {
 	// RefreshToken 用于续期（drt-… 前缀）。
 	RefreshToken string
 	// Region 是账号所属区域。
-	Region qoderapi.Region
+	Region Region
 	// Label 是展示名。
 	Label string
 	// Email 是账号邮箱（登录流程会填）。
@@ -69,7 +68,7 @@ type Credential struct {
 }
 
 // ParseCredential 解析 Qoder 凭证 JSON。
-func ParseCredential(raw []byte, fallbackRegion qoderapi.Region) (*Credential, error) {
+func ParseCredential(raw []byte, fallbackRegion Region) (*Credential, error) {
 	cred := &Credential{Region: fallbackRegion}
 	if len(raw) == 0 {
 		return cred, fmt.Errorf("credential is empty")
@@ -106,7 +105,7 @@ func ParseCredential(raw []byte, fallbackRegion qoderapi.Region) (*Credential, e
 		return cred, fmt.Errorf("credential has no token field (tried: %s)", strings.Join(credentialTokenKeys, ", "))
 	}
 	if region, okRegion := payload["region"].(string); okRegion && strings.TrimSpace(region) != "" {
-		cred.Region = qoderapi.NormalizeRegion(region)
+		cred.Region = NormalizeRegion(region)
 	}
 	if label, okLabel := payload["label"].(string); okLabel {
 		cred.Label = strings.TrimSpace(label)
@@ -178,12 +177,12 @@ func hasQoderTokenPrefix(raw map[string]any) bool {
 //
 // 与区域相关的字段只有一个 region（Qoder 的端点表不像 WorkBuddy 那样
 // 能从 domain 反推——它压根不写 domain 字段）。
-func RegionForCredential(raw map[string]any) qoderapi.Region {
+func RegionForCredential(raw map[string]any) Region {
 	if raw == nil {
 		return ""
 	}
 	if region, okRegion := raw["region"].(string); okRegion && strings.TrimSpace(region) != "" {
-		return qoderapi.NormalizeRegion(region)
+		return NormalizeRegion(region)
 	}
 	return ""
 }

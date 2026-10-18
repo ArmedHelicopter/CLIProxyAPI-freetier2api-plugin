@@ -97,16 +97,44 @@ tests/e2e                          完整 ABI 端到端
 tests/live                         实况探针（-tags live）
 tests/testhost                     共享假宿主
 
-internal/vendors/<name>            协议层 + 适配层同包，统一文件职责：
-  ├─ adapter.go                     core.Vendor 实现（嵌入 core.Meta，持有实例配置）
-  ├─ credential.go                  凭证类型/解析/归属/存储写回
-  ├─ client.go                      HTTP 端点/请求头/签名/对话执行
-  ├─ models.go                      模型目录与探测
-  ├─ login.go                       登录 + 续期
-  ├─ errors.go                      供应商专属错误分类
-  ├─ quota.go / checkin.go / tasks.go   可选能力
-  └─ payload.go / sse.go / protocol.go / sanitize.go   协议细节
+internal/vendors/<name>            协议层 + 适配层同包，文件名是**封闭白名单**：
+  ├─ adapter.go       [必需] core.Vendor 实现（嵌入 core.Meta）+ Instances/Configure/Match
+  │                          + 可选能力方法（薄转发）+ ConfigFields/RuntimeFields
+  ├─ chat.go          [必需] HTTP 传输（端点表/请求头/签名/会话基建）
+  │                          + 对话（请求体变换/协议转换/SSE 归一化/Chat/ChatStream）
+  ├─ credential.go    [必需] 凭证类型/解析/归属判定/存储写回 + 设备指纹与身份头
+  ├─ models.go        [必需] 模型目录与探测 + bundledModels() 兜底 + 控制台模型明细
+  ├─ login.go         [必需] 账号接入：AuthMode + 登录流程 + 续期
+  │                          （纯 API key 供应商只放脱敏等接入辅助）
+  ├─ errors.go        [可选] 上游错误分类：Classify(status, body) *core.Failure
+  ├─ tasks.go         [可选] 账号运营类能力：额度/签到/套餐领取/任务/每日奖励
+  ├─ protocol.go      [可选] 专有协议引擎（qoder：建链、模型列举、排队信号）
+  ├─ payload.go       [可选] 请求体加工与指纹清洗（workbuddy）
+  ├─ prompt.go        [可选] 文本提示词与工具调用解析（minimaxcode）
+  ├─ *_test.go        [按需] 必须与源文件同名；实况测试用 *_live_test.go
+  └─ assets/          [按需] go:embed 的内嵌资源（json/md），命名语义化
 ```
+
+八个供应商包的文件名集合**完全同构**：读任何一家都能立刻在另一家找到对应实现。
+可选文件按能力存在，**不需要就整份缺失**（不写空实现）——例如 opencodezen 没有
+`tasks.go`、minimaxcode 没有 `errors.go`。约定一条不落：
+
+- 单实例供应商用 `VendorID`/`VendorName` 常量，多实例供应商用
+  `VendorIDFor(region)`/`VendorNameFor(region)`；工厂统一是
+  `Instances(env core.Env) []core.Vendor`。
+- 错误分类统一返回 `*core.Failure`（不再有 `type Error = core.Failure` 这类别名），
+  兜底模型清单统一叫 `bundledModels()` / `bundledModelsFor(cfg)`。
+- 内嵌资源一律放 `assets/`，`go:embed` 写相对路径。
+
+刻意的差异（都不是漏改）：
+
+- `minimaxcode` 没有 `errors.go`：它至今未做上游错误分类，401/403 不会让坏凭证失效
+  （其它 7 家都有）。补上会改变运行时行为，列为待办。
+- 只有 `qoder` 需要 `protocol.go`、只有 `workbuddy` 需要 `payload.go`、只有
+  `minimaxcode` 需要 `prompt.go`。
+- `qoder` 原有的 `bridge/`、`cosy/`、`qoderapi/` 三个子包已扁平化进顶层包：
+  现在 8 个包都是**单包**，`tests/architecture_test.go` 的 `layerRules` 里
+  qoder 只剩一条单包条目。
 
 供应商的可变状态（base URL、运行时配置、提示词、档位表、设备令牌缓存、
 登录会话）一律放在 adapter/runtime 实例里，不声明可变包级变量；只读的
@@ -117,15 +145,16 @@ internal/vendors/<name>            协议层 + 适配层同包，统一文件职
 
 新增：
 
-1. 新建 `internal/vendors/<name>/`，实现 `adapter.go`（`core.Vendor`）与需要的
-   `credential.go`/`client.go`/`models.go`/`login.go`/`errors.go`；
-   只实现自己支持的可选能力接口（登录/额度/签到/任务/配置/存储合并）。
+1. 新建 `internal/vendors/<name>/`，先把五个必需文件补齐
+   （`adapter.go`/`chat.go`/`credential.go`/`models.go`/`login.go`），
+   再按能力加可选文件（`errors.go`/`tasks.go`/…）；只实现自己支持的可选能力
+   接口，不支持的能力**不写空实现、也不建文件**。
 2. 在 `internal/app/vendors.go` 的 `BuiltinFactories()` 里加一行
    `{Instances: <name>.Instances}`。
 3. 在本文件的供应商表与凭证字段说明里补一行；如有区域/provider key 差异，
    在 vendor 包内用 `Instances(env)` 返回多个实例。
-4. 补 `internal/vendors/<name>/adapter_test.go`（实例配置隔离）与
-   `tests/integration/` 下的归属/注册回归。
+4. 补与源文件同名的测试（至少 `adapter_test.go` 实例配置隔离、
+   `credential_test.go` 归属判定）与 `tests/integration/` 下的归属/注册回归。
 
 删除：删除 vendor 目录与 `BuiltinFactories()` 中对应的一行，删除 README 表项；
 其余层不需要改动。
@@ -202,7 +231,7 @@ CGO_ENABLED=1 go build -buildmode=c-shared -o dist/freetier2api.so .
 | `internal/auth/session_test.go` | 会话登记/TTL/轮询节流/归属查询/并发（`-race`） |
 | `internal/auth/{pool,batch,quota}_test.go` | 账号枚举去重、批量并发顺序、额度摘要格式化 |
 | `internal/tasks/{schedule,engine}_test.go` | 任务目录、排程时间、队列聚合、保活编排与供应商无关的任务契约 |
-| `internal/vendors/workbuddy/{errors,payload,credential,sse,sanitize}_test.go` | 错误分类顺序、请求体改写、凭证双形态、SSE 聚合、指纹脱敏 |
+| `internal/vendors/workbuddy/{errors,payload,credential,chat,tasks}_test.go` | 错误分类顺序、请求体改写、凭证双形态、SSE 聚合、任务与签到编排 |
 | `internal/hostbridge/http_test.go` | 宿主 HTTP 桥双形态键名兼容、缺状态码显式报错 |
 | `internal/admin/admin_test.go` | 管理路由声明、任务路由分发、未知路由 404 |
 | `tests/architecture_test.go` | 供应商互不 import、分层边界、内部包白名单、测试布局 |
@@ -680,6 +709,11 @@ CPA 按客户端 IP 统计管理鉴权失败次数，**未携带密钥的请求�
 
 ## 行为变更（分层重构）
 
+- **供应商包结构统一（v0.1.3）**：文件名收敛为封闭白名单（见「架构：按供应商插桩」），
+  qoder 的 `bridge`/`cosy`/`qoderapi` 三个子包扁平化进顶层包，并删除了零引用的
+  `OwnsLoginSession`（6 家 × 2 处）。属纯重构：13 个实例的 ID/名称/区域、配置键、
+  模型清单、凭证判定与错误映射全部保持原样，由 `tests/integration/vendor_compat_test.go`
+  与各包回归锁定。
 - **上游错误按供应商分类映射为宿主状态码**：401/403（凭证失效）、402（额度耗尽）、
   429（限流）与 5xx（上游抖动）会如实上报，宿主据此禁用/冷却账号。
   重构前除 WorkBuddy 外的供应商错误统一退化为 502 可重试，坏凭证不会被标记失效。
@@ -719,9 +753,9 @@ WorkBuddy 的 `sanitize.go` 移植自上游，但上游三个正则的实际内�
 | `sanitizeBareHdrRe` | 只匹配 `x-anthropic-billing-hdr` 这一个键名 |
 
 本插件按注释所载**意图**实现（`sanitize_rules.json` 中按「键名 + 后续键值段整段删除」表达），
-其余两条沿用原样。若上游修正正则，需要同步 `internal/vendors/workbuddy/sanitize_rules.json`。
+其余两条沿用原样。若上游修正正则，需要同步 `internal/vendors/workbuddy/assets/sanitize_rules.json`。
 该 JSON 是程序化提取生成的，以保证字节精确；修改后用
-`internal/vendors/workbuddy/sanitize_test.go` 的用例回归。
+`internal/vendors/workbuddy/payload_test.go` 的用例回归。
 
 ### 多插件共存与 priority
 
@@ -765,7 +799,7 @@ CPA 对 `/v0/management` 的鉴权失败计数包含**未带密钥**的请求，
 - **WorkBuddy 国际版签到 = 每日活跃奖励**：国际版没有国内版的 daily-checkin
   活动，每日收入路径是活跃信标——向计费域 `POST /v2/report` 发一条
   `chat_request_send` 事件，把当天成长热力图点亮；次日凌晨自动发放 30 积分
-  Bonus Pack，连续点亮解锁连登档位。实现见 `internal/vendors/workbuddy/dailybonus.go`：
+  Bonus Pack，连续点亮解锁连登档位。实现见 `internal/vendors/workbuddy/tasks.go`：
   以热力图最后一格判定「今天」，点亮即幂等跳过；信标不重试（事件按天幂等，
   盲发会把计数翻倍），单次失败由 8/12/16/20 点的排程兜底，也可经管理端
   `POST /plugins/freetier2api/dailybonus` 手动触发。**成长任务仍只在国内版提供**，

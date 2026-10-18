@@ -10,18 +10,8 @@ import (
 	"freetier2api-plugin/internal/core"
 )
 
-type ErrorKind = core.FailureKind
-
-const (
-	KindCredential = core.FailureKindCredential
-	KindRateLimit  = core.FailureKindRateLimit
-	KindTransient  = core.FailureKindTransient
-	KindClient     = core.FailureKindClient
-)
-
-type Error = core.Failure
-
-func Classify(status int, body string) error {
+// Classify 把 CodeArts 的上游响应分类成共享的上游错误。
+func Classify(status int, body string) *core.Failure {
 	var payload struct {
 		ErrorCode    string `json:"error_code"`
 		ErrorMessage string `json:"error_message"`
@@ -35,14 +25,14 @@ func Classify(status int, body string) error {
 
 	switch {
 	case status == http.StatusUnauthorized || status == http.StatusForbidden || strings.Contains(code, "ExpiredToken") || strings.Contains(code, "InvalidToken"):
-		return &Error{Kind: KindCredential, Status: status, Code: code, Msg: msg}
+		return &core.Failure{Kind: core.FailureKindCredential, Status: status, Code: code, Msg: msg}
 	case strings.Contains(body, "benefit not found") || strings.Contains(code, "InferHub.4004.200"):
-		return &Error{Kind: KindCredential, Status: status, Code: code, Msg: "未领取免费福利模型配额，请在管理端领取或开启自动领取"}
+		return &core.Failure{Kind: core.FailureKindCredential, Status: status, Code: code, Msg: "未领取免费福利模型配额，请在管理端领取或开启自动领取"}
 	case status == http.StatusTooManyRequests || strings.Contains(code, "Throttling"):
-		return &Error{Kind: KindRateLimit, Status: status, Code: code, Msg: msg}
+		return &core.Failure{Kind: core.FailureKindRateLimit, Status: status, Code: code, Msg: msg}
 	case status >= 500:
-		return &Error{Kind: KindTransient, Status: status, Code: code, Msg: msg}
+		return &core.Failure{Kind: core.FailureKindTransient, Status: status, Code: code, Msg: msg}
 	default:
-		return &Error{Kind: KindClient, Status: status, Code: code, Msg: msg}
+		return &core.Failure{Kind: core.FailureKindClient, Status: status, Code: code, Msg: msg}
 	}
 }

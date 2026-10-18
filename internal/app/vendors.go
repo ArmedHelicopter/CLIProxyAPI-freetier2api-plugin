@@ -17,10 +17,10 @@ import (
 // BuiltinFactories 返回内置供应商工厂（顺序即注册顺序）。
 func BuiltinFactories() []core.VendorFactory {
 	return []core.VendorFactory{
-		{Instances: func(env core.Env) []core.Vendor { return cline.Instances(env, core.DefaultContextWindow) }},
+		{Instances: func(env core.Env) []core.Vendor { return cline.Instances(env) }},
 		{Instances: codearts.Instances},
 		{Instances: minimaxcode.Instances},
-		{Instances: func(env core.Env) []core.Vendor { return opencodezen.Instances(env, core.DefaultContextWindow) }},
+		{Instances: func(env core.Env) []core.Vendor { return opencodezen.Instances(env) }},
 		{Instances: qoder.Instances},
 		{Instances: trae.Instances},
 		{Instances: workbuddy.Instances},

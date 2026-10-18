@@ -169,11 +169,11 @@ func hasReasoningTag(tags []string) bool {
 	return false
 }
 
-// BundledClineModels 是内置的兜底模型清单。
+// bundledModels 是内置的兜底模型清单。
 //
 // 来源：cline2api 的 builtinModels 常量（离线兜底），不是凭空构造的。
 // 真实可用集合以「刷新模型」拉到的实时清单为准。
-func BundledClineModels() []Model {
+func bundledModels() []Model {
 	return []Model{
 		{ID: "cline-free/deepseek-v4.1-flash", Name: "DeepSeek V4.1 Flash", Cost: CostFree, ContextWindow: 200000, MaxOutputTokens: 16384, SupportsTools: true},
 		{ID: "cline-free/gemini-3.8-flash", Name: "Gemini 3.8 Flash", Cost: CostFree, ContextWindow: 200000, MaxOutputTokens: 16384, SupportsTools: true},

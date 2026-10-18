@@ -18,8 +18,8 @@ type Model struct {
 	Variant       string
 }
 
-// BundledModels 返回 MiniMax Code 的内置模型清单。
-func BundledModels() []Model {
+// bundledModels 返回 MiniMax Code 的内置模型清单（探测失败时的兜底）。
+func bundledModels() []Model {
 	return []Model{
 		{
 			ID:            "minimax-agent",
@@ -83,24 +83,24 @@ func BundledModels() []Model {
 }
 
 // FindModel 根据客户端请求的模型 ID 查找模型配置。
-func FindModel(modelID string) (Model, bool) {
+func findModel(modelID string) (Model, bool) {
 	clean := strings.ToLower(strings.TrimSpace(modelID))
 	// 如果带有前缀，剥离前缀
 	if idx := strings.Index(clean, ":"); idx >= 0 {
 		clean = clean[idx+1:]
 	}
-	for _, m := range BundledModels() {
+	for _, m := range bundledModels() {
 		if strings.EqualFold(m.ID, clean) {
 			return m, true
 		}
 	}
 	// 默认回落到 minimax-agent
-	return BundledModels()[0], false
+	return bundledModels()[0], false
 }
 
 // FetchModels 返回供宿主注册的模型清单。
 func FetchModels(ctx context.Context, region Region) ([]Model, error) {
 	_ = ctx
 	_ = region
-	return BundledModels(), nil
+	return bundledModels(), nil
 }

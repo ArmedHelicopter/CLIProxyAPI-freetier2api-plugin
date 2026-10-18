@@ -12,9 +12,6 @@ import (
 
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
-	"freetier2api-plugin/internal/vendors/qoder/bridge"
-	"freetier2api-plugin/internal/vendors/qoder/cosy"
-	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
 
 // 本文件实现 Qoder 的 OAuth 设备授权登录（PKCE）。
@@ -48,7 +45,7 @@ const (
 type pendingLogin struct {
 	nonce    string
 	verifier string
-	region   qoderapi.Region
+	region   Region
 }
 
 // LoginProfile 是账号信息（取不到时保持零值）。
@@ -60,7 +57,7 @@ type LoginProfile struct {
 }
 
 // LoginStart 生成 PKCE 参数与登录 URL，并登记一个待轮询的登录会话。
-func LoginStart(ctx context.Context, logins core.LoginSessions, region qoderapi.Region) (loginURL, state string, expiresAt time.Time, err error) {
+func LoginStart(ctx context.Context, logins core.LoginSessions, region Region) (loginURL, state string, expiresAt time.Time, err error) {
 	verifier, challenge, errPKCE := core.NewPKCEPair()
 	if errPKCE != nil {
 		return "", "", time.Time{}, errPKCE
@@ -68,7 +65,7 @@ func LoginStart(ctx context.Context, logins core.LoginSessions, region qoderapi.
 	nonce := core.RandomHex(16)
 	state = core.RandomHex(16)
 
-	endpoints := qoderapi.GetEndpoints(region)
+	endpoints := GetEndpoints(region)
 	params := url.Values{}
 	params.Set("nonce", nonce)
 	params.Set("challenge", challenge)
@@ -94,7 +91,7 @@ type LoginPollResult struct {
 	RefreshToken string
 	Profile      LoginProfile
 	// Region 是本次登录的区域（取凭证时要用它拼落盘内容）。
-	Region qoderapi.Region
+	Region Region
 }
 
 // LoginPoll 轮询一次登录会话。
@@ -144,7 +141,7 @@ func OwnsLoginSession(logins core.LoginSessions, sessionID string) bool {
 //
 // waiting=true 表示用户尚未授权（上游 404），调用方应继续等待。
 func pollDeviceToken(ctx context.Context, entry *pendingLogin) (token, refreshToken string, waiting bool, err error) {
-	endpoints := qoderapi.GetEndpoints(entry.region)
+	endpoints := GetEndpoints(entry.region)
 	pollURL := fmt.Sprintf("%s?nonce=%s&verifier=%s&challenge_method=S256",
 		endpoints.PollEndpoint, url.QueryEscape(entry.nonce), url.QueryEscape(entry.verifier))
 	req, errRequest := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
@@ -181,8 +178,8 @@ func pollDeviceToken(ctx context.Context, entry *pendingLogin) (token, refreshTo
 }
 
 // fetchLoginProfile 取账号信息（失败只降级：没有 email/name 也能用）。
-func fetchLoginProfile(ctx context.Context, token string, region qoderapi.Region) LoginProfile {
-	endpoints := qoderapi.GetEndpoints(region)
+func fetchLoginProfile(ctx context.Context, token string, region Region) LoginProfile {
+	endpoints := GetEndpoints(region)
 	result, errProfile := httpGetBearerJSON(ctx, endpoints.UserinfoBase, token)
 	if errProfile != nil {
 		return LoginProfile{}
@@ -196,8 +193,8 @@ func fetchLoginProfile(ctx context.Context, token string, region qoderapi.Region
 }
 
 // FetchPlanName 取套餐名（失败留空）。
-func FetchPlanName(ctx context.Context, token string, region qoderapi.Region) string {
-	endpoints := qoderapi.GetEndpoints(region)
+func FetchPlanName(ctx context.Context, token string, region Region) string {
+	endpoints := GetEndpoints(region)
 	result, errPlan := httpGetBearerJSON(ctx, endpoints.PlanEndpoint, token)
 	if errPlan != nil {
 		return ""
@@ -208,7 +205,7 @@ func FetchPlanName(ctx context.Context, token string, region qoderapi.Region) st
 // BuildLoginStorage 生成落盘用的凭证 JSON（扁平格式）。
 //
 // 与导入路径同构：刷新时代码（auth.refresh）能原样读回这些字段。
-func BuildLoginStorage(region qoderapi.Region, token, refreshToken string, profile LoginProfile, plan string) ([]byte, *Credential) {
+func BuildLoginStorage(region Region, token, refreshToken string, profile LoginProfile, plan string) ([]byte, *Credential) {
 	payload := map[string]any{
 		"device_token": token,
 		"region":       string(region),
@@ -311,30 +308,30 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 	if cred == nil {
 		return nil, false, fmt.Errorf("credential is nil")
 	}
-	deviceToken, refreshToken := bridge.ParseOAuthSecret(cred.Token)
+	deviceToken, refreshToken := ParseOAuthSecret(cred.Token)
 	if strings.HasPrefix(deviceToken, "dt-") {
 		// 设备令牌：用 userinfo 保活，内容不变。
-		if _, errInfo := bridge.FetchUserInfoWithToken(ctx, deviceToken, cred.Region); errInfo != nil {
+		if _, errInfo := FetchUserInfoWithToken(ctx, deviceToken, cred.Region); errInfo != nil {
 			return nil, false, ClassifyCredentialError(errInfo)
 		}
 		return cred, false, nil
 	}
 
 	// PAT：换 jobToken 拿新的 securityOauthToken / refreshToken。
-	seed := cosy.FingerprintSeed("", cred.Token)
-	endpoints := qoderapi.GetEndpoints(cred.Region)
-	jobToken, errExchange := cosy.ExchangeJobToken(ctx, cred.Token,
-		cosy.DeriveMachineID(seed), cosy.DeriveMachineToken(seed), cosy.DeriveMachineType(seed),
+	seed := FingerprintSeed("", cred.Token)
+	endpoints := GetEndpoints(cred.Region)
+	jobToken, errExchange := ExchangeJobToken(ctx, cred.Token,
+		DeriveMachineID(seed), DeriveMachineToken(seed), DeriveMachineType(seed),
 		endpoints.JobTokenURL)
 	if errExchange != nil {
 		return nil, false, ClassifyCredentialError(errExchange)
 	}
-	oauthToken := bridge.StrVal(jobToken, "securityOauthToken")
+	oauthToken := StrVal(jobToken, "securityOauthToken")
 	if oauthToken == "" {
 		return nil, false, NewError("qoder_credential_invalid",
 			"jobToken 响应里没有 securityOauthToken", 401)
 	}
-	nextRefresh := bridge.StrVal(jobToken, "refreshToken")
+	nextRefresh := StrVal(jobToken, "refreshToken")
 	if nextRefresh == "" {
 		nextRefresh = refreshToken
 	}

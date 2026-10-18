@@ -79,22 +79,6 @@ func firstKeyIn(payload map[string]any) string {
 	return ""
 }
 
-// MaskedKey 返回脱敏后的 key：保留前四位与后四位，中间用 *** 代替。
-//
-// 用于展示名兜底——**绝不**把完整 key 放进 Label，因为 Label 会进日志、
-// 进管理接口响应、进页面 HTML。凭证材料只应存在于凭证文件里。
-func MaskedKey(key string) string {
-	trimmed := strings.TrimSpace(key)
-	// 太短的 key 全遮：露出前后四位等于露出全部。
-	if len(trimmed) <= 8 {
-		if trimmed == "" {
-			return ""
-		}
-		return "***"
-	}
-	return trimmed[:4] + "***" + trimmed[len(trimmed)-4:]
-}
-
 // LooksLikeCredential 判断一份 JSON 是否属于 OpenCode ZEN。
 //
 // **判定必须偏严**：宿主会把所有非内建格式的凭证依次喂给每个插件，

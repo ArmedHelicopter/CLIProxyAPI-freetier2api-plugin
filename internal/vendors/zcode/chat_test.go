@@ -1,13 +1,13 @@
 package zcode
 
-// 对话转换测试：请求侧（tools / tool_calls / tool role / 多模态）与
-// 响应侧（tool_use → tool_calls，含流式 input_json_delta）。
-
 import (
 	"encoding/json"
 	"strings"
 	"testing"
 )
+
+// 对话转换测试：请求侧（tools / tool_calls / tool role / 多模态）与
+// 响应侧（tool_use → tool_calls，含流式 input_json_delta）。
 
 // anthropicBody 解码一次请求转换的结果。
 func anthropicBody(t *testing.T, payload string, cred *Credential) map[string]any {
@@ -343,5 +343,75 @@ func TestClassifyEmbeddedError(t *testing.T) {
 	// 200 包装的业务错误必须被识别，否则错误正文会被当模型输出。
 	if errUpstream := classifyEmbeddedError([]byte(`{"code":1005,"msg":"daily quota exhausted"}`)); errUpstream == nil {
 		t.Fatal("embedded business error not detected")
+	}
+}
+
+func TestResolveTargetURLRequiresAPIKey(t *testing.T) {
+	// 有 API Key 时打到 api.z.ai 的回退端点。
+	target, errResolve := resolveTargetURL("", &Credential{APIKey: "k.s"})
+	if errResolve != nil {
+		t.Fatalf("unexpected error: %v", errResolve)
+	}
+	if target != ZAIOrigin+PathAPIMessages {
+		t.Fatalf("target = %q", target)
+	}
+
+	// 只有 JWT 时必须明确拒绝，而不是发出必然 3007 的请求。
+	if _, errResolve := resolveTargetURL("", &Credential{JWTToken: "a.b.c"}); errResolve == nil {
+		t.Fatal("缺少 API Key 时必须拒绝，而不是走需要验证码的 Plan 通道")
+	}
+}
+
+func TestApplyStartPlanSystemIsIdempotent(t *testing.T) {
+	body := map[string]any{
+		"messages": []any{map[string]any{"role": "user", "content": "hi"}},
+		"system":   "user instructions",
+	}
+	applyStartPlanSystem(body, "GLM-5.3")
+	first, _ := body["system"].([]any)
+	if len(first) == 0 {
+		t.Fatal("身份块未注入")
+	}
+
+	// 重复调用不得重复拼接（上游按内容审查，重复块会被判异常）。
+	applyStartPlanSystem(body, "GLM-5.3")
+	second, _ := body["system"].([]any)
+	if len(second) != len(first) {
+		t.Fatalf("重复注入改变了块数: %d != %d", len(second), len(first))
+	}
+
+	// 官方块在最前，用户原有 system 保留在后。
+	head, _ := second[0].(map[string]any)
+	if !strings.Contains(head["text"].(string), "ZCode") {
+		t.Fatalf("首块应为官方身份块: %v", head)
+	}
+	tail, _ := second[len(second)-1].(map[string]any)
+	if tail["text"] != "user instructions" {
+		t.Fatalf("用户 system 应保留: %v", tail)
+	}
+}
+
+func TestApplyCacheControl(t *testing.T) {
+	body := map[string]any{
+		"messages": []any{
+			map[string]any{"role": "user", "content": "first"},
+			map[string]any{"role": "assistant", "content": []any{map[string]any{"type": "text", "text": "reply"}}},
+		},
+	}
+	applyCacheControl(body)
+
+	messages := body["messages"].([]any)
+	// 最后一条非 system 消息的末块应带 cache_control。
+	last := messages[1].(map[string]any)
+	blocks := last["content"].([]any)
+	block := blocks[len(blocks)-1].(map[string]any)
+	cc, _ := block["cache_control"].(map[string]any)
+	if cc["type"] != "ephemeral" {
+		t.Fatalf("cache_control 未追加: %v", block)
+	}
+	// 前一条不应被改动。
+	first := messages[0].(map[string]any)
+	if _, isString := first["content"].(string); !isString {
+		t.Fatalf("非末条消息不应被改写: %v", first["content"])
 	}
 }

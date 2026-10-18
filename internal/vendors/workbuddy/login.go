@@ -42,15 +42,6 @@ func StoreLoginSession(logins core.LoginSessions, sessionID string, session *Pen
 	logins.Register(VendorIDFor(session.Region), sessionID, LoginSessionTTL, loginPollInterval, session)
 }
 
-// OwnsLoginSession 报告该会话是否由 WorkBuddy 持有且仍有效。
-func OwnsLoginSession(logins core.LoginSessions, sessionID string) bool {
-	if _, okOwns := logins.Owns(sessionID); okOwns {
-		return true
-	}
-	// 历史会话 id 以 workbuddy_ 开头；保留兜底以兼容极短的 GC 竞争窗口。
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "workbuddy_")
-}
-
 // RemoveLoginSession 登录成功或终止后清理会话。
 func RemoveLoginSession(logins core.LoginSessions, sessionID string) {
 	logins.Delete(sessionID)
@@ -204,8 +195,8 @@ func doLoginRequest(req *http.Request) (json.RawMessage, error) {
 		// 关键：**不能**把所有非 0 业务码都当成失败。
 		// 上游用 11217 + "login ing..." 表示「授权尚未完成」，这是轮询期间的
 		// 正常状态；当成失败会让用户看到"授权失败"而实际上只差一步。
-		return nil, &Error{
-			Kind:   KindClient,
+		return nil, &core.Failure{
+			Kind:   core.FailureKindClient,
 			Status: resp.StatusCode,
 			Msg:    fmt.Sprintf("%s %s", strconv.Itoa(envelope.Code), strings.TrimSpace(envelope.Msg)),
 		}
@@ -238,7 +229,7 @@ func IsLoginPending(err error) bool {
 	if err == nil {
 		return false
 	}
-	var upstreamErr *Error
+	var upstreamErr *core.Failure
 	if !errors.As(err, &upstreamErr) {
 		return false
 	}
@@ -282,4 +273,78 @@ func DefaultDomainFor(region Region) string {
 		return "www.workbuddy.ai"
 	}
 	return "www.codebuddy.cn"
+}
+
+// RefreshToken 刷新凭证的 access token。
+//
+// 安全红线：X-Refresh-Token 头**只允许出现在刷新端点**，对话请求绝不能携带。
+//
+// 并发采用两段式：锁内取快照 → 锁外发请求 → 锁内校验快照未被并发改动后再写回。
+func (c *Client) RefreshToken(cred *Credential) error {
+	if cred == nil {
+		return fmt.Errorf("credential is nil")
+	}
+	region := cred.Realm()
+	if !c.enabledRealm(region) {
+		return fmt.Errorf("realm %s is disabled by plugin configuration", region)
+	}
+	refreshToken := cred.RefreshTokenValue()
+	if strings.TrimSpace(refreshToken) == "" {
+		return fmt.Errorf("credential has no refresh token")
+	}
+	accessBefore, refreshBefore := cred.Snapshot()
+
+	endpoints := GetEndpoints(region)
+	req, errReq := http.NewRequestWithContext(c.opts.Context, http.MethodPost,
+		endpoints.ChatBase+tokenRefreshPath, nil)
+	if errReq != nil {
+		return fmt.Errorf("build refresh request: %w", errReq)
+	}
+	applyCommonHeaders(req, c, cred)
+	req.Header.Set("X-Refresh-Token", refreshToken)
+	req.Header.Set("X-Auth-Refresh-Source", authRefreshSource)
+
+	resp, errDo := c.refreshClient().Do(req)
+	if errDo != nil {
+		return fmt.Errorf("refresh request: %w", errDo)
+	}
+	defer closeBody(resp.Body)
+
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, apiBodyLimit))
+	if errRead != nil {
+		return fmt.Errorf("read refresh response: %w", errRead)
+	}
+	if resp.StatusCode >= 400 {
+		return enrichClassifyError(resp.StatusCode, string(body), resp.Header)
+	}
+
+	var envelope struct {
+		Code int                  `json:"code"`
+		Msg  string               `json:"msg"`
+		Data refreshTokenResponse `json:"data"`
+	}
+	var token refreshTokenResponse
+	if errUnmarshal := json.Unmarshal(body, &envelope); errUnmarshal == nil && envelope.Code == 0 && strings.TrimSpace(envelope.Data.AccessToken) != "" {
+		token = envelope.Data
+	} else if errUnmarshal == nil && envelope.Code != 0 {
+		return enrichClassifyError(resp.StatusCode, string(body), resp.Header)
+	} else if errDirect := json.Unmarshal(body, &token); errDirect != nil || strings.TrimSpace(token.AccessToken) == "" {
+		return &core.Failure{Kind: core.FailureKindSessionDead, Status: http.StatusUnauthorized, Msg: "refresh failed: no accessToken in response — re-login required"}
+	}
+
+	// 快照校验：并发刷新已经写过就放弃本次写回，避免用旧响应覆盖新值。
+	if !cred.UnchangedSince(accessBefore, refreshBefore) {
+		return nil
+	}
+	var expiresAt int64
+	if token.ExpiresIn > 0 && token.ExpiresIn <= maxRefreshTokenExpiresIn {
+		expiresAt = time.Now().Unix() + token.ExpiresIn
+	}
+	cred.ApplyTokenRefresh(token.AccessToken, token.RefreshToken, token.Domain, expiresAt)
+	if cred.FilePath != "" {
+		if errSave := SaveCredentialFile(cred.FilePath, cred); errSave != nil {
+			return fmt.Errorf("save refreshed credential: %w", errSave)
+		}
+	}
+	return nil
 }

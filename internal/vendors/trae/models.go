@@ -5,10 +5,11 @@ package trae
 import (
 	"context"
 	"encoding/json"
-	"freetier2api-plugin/internal/hostbridge"
 	"io"
 	"net/http"
 	"time"
+
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 type Model struct {
@@ -21,8 +22,8 @@ type Model struct {
 	IsReasoning   bool   `json:"is_reasoning"`
 }
 
-// DefaultModelsFor 返回某 profile 的默认模型列表。
-func DefaultModelsFor(cfg Config) []Model {
+// bundledModelsFor 返回某 profile 的默认模型列表（探测失败时的兜底）。
+func bundledModelsFor(cfg Config) []Model {
 	switch {
 	case cfg.Solo:
 		return []Model{
@@ -51,7 +52,7 @@ func DefaultModelsFor(cfg Config) []Model {
 
 // FetchModels 返回本实例可用模型清单；SOLO 尝试探测上游，失败时回退默认表。
 func FetchModels(ctx context.Context, cred *Credential, cfg Config) ([]Model, error) {
-	fallback := DefaultModelsFor(cfg)
+	fallback := bundledModelsFor(cfg)
 	if !cfg.Solo || cred == nil || cred.AccessToken == "" {
 		return fallback, nil
 	}

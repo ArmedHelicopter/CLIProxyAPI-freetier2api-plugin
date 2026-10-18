@@ -23,8 +23,6 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
-	"freetier2api-plugin/internal/vendors/qoder/bridge"
-	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
 
 const (
@@ -39,17 +37,17 @@ const (
 // adapter 是 core.Vendor 在 Qoder 上的实现。
 type adapter struct {
 	*core.NativeAdapter[*Credential]
-	region qoderapi.Region
+	region Region
 	// bridges 按凭证指纹缓存 cosy 会话（建会话要一次 jobToken 交换，很贵）。
 	bridges sync.Map
 }
 
 // Instances 构造 Qoder 的两个区域实例。
 func Instances(env core.Env) []core.Vendor {
-	return []core.Vendor{newInstance(env, qoderapi.RegionCN), newInstance(env, qoderapi.RegionGlobal)}
+	return []core.Vendor{newInstance(env, RegionCN), newInstance(env, RegionGlobal)}
 }
 
-func newInstance(env core.Env, region qoderapi.Region) core.Vendor {
+func newInstance(env core.Env, region Region) core.Vendor {
 	return &adapter{
 		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
 			Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
@@ -107,14 +105,14 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	return v.defaultRegionForParse() == v.region
 }
 
-func (v *adapter) defaultRegionForParse() qoderapi.Region {
+func (v *adapter) defaultRegionForParse() Region {
 	settings := v.Env.Settings()
 	for _, vendor := range v.Env.Registry.Vendors() {
-		if vendor.Region() == string(qoderapi.RegionGlobal) && settings.RealmEnabled(vendor.Region()) {
-			return qoderapi.RegionGlobal
+		if vendor.Region() == string(RegionGlobal) && settings.RealmEnabled(vendor.Region()) {
+			return RegionGlobal
 		}
 	}
-	return qoderapi.RegionCN
+	return RegionCN
 }
 
 // ---- 模型 ----
@@ -127,13 +125,13 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	models, errModels := v.fetchModels(ctx)
 	if errModels != nil {
 		logger.Debug("qoder: list models failed for %s, using bundled list: %v", v.ID(), errModels)
-		models = BundledQoderModels()
+		models = bundledModels()
 	}
 	return v.modelsToPluginAPI(models), nil
 }
 
 // fetchModels 借探测凭证拉取上游模型清单。
-func (v *adapter) fetchModels(ctx context.Context) ([]bridge.QoderModel, error) {
+func (v *adapter) fetchModels(ctx context.Context) ([]Model, error) {
 	cred, okCred := core.ProbeNativeCredential(v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
 		native, okNative := c.Native.(*Credential)
 		return native, okNative
@@ -163,11 +161,11 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 	if errBridge != nil {
 		// 建桥失败同样退回兜底清单：账号本身可能是好的，只是暂时连不上。
 		logger.Debug("qoder: bridge for model list failed: %v", errBridge)
-		return v.modelsToPluginAPI(BundledQoderModels()), nil
+		return v.modelsToPluginAPI(bundledModels()), nil
 	}
 	models, errModels := b.ListAvailableModels(ctx)
 	if errModels != nil {
-		return v.modelsToPluginAPI(BundledQoderModels()), nil
+		return v.modelsToPluginAPI(bundledModels()), nil
 	}
 	return v.modelsToPluginAPI(models), nil
 }
@@ -187,7 +185,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	// 复用 bridge 的 chat-completions 组装逻辑，但把结果写进内存而不是
 	// http.ResponseWriter——插件侧不做 HTTP 响应，只产出载荷。
 	recorder := newPayloadRecorder()
-	if errRun := bridge.RunChatCompletions(b, req.Payload, recorder); errRun != nil {
+	if errRun := RunChatCompletions(b, req.Payload, recorder); errRun != nil {
 		return nil, errRun
 	}
 	return &pluginapi.ExecutorResponse{
@@ -206,7 +204,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errBridge != nil {
 		return errBridge
 	}
-	return bridge.StreamChatCompletions(b, req.Payload, sink.Emit)
+	return StreamChatCompletions(b, req.Payload, sink.Emit)
 }
 
 // ---- 额度与签到 ----
@@ -337,7 +335,7 @@ func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential)
 
 // bridgeEntry 是缓存的一条 Bridge。
 type bridgeEntry struct {
-	bridge    *bridge.Bridge
+	bridge    *Bridge
 	createdAt time.Time
 }
 
@@ -345,7 +343,7 @@ type bridgeEntry struct {
 //
 // 缓存是必需的：建会话要一次 jobToken 交换 + RSA 加密，每个请求重建
 // 会让上游看到大量重复的令牌交换。
-func (v *adapter) bridgeFor(ctx context.Context, cred *Credential) (*bridge.Bridge, error) {
+func (v *adapter) bridgeFor(ctx context.Context, cred *Credential) (*Bridge, error) {
 	key := v.bridgeCacheKey(cred)
 	if cached, okCached := v.bridges.Load(key); okCached {
 		entry, okEntry := cached.(bridgeEntry)
@@ -361,7 +359,7 @@ func (v *adapter) bridgeFor(ctx context.Context, cred *Credential) (*bridge.Brid
 	if errTemplate != nil {
 		return nil, errTemplate
 	}
-	b, errBridge := bridge.NewBridge(createCtx, BridgeSecret(cred), v.region, templateBase)
+	b, errBridge := NewBridge(createCtx, BridgeSecret(cred), v.region, templateBase)
 	if errBridge != nil {
 		return nil, ClassifyCredentialError(errBridge)
 	}
@@ -384,8 +382,8 @@ func (v *adapter) bridgeCacheKey(cred *Credential) string {
 // 模型 ID 用上游的 key（gmodel / qmodel_38max …）——它就是 Qoder 网关真正
 // 接受的标识符，出站无需再翻译；display_name 只作展示名。想换一个更顺手的
 // ID 就在控制台给该模型设别名（别名是注册给宿主的对外 ID）。
-func (v *adapter) modelsToPluginAPI(models []bridge.QoderModel) []pluginapi.ModelInfo {
-	return core.ConvertModels(models, func(model bridge.QoderModel) (core.ModelDescriptor, bool) {
+func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
+	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		id := strings.TrimSpace(model.Key)
 		if id == "" {
 			return core.ModelDescriptor{}, false
@@ -407,7 +405,7 @@ func (v *adapter) modelsToPluginAPI(models []bridge.QoderModel) []pluginapi.Mode
 }
 
 // describeModel 拼接模型说明（带价格倍率）。
-func describeModel(model bridge.QoderModel) string {
+func describeModel(model Model) string {
 	description := "Qoder 上游模型"
 	if model.IsDefault {
 		description += "（默认）"

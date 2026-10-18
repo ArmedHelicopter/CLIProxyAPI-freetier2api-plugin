@@ -1,13 +1,5 @@
 package zcode
 
-// 上游错误的分类与映射。
-//
-// 这里**不定义**本供应商自己的错误类型：分类结果统一用共享的
-// *core.Failure（已实现 core.UpstreamError），由 core.ToPluginError
-// 翻译成宿主状态码。各家自建且未实现该接口的类型会被降级成「502 可重试」，
-// 连 401 凭证失效都传不出去，宿主因此不会停用坏账号。
-// 因此本文件只做一件事：把 ZCode 的上游响应翻译成 core.FailureKind。
-
 import (
 	"encoding/json"
 	"net/http"
@@ -15,6 +7,14 @@ import (
 
 	"freetier2api-plugin/internal/core"
 )
+
+// 上游错误的分类与映射。
+//
+// 这里**不定义**本供应商自己的错误类型：分类结果统一用共享的
+// *core.Failure（已实现 core.UpstreamError），由 core.ToPluginError
+// 翻译成宿主状态码。各家自建且未实现该接口的类型会被降级成「502 可重试」，
+// 连 401 凭证失效都传不出去，宿主因此不会停用坏账号。
+// 因此本文件只做一件事：把 ZCode 的上游响应翻译成 core.FailureKind。
 
 // 上游业务码（实测自 zcode.z.ai 与 api.z.ai）。
 const (

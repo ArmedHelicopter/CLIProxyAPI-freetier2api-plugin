@@ -1,12 +1,5 @@
 package zcode
 
-// 模型目录。
-//
-// 上游的权威清单在 client/configs（免鉴权的公开端点），现行只有 GLM-5.3 与
-// GLM-5.3-Flash 两个模型；早期版本的 GLM-5.x / GLM-4.7 已从套餐下线，继续
-// 公布会让客户端选到必报 3006（model not allowed）的名字。因此这里以
-// configs 为准，仅在拉取失败时回退内置清单。
-
 import (
 	"context"
 	"encoding/json"
@@ -18,6 +11,13 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 )
+
+// 模型目录。
+//
+// 上游的权威清单在 client/configs（免鉴权的公开端点），现行只有 GLM-5.3 与
+// GLM-5.3-Flash 两个模型；早期版本的 GLM-5.x / GLM-4.7 已从套餐下线，继续
+// 公布会让客户端选到必报 3006（model not allowed）的名字。因此这里以
+// configs 为准，仅在拉取失败时回退内置清单。
 
 // Model 是一个可用模型的元数据。
 type Model struct {
@@ -31,8 +31,8 @@ type Model struct {
 	IsReasoning    bool   `json:"is_reasoning"`
 }
 
-// fallbackModels 是 configs 拉取失败时的内置清单（与现行上游一致）。
-func fallbackModels() []Model {
+// bundledModels 是 configs 拉取失败时的内置清单（与现行上游一致）。
+func bundledModels() []Model {
 	return []Model{
 		{
 			ID:            "GLM-5.3",
@@ -61,24 +61,24 @@ func FetchModels(ctx context.Context) ([]Model, error) {
 	url := ZCodeOrigin + PathClientConfigs + "?app_version=" + ClientAppVersion
 	req, errNew := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if errNew != nil {
-		return fallbackModels(), nil
+		return bundledModels(), nil
 	}
 	req.Header.Set("User-Agent", UserAgent)
 
 	resp, errDo := hostbridge.Client(ctx, 15*time.Second).Do(req)
 	if errDo != nil {
-		return fallbackModels(), nil
+		return bundledModels(), nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if errRead != nil || resp.StatusCode >= 400 {
-		return fallbackModels(), nil
+		return bundledModels(), nil
 	}
 
 	models := parseConfigModels(body)
 	if len(models) == 0 {
-		return fallbackModels(), nil
+		return bundledModels(), nil
 	}
 	return models, nil
 }

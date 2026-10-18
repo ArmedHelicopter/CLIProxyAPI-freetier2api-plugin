@@ -1,7 +1,5 @@
 package workbuddy
 
-// 本文件实现模型目录：从上游探测模型清单、缓存，并提供窗口与档位的查找链。
-
 import (
 	_ "embed"
 	"encoding/json"
@@ -14,6 +12,8 @@ import (
 
 	"freetier2api-plugin/internal/core"
 )
+
+// 本文件实现模型目录：从上游探测模型清单、缓存，并提供窗口与档位的查找链。
 
 // modelCacheEntry 是某个域的模型目录缓存。
 type modelCacheEntry struct {
@@ -28,7 +28,7 @@ const (
 	modelCacheFailWindow = 5 * time.Minute
 )
 
-//go:embed catalog_seed.json
+//go:embed assets/catalog_seed.json
 var catalogSeedRaw []byte
 
 // ModelInfo 是归一化后的模型元数据。
@@ -603,7 +603,7 @@ func (c *Client) probeEnterpriseModels(region Region) ([]ModelInfo, error) {
 		if errDo != nil {
 			lastErr = errDo
 			// 仅在 404 时换下一条路径（其他错误换路径也救不回来）。
-			if upstreamErr, okErr := errDo.(*Error); okErr && upstreamErr.Kind == KindNotFound {
+			if upstreamErr, okErr := errDo.(*core.Failure); okErr && upstreamErr.Kind == core.FailureKindNotFound {
 				continue
 			}
 			return nil, errDo

@@ -187,8 +187,3 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
 	return LoginPoll(ctx, v.Env.Logins, state)
 }
-
-// OwnsLoginSession 报告该会话是否由本供应商创建。
-func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	return OwnsLoginSession(v.Env.Logins, sessionID)
-}

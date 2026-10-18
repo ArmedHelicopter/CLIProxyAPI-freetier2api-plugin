@@ -123,11 +123,6 @@ func LoginPoll(ctx context.Context, state string, store *SessionStore) (*plugina
 	}
 }
 
-// OwnsLoginSession 报告会话是否由本 profile 拥有。
-func OwnsLoginSession(store *SessionStore, sessionID string, vendorID string) bool {
-	return OwnsSession(store, sessionID, vendorID)
-}
-
 // PendingSession 记录一次进行中的 Trae 或 Trae Solo 登录。
 type PendingSession struct {
 	SessionID string

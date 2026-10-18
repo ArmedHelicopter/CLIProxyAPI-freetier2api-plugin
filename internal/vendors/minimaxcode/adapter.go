@@ -182,9 +182,12 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 	return LoginPoll(ctx, v.Env.Logins, state, v.baseURL)
 }
 
-// OwnsLoginSession 报告该会话是否由本区域创建。
-func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	return OwnsLoginSession(v.Env.Logins, sessionID, v.region)
-}
-
 func (v *adapter) SupportsCheckin() bool { return v.region == RegionGlobal }
+
+// ConfigFields 声明 MiniMax Code 专属配置。
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{
+		{Name: "minimaxcode_cn_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "国内版上游基地址覆盖。"},
+		{Name: "minimaxcode_global_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "国际版上游基地址覆盖。"},
+	}
+}

@@ -1,10 +1,11 @@
 package workbuddy
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -501,67 +502,8 @@ func realmField(level map[string]any) Region {
 // 本文件实现 WorkBuddy（国内版）的每日签到。
 //
 // daily-checkin 端点只有国内版入账；国际版的每日收入路径是每日活跃奖励
-// （活跃信标，见 dailybonus.go），由 Checkin/RunScheduled 按 realm 分流，
+// （活跃信标，见 tasks.go），由 Checkin/RunScheduled 按 realm 分流，
 // 不应把国际版凭证打进这里的端点。
-
-// CheckinResult 是一次签到的结果。
-type CheckinResult struct {
-	// Already 表示今天已经签过（幂等成功，不是错误）。
-	Already bool
-	// Credit / Energy 是本次签到所得。
-	Credit int64
-	Energy int64
-	// Streak 是连续签到天数。
-	Streak int64
-}
-
-// DailyCheckin 执行每日签到。
-//
-// 「今天已签到」被识别为幂等成功：上游对重复签到返回业务错误，
-// 直接当失败会让自动签到任务每天报错一次。
-func (c *Client) DailyCheckin(cred *Credential) (*CheckinResult, error) {
-	if cred == nil {
-		return nil, fmt.Errorf("credential is required")
-	}
-	region := cred.Realm()
-	if !c.enabledRealm(region) {
-		return nil, fmt.Errorf("realm %s is disabled by plugin configuration", region)
-	}
-	endpoints := GetEndpoints(region)
-	paths := []string{dailyCheckinPathV2}
-	if region.IsGlobal() {
-		paths = []string{dailyCheckinPath, dailyCheckinPathV2}
-	}
-
-	var lastErr error
-	for _, path := range paths {
-		data, errCall := c.billingJSON(cred, endpoints.BillingBase+path, http.MethodPost, map[string]any{})
-		if errCall != nil {
-			if IsAlreadyCheckin(errCall) {
-				return &CheckinResult{Already: true}, nil
-			}
-			lastErr = errCall
-			if upstreamErr, okErr := errCall.(*Error); okErr && upstreamErr.Kind == KindNotFound {
-				continue
-			}
-			return nil, errCall
-		}
-		var payload struct {
-			Credit int64 `json:"credit"`
-			Energy int64 `json:"energy"`
-			Streak int64 `json:"streak"`
-		}
-		if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-			// 签到成功但响应结构不认识：仍算成功（副作用已发生）。
-			return &CheckinResult{}, nil
-		}
-		return &CheckinResult{Credit: payload.Credit, Energy: payload.Energy, Streak: payload.Streak}, nil
-	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("checkin endpoint is unavailable")
-}
 
 // 本文件实现 WorkBuddy 的凭证续期。
 //
@@ -572,273 +514,577 @@ func (c *Client) DailyCheckin(cred *Credential) (*CheckinResult, error) {
 // 绝不能携带——把 refresh token 发给对话上游等于把长期凭据暴露给一个
 // 只需要 access token 的服务。
 
-// RefreshToken 刷新凭证的 access token。
-//
-// 安全红线：X-Refresh-Token 头**只允许出现在刷新端点**，对话请求绝不能携带。
-//
-// 并发采用两段式：锁内取快照 → 锁外发请求 → 锁内校验快照未被并发改动后再写回。
-func (c *Client) RefreshToken(cred *Credential) error {
-	if cred == nil {
-		return fmt.Errorf("credential is nil")
-	}
-	region := cred.Realm()
-	if !c.enabledRealm(region) {
-		return fmt.Errorf("realm %s is disabled by plugin configuration", region)
-	}
-	refreshToken := cred.RefreshTokenValue()
-	if strings.TrimSpace(refreshToken) == "" {
-		return fmt.Errorf("credential has no refresh token")
-	}
-	accessBefore, refreshBefore := cred.Snapshot()
-
-	endpoints := GetEndpoints(region)
-	req, errReq := http.NewRequestWithContext(c.opts.Context, http.MethodPost,
-		endpoints.ChatBase+tokenRefreshPath, nil)
-	if errReq != nil {
-		return fmt.Errorf("build refresh request: %w", errReq)
-	}
-	applyCommonHeaders(req, c, cred)
-	req.Header.Set("X-Refresh-Token", refreshToken)
-	req.Header.Set("X-Auth-Refresh-Source", authRefreshSource)
-
-	resp, errDo := c.refreshClient().Do(req)
-	if errDo != nil {
-		return fmt.Errorf("refresh request: %w", errDo)
-	}
-	defer closeBody(resp.Body)
-
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, apiBodyLimit))
-	if errRead != nil {
-		return fmt.Errorf("read refresh response: %w", errRead)
-	}
-	if resp.StatusCode >= 400 {
-		return enrichClassifyError(resp.StatusCode, string(body), resp.Header)
-	}
-
-	var envelope struct {
-		Code int                  `json:"code"`
-		Msg  string               `json:"msg"`
-		Data refreshTokenResponse `json:"data"`
-	}
-	var token refreshTokenResponse
-	if errUnmarshal := json.Unmarshal(body, &envelope); errUnmarshal == nil && envelope.Code == 0 && strings.TrimSpace(envelope.Data.AccessToken) != "" {
-		token = envelope.Data
-	} else if errUnmarshal == nil && envelope.Code != 0 {
-		return enrichClassifyError(resp.StatusCode, string(body), resp.Header)
-	} else if errDirect := json.Unmarshal(body, &token); errDirect != nil || strings.TrimSpace(token.AccessToken) == "" {
-		return &Error{Kind: KindSessionDead, Status: http.StatusUnauthorized, Msg: "refresh failed: no accessToken in response — re-login required"}
-	}
-
-	// 快照校验：并发刷新已经写过就放弃本次写回，避免用旧响应覆盖新值。
-	if !cred.UnchangedSince(accessBefore, refreshBefore) {
-		return nil
-	}
-	var expiresAt int64
-	if token.ExpiresIn > 0 && token.ExpiresIn <= maxRefreshTokenExpiresIn {
-		expiresAt = time.Now().Unix() + token.ExpiresIn
-	}
-	cred.ApplyTokenRefresh(token.AccessToken, token.RefreshToken, token.Domain, expiresAt)
-	if cred.FilePath != "" {
-		if errSave := SaveCredentialFile(cred.FilePath, cred); errSave != nil {
-			return fmt.Errorf("save refreshed credential: %w", errSave)
-		}
-	}
-	return nil
-}
-
 // 本文件实现 WorkBuddy 的额度查询。
 //
 // 额度口径是**积分余额**：上游的计费接口按资源包返回 remain/used/size，
 // 这里聚合成账号级的「剩余 / 总额」并保留套餐明细。
 
-// Balance 是账号的资源余额。
-type Balance struct {
-	// Remain 是剩余积分。
-	Remain int64
-	// Total 是本期总额度。
-	Total int64
-	// ExpiringSoon 是即将过期的积分（窗口由调用方定义）。
-	ExpiringSoon int64
-	// Packages 是套餐明细。
-	Packages []BalancePackage
-}
-
-// BalancePackage 是单项资源包的余额。
-type BalancePackage struct {
-	// Name 是资源包名称。
-	Name string
-	// Remain 是剩余量。
-	Remain int64
-	// Total 是总量。
-	Total int64
-	// ExpireAt 是过期时刻（Unix 秒，0 表示不过期）。
-	ExpireAt int64
-}
-
-// billingResourceAccount 是余额响应里的单个套餐。
-//
-// 字段是**上游原样的 PascalCase**（上游该接口不使用 camelCase）。
-type billingResourceAccount struct {
-	PackageName         string `json:"PackageName"`
-	CycleEndTime        string `json:"CycleEndTime"` // "2006-01-02 15:04:05"，空 = 无到期
-	CapacitySize        int64  `json:"CapacitySize"`
-	CapacityRemain      int64  `json:"CapacityRemain"`
-	CapacityUsed        int64  `json:"CapacityUsed"`
-	CycleCapacitySize   int64  `json:"CycleCapacitySize"`
-	CycleCapacityRemain int64  `json:"CycleCapacityRemain"`
-	CycleCapacityUsed   int64  `json:"CycleCapacityUsed"`
-}
-
-// billingResourceResponse 是余额接口的响应结构。
-//
-// 双层信封：Response.Data.Accounts。请求体也必须带分页与产品码，
-// 否则上游返回空列表（这一点早期实现漏了，导致余额恒为 0）。
-type billingResourceResponse struct {
-	Response struct {
-		Data struct {
-			Accounts []billingResourceAccount `json:"Accounts"`
-		} `json:"Data"`
-	} `json:"Response"`
-}
-
 // packageEndLayout 是套餐到期时间的墙钟格式（UTC+8）。
 const packageEndLayout = "2006-01-02 15:04:05"
 
-// packageRemainUsed 聚合单个套餐的 remain/used/size。
+// 本文件实现 CodeBuddy 的成长任务事件链与客户端指纹派生。
 //
-// 取数规则（照抄上游的单一事实来源，勿改）：
-//   - Cycle 期套餐优先（CycleCapacitySize > 0）：用 Cycle 三字段，
-//     remain 先钳到 [0, size]；used 取 CycleUsed 与 size-remain 的较大者，
-//     且当 used 更大时反推 remain = size - used；
-//   - 否则回退 Capacity 三字段，used 为 0 但 size > remain 时按差值补 used。
-func packageRemainUsed(account billingResourceAccount) (remain, used, size int64) {
-	if account.CycleCapacitySize > 0 {
-		remain = account.CycleCapacityRemain
-		size = account.CycleCapacitySize
-		if remain < 0 {
-			remain = 0
-		}
-		if remain > size {
-			remain = size
-		}
-		used = size - remain
-		if account.CycleCapacityUsed > used {
-			used = account.CycleCapacityUsed
-			if size >= used {
-				remain = size - used
-			}
-		}
-		return remain, used, size
-	}
-	remain = account.CapacityRemain
-	used = account.CapacityUsed
-	size = account.CapacitySize
-	if used == 0 && size > remain {
-		used = size - remain
-	}
-	return remain, used, size
+// 本包是纯逻辑层，依赖 cb 包完成出站（经宿主 HTTP 桥）。
+//
+// 整个体系的本质是**四套客户端指纹**：同一个 /v2/report 端点，
+// 服务端按请求的指纹归属到不同的任务族：
+//
+//	CLI/billing 指纹  计费域 /v2/report    对话活跃上报（chat_5、连登、领养前置）
+//	桌面指纹          对话域 /v2/report    桌面行为事件链（RichMeow、模板、专家…）
+//	web 指纹          Web 域 /v2/report    资料库阅读等 web 侧行为
+//	小程序指纹        计费域 /v2/report    开学季与小程序专属任务
+//
+// 三条普适规律（都是从真实失败中总结的）：
+//   - /v2/report 的 body 恒为**数组**，不是单个对象；
+//   - 上报 200 ≠ 计分，必须轮询回读（普通 4×3s、mp 2×3s、开学季 3×2.5s）；
+//   - 事件必须带 userId，缺失时服务端 200 但静默丢弃。
+
+// 节流参数。全部照抄原项目实测值——这些数字是风控边界，
+// 调快会触发上游限流，调慢只是浪费时间。
+const (
+	// reportGap 是连续上报之间的间隔。
+	reportGap = 1050 * time.Millisecond
+	// mpActionGap 是小程序任务写动作之间的间隔。
+	mpActionGap = 2 * time.Second
+	// expertSummonGap 是专家召唤链的间隔（实测 8s 成功率最高，取 6s 折中）。
+	expertSummonGap = 6 * time.Second
+	// nightChatGap 是夜间对话之间的间隔。
+	nightChatGap = 4 * time.Second
+	// acceptBatchGap 是批量接受任务的批间间隔。
+	acceptBatchGap = 1050 * time.Millisecond
+	// acceptBatchSize 是批量接受的每批数量。
+	acceptBatchSize = 20
+)
+
+// 异步计分的轮询参数。
+var (
+	// claimPollAttempts 与 claimPollGap 决定普通任务的等待预算（约 12 秒）。
+	claimPollAttempts = 4
+	claimPollGap      = 3 * time.Second
+	// mpPollAttempts / mpPollGap 是小程序任务的等待预算（约 6 秒）。
+	mpPollAttempts = 2
+	mpPollGap      = 3 * time.Second
+	// schoolPollLoops / schoolPollGap 是开学季的等待预算（约 7.5 秒）。
+	schoolPollLoops = 3
+	schoolPollGap   = 2500 * time.Millisecond
+)
+
+// fingerprint 生成某个账号某用途的稳定设备标识。
+//
+// 36 位 hex（18 字节），与官方客户端的设备 id 长度一致。
+// 跨重启稳定、账号间互异、部署间隔离（混入机器盐，见 runtime.configure）。
+func randomHex(n int) string {
+	return core.RandomHex(n)
 }
 
-// FetchBalance 查询账号余额。
+// nowUnixMs 返回当前毫秒时间戳。
+func nowUnixMs() int64 { return time.Now().UnixMilli() }
+
+// desktopFingerprint 是桌面指纹族注入每个事件的公共字段。
 //
-// global 域先试无 /v2 的路径，404 时回落带 /v2 的路径；CN 只有带 /v2 的。
-// 这个差异来自上游两个部署的历史，不是笔误。
-func (c *Client) FetchBalance(cred *Credential) (*Balance, error) {
-	if cred == nil {
-		return nil, fmt.Errorf("credential is required")
+// 这些字段共同把请求标识成「来自一台固定的 Windows 桌面客户端」。
+// 业务字段可以覆盖它们（map 合并时业务优先）。
+func desktopFingerprint(credential *Credential, rt *runtime) map[string]any {
+	now := nowUnixMs()
+	return map[string]any{
+		"timezone":     "Asia/Shanghai",
+		"reportDelay":  2000,
+		"userId":       credential.UIDValue(),
+		"username":     credential.NicknameValue(),
+		"userNickname": credential.NicknameValue(),
+		"product":      "SaaS",
+		// releaseDate 与 commit 是官方桌面版的构建信息，固定值即可。
+		"releaseDate": int64(1789036585355),
+		"commit":      "5f9692923c93033111c51ad7b003eb80204a9b75",
+		"ideName":     "WorkBuddy",
+		"ideType":     "WorkBuddy",
+		"ideVersion":  DesktopClientVersion,
+		"machineId":   rt.fingerprint(credential, "machine"),
+		"sessionId":   rt.fingerprint(credential, "session"),
+		"extName":     "workbuddy-desktop",
+		"extVersion":  DesktopClientVersion,
+		"os":          "win32",
+		"arch":        "x64",
+		"osVersion":   "10.0.26220",
+		"cpuCores":    20,
+		"memorySize":  24,
+		"timestamp":   now,
+		"presentAt":   now,
 	}
-	region := cred.Realm()
-	if !c.enabledRealm(region) {
-		return nil, fmt.Errorf("realm %s is disabled by plugin configuration", region)
-	}
-	endpoints := GetEndpoints(region)
-	paths := []string{billingMeterPathV2}
-	if region.IsGlobal() {
-		paths = []string{billingMeterPath, billingMeterPathV2}
-	}
+}
 
-	// 请求体是上游要求的固定形状：缺 ProductCode 或分页会拿到空列表。
-	now := time.Now()
-	body := map[string]any{
-		"PageNumber":               1,
-		"PageSize":                 100,
-		"ProductCode":              "p_tcaca",
-		"Status":                   []int{0, 3},
-		"PackageEndTimeRangeBegin": now.Format(packageEndLayout),
-		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
+// mergeEvent 把业务字段合并进指纹基底（业务字段优先）。
+func mergeEvent(base map[string]any, event map[string]any) map[string]any {
+	merged := make(map[string]any, len(base)+len(event))
+	for key, value := range base {
+		merged[key] = value
 	}
+	for key, value := range event {
+		merged[key] = value
+	}
+	return merged
+}
 
-	var lastErr error
-	for _, path := range paths {
-		data, errCall := c.billingJSON(cred, endpoints.BillingBase+path, http.MethodPost, body)
-		if errCall != nil {
-			lastErr = errCall
-			// 只在 404 时换路径：其他错误换路径也救不回来。
-			if upstreamErr, okErr := errCall.(*Error); okErr && upstreamErr.Kind == KindNotFound {
-				continue
+// DesktopChatSequence 构造 6 事件对话链（多数任务的骨架）。
+//
+// 其中 chat_message_response 必须带 isSuccessful:true —— 服务端对事件链有
+// 真实性校验，没有成功回执的链不会被计分。
+func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelName string) []map[string]any {
+	now := nowUnixMs()
+	traceID := requestID
+	assistantMessageID := messageID + "-assistant"
+	return []map[string]any{
+		{
+			"eventCode": "agent_task_created",
+			"source":    "LOCAL", "name": "working", "task_target": "local", "mode": "craft",
+			"requestModelId": modelID, "requestModelName": modelName,
+			"has_repo": false, "repo_type": "none", "workspace_type": "empty",
+			"has_connector": false, "connector_types": []any{},
+			"has_mention": false, "mention_types": []any{},
+			"has_template": false, "action": "", "template_name": "",
+			"has_expert": false, "expert_id": "", "expert_name": "", "expert_industry_id": "",
+			"has_skill": false, "skill_names": []any{},
+			"conversationId": conversationID, "messageId": messageID,
+			"buddyId": "", "buddyName": "",
+		},
+		{
+			"eventCode": "chat_message_send",
+			"messageId": assistantMessageID, "historyCount": 0, "isContextTruncated": false,
+			"currentStepCount": 1, "traceId": traceID, "rootRequestId": requestID,
+			"parentConversationId": conversationID, "agentName": "cli", "agentType": "main",
+		},
+		{
+			"eventCode":   "chat_request_send",
+			"inputLength": 24, "isPlan": false, "isAutoExecuteTerminal": false,
+			"isAutoModify": false, "codebaseEnable": false,
+			"maxToken": 0, "maxSteps": 500, "temperature": 0, "maxRetries": 0,
+			"mentionContexts": []any{}, "knowledgeId": "", "knowledgeName": "",
+			"codebaseId": "", "mentionContextCount": 0, "command": "",
+			"expertId": "", "recommendId": "", "skillId": "", "skillCount": 0,
+			"totalCount": 0, "fileUri": "", "presentAt": now,
+			"traceId": traceID, "rootRequestId": requestID, "parentConversationId": conversationID,
+			"conversationId": conversationID, "messageId": messageID,
+			"agentName": "cli", "agentType": "main",
+			"codebuddy.session_id":              conversationID,
+			"codebuddy.conversation_request_id": requestID,
+		},
+		{
+			"eventCode": "chat_message_response",
+			"messageId": assistantMessageID, "responseModelId": modelID, "responseModelName": modelName,
+			"inputToken": 120, "outputToken": 80, "totalToken": 200,
+			"isSuccessful": true, "messageErrorCode": "", "finishReason": "stop",
+			"firstTokenAt": now, "traceId": traceID, "conversationId": conversationID,
+			"parentConversationId": conversationID, "presentAt": now,
+		},
+		{
+			"eventCode": "chat_message_status",
+			"messageId": assistantMessageID, "messageErrorCode": "0",
+			"traceId": traceID, "conversationId": conversationID, "presentAt": now,
+		},
+		{
+			"eventCode": "chat_request_response",
+			"mode":      "craft", "toolCallCount": 0,
+			"inputToken": 120, "outputToken": 80, "totalToken": 200,
+			"isSuccessful": true, "finishReason": "stop",
+			"conversationId": conversationID, "requestId": requestID,
+			"traceId": traceID, "parentConversationId": conversationID, "presentAt": now,
+		},
+	}
+}
+
+// DesktopBuddyAppSequence 构造「进入 Buddy 应用」事件链（5 事件）。
+//
+// 同一组事件同时满足 Buddy_App 与 Buddy_App_QQ 两个任务：
+// 后者只要求「进入企鹅教师助手」，而本链的事件里带了该应用的标识。
+func DesktopBuddyAppSequence(buddyID, buddyName string) []map[string]any {
+	base := map[string]any{"mode": "LOCAL", "buddyId": buddyID, "buddyName": buddyName, "position": 2}
+	return []map[string]any{
+		mergeEvent(base, map[string]any{"eventCode": "buddyapp_discover_click"}),
+		mergeEvent(base, map[string]any{"eventCode": "buddyapp_show", "elementId": buddyID, "elementName": buddyName}),
+		mergeEvent(base, map[string]any{"eventCode": "buddyapp_enter_click", "elementId": buddyID, "elementName": buddyName, "isFirstPage": "1"}),
+		mergeEvent(base, map[string]any{"eventCode": "buddyapp_auth_confirm_click"}),
+		mergeEvent(base, map[string]any{"eventCode": "buddyapp_bindaccount_skip_click"}),
+	}
+}
+
+// DefaultBuddyID / DefaultBuddyName 是企鹅教师助手应用（Buddy_App_QQ 要求的目标）。
+const (
+	DefaultBuddyID   = "cb_y5Dy46tPQGGWtueMxXbe"
+	DefaultBuddyName = "企鹅教师助手"
+)
+
+// DesktopAutomationCreateEvent 构造「定时任务创建成功」事件（automation_1）。
+func DesktopAutomationCreateEvent(name string) []map[string]any {
+	return []map[string]any{{
+		"eventCode": "automated_task_create_suc", "name": name, "source": "manually",
+		"modelId": "fast-model", "modelIsThinking": true, "connectorCount": 0,
+		"skills": "", "skillCount": 0, "scheduleType": "once", "mode": "LOCAL",
+	}}
+}
+
+// DesktopTemplateUseSequence 构造模板使用链（template_5）。
+//
+// = 对话链 + 两个模板事件。template_id 服务端不校验真实性，因此可用占位 id。
+func DesktopTemplateUseSequence(conversationID, requestID, templateID, templateName string) []map[string]any {
+	events := DesktopChatSequence(conversationID, requestID, randomHex(16), "fast-model", "fast-model")
+	events = append(events,
+		map[string]any{
+			"eventCode": "agent_task_created_with_template", "mode": "working",
+			"isCustomModel": false, "id": templateID, "name": templateName, "requestId": requestID,
+		},
+		map[string]any{
+			"eventCode": "template_used", "template_id": templateID, "task_mode": "working",
+		},
+	)
+	return events
+}
+
+// DesktopPlaybookPromptSequence 构造灵感案例链（playbook_prompt）。
+//
+// 判据是 playbook_prompt_send（真正的发送动作），不是卡片点击或曝光。
+func DesktopPlaybookPromptSequence(conversationID, requestID, caseID, caseName string) []map[string]any {
+	payload := map[string]any{
+		"id": caseID, "name": caseName, "type": "document",
+		"categoryId": "", "categoryName": "",
+	}
+	events := DesktopChatSequence(conversationID, requestID, randomHex(16), "fast-model", "fast-model")
+	events = append(events,
+		mergeEvent(payload, map[string]any{
+			"eventCode": "web_element_click", "pageName": "playbook_detail",
+			"elementId": "playbook_ctaClick", "elementName": caseName, "source": "discover",
+		}),
+		mergeEvent(payload, map[string]any{
+			"eventCode": "playbook_cta_click", "source": "discover", "position": 0,
+		}),
+		mergeEvent(payload, map[string]any{
+			"eventCode": "playbook_prompt_send", "conversationId": conversationID, "requestId": requestID,
+		}),
+	)
+	return events
+}
+
+// DesktopDesignCanvasSequence 构造设计画布链（create_canvas）。
+func DesktopDesignCanvasSequence(conversationID, requestID string) []map[string]any {
+	events := DesktopChatSequence(conversationID, requestID, randomHex(16), "fast-model", "fast-model")
+	suffix := requestID
+	if len(suffix) > 8 {
+		suffix = suffix[len(suffix)-8:]
+	}
+	events = append(events,
+		map[string]any{
+			"eventCode": "wbx_design_canvas_task_create", "conversationId": conversationID,
+			"requestId": requestID, "source": "summon_keyword", "cost": 12000, "isSuccessful": true,
+		},
+		map[string]any{
+			"eventCode": "wbx_design_canvas_open", "conversationId": conversationID,
+			"requestId": requestID, "id": "ardot-file-" + suffix,
+			"source": "summon_keyword", "type": "page", "cost": 13000, "isSuccessful": true,
+		},
+	)
+	return events
+}
+
+// SchoolChatTimesEvents 构造小程序对话事件（开学季与 mp 任务共用）。
+//
+// activityID 非空时带上（开学季任务要求它，缺失则不点亮）。
+func SchoolChatTimesEvents(conversationID, activityID string) []map[string]any {
+	requestID := "wb2api-" + randomHex(8)
+	messageID := "msg-" + requestID
+	if len(requestID) > 8 {
+		messageID = "msg-" + requestID[len(requestID)-8:]
+	}
+	event := map[string]any{
+		"eventCode":   "chat_request_send",
+		"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
+		"isAutoModify": false, "codebaseEnable": false,
+		"maxToken": 0, "maxSteps": 500, "temperature": 0, "maxRetries": 0,
+		"mentionContexts": []any{}, "knowledgeId": "", "knowledgeName": "",
+		"codebaseId": "", "mentionContextCount": 0, "command": "",
+		"expertId": "", "recommendId": "", "skillId": "", "skillCount": 0,
+		"totalCount": 0, "fileUri": "", "presentAt": nowUnixMs(),
+		"traceId": requestID, "rootRequestId": requestID,
+		"parentConversationId": conversationID, "conversationId": conversationID,
+		"messageId": messageID, "agentName": "mp", "agentType": "main",
+		"codebuddy.session_id":              conversationID,
+		"codebuddy.conversation_request_id": requestID,
+	}
+	if activityID != "" {
+		event["activityId"] = activityID
+	}
+	return []map[string]any{event}
+}
+
+// MiniChatModelEvent 构造带指定模型的小程序对话事件。
+func MiniChatModelEvent(conversationID, modelID, modelName string) []map[string]any {
+	events := SchoolChatTimesEvents(conversationID, "")
+	if len(events) == 0 {
+		return events
+	}
+	events[0]["requestModelId"] = modelID
+	events[0]["requestModelName"] = modelName
+	return events
+}
+
+// MiniExpertUseEvent 构造小程序专家使用事件（Sequential_Tasks_2）。
+//
+// 注意：**不带 conversationId、不带 activityId** —— 真实事件就是这两个字段都没有。
+// expertID 必须是市场里的真实 ex_ id，空 id 服务端不入账。
+func MiniExpertUseEvent(expertID, expertName, expertType string) []map[string]any {
+	return []map[string]any{{
+		"eventCode": "expert_actual_use", "reportDelay": 0,
+		"extVersion": "2.2.8",
+		"source":     "mini_program",
+		"id":         expertID, "name": expertID, "expertTitle": expertName,
+		"type": "send_message", "characterCount": 12, "expertType": expertType,
+	}}
+}
+
+// SchoolSeasonActivityID 是开学季活动的活动标识（缺它不点亮校园日任务）。
+const SchoolSeasonActivityID = "school_open_day_2026"
+
+// 桌面指纹族请求上下文。
+type desktopContext struct {
+	credential *Credential
+	events     []map[string]any
+}
+
+// run 让事件带上指纹并发出去。
+func (c *desktopContext) run(ctx context.Context, client *Client) error {
+	base := desktopFingerprint(c.credential, client.rt)
+	merged := make([]map[string]any, 0, len(c.events))
+	for _, event := range c.events {
+		merged = append(merged, mergeEvent(base, event))
+	}
+	return client.ReportDesktopEvents(ctx, c.credential, merged)
+}
+
+// ApplyDesktopFingerprint 给事件链注入桌面指纹（导出给 main 包编排使用）。
+func ApplyDesktopFingerprint(credential *Credential, events []map[string]any, rt *runtime) []map[string]any {
+	return withFingerprint(credential, events, rt)
+}
+
+// DesktopExpertSummonSequence 构造专家召唤链（3 事件）。
+//
+// 关键字段：id 必须是市场真实 ex_ id，type 取专家的首个分类。
+func DesktopExpertSummonSequence(expert MarketExpert) []map[string]any {
+	category := expert.Category
+	if category == "" {
+		category = "expert-all"
+	}
+	version := expert.Version
+	if version == "" {
+		version = "1.0.0"
+	}
+	pageURL := "/C:/Program%20Files/WorkBuddy/resources/app.asar/renderer/index.html"
+	return []map[string]any{
+		{
+			"eventCode": "web_element_click", "source": expert.ID, "type": category, "version": version,
+			"elementId": "expert_summon_click", "elementName": "立即召唤", "pageURL": pageURL,
+		},
+		{
+			"eventCode": "expert_summon_click", "id": expert.ID, "name": expert.Name,
+			"expertTitle": expert.Profession, "type": "expert-all", "position": 0,
+			"expertType": expert.Type, "version": version, "mode": "LOCAL",
+		},
+		{
+			"eventCode": "expert_summoned", "id": expert.ID, "name": expert.Name,
+			"expertTitle": expert.Profession, "type": "expert-all",
+		},
+	}
+}
+
+// DesktopExpertActualUseEvent 构造专家实际使用事件。
+//
+// requestId 必须是**真实对话的服务端 id**：自造 UUID 不会被计分。
+func DesktopExpertActualUseEvent(expert MarketExpert, conversationID, requestID string) []map[string]any {
+	category := expert.Category
+	if category == "" {
+		category = "expert-all"
+	}
+	version := expert.Version
+	if version == "" {
+		version = "1.0.0"
+	}
+	return []map[string]any{{
+		"eventCode": "expert_actual_use", "id": expert.ID, "name": expert.Name,
+		"expertTitle": expert.Profession, "type": category, "expertType": expert.Type,
+		"source": "builtin", "version": version,
+		"cost": 9000, "characterCount": 14,
+		"conversationId": conversationID, "requestId": requestID,
+		"messageId":      "msg-" + tailOfString(requestID, 8),
+		"requestModelId": "fast-model", "requestModelName": "fast-model",
+		"mode": "craft",
+	}}
+}
+
+// tailOfString 取字符串末尾 n 个字符。
+func tailOfString(text string, n int) string {
+	if len(text) <= n {
+		return text
+	}
+	return text[len(text)-n:]
+}
+
+// 本文件生成请求标识与从请求体里提取会话键。
+
+// NewHexID 生成 32 位十六进制随机 ID（与官方客户端的 messageId 形态一致）。
+func NewHexID() string {
+	return core.RandomHex(16)
+}
+
+func newHexID() string {
+	return NewHexID()
+}
+
+// ConversationKey 从请求体里提取会话键，用于生成稳定的会话头族。
+//
+// 识别顺序照抄原实现（粒度由细到粗）：
+//  1. metadata.conversation_id / conversationId
+//  2. 顶层 conversation_id / conversationId
+//  3. prompt_cache_key
+//  4. 派生键：system 文本 + 首条 user 消息的哈希
+//
+// 刻意**不**把 user_id 当会话键：同一用户的所有会话会粘到同一个键上，
+// 反而破坏会话隔离。
+func ConversationKey(body []byte) string {
+	payload := decodeBodyMap(body)
+	if payload == nil {
+		return ""
+	}
+	if metadata, okMeta := payload["metadata"].(map[string]any); okMeta {
+		for _, key := range []string{"conversation_id", "conversationId"} {
+			if value, okValue := metadata[key].(string); okValue && strings.TrimSpace(value) != "" {
+				return strings.TrimSpace(value)
 			}
-			return nil, errCall
 		}
-		var payload billingResourceResponse
-		if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-			lastErr = fmt.Errorf("decode balance: %w", errUnmarshal)
+	}
+	for _, key := range []string{"conversation_id", "conversationId"} {
+		if value, okValue := payload[key].(string); okValue && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	if value, okValue := payload["prompt_cache_key"].(string); okValue && strings.TrimSpace(value) != "" {
+		return strings.TrimSpace(value)
+	}
+	return deriveConversationKey(payload)
+}
+
+// deriveConversationKey 用 system 与首条 user 消息派生会话键。
+//
+// 通用 OpenAI 客户端不传任何会话标识，派生键让它们也能享受会话聚合。
+// 前缀 "d-" 标明这是派生值（便于与客户端显式传的值区分）。
+func deriveConversationKey(payload map[string]any) string {
+	messages, okMessages := payload["messages"].([]any)
+	if !okMessages || len(messages) == 0 {
+		return ""
+	}
+	systemText := ""
+	firstUser := ""
+	for _, item := range messages {
+		message, okMessage := item.(map[string]any)
+		if !okMessage {
 			continue
 		}
-		return parseBalance(payload), nil
+		role, _ := message["role"].(string)
+		switch strings.ToLower(strings.TrimSpace(role)) {
+		case "system", "developer":
+			if systemText == "" {
+				systemText = contentSignature(message["content"])
+			}
+		case "user":
+			if firstUser == "" {
+				firstUser = contentSignature(message["content"])
+			}
+		}
 	}
-	if lastErr != nil {
-		return nil, lastErr
+	if firstUser == "" {
+		return ""
 	}
-	return nil, fmt.Errorf("balance endpoint is unavailable")
+	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUser))
+	return "d-" + hex.EncodeToString(sum[:])[:16]
 }
 
-// parseBalance 归一化余额响应。
+// contentSignature 把消息内容压成一个稳定的短签名。
 //
-// remain/total 是各套餐的**求和**（用户关心的是账号总量，不是单个套餐）。
-func parseBalance(payload billingResourceResponse) *Balance {
-	balance := &Balance{}
-	for _, account := range payload.Response.Data.Accounts {
-		remain, _, size := packageRemainUsed(account)
-		balance.Remain += remain
-		balance.Total += size
-		balance.Packages = append(balance.Packages, BalancePackage{
-			Name:     strings.TrimSpace(account.PackageName),
-			Remain:   remain,
-			Total:    size,
-			ExpireAt: parsePackageExpiry(account.CycleEndTime),
-		})
+// 数组形态（多模态）只取文本部分并保留非文本部分的类型，这样
+// 图片消息不会与纯文本消息撞成同一个签名。
+func contentSignature(content any) string {
+	switch typed := content.(type) {
+	case string:
+		return typed
+	case []any:
+		parts := make([]string, 0, len(typed))
+		for _, item := range typed {
+			part, okPart := item.(map[string]any)
+			if !okPart {
+				continue
+			}
+			if text, okText := part["text"].(string); okText {
+				parts = append(parts, text)
+				continue
+			}
+			partType, _ := part["type"].(string)
+			sum := sha256.Sum256([]byte(partType))
+			parts = append(parts, "["+partType+":"+hex.EncodeToString(sum[:4])+"]")
+		}
+		return strings.Join(parts, "\x1f")
 	}
-	return balance
+	return ""
 }
 
-// parsePackageExpiry 解析套餐到期时刻（UTC+8 墙钟）；解析失败返回 0。
-func parsePackageExpiry(raw string) int64 {
-	trimmed := strings.TrimSpace(raw)
-	if trimmed == "" {
-		return 0
+// TurnKey 返回当前轮次的键（最后一条 user 消息）。
+//
+// 序号入键是刻意的：连续两次内容相同的「继续」必须被识别为不同轮次，
+// 否则第二轮会复用第一轮的请求 ID，后台聚合会把它们合并成一次。
+func TurnKey(body []byte) string {
+	payload := decodeBodyMap(body)
+	if payload == nil {
+		return ""
 	}
-	parsed, errParse := time.ParseInLocation(packageEndLayout, trimmed, cstZone)
-	if errParse != nil {
-		return 0
+	messages, okMessages := payload["messages"].([]any)
+	if !okMessages {
+		return ""
 	}
-	return parsed.Unix()
+	for index := len(messages) - 1; index >= 0; index-- {
+		message, okMessage := messages[index].(map[string]any)
+		if !okMessage {
+			continue
+		}
+		role, _ := message["role"].(string)
+		if !strings.EqualFold(strings.TrimSpace(role), "user") {
+			continue
+		}
+		signature := contentSignature(message["content"])
+		if signature == "" {
+			continue
+		}
+		return fmt.Sprintf("u%d:%s", index, signature)
+	}
+	return ""
 }
 
-// billingJSON 发起一次计费域请求并解开信封。
-func (c *Client) billingJSON(cred *Credential, url, method string, body any) (json.RawMessage, error) {
-	encoded, errEncode := json.Marshal(body)
-	if errEncode != nil {
-		return nil, fmt.Errorf("encode request: %w", errEncode)
+// RequestIDForKey 从会话键派生一个稳定的请求 ID。
+func RequestIDForKey(key string) string {
+	if strings.TrimSpace(key) == "" {
+		return ""
 	}
-	req, errReq := http.NewRequestWithContext(c.opts.Context, method, url, strings.NewReader(string(encoded)))
-	if errReq != nil {
-		return nil, fmt.Errorf("build request: %w", errReq)
-	}
-	c.applyBillingHeaders(req, cred)
-	return c.doJSON(req)
+	sum := sha256.Sum256([]byte("req|" + key))
+	return hex.EncodeToString(sum[:16])
 }
 
-// FetchQuota 汇总账号的额度信息（供宿主的管理端展示）。
-func (c *Client) FetchQuota(cred *Credential) (*Balance, error) {
-	return c.FetchBalance(cred)
+// TurnRequestID 从轮次键派生一个稳定的请求 ID。
+func TurnRequestID(key string) string {
+	if strings.TrimSpace(key) == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte("turn|" + key))
+	return hex.EncodeToString(sum[:16])
+}
+
+// RealmDisplayName 返回域的展示名。
+func RealmDisplayName(region Region) string {
+	if region.IsGlobal() {
+		return "国际版 (WorkBuddy AI)"
+	}
+	return "国内版 (CodeBuddy)"
 }

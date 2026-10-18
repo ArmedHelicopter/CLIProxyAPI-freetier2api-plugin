@@ -1,7 +1,5 @@
 package tests
 
-// 本文件用静态 import 图守住分层边界。
-
 import (
 	"go/parser"
 	"go/token"
@@ -11,6 +9,8 @@ import (
 	"strings"
 	"testing"
 )
+
+// 本文件用静态 import 图守住分层边界。
 
 const vendorImportPrefix = "freetier2api-plugin/internal/vendors/"
 
@@ -196,10 +196,7 @@ var layerRules = []layerRule{
 	{pkg: "vendors/codearts", allowlist: []string{"core", "hostbridge", "logger", "vendors/codearts"}},
 	{pkg: "vendors/minimaxcode", allowlist: []string{"core", "hostbridge", "logger", "vendors/minimaxcode"}},
 	{pkg: "vendors/opencodezen", allowlist: []string{"core", "hostbridge", "logger", "vendors/opencodezen"}},
-	{pkg: "vendors/qoder", allowlist: []string{"core", "hostbridge", "logger", "vendors/qoder", "vendors/qoder/bridge", "vendors/qoder/cosy", "vendors/qoder/qoderapi"}},
-	{pkg: "vendors/qoder/bridge", allowlist: []string{"core", "hostbridge", "logger", "vendors/qoder", "vendors/qoder/bridge", "vendors/qoder/cosy", "vendors/qoder/qoderapi"}},
-	{pkg: "vendors/qoder/cosy", allowlist: []string{"core", "hostbridge", "logger", "vendors/qoder", "vendors/qoder/bridge", "vendors/qoder/cosy", "vendors/qoder/qoderapi"}},
-	{pkg: "vendors/qoder/qoderapi", allowlist: []string{"core", "hostbridge", "logger", "vendors/qoder", "vendors/qoder/bridge", "vendors/qoder/cosy", "vendors/qoder/qoderapi"}},
+	{pkg: "vendors/qoder", allowlist: []string{"core", "hostbridge", "logger", "vendors/qoder"}},
 	{pkg: "vendors/trae", allowlist: []string{"core", "hostbridge", "logger", "vendors/trae"}},
 	{pkg: "vendors/workbuddy", allowlist: []string{"core", "hostbridge", "logger", "vendors/workbuddy"}},
 	{pkg: "vendors/zcode", allowlist: []string{"core", "hostbridge", "logger", "vendors/zcode"}},

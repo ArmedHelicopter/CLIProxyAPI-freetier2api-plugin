@@ -23,8 +23,7 @@ import (
 // adapter 是 core.Vendor 在 Cline 上的实现。
 type adapter struct {
 	*core.NativeAdapter[*Credential]
-	contextFallback func(string) int64
-	baseURL         string
+	baseURL string
 }
 
 // pendingLogin 是一次进行中的 Cline 登录（会话数据）。
@@ -33,11 +32,8 @@ type pendingLogin struct {
 }
 
 // Instances 构造 Cline 实例（只有一个，没有区域之分）。
-func Instances(env core.Env, contextFallback func(string) int64) []core.Vendor {
-	if contextFallback == nil {
-		contextFallback = core.DefaultContextWindow
-	}
-	inst := &adapter{contextFallback: contextFallback}
+func Instances(env core.Env) []core.Vendor {
+	inst := &adapter{}
 	inst.NativeAdapter = core.NewNativeAdapter(core.NativeSpec[*Credential]{
 		Meta: core.Meta{VendorID: VendorID, VendorName: VendorName},
 		Env:  env,
@@ -80,9 +76,6 @@ func Instances(env core.Env, contextFallback func(string) int64) []core.Vendor {
 	return []core.Vendor{inst}
 }
 
-// AuthMode 报告本供应商的凭证形态。
-func (v *adapter) AuthMode() string { return "oauth" }
-
 // Configure 解析供应商专属配置。
 func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
 	v.baseURL = strings.TrimSpace(raw["cline_base_url"])
@@ -102,7 +95,7 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 		// 探测失败退回内置兜底清单：没有模型注册比注册一份可能过时的
 		// 清单更糟（客户端会看不到任何模型）。
 		logger.Debug("cline: list models failed, using bundled list: %v", errModels)
-		models = BundledClineModels()
+		models = bundledModels()
 	}
 	return v.modelsToPluginAPI(models), nil
 }
@@ -120,7 +113,7 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 		}
 		contextWindow := model.ContextWindow
 		if contextWindow == 0 {
-			contextWindow = v.contextFallback(id)
+			contextWindow = core.DefaultContextWindow(id)
 		}
 		maxOutput := model.MaxOutputTokens
 		if maxOutput == 0 {
@@ -280,10 +273,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 	}, nil
 }
 
-// OwnsLoginSession 报告该会话是否由本供应商创建。
-func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	if vendorID, okOwns := v.Env.Logins.Owns(sessionID); okOwns {
-		return vendorID == VendorID
-	}
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "cline_")
+// ConfigFields 声明 cline 专属配置。
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{{Name: "cline_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"}}
 }

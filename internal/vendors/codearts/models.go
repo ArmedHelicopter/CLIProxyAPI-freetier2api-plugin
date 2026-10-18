@@ -6,10 +6,11 @@ package codearts
 import (
 	"context"
 	"encoding/json"
-	"freetier2api-plugin/internal/hostbridge"
 	"io"
 	"net/http"
 	"time"
+
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 type Model struct {
@@ -23,7 +24,7 @@ type Model struct {
 }
 
 // DefaultModels 返回 CodeArts 的默认模型清单。
-func DefaultModels() []Model {
+func bundledModels() []Model {
 	return []Model{
 		{
 			ID:            "GLM-5.2",
@@ -67,12 +68,12 @@ func DefaultModels() []Model {
 // FetchModels 尝试从上游拉取模型列表。
 func FetchModels(ctx context.Context, cred *Credential) ([]Model, error) {
 	if cred == nil || cred.AccessKeyID == "" {
-		return DefaultModels(), nil
+		return bundledModels(), nil
 	}
 
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, SnapEngineApiHost+EpModelBuiltin, nil)
 	if errReq != nil {
-		return DefaultModels(), nil
+		return bundledModels(), nil
 	}
 	req.Header.Set("Agent-Type", "PromptCenter")
 	signHuaweiRequest(req, nil, cred)
@@ -80,12 +81,12 @@ func FetchModels(ctx context.Context, cred *Credential) ([]Model, error) {
 	client := hostbridge.Client(ctx, 15*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return DefaultModels(), nil
+		return bundledModels(), nil
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return DefaultModels(), nil
+		return bundledModels(), nil
 	}
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -114,5 +115,5 @@ func FetchModels(ctx context.Context, cred *Credential) ([]Model, error) {
 		}
 	}
 
-	return DefaultModels(), nil
+	return bundledModels(), nil
 }

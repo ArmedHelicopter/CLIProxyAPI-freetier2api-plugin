@@ -4,6 +4,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 func TestClassifyOrderingMatters(t *testing.T) {
@@ -11,42 +13,42 @@ func TestClassifyOrderingMatters(t *testing.T) {
 		name   string
 		status int
 		body   string
-		want   Kind
+		want   core.FailureKind
 	}{
 		// 11102 必须先判：它可能是 400 也可能是 404，晚判会被 404 分支吞掉。
-		{"model blocked on 400", 400, `{"code":11102,"msg":"service info not found"}`, KindModelBlocked},
-		{"model blocked on 404", 404, `{"code":11102,"msg":"service info not found"}`, KindModelBlocked},
+		{"model blocked on 400", 400, `{"code":11102,"msg":"service info not found"}`, core.FailureKindModelBlocked},
+		{"model blocked on 404", 404, `{"code":11102,"msg":"service info not found"}`, core.FailureKindModelBlocked},
 		// 429 必须早于余额关键词：429 正文常带 "quota exceeded" 这类跨界的措辞，
 		// 先判余额会把限流误冷却到次日，白扔一个号。
-		{"429 with credit wording stays rate limit", 429, `{"code":1,"msg":"quota exceeded, too many requests"}`, KindSoftRate},
+		{"429 with credit wording stays rate limit", 429, `{"code":1,"msg":"quota exceeded, too many requests"}`, core.FailureKindSoftRate},
 		// 真正的余额耗尽由 402 或业务码 14018 捕获。
-		{"402 is hard credit", 402, `{"code":1,"msg":"payment required"}`, KindHardCredit},
-		{"429 with 14018 is hard credit", 429, `{"code":14018,"msg":"insufficient"}`, KindHardCredit},
+		{"402 is hard credit", 402, `{"code":1,"msg":"payment required"}`, core.FailureKindHardCredit},
+		{"429 with 14018 is hard credit", 429, `{"code":14018,"msg":"insufficient"}`, core.FailureKindHardCredit},
 		// 会话失效优先于账号故障。
-		{"session dead", 401, `{"code":12153,"msg":"Offline user session not found"}`, KindSessionDead},
+		{"session dead", 401, `{"code":12153,"msg":"Offline user session not found"}`, core.FailureKindSessionDead},
 		// 账号故障不能按 11140 判定（该 code 同时承载模型级限流文案），只看关键词。
-		{"account fault by keyword", 400, `{"msg":"request illegal"}`, KindAccountFault},
+		{"account fault by keyword", 400, `{"msg":"request illegal"}`, core.FailureKindAccountFault},
 		// 11140 带限流文案时必须按文案归为限流，而不是账号故障——
 		// 按 code 判定会把一个只是被限流的账号当成被封禁处理。
-		{"11140 with rate-limit wording is soft rate", 400, `{"code":11140,"msg":"The model provider is rate-limiting requests."}`, KindSoftRate},
+		{"11140 with rate-limit wording is soft rate", 400, `{"code":11140,"msg":"The model provider is rate-limiting requests."}`, core.FailureKindSoftRate},
 		// 上下文超限是请求级错误，必须先于 404/5xx/WAF 判定。
-		{"prompt too long on 400", 400, `{"code":11115,"msg":"prompt is too long"}`, KindPromptTooLong},
-		{"prompt too long on 413", 413, `{"code":11115,"msg":"prompt is too long"}`, KindPromptTooLong},
+		{"prompt too long on 400", 400, `{"code":11115,"msg":"prompt is too long"}`, core.FailureKindPromptTooLong},
+		{"prompt too long on 413", 413, `{"code":11115,"msg":"prompt is too long"}`, core.FailureKindPromptTooLong},
 		// WAF：403 且没有业务信封。
-		{"waf block", 403, `<html>Request blocked by WAF</html>`, KindWAFBlock},
-		{"403 with envelope is not waf", 403, `{"code":1000,"msg":"quota exceeded"}`, KindHardCredit},
+		{"waf block", 403, `<html>Request blocked by WAF</html>`, core.FailureKindWAFBlock},
+		{"403 with envelope is not waf", 403, `{"code":1000,"msg":"quota exceeded"}`, core.FailureKindHardCredit},
 		// 图片无效。
-		{"image invalid", 400, `{"code":11135,"msg":"invalid_image_data"}`, KindImageInvalid},
+		{"image invalid", 400, `{"code":11135,"msg":"invalid_image_data"}`, core.FailureKindImageInvalid},
 		// 内容策略拦截。
-		{"content blocked", 400, `{"msg":"blocked by security policy"}`, KindContentBlocked},
+		{"content blocked", 400, `{"msg":"blocked by security policy"}`, core.FailureKindContentBlocked},
 		// 参数非法。
-		{"bad params", 400, `{"msg":"Unmarshal chat params failed"}`, KindBadParams},
+		{"bad params", 400, `{"msg":"Unmarshal chat params failed"}`, core.FailureKindBadParams},
 		// 其它 4xx。
-		{"other client error", 400, `{"code":12345,"msg":"whatever"}`, KindClient},
+		{"other client error", 400, `{"code":12345,"msg":"whatever"}`, core.FailureKindClient},
 		// 偶发 404（无 11102 标记）。
-		{"plain 404", 404, `{"msg":"not found"}`, KindNotFound},
+		{"plain 404", 404, `{"msg":"not found"}`, core.FailureKindNotFound},
 		// 上游故障。
-		{"server error", 500, `{"msg":"internal error"}`, KindServer},
+		{"server error", 500, `{"msg":"internal error"}`, core.FailureKindServer},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -66,11 +68,11 @@ func TestClassifyModelBlockedNeedsFieldBoundary(t *testing.T) {
 	// 11102 只出现在 requestId 里：不该被判成模型不可用。
 	body := `{"code":12345,"msg":"bad request","requestId":"trace-11102-abc"}`
 	got := Classify(http.StatusBadRequest, body)
-	if got.Kind == KindModelBlocked {
+	if got.Kind == core.FailureKindModelBlocked {
 		t.Fatalf("11102 inside requestId must not trigger model blocking: %s", got.Kind)
 	}
 	// code 字段真的是 11102：应当命中。
-	if got := Classify(http.StatusBadRequest, `{"code":11102}`); got.Kind != KindModelBlocked {
+	if got := Classify(http.StatusBadRequest, `{"code":11102}`); got.Kind != core.FailureKindModelBlocked {
 		t.Fatalf("explicit code 11102 must be model blocked, got %s", got.Kind)
 	}
 }

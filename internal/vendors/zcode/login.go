@@ -1,20 +1,5 @@
 package zcode
 
-// OAuth CLI 登录流程（headless，服务端中转）与 API Key 兑换。
-//
-// 流程：
-//  1. POST oauth/cli/init（Bearer <本地 poll_token>）→ flow_id + authorize_url
-//     + poll_token。**2026-09 起 poll_token 由服务端下发**，后续轮询必须改用
-//     该值；未下发时回退本地随机值（旧协议兼容）。
-//  2. 用户在浏览器打开 authorize_url 完成授权。
-//  3. GET oauth/cli/poll/{flow_id}（Bearer <poll_token>）→ status=ready 时给出
-//     token（Coding Plan JWT）与 zai.access_token。
-//  4. 用 access_token 兑换业务 API Key（api.z.ai 链路），免人机验证码。
-//
-// 请求头刻意保持最小集：官方 CLI 只带 Authorization 与 Content-Type，
-// 夹带伪造头会让上游对 OAuth 会话产生异常的设备绑定限制。
-// 参考 zcode2api/app/oauth.py。
-
 import (
 	"bytes"
 	"context"
@@ -30,6 +15,21 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
 )
+
+// OAuth CLI 登录流程（headless，服务端中转）与 API Key 兑换。
+//
+// 流程：
+//  1. POST oauth/cli/init（Bearer <本地 poll_token>）→ flow_id + authorize_url
+//     + poll_token。**2026-09 起 poll_token 由服务端下发**，后续轮询必须改用
+//     该值；未下发时回退本地随机值（旧协议兼容）。
+//  2. 用户在浏览器打开 authorize_url 完成授权。
+//  3. GET oauth/cli/poll/{flow_id}（Bearer <poll_token>）→ status=ready 时给出
+//     token（Coding Plan JWT）与 zai.access_token。
+//  4. 用 access_token 兑换业务 API Key（api.z.ai 链路），免人机验证码。
+//
+// 请求头刻意保持最小集：官方 CLI 只带 Authorization 与 Content-Type，
+// 夹带伪造头会让上游对 OAuth 会话产生异常的设备绑定限制。
+// 参考 zcode2api/app/oauth.py。
 
 const (
 	// loginFlowTTL 是单次登录会话的有效期。
@@ -455,14 +455,6 @@ func decryptSecret(ctx context.Context, client *http.Client, bizToken, keyURL, a
 	return payload.Data.SecretKey, nil
 }
 
-// OwnsLoginSession 报告会话是否归属本供应商且仍有效。
-func OwnsLoginSession(logins core.LoginSessions, sessionID string) bool {
-	if vendorID, okOwns := logins.Owns(sessionID); okOwns {
-		return vendorID == VendorID
-	}
-	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "zcode_")
-}
-
 // zcodeFileName 生成凭证文件名（邮箱优先，便于辨识账号）。
 func zcodeFileName(cred *Credential) string {
 	seed := core.FirstNonEmpty(cred.Email, MaskedKey(core.FirstNonEmpty(cred.APIKey, cred.JWTToken)))
@@ -476,4 +468,42 @@ func base64URLDecode(segment string) ([]byte, error) {
 	}
 	padded := segment + strings.Repeat("=", (4-len(segment)%4)%4)
 	return base64.URLEncoding.DecodeString(padded)
+}
+
+// Refresh 校验凭证。
+//
+// ZCode 没有 refresh_token 流程（JWT 与 API Key 都不支持续期），因此这里只做
+// 本地校验并返回 refreshed=false——不触发无意义的写盘。
+func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return nil, false, errNative
+	}
+	if errValidate := ValidateCredential(ctx, native); errValidate != nil {
+		return nil, false, errValidate
+	}
+	return cred, false, nil
+}
+
+// ValidateCredential 校验凭证形态与上游可用性。
+//
+// 只做本地形态校验，不产生上游流量：宿主会在每次刷新时调用本方法，
+// 让它去打上游等于把额度查询变成了周期性的风控信号。
+func ValidateCredential(ctx context.Context, cred *Credential) error {
+	if cred == nil {
+		return transientErr("zcode credential is nil")
+	}
+	if strings.TrimSpace(cred.APIKey) == "" && strings.TrimSpace(cred.JWTToken) == "" {
+		return transientErr("zcode credential missing both api_key and jwt_token")
+	}
+	return nil
+}
+
+// MaskedKey 对凭证脱敏：保留前 4 位与后 4 位。
+func MaskedKey(val string) string {
+	s := strings.TrimSpace(val)
+	if len(s) <= 8 {
+		return "****"
+	}
+	return s[:4] + "***" + s[len(s)-4:]
 }

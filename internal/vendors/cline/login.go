@@ -80,13 +80,13 @@ func LoginStart(ctx context.Context) (*DeviceAuth, error) {
 
 	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
-		return nil, &Error{Msg: "device auth: " + errDo.Error(), Kind: KindTransient}
+		return nil, &core.Failure{Msg: "device auth: " + errDo.Error(), Kind: core.FailureKindTransient}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if errRead != nil {
-		return nil, &Error{Status: resp.StatusCode, Msg: "read device auth response: " + errRead.Error(), Kind: KindTransient}
+		return nil, &core.Failure{Status: resp.StatusCode, Msg: "read device auth response: " + errRead.Error(), Kind: core.FailureKindTransient}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, Classify(resp.StatusCode, string(raw))
@@ -144,13 +144,13 @@ func LoginPoll(ctx context.Context, baseURL string, deviceCode string) (*Credent
 
 	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
-		return nil, &Error{Msg: "login poll: " + errDo.Error(), Kind: KindTransient}
+		return nil, &core.Failure{Msg: "login poll: " + errDo.Error(), Kind: core.FailureKindTransient}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if errRead != nil {
-		return nil, &Error{Status: resp.StatusCode, Msg: "read poll response: " + errRead.Error(), Kind: KindTransient}
+		return nil, &core.Failure{Status: resp.StatusCode, Msg: "read poll response: " + errRead.Error(), Kind: core.FailureKindTransient}
 	}
 
 	var payload struct {
@@ -204,13 +204,13 @@ func registerWithCline(ctx context.Context, baseURL, workosAccess, workosRefresh
 
 	resp, errDo := hostbridge.Client(ctx, loginHTTPTimeout).Do(req)
 	if errDo != nil {
-		return nil, &Error{Msg: "register: " + errDo.Error(), Kind: KindTransient}
+		return nil, &core.Failure{Msg: "register: " + errDo.Error(), Kind: core.FailureKindTransient}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if errRead != nil {
-		return nil, &Error{Status: resp.StatusCode, Msg: "read register response: " + errRead.Error(), Kind: KindTransient}
+		return nil, &core.Failure{Status: resp.StatusCode, Msg: "read register response: " + errRead.Error(), Kind: core.FailureKindTransient}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, Classify(resp.StatusCode, string(raw))
@@ -345,13 +345,13 @@ func RefreshCredential(ctx context.Context, baseURL string, cred *Credential) (*
 
 	resp, errDo := hostbridge.Client(ctx, refreshHTTPTimeout).Do(req)
 	if errDo != nil {
-		return nil, false, &Error{Msg: "refresh: " + errDo.Error(), Kind: KindTransient}
+		return nil, false, &core.Failure{Msg: "refresh: " + errDo.Error(), Kind: core.FailureKindTransient}
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if errRead != nil {
-		return nil, false, &Error{Status: resp.StatusCode, Msg: "read refresh response: " + errRead.Error(), Kind: KindTransient}
+		return nil, false, &core.Failure{Status: resp.StatusCode, Msg: "read refresh response: " + errRead.Error(), Kind: core.FailureKindTransient}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, false, Classify(resp.StatusCode, string(raw))
@@ -393,8 +393,8 @@ func RefreshCredential(ctx context.Context, baseURL string, cred *Credential) (*
 }
 
 // NewCredentialError 构造一个凭证失效错误。
-func NewCredentialError(code, message string) *Error {
-	return &Error{Code: code, Msg: message, Kind: KindCredential, Status: http.StatusUnauthorized}
+func NewCredentialError(code, message string) *core.Failure {
+	return &core.Failure{Code: code, Msg: message, Kind: core.FailureKindCredential, Status: http.StatusUnauthorized}
 }
 
 // parseExpiry 解析过期时刻，兼容上游的多种形态。
@@ -445,3 +445,6 @@ func millisToSeconds(value int64) int64 {
 	}
 	return value / 1000
 }
+
+// AuthMode 报告本供应商的凭证形态。
+func (v *adapter) AuthMode() string { return "oauth" }

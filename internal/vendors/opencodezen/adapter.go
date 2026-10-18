@@ -26,15 +26,11 @@ import (
 // adapter 是 core.Vendor 在 OpenCode ZEN 上的实现。
 type adapter struct {
 	*core.NativeAdapter[*Credential]
-	contextFallback func(string) int64
-	baseURL         string
+	baseURL string
 }
 
 // Instances 构造 ZEN 实例（只有一个，没有区域之分）。
-func Instances(env core.Env, contextFallback func(string) int64) []core.Vendor {
-	if contextFallback == nil {
-		contextFallback = core.DefaultContextWindow
-	}
+func Instances(env core.Env) []core.Vendor {
 	return []core.Vendor{&adapter{
 		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
 			Meta: core.Meta{VendorID: VendorID, VendorName: VendorName},
@@ -58,12 +54,8 @@ func Instances(env core.Env, contextFallback func(string) int64) []core.Vendor {
 				}, native, nil
 			},
 		}),
-		contextFallback: contextFallback,
 	}}
 }
-
-// AuthMode 报告本供应商的凭证形态。
-func (v *adapter) AuthMode() string { return "apikey" }
 
 // Configure 解析供应商专属配置。
 func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
@@ -122,7 +114,7 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 
 // modelsToPluginAPI 把上游模型条目转成宿主契约类型。
 //
-// 元数据字段可能已被 models.dev 目录补全（见 modelsdev.go）；仍缺的
+// 元数据字段可能已被 models.dev 目录补全（见 models.go）；仍缺的
 // 上下文/输出上限在这里走通用兜底。
 func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
@@ -136,7 +128,7 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 		}
 		contextWindow := model.ContextWindow
 		if contextWindow == 0 {
-			contextWindow = v.contextFallback(id)
+			contextWindow = core.DefaultContextWindow(id)
 		}
 		maxOutput := model.MaxOutputTokens
 		if maxOutput == 0 {
@@ -213,4 +205,9 @@ func (v *adapter) probeAPIKey() string {
 		return ""
 	}
 	return native.APIKey
+}
+
+// ConfigFields 声明 opencodezen 专属配置。
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{{Name: "opencodezen_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"}}
 }
