@@ -2,7 +2,6 @@ package modelconfig
 
 import (
 	"context"
-	"sync"
 	"testing"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -27,15 +26,6 @@ func (v *fakeVendor) ExecuteStream(context.Context, *core.Credential, *core.Exec
 	return nil
 }
 
-var registerFakes sync.Once
-
-func registerTestVendors() {
-	registerFakes.Do(func() {
-		core.RegisterVendor(&fakeVendor{Meta: core.Meta{VendorID: "workbuddycn", VendorName: "WB CN", VendorRegion: "cn"}})
-		core.RegisterVendor(&fakeVendor{Meta: core.Meta{VendorID: "workbuddyglobal", VendorName: "WB Global", VendorRegion: "global"}})
-	})
-}
-
 func newTestManager(t *testing.T) *Manager {
 	t.Helper()
 	store := state.NewStore()
@@ -43,18 +33,27 @@ func newTestManager(t *testing.T) *Manager {
 	if _, err := store.Load(); err != nil {
 		t.Fatal(err)
 	}
-	return New(store)
+	registry := core.NewRegistry()
+	for _, vendor := range []core.Vendor{
+		&fakeVendor{Meta: core.Meta{VendorID: "workbuddycn", VendorName: "WB CN", VendorRegion: "cn"}},
+		&fakeVendor{Meta: core.Meta{VendorID: "workbuddyglobal", VendorName: "WB Global", VendorRegion: "global"}},
+	} {
+		if err := registry.Register(vendor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return New(store, registry)
 }
 
 func TestExpandKeysByVendorAndRegion(t *testing.T) {
-	registerTestVendors()
-	if got := ExpandKeys("glm-5.2"); len(got) != 1 || got[0] != "glm-5.2" {
+	manager := newTestManager(t)
+	if got := manager.ExpandKeys("glm-5.2"); len(got) != 1 || got[0] != "glm-5.2" {
 		t.Fatalf("bare key = %#v", got)
 	}
-	if got := ExpandKeys("workbuddycn:glm-5.2"); len(got) != 1 || got[0] != "workbuddycn:glm-5.2" {
+	if got := manager.ExpandKeys("workbuddycn:glm-5.2"); len(got) != 1 || got[0] != "workbuddycn:glm-5.2" {
 		t.Fatalf("vendor key = %#v", got)
 	}
-	keys := ExpandKeys("cn:glm-5.2")
+	keys := manager.ExpandKeys("cn:glm-5.2")
 	if len(keys) == 0 {
 		t.Fatal("region alias must expand to registered cn vendors")
 	}
@@ -81,7 +80,6 @@ func TestAliasUniquenessAndResolve(t *testing.T) {
 }
 
 func TestDisabledUnionConfigAndState(t *testing.T) {
-	registerTestVendors()
 	m := newTestManager(t)
 	m.Configure(Settings{EnabledRealms: []string{"cn", "global"}, DisabledModels: []string{"cn:glm-5.2"}})
 	if !m.IsDisabled("workbuddycn", "glm-5.2") {

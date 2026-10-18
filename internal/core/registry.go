@@ -1,84 +1,93 @@
 package core
 
+// 本文件提供显式的供应商注册表。
+//
+// Registry 由组合根构造并注入到 modelconfig/admin/tasks/accounts/供应商，
+// 不再使用包级全局注册表：这样同一个进程里的多个 App 实例彼此隔离，
+// 测试也不需要 ResetForTest。
+
 import (
+	"encoding/json"
 	"sort"
 	"strings"
 	"sync"
 )
 
-var (
-	vendorMu       sync.RWMutex
-	vendorRegistry = map[string]Vendor{}
-	// vendorOrder 保持注册顺序，让 UI 与状态输出稳定可复现。
-	vendorOrder []string
-)
+// Registry 是供应商实例的有序注册表。
+type Registry struct {
+	mu    sync.RWMutex
+	order []string
+	byID  map[string]Vendor
+}
 
-// RegisterVendor 注册一个供应商实例（由根层在 init 时调用）。
-//
-// 重复注册同一个 ID 会 panic：这是编程错误（两个实例抢同一个文件名前缀），
-// 静默覆盖会让其中一个供应商的凭证永远无法归属。
-func RegisterVendor(v Vendor) {
+// NewRegistry 构造一个空注册表。
+func NewRegistry() *Registry {
+	return &Registry{byID: map[string]Vendor{}}
+}
+
+// Register 注册一个供应商实例；重复或空 ID 返回错误。
+func (r *Registry) Register(v Vendor) error {
 	if v == nil {
-		panic("core: RegisterVendor called with nil vendor")
+		return NewPluginError("vendor_invalid", "nil vendor", 500)
 	}
 	id := strings.ToLower(strings.TrimSpace(v.ID()))
 	if id == "" {
-		panic("core: RegisterVendor called with empty vendor ID")
+		return NewPluginError("vendor_invalid", "vendor ID is empty", 500)
 	}
-	vendorMu.Lock()
-	defer vendorMu.Unlock()
-	if _, exists := vendorRegistry[id]; exists {
-		panic("core: duplicate vendor ID: " + id)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.byID[id]; exists {
+		return NewPluginError("vendor_duplicate", "duplicate vendor ID: "+id, 500)
 	}
-	vendorRegistry[id] = v
-	vendorOrder = append(vendorOrder, id)
+	r.byID[id] = v
+	r.order = append(r.order, id)
+	return nil
 }
 
-// Vendors 返回全部已注册的供应商实例（按注册顺序）。
-func Vendors() []Vendor {
-	vendorMu.RLock()
-	defer vendorMu.RUnlock()
-	out := make([]Vendor, 0, len(vendorOrder))
-	for _, id := range vendorOrder {
-		out = append(out, vendorRegistry[id])
+// Vendors 返回全部供应商（按注册顺序）。
+func (r *Registry) Vendors() []Vendor {
+	if r == nil {
+		return nil
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]Vendor, 0, len(r.order))
+	for _, id := range r.order {
+		out = append(out, r.byID[id])
 	}
 	return out
 }
 
-// VendorByID 按 ID 取供应商实例。
-func VendorByID(id string) (Vendor, bool) {
-	vendorMu.RLock()
-	defer vendorMu.RUnlock()
-	v, ok := vendorRegistry[strings.ToLower(strings.TrimSpace(id))]
+// ByID 按 ID 取供应商。
+func (r *Registry) ByID(id string) (Vendor, bool) {
+	if r == nil {
+		return nil, false
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	v, ok := r.byID[strings.ToLower(strings.TrimSpace(id))]
 	return v, ok
 }
 
-// ResolveVendor 按凭证判定归属哪个供应商。
-//
-// 判定顺序（证据由强到弱）：
-//  1. 凭证内的 vendor 字段 —— 最可靠，是插件自己写进去的；
-//  2. 文件名前缀 —— 用户可读，且登录落盘时就按供应商命名；
-//  3. 各供应商自己的 Match —— 内容嗅探兜底（兼容手写/改名凭证）。
-//
-// 刻意不用「第一个认领的就收下」：供应商之间的结构有重叠（都可能有
-// accessToken 字段），靠遍历顺序决定归属会让结果随注册顺序漂移。
-func ResolveVendor(fileName, provider string, raw map[string]any) (Vendor, bool) {
-	// 1) vendor 字段。
+// Resolve 按 vendor 字段 -> 文件名前缀 -> 内容嗅探的顺序判定凭证归属。
+func (r *Registry) Resolve(fileName, provider string, raw map[string]any) (Vendor, bool) {
+	if r == nil {
+		return nil, false
+	}
 	if raw != nil {
 		if rawVendor, okVendor := raw[VendorKey].(string); okVendor {
-			if v, ok := VendorByID(rawVendor); ok {
+			if v, ok := r.ByID(rawVendor); ok {
 				return v, true
 			}
 		}
 	}
 
-	// 2) 文件名前缀。按 ID 长度倒序匹配，避免前缀互为前缀时短的抢先命中。
 	base := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(fileName), ".json"))
 	if base != "" {
-		vendorMu.RLock()
-		ids := make([]string, len(vendorOrder))
-		copy(ids, vendorOrder)
-		vendorMu.RUnlock()
+		r.mu.RLock()
+		ids := make([]string, len(r.order))
+		copy(ids, r.order)
+		r.mu.RUnlock()
 		sort.Slice(ids, func(i, j int) bool {
 			if len(ids[i]) != len(ids[j]) {
 				return len(ids[i]) > len(ids[j])
@@ -87,13 +96,12 @@ func ResolveVendor(fileName, provider string, raw map[string]any) (Vendor, bool)
 		})
 		for _, id := range ids {
 			if fileNameHasVendorPrefix(base, id) {
-				return vendorRegistry[id], true
+				return r.byID[id], true
 			}
 		}
 	}
 
-	// 3) 内容嗅探兜底。
-	for _, v := range Vendors() {
+	for _, v := range r.Vendors() {
 		if v.Match(fileName, provider, raw) {
 			return v, true
 		}
@@ -101,26 +109,64 @@ func ResolveVendor(fileName, provider string, raw map[string]any) (Vendor, bool)
 	return nil, false
 }
 
-// fileNameHasVendorPrefix 判断文件名是否符合某个供应商的前缀约定。
-//
-// 约定：<vendor>.json / <vendor>-<id>.json / <vendor>_<id>.json，
-// 或名字里含 -<vendor> / _<vendor> 段（如 my-workbuddycn.json）。
+// ParseCredential 归属并解析一份凭证，同时兜底账号身份。
+func (r *Registry) ParseCredential(raw []byte, fileNameHint string, attributes map[string]string) (*Credential, bool) {
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
+		return nil, false
+	}
+	fileName := strings.TrimSpace(fileNameHint)
+	if fileName != "" && !strings.HasSuffix(strings.ToLower(fileName), ".json") {
+		fileName += ".json"
+	}
+	vendor, okVendor := r.Resolve(fileName, attributes["provider"], payload)
+	if !okVendor {
+		return nil, false
+	}
+	credential, errParse := vendor.Parse(raw, fileName)
+	if errParse != nil {
+		return nil, false
+	}
+	if credential.FileIDValue() == "" {
+		credential.SetFileID(FileIDFromFileName(fileName))
+	}
+	applyAttributeOverrides(credential, attributes)
+	return credential, true
+}
+
+// SplitModelID 拆分模型 ID；只有已知供应商或区域别名才剥离前缀。
+func (r *Registry) SplitModelID(modelID string) (vendorID, bareModel string) {
+	trimmed := strings.TrimSpace(modelID)
+	index := strings.Index(trimmed, ":")
+	if index < 0 {
+		return "", trimmed
+	}
+	prefix := strings.ToLower(strings.TrimSpace(trimmed[:index]))
+	if _, ok := r.ByID(prefix); !ok && !isRegionAlias(prefix) {
+		return "", trimmed
+	}
+	return prefix, trimmed[index+1:]
+}
+
+// ModelKeyFor 生成模型禁用键 <vendorID>:<裸名>。
+func (r *Registry) ModelKeyFor(vendorID, modelID string) string {
+	_, bare := r.SplitModelID(modelID)
+	return strings.ToLower(strings.TrimSpace(vendorID)) + ":" + strings.TrimSpace(bare)
+}
+
 func fileNameHasVendorPrefix(base, vendorID string) bool {
 	if base == vendorID {
 		return true
 	}
 	for _, separator := range []string{"-", "_", "."} {
-		if strings.HasPrefix(base, vendorID+separator) ||
-			strings.Contains(base, separator+vendorID) {
+		if strings.HasPrefix(base, vendorID+separator) || strings.Contains(base, separator+vendorID) {
 			return true
 		}
 	}
 	return false
 }
 
-// FileNameFor 生成某个供应商的凭证文件名：<vendor>-<标识>.json。
-//
-// 标识做文件名安全化，防止上游 uid 里的路径分隔符造成目录穿越。
+// FileNameFor 生成 <vendor>-<标识>.json。
 func FileNameFor(vendorID, identifier string) string {
 	vendorID = strings.ToLower(strings.TrimSpace(vendorID))
 	identifier = SanitizeFileComponent(identifier)
@@ -130,7 +176,12 @@ func FileNameFor(vendorID, identifier string) string {
 	return vendorID + "-" + identifier + ".json"
 }
 
-// SanitizeFileComponent 只保留文件名安全字符，并截断到合理长度。
+// FileIDFromFileName 返回凭证文件名去掉 .json 后的账号身份。
+func FileIDFromFileName(fileName string) string {
+	return strings.TrimSuffix(strings.TrimSpace(fileName), ".json")
+}
+
+// SanitizeFileComponent 只保留文件名安全字符并截断。
 func SanitizeFileComponent(value string) string {
 	var builder strings.Builder
 	for _, r := range strings.TrimSpace(value) {
@@ -147,4 +198,12 @@ func SanitizeFileComponent(value string) string {
 		}
 	}
 	return strings.Trim(builder.String(), "-.@")
+}
+
+func isRegionAlias(prefix string) bool {
+	switch prefix {
+	case "cn", "global":
+		return true
+	}
+	return false
 }

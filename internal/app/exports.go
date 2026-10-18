@@ -1,0 +1,80 @@
+package app
+
+import (
+	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/admin"
+	"freetier2api-plugin/internal/state"
+)
+
+// 本文件只导出测试与嵌入方需要的纯类型/纯函数，不暴露任何进程级状态。
+
+type Config = pluginConfig
+type RegistrationInfo = registration
+type LifecycleRequest = lifecycleRequest
+type ExecutorRPCRequest = executorRPCRequest
+type ExecutorStreamResponse = rpcExecutorStreamResponse
+
+const (
+	ProviderKey           = providerKey
+	PluginID              = pluginID
+	FormatChatCompletions = formatChatCompletions
+	ManagementRoutePrefix = managementRoutePrefix
+)
+
+func DefaultConfig() Config   { return defaultPluginConfig() }
+func DefaultStateDir() string { return defaultStateDir() }
+
+// LoadState 从磁盘加载状态（测试/嵌入用）。
+func (a *App) LoadState(cfg Config) (*state.State, error) { return a.loadState(cfg) }
+func FormatSSEChunk(b []byte) []byte                      { return formatSSEChunk(b) }
+func RewritePayloadModel(payload []byte, model string) []byte {
+	return rewritePayloadModel(payload, model)
+}
+
+func (a *App) DecodeConfig(raw []byte) (Config, error) { return a.decodeConfig(raw) }
+
+func (a *App) IsModelDisabled(vendorID, modelID string) bool {
+	return a.isModelDisabled(vendorID, modelID)
+}
+
+func (a *App) ResolveOutboundModel(vendorID, model string) string {
+	return a.resolveOutboundModel(vendorID, model)
+}
+
+func (a *App) ApplyModelAliases(vendorID string, models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	return a.applyModelAliases(vendorID, models)
+}
+
+func (a *App) ModelAliasFor(vendorID, modelID string) string {
+	return a.models.AliasFor(vendorID, modelID)
+}
+
+func (a *App) HandleModelsToggle(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	return a.admin.ModelToggle(req)
+}
+
+func (a *App) HandleModelAlias(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	return a.admin.ModelAlias(req)
+}
+
+func (a *App) BuildStatusPayload(req pluginapi.ManagementRequest) map[string]any {
+	return a.admin.StatusPayload(req)
+}
+
+func (a *App) ApplyModelCatalog(cfg Config) { a.applyModelCatalog(cfg) }
+
+func (a *App) ManagementRegistration() pluginapi.ManagementRegistrationResponse {
+	return a.managementRegistration()
+}
+
+func JSONResponse(status int, payload any) pluginapi.ManagementResponse {
+	return jsonResponse(status, payload)
+}
+
+func HTMLResponse(status int, body []byte) pluginapi.ManagementResponse {
+	return htmlResponse(status, body)
+}
+
+func ErrorResponse(err error) pluginapi.ManagementResponse { return admin.ErrorResponse(err) }
+
+func (a *App) ConfigureVendors(cfg Config) { a.configureVendors(cfg) }

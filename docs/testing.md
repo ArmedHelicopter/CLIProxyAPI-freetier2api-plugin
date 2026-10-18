@@ -1,0 +1,220 @@
+# 验证记录
+
+本文件记录移植过程中的验证方式与发现的偏差，便于后续排查与接手。
+
+## 一、自动化验证
+
+```
+gofmt -l .            # 干净（cpasdk/ 按约定豁免）
+go vet ./...          # 无告警
+go test ./... -count=1  # 全绿
+CGO_ENABLED=1 go build -buildmode=c-shared  # 产出 freetier2api.so（约 10 MB）
+```
+
+测试覆盖（无需真实 CPA 进程，全部走内存假宿主）：
+
+| 文件 | 覆盖主题 |
+| --- | --- |
+| `tests/plugin_register_test.go` | 注册响应契约（含 `executor_model_scope`）、热更新、未知方法、凭证解析与登录元数据 |
+| `tests/plugin_models_test.go` | **realm 隔离**、静态模型合并、禁用并集、别名路由、提示词改写、重启待生效标记 |
+| `tests/plugin_executor_test.go` | 非流式聚合、流式分帧与错误上报、格式校验、签到式额度重置、SSE 分帧 |
+| `tests/registry_test.go` | 三方源清单格式、插件 ID 与产物名一致、管理响应线格式、能力与实现一致 |
+| `tests/auth_test.go` / `tests/identity_test.go` | 供应商归属矩阵、账号身份跨路径稳定 |
+| `internal/vendors/workbuddy/cb_test.go` | 错误分类 15 级顺序、模型避让的字段边界、重试与状态码映射、等待信息解析、凭证双形态、合并写回、指纹稳定性、缓存键隔离、改写管线各步、工具配对、SSE 聚合与白名单重建、脱敏 |
+| `internal/core/core_test.go` | 归属三级判定、注册表幂等约束、模型键协议、`ParseCredential` 身份兜底、`ToPluginError` 映射、`core.Meta` 默认行为 |
+| `internal/loginsession/loginsession_test.go` | 会话登记/TTL/轮询节流/归属查询/并发（`-race`） |
+| `tests/vendor_compat_test.go` | 13 个供应商实例的 ID/名称/区域 golden 对比、供应商专属配置键兼容 |
+| `internal/httpx/transport_test.go` | 宿主 HTTP 桥的**双形态键名兼容**、缺状态码的显式报错 |
+| `internal/vendors/workbuddy/task_flows_test.go` | 各事件链结构与关键字段、小程序事件形态、指纹注入、夜猫子窗口边界 |
+| `internal/admin/admin_test.go` | 管理路由声明、状态接口分发、未知路由 404 |
+| `internal/pluginconfig/config_test.go` | 列表写法、未知键容忍、校验与时钟解析 |
+| `internal/state/state_test.go` | state.json 往返、损坏回退、深拷贝快照、并发（`-race`） |
+| `internal/modelconfig/modelconfig_test.go` | 禁用键展开、别名唯一性、配置∪状态并集、同名合并 |
+| `internal/console/console_test.go` | 控制台页密钥解码、请求闸门、单页布局与静态自包含 |
+| `internal/logger/logger_test.go` | 日志环边界、增量快照、并发写入（`-race`） |
+
+## 二、关键机制验证（读宿主源码确认）
+
+realm 隔离是本插件最容易失效的机制，已逐环节验证：
+
+| 环节 | 证据 |
+| --- | --- |
+| 插件按凭证注册模型 | `sdk/cliproxy/service_executors.go:454` `RegisterClient(a.ID, providerKey, models)` |
+| **选凭证时按模型过滤** | `sdk/cliproxy/auth/conductor_selection.go:1202/1294/1756/2090/2314` → `:993` `ClientSupportsModel(auth.ID, routeKey)` |
+| 入站模型 → provider | `internal/registry/model_registry.go:1585` `r.models[modelID]`（map 精确匹配） |
+| `cn:` 冒号安全性 | `internal/thinking/suffix.go:25` 只解析尾部括号，不受冒号影响 |
+| `model.for_auth` 生效前提 | `internal/pluginhost/adapters.go:317` `executorScopeAllowsOAuthModels`——**必须声明 `executor_model_scope` 为 `oauth`/`both`**，否则该能力被静默跳过 |
+| 插件错误 → 宿主处置 | `internal/pluginhost/rpc_client.go:368` 只保留 `code` 与 `http_status`，其中 **`code` 被丢弃、只有 `http_status` 影响冷却** |
+| (凭证, 模型) 级冷却 | `sdk/cliproxy/auth/conductor_cooldown.go:872`——插件返回 429 天然是 per-(auth, model) 冷却（`rpcError` 无 `IsCredentialScoped()`） |
+
+`tests/registry_test.go` 里的 `TestCapabilitiesMatchImplementedHandlers` 与
+`tests/plugin_models_test.go` 里的 `TestModelsForAuthIsolatesRealms` 把其中两条锁进了回归测试。
+
+## 三、移植中发现的上游偏差
+
+### 3.1 `sanitize.go` 的三个正则名不副实
+
+上游 `internal/upstream/sanitize.go` 里三个正则的实际内容与名字/注释不符：
+
+| 名字 | 注释声称 | 实际内容 | 实际行为 |
+| --- | --- | --- | --- |
+| `sanitizeHdrRe` | 「剥离层：header 键名即触发，整段删除」 | `` `(?i)\n]*;?\s*` `` | 只匹配 `\n]*` + 可选 `;` + 空白；**不含键名**，删不掉键值段 |
+| `sanitizeKvRe` | 「剥离层：尾随裸键值（cc_xxx=...;）循环清理」 | `` `(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*` `` | 只删 `cc_` 前缀的键值对，不是通用的 `x-anthropic-billing-hdr: ...` 形态 |
+| `sanitizeBareHdrRe` | 「裸键名（无冒号无值）同样是指纹」 | `` `(?i)x-anthropic-billing-hdr` `` | 只匹配那个完整键名 |
+
+结论：header 键值段的实际剥离能力弱于注释所述。**本插件按注释所载的意图实现**
+（`sanitizeHdrRe` 在 `sanitize_rules.json` 中按「键名 + 后续键值段整段删除」表达），
+其余两条沿用原样。若上游修正了这三个正则，需要同步 `internal/vendors/workbuddy/sanitize_rules.json`。
+
+> 注：该文件的部分字符串字面量在读取工具的输出中会被脱敏改写，
+> 因此规则表是**程序化提取**（而非手工转录）生成的，以保证字节精确。
+> 已用哈希与源文件比对确认。
+
+### 3.2 错误分类的一处顺序陷阱
+
+`Classify` 把「含 `rate-limiting` 文案的 400」归为 `soft_rate` 而非 `account_fault`，
+因为 `accountFaultMarkers` 只看 `request illegal` 等关键词、**刻意不按 code 11140 判定**
+（该 code 同时承载模型级限流文案）。测试 `TestClassifyOrderingMatters` 固定了这个行为。
+
+## 四、需要真实环境才能验证的部分
+
+以下无法在无 CPA 的环境下验证，需用户自备 CPA 与真实 CodeBuddy 账号：
+
+1. 插件加载与 `plugin.register` 的实际往返；
+2. 真实上游的模型清单探测结果（模型数量与字段）；
+3. 真实对话出字（流式与非流式）；
+4. 签到、余额查询与任务上报的真实返回；
+5. **双域隔离的端到端行为**：`cn:` 模型只被 cn 凭证服务。
+
+建议的验证顺序：
+
+```bash
+# 1. 账号是否被识别（应带 realm 与余额）
+curl -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
+  http://127.0.0.1:8317/v0/management/plugins/freetier2api/status
+
+# 2. 模型清单是否拉到
+curl -X POST -H "Authorization: Bearer $CPA_MANAGEMENT_KEY" \
+  http://127.0.0.1:8317/v0/management/plugins/freetier2api/models/refresh
+
+# 3. 对话（非流式与流式）
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer $CPA_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model":"cn:glm-5.2","messages":[{"role":"user","content":"hi"}]}'
+```
+
+## 五、与其它插件共存时的凭证解析阻断（真实踩坑记录）
+
+### 现象
+
+插件注册日志完全正常（`plugin registered` / `registered: realms=[cn global]`），
+管理接口 200，但**账号列表为空**，且宿主日志里**从未出现本插件的 `auth.parse` 调用**。
+
+### 根因
+
+宿主解析凭证文件时有两个行为叠加：
+
+1. **遍历插件，一旦报错或认领就中止循环**（`internal/pluginhost/auth_provider.go`）：
+
+   ```go
+   for _, record := range h.activeRecords() {
+       auths, handled, errParse := h.callParseAuths(ctx, record, req)
+       if errParse != nil || handled {
+           return auths, handled, errParse   // 后面的插件轮不到
+       }
+   }
+   ```
+
+2. **把「当前询问的插件的 identifier」兜底填进 `provider`**
+   （`internal/pluginhost/auth_provider.go`）：
+
+   ```go
+   req.Provider = normalizeProviderID(req.Provider)   // 文件里没有 type 字段 → 空
+   if req.Provider == "" {
+       req.Provider = normalizeProviderID(provider.Identifier())   // 被填成"当前插件"
+   }
+   ```
+
+因此一个归属判定写成「provider 等于自己就认领」的插件，会在被询问时**认领所有文件**；
+若它解析不了目标插件格式的文件而返回错误，循环即中止。
+
+遍历顺序是 `priority` 降序、同优先级按 `id` 升序。不配 priority 时
+`qoder2api` < `workbuddy2api`，本插件排在后面 → 被压制。
+
+### 修复
+
+给本插件更高的 `priority`：
+
+```yaml
+plugins:
+  configs:
+    workbuddy2api:
+      priority: 100
+```
+
+修复后宿主按预期调用本插件并认领全部凭证（实测 4 个账号，2 cn + 2 global）。
+
+### 另需注意：动态库的 libc 必须与宿主一致
+
+本插件是 cgo 构建的 c-shared 动态库，**libc 必须与宿主运行时一致**。
+用 alpine（musl）构建的产物在 Debian（glibc）宿主上会加载失败：
+
+```
+failed to load plugin workbuddy2api: dlopen ...:
+libc.musl-aarch64.so.1: cannot open shared object file
+```
+
+自己构建时请选与宿主同族的镜像（宿主是 `eceasy/cli-proxy-api`，基于 Debian）：
+
+```bash
+docker run --rm -v "$PWD":/app -w /app golang:1.24-bookworm \
+  sh -c 'CGO_ENABLED=1 GOOS=linux GOARCH=arm64 go build -buildmode=c-shared -o dist/freetier2api.so .'
+```
+
+## 六、控制台页复用管理面板密钥（0.0.10）
+
+### 6.1 根因（实测 CPAMC 线上 bundle）
+
+打开 `http://<CPA>/management.html` 下载到的 bundle（约 3.3 MB）后确认：
+
+| 事实 | 证据 |
+| --- | --- |
+| 面板认证状态存在 `localStorage["cli-proxy-auth"]` | zustand persist `{name:Bc}`，`Bc = "cli-proxy-auth"` |
+| 值是可逆 XOR 混淆 | `_l = "enc::v1::"`、`vl = "cli-proxy-api-webui::secure-storage"`，seed 由 `vl` + host + userAgent 用竖线拼接 |
+| 明文是 `{state:{...},version:N}` | persist 落盘格式；`state.managementKey` 即 CPA 管理密钥 |
+| **未勾选「记住密码」时快照里没有密钥** | `partialize: e => ({apiBase, ...(e.rememberPassword ? {managementKey} : {}), rememberPassword, ...})` |
+| 登录表单默认不勾选记住密码 | 登录组件 `useState(!1)` |
+| 插件资源页由面板 iframe 加载，同源 | `<iframe src={apiBase + menu.path} referrerPolicy="no-referrer">`，无 sandbox |
+| 面板请求头 | axios 拦截器 `Authorization = "Bearer " + managementKey` |
+
+旧版插件页只读 `localStorage["managementKey"]` / `cpa-management-key`，因此即使用户
+勾选了「记住密码」也复用不到，只能手输。
+
+### 6.2 封禁机制（来自 CPA 源码）
+
+`internal/api/handlers/management/handler.go`：
+
+- `AuthenticateManagementKey`：`provided == ""`（没带密钥）也调用 `fail()`；
+- `maxFailures = 5`、`banDuration = 30 * time.Minute`，计数按 `c.ClientIP()`；
+- 中间件挂在整个 `/v0/management` 路由组上（含插件管理路由），因此封禁会锁死整个后台。
+
+旧版控制台页在拿不到密钥时仍按 `vendors → models + logs + status → quotas` 并发发起
+**5 个**请求 → 正好打满 5 次失败 → 立即封禁 30 分钟。
+
+### 6.3 修复后的不变量
+
+- 只读 `localStorage["cli-proxy-auth"]` → XOR 解码 → `JSON.parse` → `state.managementKey`；
+- 没有密钥：**0 个管理请求**，只展开手填框；
+- 有密钥：先发 **1 个** `GET /vendors` 探针，成功后才串行加载首屏；
+- 任一 401/403：置 `stopped`，清空日志/队列/登录轮询，后续 `api()` 一律不出网；
+- 手输值只在探针通过后写入 `sessionStorage`（仅当前标签页）。
+
+### 6.4 验收步骤
+
+1. 面板勾选「记住密码」登录 → 打开插件页：输入框不出现；DevTools Network 中首个请求是
+   `GET /v0/management/plugins/freetier2api/vendors`，成功后才出现其余请求。
+2. 面板未勾选「记住密码」→ 打开插件页：Network **无** `/v0/management/...` 请求，页面
+   直接展开手填框；填入密钥后仅 1 个探针请求，成功后才加载数据。
+3. 故意填错密钥：只产生 1 次 401/403；10 秒内再次提交会被前端拦截；CPA 后台仍可正常登录
+   （失败计数从 1 开始而不是 5）。
+4. 无密钥场景同时打开 3 个标签页：`/v0/management` 失败计数不增长。

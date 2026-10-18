@@ -1,14 +1,12 @@
 package admin
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/http"
-	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/accounts"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 )
 
@@ -21,15 +19,15 @@ type keepaliveResult struct {
 	Message  string `json:"message"`
 }
 
-func handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+func (s *Service) handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	ctx, cancel := managementContext(req)
 	defer cancel()
 	callbackID := hostCallbackID(req)
 
-	entries, errList := hostabi.ListAuths(ctx, callbackID)
-	if errList != nil {
-		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "error": "读取账号列表失败：" + errList.Error()})
-	}
+	cfg := s.deps.Config()
+	accounts, _ := s.pool.Load(ctx, callbackID, accounts.Options{
+		RealmEnabled: func(region string) bool { return realmEnabled(cfg, region) },
+	})
 	type job struct {
 		entry      core.HostAuth
 		vendor     core.Vendor
@@ -37,23 +35,15 @@ func handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.Managemen
 		rawJSON    []byte
 		filePath   string
 	}
-	jobs := make([]job, 0, len(entries))
-	for _, entry := range entries {
-		if entry.Disabled || entry.Unavailable {
-			continue
+	jobs := make([]job, 0, len(accounts))
+	for _, account := range accounts {
+		if account.FilePath != "" {
+			account.Credential.SetFilePath(account.FilePath)
 		}
-		raw, filePath, okRaw := hostabi.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
-		if !okRaw {
-			continue
-		}
-		credential, vendor, errResolve := deps.ResolveCredential(ctx, callbackID, raw, hostabi.AccountIdentity(entry), nil)
-		if errResolve != nil {
-			continue
-		}
-		if filePath != "" {
-			credential.SetFilePath(filePath)
-		}
-		jobs = append(jobs, job{entry: entry, vendor: vendor, credential: credential, rawJSON: raw, filePath: filePath})
+		jobs = append(jobs, job{
+			entry: account.Entry, vendor: account.Vendor, credential: account.Credential,
+			rawJSON: account.RawJSON, filePath: account.FilePath,
+		})
 	}
 	if len(jobs) == 0 {
 		return JSONResponse(http.StatusOK, map[string]any{
@@ -83,7 +73,7 @@ func handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.Managemen
 			result.OK = true
 			if refreshed {
 				result.Message = "Token 续期成功"
-				deps.SaveRefreshedCredential(ctx, callbackID, j.vendor, j.entry, j.rawJSON, updated, j.filePath)
+				s.deps.SaveRefreshedCredential(ctx, callbackID, j.vendor, j.entry, j.rawJSON, updated, j.filePath)
 			} else {
 				result.Message = "凭证有效（未变更）"
 			}
@@ -105,6 +95,3 @@ func handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.Managemen
 		"message": message, "results": results,
 	})
 }
-
-var _ = json.Marshal
-var _ = strings.TrimSpace

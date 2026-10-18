@@ -13,6 +13,7 @@ import (
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/accounts"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
@@ -20,37 +21,37 @@ import (
 )
 
 // StatusPayload 构造账号状态概览（导出给根层测试/兼容包装）。
-func StatusPayload(req pluginapi.ManagementRequest) map[string]any {
-	return buildStatusPayload(req)
+func (s *Service) StatusPayload(req pluginapi.ManagementRequest) map[string]any {
+	return s.buildStatusPayload(req)
 }
 
 // buildStatusPayload 构造账号状态概览（不含任何 token）。
-func buildStatusPayload(req pluginapi.ManagementRequest) map[string]any {
-	cfg := deps.Config()
-	current := deps.State()
+func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string]any {
+	cfg := s.deps.Config()
+	current := s.deps.State()
 	ctx, cancel := managementContext(req)
 	defer cancel()
 
-	accounts := listAccountSummaries(ctx, hostCallbackID(req))
+	accounts := s.listAccountSummaries(ctx, hostCallbackID(req))
 	modelCounts := map[string]int{}
 	for _, model := range current.Models {
 		modelCounts[model.Realm]++
 	}
 	return map[string]any{
-		"ok":                true,
-		"plugin":            deps.Identity().ID,
-		"version":           deps.Identity().Version,
-		"enabled_realms":    cfg.EnabledRealms,
-		"prompt_mode":       deps.PromptMode(),
-		"log_level":         logger.CurrentLevel(),
-		"state_dir":         cfg.StateDir,
-		"accounts":          accounts,
-		"account_count":     len(accounts),
-		"model_counts":      modelCounts,
-		"models_fetched_at": current.ModelsFetchedAt,
-		"restart_pending":   current.RestartPending,
-		"settings":          deps.EffectiveSettings(),
-		"scheduler":         deps.SchedulerStatus(),
+		"ok":                    true,
+		"plugin":                s.deps.Identity().ID,
+		"version":               s.deps.Identity().Version,
+		"enabled_realms":        cfg.EnabledRealms,
+		"workbuddy_prompt_mode": s.deps.WorkbuddyPromptMode(),
+		"log_level":             logger.CurrentLevel(),
+		"state_dir":             cfg.StateDir,
+		"accounts":              accounts,
+		"account_count":         len(accounts),
+		"model_counts":          modelCounts,
+		"models_fetched_at":     current.ModelsFetchedAt,
+		"restart_pending":       current.RestartPending,
+		"settings":              s.deps.EffectiveSettings(),
+		"scheduler":             s.deps.SchedulerStatus(),
 	}
 }
 
@@ -99,13 +100,13 @@ func cacheQuotaResult(q quotaResult, keys ...string) {
 	}
 }
 
-func listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
-	entries, errList := hostabi.ListAuths(ctx, callbackID)
+func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
+	entries, errList := hostabi.ListAuths(ctx, callbackID, s.registry)
 	if errList != nil {
 		logger.Debug("list host auths failed: %v", errList)
 		return nil
 	}
-	current := deps.State()
+	current := s.deps.State()
 	out := make([]accountSummary, 0, len(entries))
 	seenIndex := make(map[string]int)
 
@@ -132,10 +133,10 @@ func listAccountSummaries(ctx context.Context, callbackID string) []accountSumma
 					modTime = fi.ModTime()
 				}
 			}
-			if credential, okParse := core.ParseCredential(raw, hostabi.AccountIdentity(entry), nil); okParse {
+			if credential, okParse := s.registry.ParseCredential(raw, hostabi.AccountIdentity(entry), nil); okParse {
 				summary.VendorID = credential.VendorIDValue()
 				summary.Realm = credential.RegionValue()
-				if vendor, okVendor := core.VendorByID(summary.VendorID); okVendor {
+				if vendor, okVendor := s.registry.ByID(summary.VendorID); okVendor {
 					summary.VendorName = vendor.Name()
 					summary.SupportsCheckin = core.SupportsCheckin(vendor)
 				}
@@ -203,7 +204,7 @@ func lookupLegacyCheckin(current state.State, credential *core.Credential) (stat
 	return record, okRecord
 }
 
-func buildLogsPayload(req pluginapi.ManagementRequest) map[string]any {
+func (s *Service) buildLogsPayload(req pluginapi.ManagementRequest) map[string]any {
 	since := queryInt64(req.Query, "since", 0)
 	limit := int(queryInt64(req.Query, "limit", 200))
 	entries, newest := logger.Snapshot(uint64(since), limit)
@@ -214,7 +215,7 @@ type accountBatchRequest struct {
 	AccountIDs []string `json:"account_ids"`
 }
 
-func handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body accountBatchRequest
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
@@ -226,7 +227,7 @@ func handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.Manag
 	defer cancel()
 	callbackID := hostCallbackID(req)
 
-	entries, errList := hostabi.ListAuths(ctx, callbackID)
+	entries, errList := hostabi.ListAuths(ctx, callbackID, s.registry)
 	if errList != nil {
 		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "error": "读取账号列表失败：" + errList.Error()})
 	}
@@ -244,7 +245,7 @@ func handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.Manag
 			AuthID: core.FirstNonEmpty(entry.ID, entry.Name),
 			Label:  core.FirstNonEmpty(entry.Label, entry.Name, entry.ID),
 		}
-		if errDelete := deleteAuthFile(ctx, callbackID, entry); errDelete != nil {
+		if errDelete := s.deleteAuthFile(ctx, callbackID, entry); errDelete != nil {
 			result.OK = false
 			result.Message = errDelete.Error()
 			results = append(results, result)
@@ -258,12 +259,12 @@ func handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.Manag
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "deleted": deleted, "results": results})
 }
 
-func deleteAuthFile(ctx context.Context, callbackID string, entry core.HostAuth) error {
+func (s *Service) deleteAuthFile(ctx context.Context, callbackID string, entry core.HostAuth) error {
 	raw, filePath, okRaw := hostabi.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
 	if !okRaw {
 		return fmt.Errorf("读取凭证失败，无法确认归属")
 	}
-	if _, okParse := core.ParseCredential(raw, hostabi.AccountIdentity(entry), nil); !okParse {
+	if _, okParse := s.registry.ParseCredential(raw, hostabi.AccountIdentity(entry), nil); !okParse {
 		return fmt.Errorf("该凭证不属于本插件，拒绝删除")
 	}
 	targetPath := strings.TrimSpace(filePath)
@@ -315,7 +316,7 @@ type accountAddRequest struct {
 	Label  string `json:"label"`
 }
 
-func handleAccountAddRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body accountAddRequest
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
@@ -329,12 +330,12 @@ func handleAccountAddRequest(req pluginapi.ManagementRequest) pluginapi.Manageme
 	if apiKey == "" {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "api_key 不能为空"})
 	}
-	vendor, okVendor := core.VendorByID(vendorID)
+	vendor, okVendor := s.registry.ByID(vendorID)
 	if !okVendor {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": fmt.Sprintf("未知供应商 %q", vendorID)})
 	}
 	payload := map[string]any{
-		"type":         deps.Identity().ProviderKey,
+		"type":         s.deps.Identity().ProviderKey,
 		core.VendorKey: vendor.ID(),
 		"api_key":      apiKey,
 	}
@@ -391,14 +392,14 @@ func maskedAPIKey(key string) string {
 	return trimmed[:4] + "***" + trimmed[len(trimmed)-4:]
 }
 
-func handleCheckinRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body accountBatchRequest
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
 	}
 	ctx, cancel := managementContext(req)
 	defer cancel()
-	results := runForAccounts(ctx, hostCallbackID(req), body.AccountIDs,
+	results := s.runForAccounts(ctx, hostCallbackID(req), body.AccountIDs,
 		func(vendor core.Vendor, _ *core.Credential) bool { return core.SupportsCheckin(vendor) },
 		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (string, error) {
 			checkin, okCheckin := core.As[core.CheckinProvider](vendor)
@@ -412,7 +413,7 @@ func handleCheckinRequest(req pluginapi.ManagementRequest) pluginapi.ManagementR
 			if result == nil {
 				return "", fmt.Errorf("签到未返回结果")
 			}
-			deps.RecordCheckin(credential, result)
+			s.deps.RecordCheckin(credential, result)
 			return result.Message, nil
 		})
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": results})
@@ -427,81 +428,51 @@ type accountActionResult struct {
 	Message  string `json:"message"`
 }
 
-func runForAccounts(
+func (s *Service) runForAccounts(
 	ctx context.Context,
 	callbackID string,
 	targets []string,
 	filter func(core.Vendor, *core.Credential) bool,
 	action func(context.Context, core.Vendor, *core.Credential) (string, error),
 ) []accountActionResult {
-	entries, errList := hostabi.ListAuths(ctx, callbackID)
-	if errList != nil {
-		return []accountActionResult{{OK: false, Message: "读取账号列表失败：" + errList.Error()}}
+	cfg := s.deps.Config()
+	accounts, failures := s.pool.Load(ctx, callbackID, accounts.Options{
+		Targets:      targets,
+		RealmEnabled: func(region string) bool { return realmEnabled(cfg, region) },
+		Filter: func(account accounts.Account) bool {
+			return filter == nil || filter(account.Vendor, account.Credential)
+		},
+	})
+	results := make([]accountActionResult, 0, len(accounts)+len(failures))
+	for _, failure := range failures {
+		results = append(results, accountActionResult{
+			AuthID: core.FirstNonEmpty(failure.Entry.ID, failure.Entry.Name),
+			Label:  core.FirstNonEmpty(failure.Entry.Label, failure.Entry.Name, failure.Entry.ID),
+			OK:     false, Message: failure.Message,
+		})
 	}
-	wanted := make(map[string]bool, len(targets))
-	for _, target := range targets {
-		wanted[strings.TrimSpace(target)] = true
-	}
-	cfg := deps.Config()
-	type job struct {
-		entry      core.HostAuth
-		vendor     core.Vendor
-		credential *core.Credential
-	}
-	jobs := make([]job, 0, len(entries))
-	seenUID := make(map[string]bool)
-	for _, entry := range entries {
-		if len(wanted) > 0 && !wanted[entry.ID] && !wanted[entry.Name] && !wanted[entry.AuthIndex] {
-			continue
-		}
-		if entry.Disabled || entry.Unavailable {
-			continue
-		}
-		raw, okRaw := hostabi.AuthJSON(ctx, callbackID, entry.AuthIndex)
-		if !okRaw {
-			continue
-		}
-		credential, vendor, errResolve := deps.ResolveCredential(ctx, callbackID, raw, hostabi.AccountIdentity(entry), nil)
-		if errResolve != nil || !realmEnabled(cfg, vendor.Region()) {
-			continue
-		}
-		if filter != nil && !filter(vendor, credential) {
-			continue
-		}
-		uid := credential.FileIDValue()
-		if uid == "" {
-			uid = core.FirstNonEmpty(entry.ID, entry.Name)
-		}
-		if uid != "" {
-			if seenUID[uid] {
-				continue
-			}
-			seenUID[uid] = true
-		}
-		jobs = append(jobs, job{entry: entry, vendor: vendor, credential: credential})
-	}
-	results := make([]accountActionResult, len(jobs))
 	concurrency := batchConcurrency
-	if concurrency > len(jobs) {
-		concurrency = len(jobs)
+	if concurrency > len(accounts) {
+		concurrency = len(accounts)
 	}
 	if concurrency < 1 {
 		concurrency = 1
 	}
+	jobResults := make([]accountActionResult, len(accounts))
 	semaphore := make(chan struct{}, concurrency)
-	done := make(chan int, len(jobs))
-	for index := range jobs {
+	done := make(chan int, len(accounts))
+	for index := range accounts {
 		go func(slot int) {
 			semaphore <- struct{}{}
 			defer func() { <-semaphore }()
-			current := jobs[slot]
+			current := accounts[slot]
 			result := accountActionResult{
-				AuthID:   core.FirstNonEmpty(current.entry.ID, current.entry.Name),
-				Label:    core.FirstNonEmpty(current.credential.LabelValue(), current.entry.Label),
-				VendorID: current.vendor.ID(),
-				Realm:    current.credential.RegionValue(),
+				AuthID:   core.FirstNonEmpty(current.Entry.ID, current.Entry.Name),
+				Label:    core.FirstNonEmpty(current.Credential.LabelValue(), current.Entry.Label),
+				VendorID: current.Vendor.ID(),
+				Realm:    current.Credential.RegionValue(),
 			}
-			message, errAction := action(ctx, current.vendor, current.credential)
+			message, errAction := action(ctx, current.Vendor, current.Credential)
 			if errAction != nil {
 				result.OK = false
 				result.Message = errAction.Error()
@@ -509,12 +480,12 @@ func runForAccounts(
 				result.OK = true
 				result.Message = message
 			}
-			results[slot] = result
+			jobResults[slot] = result
 			done <- slot
 		}(index)
 	}
-	for range jobs {
+	for range accounts {
 		<-done
 	}
-	return results
+	return append(results, jobResults...)
 }

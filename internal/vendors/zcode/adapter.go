@@ -20,79 +20,48 @@ import (
 
 // adapter 是 core.Vendor 在 ZCode 上的实现。
 type adapter struct {
-	core.Meta
+	*core.NativeAdapter[*Credential]
 }
 
 // Instances 构造 ZCode 实例。
-func Instances() []core.Vendor {
-	return []core.Vendor{&adapter{Meta: core.Meta{
-		VendorID:     VendorID,
-		VendorName:   VendorName,
-		VendorRegion: "global",
-	}}}
+func Instances(env core.Env) []core.Vendor {
+	return []core.Vendor{&adapter{NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+		Meta: core.Meta{VendorID: VendorID, VendorName: VendorName, VendorRegion: "global"},
+		Env:  env,
+		Extract: func(c *core.Credential) (*Credential, bool) {
+			native, ok := c.Native.(*Credential)
+			return native, ok
+		},
+		ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+			native, errParse := ParseCredential(raw)
+			if errParse != nil {
+				return core.CredentialSeed{}, nil, errParse
+			}
+			label := native.Label
+			if label == "" {
+				label = core.FirstNonEmpty(native.Email, "ZCode-"+MaskedKey(native.OutboundToken()))
+			}
+			return core.CredentialSeed{
+				VendorID: VendorID, Region: "global", Label: label,
+				FileID: core.FileIDFromFileName(fileName), UID: core.FirstNonEmpty(native.UserID, native.Email),
+				Token: native.APIKey, AuthMode: native.AuthMode,
+			}, native, nil
+		},
+		MergeNative: func(original []byte, native *Credential) ([]byte, error) {
+			return MergeStorageJSON(original, native)
+		},
+	})}}
 }
 
-// AuthMode 返回凭证形态：oauth。页面据此在「添加账号」时发起登录流程。
+// AuthMode 返回凭证形态：oauth。
 func (v *adapter) AuthMode() string { return "oauth" }
 
 // Configure 解析供应商专属配置。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
-	Configure(settings, raw)
-}
-
-// ---- 凭证 ----
+func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
 
 // Match 判断一份凭证是否属于本供应商。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	return LooksLikeCredential(raw, fileName, provider)
-}
-
-// Parse 把凭证 JSON 解析成 core.Credential。
-func (v *adapter) Parse(raw []byte, fileName string) (*core.Credential, error) {
-	native, errParse := ParseCredential(raw)
-	if errParse != nil {
-		return nil, errParse
-	}
-
-	// 展示名优先邮箱（可读），其次是脱敏凭证。
-	label := native.Label
-	if label == "" {
-		label = core.FirstNonEmpty(native.Email, "ZCode-"+MaskedKey(native.OutboundToken()))
-	}
-
-	// FileID 是账号身份（文件名）：签到记录与额度缓存都以它为键。
-	// UID（邮箱/user_id）只用于展示与激活上报，不承担身份职责。
-	fileID := strings.TrimSuffix(strings.TrimSpace(fileName), ".json")
-
-	// core.Token 是「出站凭证」：对话用 API Key 通道，因此这里放 API Key。
-	// JWT 留在 Native 里，供额度查询与套餐领取使用。
-	return &core.Credential{
-		VendorID: VendorID,
-		Region:   "global",
-		Label:    label,
-		FileID:   fileID,
-		UID:      core.FirstNonEmpty(native.UserID, native.Email),
-		Token:    native.APIKey,
-		AuthMode: native.AuthMode,
-		Native:   native,
-	}, nil
-}
-
-// nativeCredential 取回协议层凭证对象。
-func (v *adapter) nativeCredential(cred *core.Credential) (*Credential, error) {
-	return core.NativeCredential(cred, VendorID, func(c *core.Credential) (*Credential, bool) {
-		native, okNative := c.Native.(*Credential)
-		return native, okNative
-	})
-}
-
-// MergeStorageJSON 把刷新后的凭证合并回原文件，保留用户手工维护的其它键。
-func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential) ([]byte, error) {
-	native, errNative := v.nativeCredential(credential)
-	if errNative != nil {
-		return original, errNative
-	}
-	return MergeStorageJSON(original, native)
 }
 
 // ---- 模型 ----
@@ -127,7 +96,7 @@ func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 
 // Execute 执行一次非流式对话。
 func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -147,7 +116,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 
 // ExecuteStream 执行一次流式对话。
 func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest, sink core.StreamSink) error {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return errNative
 	}
@@ -164,7 +133,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 
 // Quota 查询账号额度。
 func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -191,7 +160,7 @@ func (v *adapter) OwnsLoginSession(sessionID string) bool { return OwnsLoginSess
 // ZCode 没有 refresh_token 流程（JWT 与 API Key 都不支持续期），因此这里只做
 // 本地校验并返回 refreshed=false——不触发无意义的写盘。
 func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, false, errNative
 	}

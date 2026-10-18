@@ -217,12 +217,6 @@ func (h *IdentityHeaders) Apply(target map[string]string) {
 	}
 }
 
-// Has 报告某个身份头是否已设置。
-func (h *IdentityHeaders) Has(key string) bool {
-	_, ok := h.values[key]
-	return ok
-}
-
 // BuildIdentityHeaders 构造完整身份头（对齐官方桌面端 companion 头集合）。
 //
 // 有账号时取该账号的设备档案；profile 为零值时回退全局伪装常量。

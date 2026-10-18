@@ -201,6 +201,7 @@ progress { width: 160px; height: 8px; }
           </select>
         </label>
       </div>
+      <div id="taskSchedule" style="margin-top:12px"></div>
       <div class="row" style="margin-top:12px">
         <button class="act primary" id="btnSaveSettings">保存设置</button>
       </div>
@@ -668,11 +669,44 @@ progress { width: 160px; height: 8px; }
       if (promptSel) {
         promptSel.value = status.prompt_mode || settings.prompt_mode || "passthrough";
       }
+      renderTaskSchedules(settings);
       var scheduler = status.scheduler || {};
+      var labels = {};
+      (settings.task_specs || []).forEach(function (spec) { labels[spec.kind] = spec.label || spec.kind; });
+      var nextTasks = (scheduler.next_tasks || []).map(function (kind) { return labels[kind] || kind; });
       document.getElementById("scheduleInfo").textContent =
-        "下次执行：" + (scheduler.next_at || "-") + " · 任务：" + ((scheduler.next_tasks || []).join(", ") || "无");
+        "下次执行：" + (scheduler.next_at || "-") + " · 任务：" + (nextTasks.join("、") || "无");
       setPendingBar(!!status.restart_pending);
     }).catch(function (err) { banner("err", err.message); throw err; });
+  }
+
+  function renderTaskSchedules(settings) {
+    var host = document.getElementById("taskSchedule");
+    if (!host) return;
+    host.innerHTML = "";
+    var specs = settings.task_specs || [];
+    var schedule = settings.schedule || {};
+    if (!specs.length) return;
+    var title = document.createElement("div");
+    title.className = "hint";
+    title.textContent = "任务排程（逗号分隔整点小时，留空使用默认值）";
+    host.appendChild(title);
+    specs.forEach(function (spec) {
+      var row = document.createElement("div");
+      row.className = "row";
+      row.style.marginTop = "6px";
+      var label = document.createElement("label");
+      label.textContent = (spec.label || spec.kind) + " ";
+      var input = document.createElement("input");
+      input.type = "text";
+      input.dataset.taskKind = spec.kind;
+      input.placeholder = (spec.default_hours || []).join(",");
+      input.value = (schedule[spec.kind] || []).join(",");
+      input.style.width = "180px";
+      label.appendChild(input);
+      row.appendChild(label);
+      host.appendChild(row);
+    });
   }
 
   // deleteAccount 删除一个账号（带确认）。
@@ -1393,8 +1427,15 @@ progress { width: 160px; height: 8px; }
       auto_checkin: document.getElementById("setAutoCheckin").checked,
       auto_checkin_at: document.getElementById("setCheckinAt").value,
       auto_tasks: document.getElementById("setAutoTasks").checked,
-      prompt_mode: promptSel ? promptSel.value : "passthrough"
+      prompt_mode: promptSel ? promptSel.value : "passthrough",
+      task_schedules: {}
     };
+    document.querySelectorAll("#taskSchedule input[data-task-kind]").forEach(function (input) {
+      var raw = (input.value || "").trim();
+      if (!raw) return;
+      var hours = raw.split(",").map(function (v) { return parseInt(v.trim(), 10); }).filter(function (v) { return !isNaN(v); });
+      payload.task_schedules[input.dataset.taskKind] = hours;
+    });
     api("POST", "/settings", payload).then(function () {
       banner("ok", "设置已保存并生效");
       loadStatus();

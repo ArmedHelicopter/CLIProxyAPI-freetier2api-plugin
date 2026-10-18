@@ -511,8 +511,6 @@ func fileNameMatchesConvention(fileName string) bool {
 // 永久缓存，且与 auth 文件的 type 字段严格相等才认领该文件。因此供应商的区分
 // 落在凭证文件名前缀（workbuddycn-<uid>.json）与文件内的 vendor 字段上，
 // 而不是 provider key。
-//
-// 唯一来源是 core.ProviderKey（core 不 import vendors，因此这里引用它不成环）。
 const ProviderKey = core.ProviderKey
 
 // RegionForCredential 从凭证 JSON 推断所属区域，推断不出返回空。

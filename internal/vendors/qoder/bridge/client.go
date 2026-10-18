@@ -71,11 +71,6 @@ func PathSigFrom(rawURL string) (string, error) {
 	return p, nil
 }
 
-// CallGet 用 cosy 签名发送 GET（模型清单、额度等查询接口）。
-func (c *BearerClient) CallGet(ctx context.Context, fullURL string) (map[string]interface{}, error) {
-	return c.callGet(ctx, fullURL)
-}
-
 // callGet 用 cosy 签名发送 GET 请求，body 部分参与签名时为空字符串。
 // 用于 /algo/api/v2/model/list 之类的纯查询接口。
 func (c *BearerClient) callGet(ctx context.Context, fullURL string) (map[string]interface{}, error) {

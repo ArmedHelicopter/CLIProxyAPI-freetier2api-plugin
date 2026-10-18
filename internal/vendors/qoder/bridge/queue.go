@@ -6,7 +6,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -67,42 +66,11 @@ const (
 	MaxQueueWait = 90 * time.Second
 )
 
-// 排队策略由插件配置驱动（宿主热重载插件配置时会更新），所以不能是编译期常量。
-var (
-	queuePolicyMu    sync.RWMutex
-	queueMaxWaits    = DefaultQueueMaxWaits
-	queueWaitSeconds int // > 0 时覆盖上游建议的等待时长
-)
-
-// SetQueuePolicy 应用配置里的排队策略：maxWaits 为 0 表示完全不等待（立即返回排队错误）。
-func SetQueuePolicy(maxWaits, waitSeconds int) {
-	if maxWaits < 0 {
-		maxWaits = 0
-	}
-	if waitSeconds < 0 {
-		waitSeconds = 0
-	}
-	queuePolicyMu.Lock()
-	queueMaxWaits = maxWaits
-	queueWaitSeconds = waitSeconds
-	queuePolicyMu.Unlock()
-}
-
 // QueueMaxWaits 返回当前允许的排队等待次数。
-func QueueMaxWaits() int {
-	queuePolicyMu.RLock()
-	defer queuePolicyMu.RUnlock()
-	return queueMaxWaits
-}
+func QueueMaxWaits() int { return DefaultQueueMaxWaits }
 
 // queueWaitFor 计算这次排队该等多久：配置覆盖优先，否则用上游建议值（受 MaxQueueWait 约束）。
 func queueWaitFor(signal QueueSignal) time.Duration {
-	queuePolicyMu.RLock()
-	override := queueWaitSeconds
-	queuePolicyMu.RUnlock()
-	if override > 0 {
-		return time.Duration(override) * time.Second
-	}
 	if signal.retryAfter() > 0 {
 		return signal.cappedWait()
 	}

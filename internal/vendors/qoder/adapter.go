@@ -38,37 +38,62 @@ const (
 
 // adapter 是 core.Vendor 在 Qoder 上的实现。
 type adapter struct {
-	core.Meta
+	*core.NativeAdapter[*Credential]
 	region qoderapi.Region
 	// bridges 按凭证指纹缓存 cosy 会话（建会话要一次 jobToken 交换，很贵）。
 	bridges sync.Map
 }
 
 // Instances 构造 Qoder 的两个区域实例。
-func Instances() []core.Vendor {
-	return []core.Vendor{
-		newInstance(qoderapi.RegionCN),
-		newInstance(qoderapi.RegionGlobal),
-	}
+func Instances(env core.Env) []core.Vendor {
+	return []core.Vendor{newInstance(env, qoderapi.RegionCN), newInstance(env, qoderapi.RegionGlobal)}
 }
 
-func newInstance(region qoderapi.Region) core.Vendor {
+func newInstance(env core.Env, region qoderapi.Region) core.Vendor {
 	return &adapter{
-		Meta: core.Meta{
-			VendorID:     VendorIDFor(region),
-			VendorName:   VendorNameFor(region),
-			VendorRegion: string(region),
-		},
+		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+			Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
+			Env:  env,
+			Extract: func(c *core.Credential) (*Credential, bool) {
+				native, ok := c.Native.(*Credential)
+				return native, ok
+			},
+			ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+				native, errParse := ParseCredential(raw, region)
+				if errParse != nil {
+					return core.CredentialSeed{}, nil, errParse
+				}
+				if native.Region != region {
+					return core.CredentialSeed{}, nil, fmt.Errorf("credential region %q does not match vendor %q", native.Region, VendorIDFor(region))
+				}
+				label := native.Label
+				if label == "" {
+					label = native.Email
+				}
+				if label == "" {
+					label = fileName
+				}
+				return core.CredentialSeed{
+					VendorID: VendorIDFor(region), Region: string(native.Region), Label: label,
+					FileID: core.FileIDFromFileName(fileName), Token: native.Token,
+					RefreshToken: native.RefreshToken, AuthMode: "oauth",
+				}, native, nil
+			},
+			RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
+				updated, refreshed, errRefresh := RefreshCredential(ctx, native)
+				if errRefresh != nil {
+					return core.NativeRefresh[*Credential]{}, errRefresh
+				}
+				return core.NativeRefresh[*Credential]{
+					Native: updated, Token: updated.Token, RefreshToken: updated.RefreshToken, Changed: refreshed,
+				}, nil
+			},
+		}),
 		region: region,
 	}
 }
 
-// ---- 凭证 ----
-
 // Match 判断一份凭证是否属于本区域。
-//
-// 与 WorkBuddy 同样要求区域一致，但 Qoder 的凭证可能压根没有 region 字段
-// （手写或旧格式），此时回落到配置兜底——否则这类凭证会两边都不认领。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	if !LooksLikeCredential(raw, fileName, provider) {
 		return false
@@ -79,65 +104,17 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	if region := RegionForCredential(raw); region != "" {
 		return region == v.region
 	}
-	return defaultRegionForParse() == v.region
+	return v.defaultRegionForParse() == v.region
 }
 
-// defaultRegionForParse 决定解析无区域声明的 Qoder 凭证时的兜底区域。
-//
-// Qoder 国际版是主站，因此默认 global（与 WorkBuddy 默认 cn 相反——
-// 各家的主站不同，兜底必须跟着自己的实际情况走）。
-func defaultRegionForParse() qoderapi.Region {
-	settings := core.HostSettings()
-	for _, vendor := range core.Vendors() {
+func (v *adapter) defaultRegionForParse() qoderapi.Region {
+	settings := v.Env.Settings()
+	for _, vendor := range v.Env.Registry.Vendors() {
 		if vendor.Region() == string(qoderapi.RegionGlobal) && settings.RealmEnabled(vendor.Region()) {
 			return qoderapi.RegionGlobal
 		}
 	}
 	return qoderapi.RegionCN
-}
-
-// Parse 把凭证 JSON 解析成 core.Credential。
-func (v *adapter) Parse(raw []byte, fileName string) (*core.Credential, error) {
-	native, errParse := ParseCredential(raw, v.region)
-	if errParse != nil {
-		return nil, errParse
-	}
-	if native.Region != v.region {
-		return nil, fmt.Errorf("credential region %q does not match vendor %q", native.Region, v.ID())
-	}
-	return newCoreCredential(native, v.ID(), fileName), nil
-}
-
-// newCoreCredential 把协议层凭证包装成 core.Credential。
-func newCoreCredential(native *Credential, vendorID, fileName string) *core.Credential {
-	label := native.Label
-	if label == "" {
-		label = native.Email
-	}
-	if label == "" {
-		label = fileName
-	}
-	// Qoder 的 PAT 是长期凭证，没有过期时间概念；设备令牌同理。
-	// 因此 ExpiresAt 留 0（表示未知），刷新由宿主按 NextRefreshAfter 驱动。
-	fileID := strings.TrimSuffix(strings.TrimSpace(fileName), ".json")
-	return &core.Credential{
-		VendorID:     vendorID,
-		Region:       string(native.Region),
-		Label:        label,
-		FileID:       fileID,
-		Token:        native.Token,
-		RefreshToken: native.RefreshToken,
-		AuthMode:     "oauth",
-		Native:       native,
-	}
-}
-
-// nativeCredential 取回协议层凭证对象。
-func (v *adapter) nativeCredential(cred *core.Credential) (*Credential, error) {
-	return core.NativeCredential(cred, v.ID(), func(c *core.Credential) (*Credential, bool) {
-		native, okNative := c.Native.(*Credential)
-		return native, okNative
-	})
 }
 
 // ---- 模型 ----
@@ -157,7 +134,7 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 
 // fetchModels 借探测凭证拉取上游模型清单。
 func (v *adapter) fetchModels(ctx context.Context) ([]bridge.QoderModel, error) {
-	cred, okCred := core.ProbeNativeCredential(v.ID(), func(c *core.Credential) (*Credential, bool) {
+	cred, okCred := core.ProbeNativeCredential(v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
 		native, okNative := c.Native.(*Credential)
 		return native, okNative
 	})
@@ -178,7 +155,7 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 		// 这正是我们想要的结果（避免用错域的凭证打上游）。
 		return nil, nil
 	}
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -199,7 +176,7 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 
 // Execute 执行一次非流式对话。
 func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -221,7 +198,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 
 // ExecuteStream 执行一次流式对话。
 func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest, sink core.StreamSink) error {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return errNative
 	}
@@ -236,7 +213,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 
 // Quota 查询账号额度。
 func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -250,7 +227,7 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 
 // Checkin 执行一次签到。
 func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.CheckinResult, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -317,23 +294,6 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 
 // OwnsLoginSession 报告该会话是否由本供应商创建。
 func (v *adapter) OwnsLoginSession(sessionID string) bool { return OwnsLoginSession(sessionID) }
-
-// Refresh 校验并刷新凭证。
-func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
-	native, errNative := v.nativeCredential(cred)
-	if errNative != nil {
-		return nil, false, errNative
-	}
-	updated, refreshed, errRefresh := RefreshCredential(ctx, native)
-	if errRefresh != nil {
-		return nil, false, errRefresh
-	}
-	if refreshed && updated != nil {
-		cred.ApplyTokenRefresh(updated.Token, updated.RefreshToken, 0)
-		cred.Native = updated
-	}
-	return cred, refreshed, nil
-}
 
 // MergeStorageJSON 实现 core.StorageMerger：把续期后的令牌合并回原凭证 JSON。
 //

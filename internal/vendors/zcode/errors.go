@@ -3,10 +3,10 @@ package zcode
 // 上游错误的分类与映射。
 //
 // 这里**不定义**本供应商自己的错误类型：分类结果统一用共享的
-// *workbuddy.Error（已实现 core.UpstreamError），由 core.ToPluginError
+// *upstream.Error（已实现 core.UpstreamError），由 core.ToPluginError
 // 翻译成宿主状态码。各家自建且未实现该接口的类型会被降级成「502 可重试」，
 // 连 401 凭证失效都传不出去，宿主因此不会停用坏账号。
-// 因此本文件只做一件事：把 ZCode 的上游响应翻译成 workbuddy.Kind。
+// 因此本文件只做一件事：把 ZCode 的上游响应翻译成 upstream.Kind。
 
 import (
 	"encoding/json"
@@ -14,7 +14,7 @@ import (
 	"strings"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/vendors/workbuddy"
+	"freetier2api-plugin/internal/upstream"
 )
 
 // 上游业务码（实测自 zcode.z.ai 与 api.z.ai）。
@@ -36,7 +36,7 @@ const (
 //
 // 分类顺序即优先级：验证码挑战必须先于鉴权判定——上游把 403 同时用于
 // 「凭证失效」与「人机校验」，先判 403 会把只是要过码的账号错杀成失效。
-func Classify(status int, body string) *workbuddy.Error {
+func Classify(status int, body string) *upstream.Error {
 	var payload struct {
 		Code  int    `json:"code"`
 		Msg   string `json:"msg"`
@@ -53,71 +53,71 @@ func Classify(status int, body string) *workbuddy.Error {
 	switch {
 	// 1) 验证码挑战（Plan 通道）：403 + captcha 文案，或 400 + code=3007
 	case isCaptchaChallenge(status, payload.Code, lower):
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindWAFBlock,
+		return &upstream.Error{
+			Kind:   upstream.KindWAFBlock,
 			Status: status,
 			Msg:    "触发上游人机验证码校验。该验证码为阿里云无痕验证（无图片可作答），本插件未内置浏览器求解器——对话请改用 API Key 通道，领取活动套餐需在官方客户端完成",
 		}
 
 	// 2) 风控：405 + 3012 unusual activity（高频请求触发，属临时限制）
 	case isRiskControl(status, payload.Code, lower):
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindWAFBlock,
+		return &upstream.Error{
+			Kind:   upstream.KindWAFBlock,
 			Status: status,
 			Msg:    "触发上游风控限制（3012 unusual activity）",
 		}
 
 	// 3) 鉴权失败：凭证失效，宿主应停用该账号
 	case status == http.StatusUnauthorized || status == http.StatusForbidden:
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindSessionDead,
+		return &upstream.Error{
+			Kind:   upstream.KindSessionDead,
 			Status: status,
 			Msg:    core.FirstNonEmpty(msg, "凭证失效"),
 		}
 
 	// 4) 额度耗尽
 	case status == http.StatusPaymentRequired || promptExhausted(lower, payload.Code):
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindHardCredit,
+		return &upstream.Error{
+			Kind:   upstream.KindHardCredit,
 			Status: pickStatus(status, http.StatusPaymentRequired),
 			Msg:    core.FirstNonEmpty(msg, "额度已用完"),
 		}
 
 	// 5) 限流
 	case status == http.StatusTooManyRequests:
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindSoftRate,
+		return &upstream.Error{
+			Kind:   upstream.KindSoftRate,
 			Status: status,
 			Msg:    core.FirstNonEmpty(msg, "上游限流"),
 		}
 
 	// 6) 该后端无此模型（按账号×模型避让）
 	case payload.Code == codeModelNotAllowed:
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindModelBlocked,
+		return &upstream.Error{
+			Kind:   upstream.KindModelBlocked,
 			Status: status,
 			Msg:    core.FirstNonEmpty(msg, "该账号套餐不包含此模型"),
 		}
 
 	// 7) 参数非法（max_tokens 越界等）：换号无意义
 	case payload.Code == codeMaxTokens || payload.Code == codeParameterError:
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindBadParams,
+		return &upstream.Error{
+			Kind:   upstream.KindBadParams,
 			Status: status,
 			Msg:    core.FirstNonEmpty(msg, "请求参数被上游拒绝"),
 		}
 
 	// 8) 上游 5xx
 	case status >= 500:
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindServer,
+		return &upstream.Error{
+			Kind:   upstream.KindServer,
 			Status: status,
 			Msg:    msg,
 		}
 
 	default:
-		return &workbuddy.Error{
-			Kind:   workbuddy.KindClient,
+		return &upstream.Error{
+			Kind:   upstream.KindClient,
 			Status: status,
 			Msg:    msg,
 		}

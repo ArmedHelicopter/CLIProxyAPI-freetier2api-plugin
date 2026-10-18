@@ -498,28 +498,6 @@ func isRetryableStreamError(err error) bool {
 	return IsTransientTransport(err)
 }
 
-// RedactRequestBodyJSON 接收原始请求 JSON 字节，深拷贝后把可能含敏感对话内容的字段
-// （messages[*].content / system / input / tools[*].description 等）的字符串值替换为
-// `<redacted len=N>`，保留 JSON 结构和长度信息便于排查问题，但不泄露用户对话原文。
-//
-// 设计：
-//  1. 只对 string 类型脱敏，结构和数字保留
-//  2. 长度阈值：>32 才脱敏（避免把短角色名 "user" 也替换掉）
-//  3. 按字段名递归：content/text/system/input/instructions/prompt/description
-//  4. 失败时退回原始内容（脱敏只是日志辅助，不能影响主流程）
-func RedactRequestBodyJSON(raw []byte) string {
-	var v interface{}
-	if err := json.Unmarshal(raw, &v); err != nil {
-		return string(raw)
-	}
-	redactValue(v, "")
-	out, err := json.Marshal(v)
-	if err != nil {
-		return string(raw)
-	}
-	return string(out)
-}
-
 // sensitiveFieldNames 命中后其字符串子值会被脱敏（递归进数组/对象继续处理）
 var sensitiveFieldNames = map[string]bool{
 	"content":      true,

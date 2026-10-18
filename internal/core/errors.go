@@ -36,17 +36,6 @@ type UpstreamDetail interface {
 	UpstreamMessage() string
 }
 
-// MappedError 是「已经映射好宿主状态码」的供应商错误。
-//
-// 适用于在协议层就完成分类、但字段名与 UpstreamError 方法冲突的类型
-// （例如 Qoder 的 PluginError 已有 HTTPStatus 字段，不能再有同名方法）。
-type MappedError interface {
-	error
-	MappedStatus() int
-	MappedRetryable() bool
-	MappedKind() string
-}
-
 // ToPluginError 把供应商错误翻译成宿主契约错误。
 //
 // 非分类错误按 502 可重试处理：那通常是本地问题（编解码、连接），
@@ -55,32 +44,19 @@ func ToPluginError(err error) error {
 	if err == nil {
 		return nil
 	}
-	var upstream UpstreamError
-	var mapped MappedError
-	switch {
-	case errors.As(err, &upstream):
-		status := upstream.HTTPStatus()
+	var upstreamErr UpstreamError
+	if errors.As(err, &upstreamErr) {
+		status := upstreamErr.HTTPStatus()
 		if status <= 0 {
 			status = http.StatusBadGateway
 		}
-		code := upstreamCode(upstream.UpstreamKind())
-		if upstream.Retryable() {
-			return RetryablePluginError(code, upstream.Error(), status)
+		code := upstreamCode(upstreamErr.UpstreamKind())
+		if upstreamErr.Retryable() {
+			return RetryablePluginError(code, upstreamErr.Error(), status)
 		}
-		return NewPluginError(code, upstream.Error(), status)
-	case errors.As(err, &mapped):
-		status := mapped.MappedStatus()
-		if status <= 0 {
-			status = http.StatusBadGateway
-		}
-		code := upstreamCode(mapped.MappedKind())
-		if mapped.MappedRetryable() {
-			return RetryablePluginError(code, mapped.Error(), status)
-		}
-		return NewPluginError(code, mapped.Error(), status)
-	default:
-		return RetryablePluginError("upstream_request_failed", err.Error(), http.StatusBadGateway)
+		return NewPluginError(code, upstreamErr.Error(), status)
 	}
+	return RetryablePluginError("upstream_request_failed", err.Error(), http.StatusBadGateway)
 }
 
 // upstreamCode 生成错误码：upstream_<kind>。

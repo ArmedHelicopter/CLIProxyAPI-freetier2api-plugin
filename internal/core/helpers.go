@@ -6,7 +6,6 @@ package core
 // 同一种语义只允许有一份实现，供应商包只负责"哪些键、什么特征"的差异。
 
 import (
-	"context"
 	"encoding/json"
 	"strings"
 
@@ -207,32 +206,3 @@ const DefaultContextWindowTokens int64 = 1000000
 
 // DefaultContextWindow 返回兜底上下文窗口（忽略模型名）。
 func DefaultContextWindow(_ string) int64 { return DefaultContextWindowTokens }
-
-// ProbeNativeCredential 从宿主列出的凭证里挑第一个属于 vendorID 的可用原生凭证。
-//
-// 模型探测（列模型）需要真实凭证；这里把「列凭证 → 取 JSON → 解析 → 归属过滤 →
-// 取原生对象」这条链收口一处，避免每个供应商各写一份。
-func ProbeNativeCredential[T any](vendorID string, extract NativeExtractor[T]) (*T, bool) {
-	ctx := context.Background()
-	entries, errList := ListHostAuths(ctx)
-	if errList != nil {
-		return nil, false
-	}
-	for _, entry := range entries {
-		if entry.Disabled || entry.Unavailable {
-			continue
-		}
-		raw, okRaw := HostAuthJSON(ctx, entry.AuthIndex)
-		if !okRaw {
-			continue
-		}
-		credential, okParse := ParseCredential(raw, entry.Name, nil)
-		if !okParse || credential.VendorIDValue() != vendorID {
-			continue
-		}
-		if native, okNative := extract(credential); okNative && native != nil {
-			return native, true
-		}
-	}
-	return nil, false
-}

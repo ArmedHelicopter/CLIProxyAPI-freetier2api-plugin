@@ -14,15 +14,16 @@ import (
 // 会把本插件的文件抢走（provider 变成对方），只按 provider 过滤会让这些
 // 账号从页面凭空消失。文件名仍是本插件约定，因此按文件名兜底认领。
 func TestListHostAuthsClaimsHijackedCredentials(t *testing.T) {
-	if !fileNameBelongsToPlugin("workbuddy-79fdc1fc-de43-40da-b6f0-fe05d9e4367b.json") {
+	registry := core.NewRegistry()
+	if !fileNameBelongsToPlugin("workbuddy-79fdc1fc-de43-40da-b6f0-fe05d9e4367b.json", registry) {
 		t.Fatal("workbuddy-<uuid>.json must be recognized by file name")
 	}
-	if !fileNameBelongsToPlugin("my-workbuddy.json") {
+	if !fileNameBelongsToPlugin("my-workbuddy.json", registry) {
 		t.Fatal("file name containing the workbuddy segment must be recognized")
 	}
 	// 别家的文件名不能被认领，否则会把别人的账号当成自己的。
 	for _, foreign := range []string{"qoder-login-x.json", "claude-1.json", "codex-a@b.com.json", "auth.json"} {
-		if fileNameBelongsToPlugin(foreign) {
+		if fileNameBelongsToPlugin(foreign, registry) {
 			t.Fatalf("foreign file %q must not be claimed", foreign)
 		}
 	}
@@ -32,7 +33,7 @@ func TestListHostAuthsClaimsHijackedCredentials(t *testing.T) {
 		{Name: "workbuddy-79fdc1fc-de43-40da-b6f0-fe05d9e4367b.json", Provider: "qoder", AuthIndex: "1"},
 		{Name: "workbuddy-110693a0-d32d-4d81-8a0a-7a3445069f96.json", Provider: "workbuddy", AuthIndex: "2"},
 		{Name: "qoder-login-f34c07f7.json", Provider: "qoder", AuthIndex: "3"},
-	})
+	}, registry)
 	if len(entries) != 2 {
 		t.Fatalf("want 2 workbuddy credentials (one hijacked), got %d: %+v", len(entries), entries)
 	}

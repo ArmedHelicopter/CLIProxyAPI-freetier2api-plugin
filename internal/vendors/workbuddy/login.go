@@ -73,15 +73,6 @@ func CheckLoginSession(sessionID string) (session *PendingLogin, exists bool, sh
 	return pending, true, pollState == loginsession.PollReady
 }
 
-// TakeLoginSession 取出登录会话，同时应用节流（兼容旧调用）。
-func TakeLoginSession(sessionID string) (*PendingLogin, bool) {
-	s, exists, shouldPoll := CheckLoginSession(sessionID)
-	if !exists {
-		return nil, false
-	}
-	return s, shouldPoll
-}
-
 // loginAccount 是登录流程取到的账号信息。
 type LoginAccount struct {
 	UID          string
@@ -292,12 +283,4 @@ func DefaultDomainFor(region Region) string {
 		return "www.workbuddy.ai"
 	}
 	return "www.codebuddy.cn"
-}
-
-// ResetLoginStoreForTest 清空登录会话（测试用）。
-//
-// 登录会话是包级的：测试之间不清空会让上一个用例的会话泄漏到下一个，
-// 表现为「随便一个 state 都能命中旧会话」。
-func ResetLoginStoreForTest() {
-	loginsession.ResetForTest()
 }

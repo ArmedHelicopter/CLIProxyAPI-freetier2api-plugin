@@ -10,6 +10,7 @@ package state
 import (
 	"encoding/json"
 	"fmt"
+	"freetier2api-plugin/internal/core"
 	"os"
 	"path/filepath"
 	"sync"
@@ -37,21 +38,8 @@ type CheckinRecord struct {
 	Energy   int64  `json:"energy,omitempty"`
 }
 
-// CachedModel 是缓存的单条上游模型元数据。
-type CachedModel struct {
-	ID              string   `json:"id"`
-	Name            string   `json:"name,omitempty"`
-	Realm           string   `json:"realm"`
-	ContextLength   int64    `json:"context_length,omitempty"`
-	MaxOutputTokens int64    `json:"max_output_tokens,omitempty"`
-	Efforts         []string `json:"efforts,omitempty"`
-	DefaultEffort   string   `json:"default_effort,omitempty"`
-	SupportsImages  bool     `json:"supports_images,omitempty"`
-	SupportsTool    bool     `json:"supports_tool_call,omitempty"`
-	CanDisableThink bool     `json:"can_disable_thinking,omitempty"`
-	OnlyReasoning   bool     `json:"only_reasoning,omitempty"`
-	Description     string   `json:"description,omitempty"`
-}
+// CachedModel 是缓存的单条上游模型元数据（定义在 core，避免 core 反向依赖 state）。
+type CachedModel = core.CachedModel
 
 // State 是 state.json 的完整结构。
 //
@@ -61,13 +49,17 @@ type State struct {
 	Version int `json:"version"`
 
 	// AutoCheckin / AutoCheckinAt / AutoTasks 是页面上可改的任务设置。
-	AutoCheckin   *bool   `json:"auto_checkin,omitempty"`
-	AutoCheckinAt string  `json:"auto_checkin_at,omitempty"`
-	AutoTasks     *bool   `json:"auto_tasks,omitempty"`
-	PromptMode    *string `json:"prompt_mode,omitempty"`
+	AutoCheckin   *bool  `json:"auto_checkin,omitempty"`
+	AutoCheckinAt string `json:"auto_checkin_at,omitempty"`
+	AutoTasks     *bool  `json:"auto_tasks,omitempty"`
+	// VendorSettings 是供应商自描述的运行时设置（键名即配置键）。
+	VendorSettings map[string]string `json:"vendor_settings,omitempty"`
 
-	// CheckinHours / TravelHours / ActivityHours / KeepaliveHours / BlackcatHours
-	// 是各定时任务的整点小时列表（0-23）。
+	// TaskSchedules 是按任务族保存的整点小时列表（0-23）。
+	// 新代码只读写这个字段；下面五个字段仅用于读取旧状态并迁移。
+	TaskSchedules map[string][]int `json:"task_schedules,omitempty"`
+
+	// Deprecated: 旧版固定字段，仅用于迁移读取。
 	CheckinHours   []int `json:"checkin_hours,omitempty"`
 	TravelHours    []int `json:"travel_hours,omitempty"`
 	ActivityHours  []int `json:"activity_hours,omitempty"`
@@ -111,20 +103,14 @@ func (s *Store) Configure(dir string) {
 	s.mu.Unlock()
 }
 
-// Dir 返回当前状态目录。
-func (s *Store) Dir() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.dir
-}
-
 // New 返回一个补齐 map 的空状态。
 func New() *State {
 	return &State{
-		Version:      Version,
-		Checkin:      map[string]CheckinRecord{},
-		Tasks:        map[string]TaskRecord{},
-		ModelAliases: map[string]string{},
+		Version:       Version,
+		Checkin:       map[string]CheckinRecord{},
+		Tasks:         map[string]TaskRecord{},
+		ModelAliases:  map[string]string{},
+		TaskSchedules: map[string][]int{},
 	}
 }
 
@@ -162,6 +148,28 @@ func (s *Store) pathLocked() string {
 
 func normalize(state *State) {
 	state.Version = Version
+	if state.TaskSchedules == nil {
+		state.TaskSchedules = map[string][]int{}
+	}
+	for kind, hours := range map[string][]int{
+		"checkin":   state.CheckinHours,
+		"travel":    state.TravelHours,
+		"activity":  state.ActivityHours,
+		"keepalive": state.KeepaliveHours,
+		"blackcat":  state.BlackcatHours,
+	} {
+		if len(hours) > 0 {
+			if _, exists := state.TaskSchedules[kind]; !exists {
+				state.TaskSchedules[kind] = append([]int(nil), hours...)
+			}
+		}
+	}
+	// 迁移后清空旧字段，后续保存不会再写它们。
+	state.CheckinHours = nil
+	state.TravelHours = nil
+	state.ActivityHours = nil
+	state.KeepaliveHours = nil
+	state.BlackcatHours = nil
 	if state.Checkin == nil {
 		state.Checkin = map[string]CheckinRecord{}
 	}
@@ -187,11 +195,15 @@ func (s *Store) Snapshot() State {
 func clone(state *State) State {
 	out := *state
 	out.Models = append([]CachedModel(nil), state.Models...)
-	out.CheckinHours = append([]int(nil), state.CheckinHours...)
-	out.TravelHours = append([]int(nil), state.TravelHours...)
-	out.ActivityHours = append([]int(nil), state.ActivityHours...)
-	out.KeepaliveHours = append([]int(nil), state.KeepaliveHours...)
-	out.BlackcatHours = append([]int(nil), state.BlackcatHours...)
+	out.TaskSchedules = make(map[string][]int, len(state.TaskSchedules))
+	for kind, hours := range state.TaskSchedules {
+		out.TaskSchedules[kind] = append([]int(nil), hours...)
+	}
+	out.CheckinHours = nil
+	out.TravelHours = nil
+	out.ActivityHours = nil
+	out.KeepaliveHours = nil
+	out.BlackcatHours = nil
 	out.DisabledModels = append([]string(nil), state.DisabledModels...)
 	if state.AutoCheckin != nil {
 		enabled := *state.AutoCheckin
@@ -201,9 +213,9 @@ func clone(state *State) State {
 		enabled := *state.AutoTasks
 		out.AutoTasks = &enabled
 	}
-	if state.PromptMode != nil {
-		mode := *state.PromptMode
-		out.PromptMode = &mode
+	out.VendorSettings = make(map[string]string, len(state.VendorSettings))
+	for key, value := range state.VendorSettings {
+		out.VendorSettings[key] = value
 	}
 	out.Checkin = make(map[string]CheckinRecord, len(state.Checkin))
 	for key, value := range state.Checkin {
@@ -234,13 +246,6 @@ func (s *Store) Mutate(mutate func(*State)) {
 	if errSave := s.saveLocked(); errSave != nil {
 		logger.Error("save state failed: %v", errSave)
 	}
-}
-
-// Save 原子写入当前缓存。
-func (s *Store) Save() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.saveLocked()
 }
 
 // saveLocked 原子写入状态文件。调用方必须持有 s.mu。

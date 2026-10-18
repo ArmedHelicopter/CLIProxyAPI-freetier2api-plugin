@@ -69,17 +69,32 @@ func autoActionIndex(code string) int {
 	return len(autoActions)
 }
 
-// TaskActions 返回本区域暴露的任务动作（控制台展示用）。
-func TaskActions(region Region) []core.Task {
+const (
+	TaskKindTravel    = "travel"
+	TaskKindActivity  = "activity"
+	TaskKindKeepalive = "keepalive"
+	TaskKindBlackcat  = "blackcat"
+	TaskKindSchool    = "school"
+	TaskKindStreak    = "streak"
+)
+
+// TaskSpecsFor 返回本区域注册的任务族与默认排程。
+func TaskSpecsFor(region Region) []core.TaskSpec {
 	if region.IsGlobal() {
 		return nil
 	}
-	out := make([]core.Task, 0, len(autoActions))
-	for _, action := range autoActions {
-		out = append(out, core.Task{Code: action.Code, Desc: action.Desc, UsesChat: action.UsesChat})
+	return []core.TaskSpec{
+		{Kind: TaskKindTravel, Label: "猫猫旅行", Description: "每日猫猫旅行任务", DefaultHours: []int{9, 21}, Manual: true, Route: "/travel"},
+		{Kind: TaskKindActivity, Label: "活跃上报", Description: "每日活跃与连登上报", DefaultHours: []int{10}, Manual: true, Route: "/activity"},
+		{Kind: TaskKindKeepalive, Label: "Token 保活", Description: "刷新账号 token", DefaultHours: []int{22}, Manual: true},
+		{Kind: TaskKindBlackcat, Label: "夜猫子", Description: "夜间任务补足", DefaultHours: []int{23}, Manual: true, Route: "/blackcat"},
+		{Kind: TaskKindSchool, Label: "开学季", Description: "开学季活动闭环", AfterCheckin: true, Manual: true, Route: "/school/run"},
+		{Kind: TaskKindStreak, Label: "连登奖励", Description: "连登兑换与抽奖闭环", AfterCheckin: true},
 	}
-	return out
 }
+
+// TaskSpecs 实现 core.TaskCatalogProvider。
+func (v *adapter) TaskSpecs() []core.TaskSpec { return TaskSpecsFor(v.region) }
 
 // ---- 任务扫描 ----
 
@@ -87,7 +102,7 @@ func (v *adapter) InspectTasks(ctx context.Context, cred *core.Credential) (core
 	if v.region.IsGlobal() {
 		return core.TaskInspection{}, nil
 	}
-	native, err := v.nativeCredential(cred)
+	native, err := v.Native(cred)
 	if err != nil {
 		return core.TaskInspection{}, err
 	}
@@ -202,7 +217,7 @@ func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code strin
 	if v.region.IsGlobal() {
 		return core.TaskRunResult{Status: "skipped", Message: "国际版账号没有成长任务"}, nil
 	}
-	native, err := v.nativeCredential(cred)
+	native, err := v.Native(cred)
 	if err != nil {
 		return core.TaskRunResult{}, err
 	}
@@ -229,7 +244,7 @@ func (v *adapter) PrepareTasks(ctx context.Context, cred *core.Credential) int {
 	if v.region.IsGlobal() {
 		return 0
 	}
-	native, err := v.nativeCredential(cred)
+	native, err := v.Native(cred)
 	if err != nil {
 		return 0
 	}
@@ -240,7 +255,7 @@ func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core
 	if v.region.IsGlobal() {
 		return nil
 	}
-	native, err := v.nativeCredential(cred)
+	native, err := v.Native(cred)
 	if err != nil {
 		return []core.AutoTaskResult{{Code: "(账号)", Status: "error", Message: err.Error()}}
 	}
@@ -427,7 +442,7 @@ func (v *adapter) SchoolStatus(ctx context.Context, cred *core.Credential) core.
 	if v.region.IsGlobal() {
 		return core.SchoolStatusResult{Error: "global realm（无开学季活动）"}
 	}
-	native, err := v.nativeCredential(cred)
+	native, err := v.Native(cred)
 	if err != nil {
 		return core.SchoolStatusResult{Error: err.Error()}
 	}
@@ -457,30 +472,30 @@ func (v *adapter) RunScheduled(ctx context.Context, cred *core.Credential, kind 
 	if v.region.IsGlobal() {
 		return "", nil
 	}
-	native, err := v.nativeCredential(cred)
+	native, err := v.Native(cred)
 	if err != nil {
 		return "", err
 	}
 	client := UpstreamClient(ctx)
 	switch kind {
-	case core.TaskKindActivity:
+	case TaskKindActivity:
 		conversationID := fmt.Sprintf("wb2api-%d", time.Now().UnixMilli())
 		if errReport := client.ReportChatActivity(ctx, native, conversationID, "", "", ""); errReport != nil {
 			return "", errReport
 		}
 		return checkActivityStreak(ctx, client, native), nil
-	case core.TaskKindKeepalive:
+	case TaskKindKeepalive:
 		return "", refreshAndSaveCredential(ctx, client, cred, native)
-	case core.TaskKindTravel:
+	case TaskKindTravel:
 		return RunTravel(ctx, client, native), nil
-	case core.TaskKindBlackcat:
+	case TaskKindBlackcat:
 		if !InNightWindow(time.Now()) {
 			return "", nil
 		}
 		return RunBlackcat(ctx, client, native)
-	case core.TaskKindSchool:
+	case TaskKindSchool:
 		return RunSchool(ctx, client, native)
-	case core.TaskKindStreak:
+	case TaskKindStreak:
 		return RunStreakBonus(ctx, client, native)
 	}
 	return "", fmt.Errorf("unknown scheduled task kind %q", kind)
@@ -775,20 +790,4 @@ func tailOf(text string, n int) string {
 	return text[len(text)-n:]
 }
 
-// sleepCtx 可取消的睡眠。返回 false 表示上下文已取消。
-//
-// 任务链上的每个动作之间都要按上游的风控节奏间隔（见 fingerprint.go 的节流
-// 参数），而整个闭环必须可被取消——用 time.Sleep 会让取消后仍要等满间隔。
-func sleepCtx(ctx context.Context, d time.Duration) bool {
-	if d <= 0 {
-		return ctx.Err() == nil
-	}
-	timer := time.NewTimer(d)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
-}
+func sleepCtx(ctx context.Context, d time.Duration) bool { return sleepContext(ctx, d) }

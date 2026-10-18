@@ -2,14 +2,7 @@ package loginsession
 
 // Package loginsession 提供供应商无关的登录会话登记表。
 //
-// 为什么需要它：多步登录（设备码 / OAuth 回调）都有一张「进行中会话」表，
-// 每张表都自带 TTL、轮询节流与归属查询。此前每个供应商各写一份，根层为了
-// 把 poll 路由回正确的供应商，还长出了一段靠 session id 前缀猜归属的补丁。
-//
-// 这里的职责只有三件事：
-//   - 登记会话（会话 id → 供应商 + 供应商自定义数据 + TTL）；
-//   - 轮询节流（控制台页面轮询远高于上游建议频率）；
-//   - 归属查询（根层按 session id 找供应商，不再猜前缀）。
+// 会话表是 Registry 实例：每个 App 一份，测试与多实例互不共享。
 
 import (
 	"strings"
@@ -21,41 +14,33 @@ import (
 
 // Session 是一次进行中的登录会话。
 type Session struct {
-	// VendorID 是创建会话的供应商实例。
-	VendorID string
-	// ExpiresAt 是会话失效时刻。
-	ExpiresAt time.Time
-	// PollMinGap 是同一会话两次访问上游 poll 端点之间的最小间隔。
+	VendorID   string
+	ExpiresAt  time.Time
 	PollMinGap time.Duration
-	// Data 是供应商自定义的会话数据（设备码、PKCE verifier 等）。
-	Data any
-
-	lastPoll time.Time
+	Data       any
+	LastPoll   time.Time
 }
 
-// PollState 描述一次轮询的准入结果。
-type PollState int
+// Registry 是登录会话登记表。
+type Registry struct {
+	mu  sync.Mutex
+	now func() time.Time
+	m   map[string]*Session
+}
 
-const (
-	// PollMissing 表示会话不存在或已过期。
-	PollMissing PollState = iota
-	// PollThrottled 表示还没到下一次允许打上游的时刻。
-	PollThrottled
-	// PollReady 表示可以向上游发起一次 poll。
-	PollReady
-)
+// NewRegistry 构造一个会话表。
+func NewRegistry() *Registry { return NewRegistryWithClock(time.Now) }
 
-var (
-	storeMu sync.Mutex
-	store   = map[string]*Session{}
-	// fallbackCounter 给随机源不可用时的确定性 id 用。
-	fallbackCounter int64
-)
+// NewRegistryWithClock 构造一个使用指定时钟的会话表（测试用）。
+func NewRegistryWithClock(now func() time.Time) *Registry {
+	if now == nil {
+		now = time.Now
+	}
+	return &Registry{now: now, m: map[string]*Session{}}
+}
 
-// Register 登记一个登录会话。
-//
-// ttl <= 0 时按 15 分钟处理；pollMinGap <= 0 表示不节流。
-func Register(vendorID, sessionID string, ttl, pollMinGap time.Duration, data any) {
+// Register 登记一个登录会话。ttl <= 0 按 15 分钟处理。
+func (r *Registry) Register(vendorID, sessionID string, ttl, pollMinGap time.Duration, data any) {
 	id := strings.TrimSpace(sessionID)
 	if id == "" {
 		return
@@ -63,83 +48,83 @@ func Register(vendorID, sessionID string, ttl, pollMinGap time.Duration, data an
 	if ttl <= 0 {
 		ttl = 15 * time.Minute
 	}
-	storeMu.Lock()
-	store[id] = &Session{
-		VendorID:   vendorID,
-		ExpiresAt:  time.Now().Add(ttl),
-		PollMinGap: pollMinGap,
-		Data:       data,
-	}
-	storeMu.Unlock()
+	r.mu.Lock()
+	r.m[id] = &Session{VendorID: vendorID, ExpiresAt: r.now().Add(ttl), PollMinGap: pollMinGap, Data: data}
+	r.mu.Unlock()
 }
 
-// Poll 查询一次会话，并按需做过期清理与轮询节流。
-//
-// 返回的 *Session 可直接读取 Data；供应商不应长期持有该指针（会话可能被删除）。
-func Poll(sessionID string) (*Session, PollState) {
+// Poll 查询会话并按需做过期清理与轮询节流。
+func (r *Registry) Poll(sessionID string) (*core.LoginSession, core.PollState) {
 	id := strings.TrimSpace(sessionID)
 	if id == "" {
-		return nil, PollMissing
+		return nil, core.PollMissing
 	}
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	session, okSession := store[id]
-	if !okSession {
-		return nil, PollMissing
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.m[id]
+	if !ok {
+		return nil, core.PollMissing
 	}
-	if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
-		delete(store, id)
-		return nil, PollMissing
+	if !session.ExpiresAt.IsZero() && r.now().After(session.ExpiresAt) {
+		delete(r.m, id)
+		return nil, core.PollMissing
 	}
-	if session.PollMinGap > 0 && time.Since(session.lastPoll) < session.PollMinGap {
-		return session, PollThrottled
+	if session.PollMinGap > 0 && r.now().Sub(session.LastPoll) < session.PollMinGap {
+		return &core.LoginSession{VendorID: session.VendorID, Data: session.Data}, core.PollThrottled
 	}
-	session.lastPoll = time.Now()
-	return session, PollReady
+	session.LastPoll = r.now()
+	return &core.LoginSession{VendorID: session.VendorID, Data: session.Data}, core.PollReady
 }
 
-// Delete 删除一个会话（登录完成或失败后调用）。
-func Delete(sessionID string) {
+// Delete 删除一个会话。
+func (r *Registry) Delete(sessionID string) {
 	id := strings.TrimSpace(sessionID)
 	if id == "" {
 		return
 	}
-	storeMu.Lock()
-	delete(store, id)
-	storeMu.Unlock()
+	r.mu.Lock()
+	delete(r.m, id)
+	r.mu.Unlock()
 }
 
-// Owns 报告会话是否由某个供应商创建：返回 (vendorID, true)。
-func Owns(sessionID string) (string, bool) {
+// Owns 报告会话归属。
+func (r *Registry) Owns(sessionID string) (string, bool) {
 	id := strings.TrimSpace(sessionID)
 	if id == "" {
 		return "", false
 	}
-	storeMu.Lock()
-	defer storeMu.Unlock()
-	session, okSession := store[id]
-	if !okSession {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	session, ok := r.m[id]
+	if !ok {
 		return "", false
 	}
-	if !session.ExpiresAt.IsZero() && time.Now().After(session.ExpiresAt) {
-		delete(store, id)
+	if !session.ExpiresAt.IsZero() && r.now().After(session.ExpiresAt) {
+		delete(r.m, id)
 		return "", false
 	}
 	return session.VendorID, true
 }
 
-// NewID 生成 n 字节随机十六进制串（2n 个字符）。
-//
-// 随机源不可用时退回基于时间与计数的确定性串：登录会话 id 只影响会话查找的
-// 唯一性，退化的熵在这种场景下可接受——比返回空串让登录链路崩掉好。
+// NewID 生成会话 ID。
 func NewID(n int) string { return core.RandomHex(n) }
 
-// ResetForTest 清空全部会话（仅测试使用）。
-//
-// 会话表是包级的：测试之间不清空会让上一个用例的会话泄漏到下一个，
-// 表现为「随便一个 state 都能命中旧会话」。
-func ResetForTest() {
-	storeMu.Lock()
-	store = map[string]*Session{}
-	storeMu.Unlock()
+// Default 返回进程级默认会话表，仅用于逐步迁移中的旧调用点。
+var defaultRegistry = NewRegistry()
+
+func Register(vendorID, sessionID string, ttl, interval time.Duration, data any) {
+	defaultRegistry.Register(vendorID, sessionID, ttl, interval, data)
 }
+func Poll(sessionID string) (*core.LoginSession, core.PollState) {
+	return defaultRegistry.Poll(sessionID)
+}
+func Delete(sessionID string)              { defaultRegistry.Delete(sessionID) }
+func Owns(sessionID string) (string, bool) { return defaultRegistry.Owns(sessionID) }
+
+const (
+	PollMissing   = core.PollMissing
+	PollThrottled = core.PollThrottled
+	PollReady     = core.PollReady
+)
+
+type PollState = core.PollState

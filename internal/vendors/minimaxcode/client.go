@@ -13,6 +13,8 @@ import (
 
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
+
+	"freetier2api-plugin/cpasdk/pluginapi"
 )
 
 // Target 是一次签名的 MiniMax 上游请求。
@@ -470,4 +472,33 @@ func findDeepString(data any, keys ...string) string {
 		}
 	}
 	return ""
+}
+
+// 本文件解析 MiniMax Code 的供应商专属配置。
+
+var (
+	baseURLCN     core.URLOverride
+	baseURLGlobal core.URLOverride
+)
+
+// Configure 解析两个区域的基地址覆盖，兼容新旧键名。
+func Configure(_ core.Settings, raw map[string]string) {
+	baseURLCN.Set(core.FirstNonEmpty(raw["minimaxcode_cn_base_url"]))
+	baseURLGlobal.Set(core.FirstNonEmpty(raw["minimaxcode_global_base_url"]))
+}
+
+// BaseURLFor 返回某区域的基地址覆盖值；空表示用内置默认。
+func BaseURLFor(region Region) string {
+	if region == RegionGlobal {
+		return strings.TrimSpace(baseURLGlobal.Raw())
+	}
+	return strings.TrimSpace(baseURLCN.Raw())
+}
+
+// ConfigFields 声明 MiniMax Code 专属配置。
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{
+		{Name: "minimaxcode_cn_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "国内版上游基地址覆盖。"},
+		{Name: "minimaxcode_global_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "国际版上游基地址覆盖。"},
+	}
 }

@@ -13,7 +13,7 @@ package core
 import (
 	"context"
 	"errors"
-	"sync"
+	"strings"
 	"time"
 )
 
@@ -45,10 +45,6 @@ type Settings struct {
 	EnabledRealms []string
 	// StateDir 是插件状态目录（落盘模型的根）。
 	StateDir string
-	// PassthroughIP 报告是否把客户端 IP 透传给上游。
-	PassthroughIP bool
-	// SanitizeFingerprints 报告是否开启出站请求体指纹脱敏。
-	SanitizeFingerprints bool
 	// MachineSalt 是本部署的设备指纹盐（为空表示供应商未配置）。
 	MachineSalt string
 	// AutoCheckin / AutoCheckinAt / AutoTasks 是后台自动化开关。
@@ -61,10 +57,15 @@ type Settings struct {
 
 // RealmEnabled 报告某个域是否被配置启用。
 func (s Settings) RealmEnabled(region string) bool {
-	if len(s.EnabledRealms) == 0 {
+	return RealmEnabled(s.EnabledRealms, region)
+}
+
+// RealmEnabled 判断区域是否在启用列表中；空区域或空列表视为启用。
+func RealmEnabled(enabled []string, region string) bool {
+	if strings.TrimSpace(region) == "" || len(enabled) == 0 {
 		return true
 	}
-	for _, realm := range s.EnabledRealms {
+	for _, realm := range enabled {
 		if realm == region {
 			return true
 		}
@@ -80,54 +81,4 @@ type Host interface {
 	AuthJSON(ctx context.Context, authIndex string) ([]byte, bool)
 	// Settings 返回当前全局配置快照。
 	Settings() Settings
-}
-
-var (
-	hostPortMu sync.RWMutex
-	hostPort   Host
-)
-
-// ConfigureHost 注入宿主端口实现。由根层在 init 里调用一次。
-func ConfigureHost(host Host) {
-	hostPortMu.Lock()
-	hostPort = host
-	hostPortMu.Unlock()
-}
-
-// HostPort 返回当前注入的宿主端口；未注入时为 nil。
-func HostPort() Host {
-	hostPortMu.RLock()
-	host := hostPort
-	hostPortMu.RUnlock()
-	return host
-}
-
-// HostConfigured 报告宿主端口是否已注入。
-func HostConfigured() bool { return HostPort() != nil }
-
-// HostSettings 返回全局配置快照；端口缺失时返回零值。
-func HostSettings() Settings {
-	host := HostPort()
-	if host == nil {
-		return Settings{}
-	}
-	return host.Settings()
-}
-
-// ListHostAuths 是端口的安全包装：端口缺失或调用失败都返回错误。
-func ListHostAuths(ctx context.Context) ([]HostAuth, error) {
-	host := HostPort()
-	if host == nil {
-		return nil, ErrHostNotConfigured
-	}
-	return host.ListAuths(ctx)
-}
-
-// HostAuthJSON 按 auth_index 取凭证 JSON；端口缺失时返回 false。
-func HostAuthJSON(ctx context.Context, authIndex string) ([]byte, bool) {
-	host := HostPort()
-	if host == nil {
-		return nil, false
-	}
-	return host.AuthJSON(ctx, authIndex)
 }

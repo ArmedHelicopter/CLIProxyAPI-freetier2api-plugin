@@ -152,16 +152,6 @@ func (c *Credential) RegionValue() string {
 	return c.Region
 }
 
-// SetVendorID 设置供应商标识（解析凭证后回填）。
-func (c *Credential) SetVendorID(vendorID string) {
-	if c == nil {
-		return
-	}
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.VendorID = vendorID
-}
-
 // SetRegion 设置区域（宿主 attributes 可覆盖凭证自带的区域声明）。
 func (c *Credential) SetRegion(region string) {
 	if c == nil {
@@ -206,4 +196,24 @@ func (c *Credential) ApplyTokenRefresh(token, refreshToken string, expiresAt int
 		changed = true
 	}
 	return changed
+}
+
+// CachedModel 是缓存的单条上游模型元数据。
+//
+// 定义在 core 而不是 state：供应商与 modelconfig 都使用它，
+// 这样 core 不需要反向依赖持久化层。
+type CachedModel struct {
+	VendorID        string   `json:"vendor_id,omitempty"`
+	ID              string   `json:"id"`
+	Name            string   `json:"name,omitempty"`
+	Realm           string   `json:"realm"`
+	ContextLength   int64    `json:"context_length,omitempty"`
+	MaxOutputTokens int64    `json:"max_output_tokens,omitempty"`
+	Efforts         []string `json:"efforts,omitempty"`
+	DefaultEffort   string   `json:"default_effort,omitempty"`
+	SupportsImages  bool     `json:"supports_images,omitempty"`
+	SupportsTool    bool     `json:"supports_tool_call,omitempty"`
+	CanDisableThink bool     `json:"can_disable_thinking,omitempty"`
+	OnlyReasoning   bool     `json:"only_reasoning,omitempty"`
+	Description     string   `json:"description,omitempty"`
 }

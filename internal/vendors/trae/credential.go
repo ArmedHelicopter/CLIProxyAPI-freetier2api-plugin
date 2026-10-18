@@ -1,7 +1,6 @@
 package trae
 
-// 本文件实现 Trae 凭证的解析、特征识别与存储。
-// 参考：/Users/jiandan/Workspaces/trae2api/src/auth.js
+// 本文件实现 Trae 家族凭证的解析、特征识别与存储。
 
 import (
 	"encoding/json"
@@ -25,8 +24,17 @@ type Credential struct {
 	Label        string `json:"label,omitempty"`
 }
 
-// ParseCredential 解析 JSON 凭证。
+// ParseCredential 解析 JSON 凭证（保留给协议层测试使用）。
 func ParseCredential(raw []byte, defaultRegion Region) (*Credential, error) {
+	return parseCredential(raw, VendorIDFor(defaultRegion), defaultRegion)
+}
+
+// ParseCredentialFor 按实例 profile 解析凭证。
+func ParseCredentialFor(raw []byte, cfg Config) (*Credential, error) {
+	return parseCredential(raw, cfg.VendorID, cfg.Region)
+}
+
+func parseCredential(raw []byte, defaultVendor string, defaultRegion Region) (*Credential, error) {
 	if len(raw) == 0 {
 		return nil, fmt.Errorf("trae credential is empty")
 	}
@@ -36,41 +44,45 @@ func ParseCredential(raw []byte, defaultRegion Region) (*Credential, error) {
 		return nil, fmt.Errorf("decode trae credential json: %w", err)
 	}
 
-	authObj := getMap(m, "auth")
+	authObj := core.GetMap(m, "auth")
 	if authObj == nil {
 		authObj = m
 	}
-	accountObj := getMap(m, "account")
+	accountObj := core.GetMap(m, "account")
 
-	regionStr := strings.ToLower(firstNonEmpty(
-		getString(m, "region"),
-		getString(m, "realm"),
-		getString(m, "_edition"),
+	vendor := strings.ToLower(core.FirstNonEmpty(core.GetString(m, "vendor"), defaultVendor))
+	r := defaultRegion
+	regionStr := strings.ToLower(core.FirstNonEmpty(
+		core.GetString(m, "region"),
+		core.GetString(m, "realm"),
+		core.GetString(m, "_edition"),
 		string(defaultRegion),
 	))
-	r := RegionCN
-	if regionStr == "global" || regionStr == "sg" || regionStr == "traeglobal" {
+	switch {
+	case vendor == VendorIDSolo:
+		r = RegionCN
+	case regionStr == "global" || regionStr == "sg" || regionStr == "traeglobal":
 		r = RegionGlobal
+	default:
+		r = RegionCN
 	}
-
 	c := &Credential{
-		Vendor:       firstNonEmpty(getString(m, "vendor"), string(VendorIDFor(r))),
+		Vendor:       core.FirstNonEmpty(vendor, defaultVendor),
 		Region:       r,
-		AccessToken:  firstNonEmpty(getString(authObj, "access_token"), getString(authObj, "accessToken"), getString(authObj, "token")),
-		RefreshToken: firstNonEmpty(getString(authObj, "refresh_token"), getString(authObj, "refreshToken")),
-		ExpiresAt:    getInt64(authObj, "expires_at", "expiresAt", "TokenExpireAt"),
-		UID:          firstNonEmpty(getString(authObj, "uid"), getString(accountObj, "uid"), getString(m, "uid")),
-		Nickname:     firstNonEmpty(getString(authObj, "nickname"), getString(accountObj, "nickname"), getString(m, "nickname")),
-		EnterpriseID: firstNonEmpty(getString(authObj, "enterprise_id"), getString(accountObj, "enterprise_id"), getString(m, "enterprise_id")),
-		MachineID:    firstNonEmpty(getString(authObj, "machine_id"), getString(authObj, "machineId"), getString(m, "machine_id")),
-		DeviceID:     firstNonEmpty(getString(authObj, "device_id"), getString(authObj, "deviceId"), getString(m, "device_id")),
-		Label:        getString(m, "label"),
+		AccessToken:  core.FirstNonEmpty(core.GetString(authObj, "access_token"), core.GetString(authObj, "accessToken"), core.GetString(authObj, "token")),
+		RefreshToken: core.FirstNonEmpty(core.GetString(authObj, "refresh_token"), core.GetString(authObj, "refreshToken")),
+		ExpiresAt:    core.GetUnixSeconds(authObj, "expires_at", "expiresAt", "TokenExpireAt"),
+		UID:          core.FirstNonEmpty(core.GetString(authObj, "uid"), core.GetString(accountObj, "uid"), core.GetString(m, "uid")),
+		Nickname:     core.FirstNonEmpty(core.GetString(authObj, "nickname"), core.GetString(accountObj, "nickname"), core.GetString(m, "nickname")),
+		EnterpriseID: core.FirstNonEmpty(core.GetString(authObj, "enterprise_id"), core.GetString(accountObj, "enterprise_id"), core.GetString(m, "enterprise_id")),
+		MachineID:    core.FirstNonEmpty(core.GetString(authObj, "machine_id"), core.GetString(authObj, "machineId"), core.GetString(m, "machine_id")),
+		DeviceID:     core.FirstNonEmpty(core.GetString(authObj, "device_id"), core.GetString(authObj, "deviceId"), core.GetString(m, "device_id")),
+		Label:        core.GetString(m, "label"),
 	}
 
 	if c.AccessToken == "" && c.RefreshToken == "" {
 		return nil, fmt.Errorf("trae credential missing access_token and refresh_token")
 	}
-
 	return c, nil
 }
 
@@ -84,35 +96,47 @@ func VendorIDFor(r Region) string {
 
 // LooksLikeCredential 判断文件或数据是否属于本 Trae 区域实例。
 func LooksLikeCredential(raw map[string]any, fileName, provider string, targetRegion Region) bool {
-	expectedVendor := VendorIDFor(targetRegion)
+	return LooksLikeCredentialFor(raw, fileName, provider, ConfigFor(targetRegion))
+}
 
-	// 1/2. 显式 vendor 字段优先（"trae" 是家族别名，交给区域判定）。
+// LooksLikeCredentialFor 判断文件或数据是否属于某个 Trae profile。
+func LooksLikeCredentialFor(raw map[string]any, fileName, provider string, cfg Config) bool {
+	if cfg.Solo {
+		if decided, claimed := core.VendorFieldVerdict(raw, VendorIDSolo, "trae"); decided {
+			return claimed
+		}
+		if core.FileNameMatchesConvention(fileName, VendorIDSolo) {
+			return true
+		}
+		return core.GetString(raw, "function") == FunctionSolo || strings.Contains(core.GetString(raw, "api_host"), "mchost.guru")
+	}
+
+	expectedVendor := cfg.VendorID
 	if decided, claimed := core.VendorFieldVerdict(raw, expectedVendor, "trae"); decided {
 		return claimed
 	}
-
-	// 3. 文件名前缀
-	baseName := strings.ToLower(fileName)
-	if strings.HasPrefix(baseName, expectedVendor+"-") || strings.HasPrefix(baseName, expectedVendor+"_") || baseName == expectedVendor+".json" {
+	if core.FileNameMatchesConvention(fileName, expectedVendor) {
 		return true
 	}
-
-	// 4. 通用 trae 前缀，按内部 region 判断
-	if strings.HasPrefix(baseName, "trae-") || strings.HasPrefix(baseName, "trae_") || baseName == "trae.json" {
-		rStr := strings.ToLower(firstNonEmpty(getString(raw, "region"), getString(raw, "realm"), getString(raw, "_edition")))
-		if targetRegion == RegionGlobal {
+	// 旧的家族前缀 trae-*.json：按文件内 region 判定。
+	if core.FileNameMatchesConvention(fileName, "trae") {
+		rStr := strings.ToLower(core.FirstNonEmpty(core.GetString(raw, "region"), core.GetString(raw, "realm"), core.GetString(raw, "_edition")))
+		if cfg.Region == RegionGlobal {
 			return rStr == "global" || rStr == "sg"
 		}
-		return rStr == "cn" || rStr == "" // 默认 cn
+		return rStr == "cn" || rStr == ""
 	}
-
 	return false
 }
 
 func (c *Credential) StorageJSON() ([]byte, error) {
+	vendor := c.Vendor
+	if vendor == "" {
+		vendor = VendorIDFor(c.Region)
+	}
 	m := map[string]any{
 		"type":          "freetier",
-		"vendor":        VendorIDFor(c.Region),
+		"vendor":        vendor,
 		"region":        string(c.Region),
 		"access_token":  c.AccessToken,
 		"refresh_token": c.RefreshToken,
@@ -128,8 +152,3 @@ func (c *Credential) StorageJSON() ([]byte, error) {
 	}
 	return json.MarshalIndent(m, "", "  ")
 }
-
-func getMap(m map[string]any, key string) map[string]any { return core.GetMap(m, key) }
-func getString(m map[string]any, key string) string      { return core.GetString(m, key) }
-func getInt64(m map[string]any, keys ...string) int64    { return core.GetUnixSeconds(m, keys...) }
-func firstNonEmpty(values ...string) string              { return core.FirstNonEmpty(values...) }

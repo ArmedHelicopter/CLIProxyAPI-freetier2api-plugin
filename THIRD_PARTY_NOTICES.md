@@ -32,9 +32,9 @@
 | `internal/vendors/workbuddy/sanitize.go` | `internal/upstream/sanitize.go` | 规则外置为 `sanitize_rules.json`（便于审计改动过的字面量） |
 | `internal/vendors/workbuddy/catalog*.go`、`catalog_seed.json` | `internal/upstream/model_catalog.go`、`global_models.go`、`context_catalog.go`、`effort_catalog.go` | 保留多路探测与四级查找链；静态表转为内嵌 JSON |
 | `internal/vendors/workbuddy/growth.go`、`activity.go`、`desktop.go`、`report.go` | `internal/upstream/tasks.go`、`streak.go`、`travel.go`、`school.go`、`blackcat.go`、`desktop.go`、`report.go`、`trial.go`、`global_register.go` | 保留全部端点、事件链与节流参数 |
-| `internal/vendors/workbuddy/tasks/` | `internal/panel/autotask.go`、`internal/scheduler/` | 保留 17 个任务的动作与依赖序、四套指纹、异步计分轮询与幂等规则 |
+| `internal/vendors/workbuddy/tasks*.go` | `internal/panel/autotask.go`、`internal/scheduler/` | 保留 17 个任务的动作与依赖序、四套指纹、异步计分轮询与幂等规则 |
 | `internal/vendors/workbuddy/prompt_default.md` | `internal/prompt/defaultprompt.md` | 原文件 |
-| `auth_login.go` | `internal/panel/login.go`、`cmd/login` | OAuth 设备授权流程；改为返回宿主的 `AuthData` |
+| `internal/app/auth.go` | `internal/panel/login.go`、`cmd/login` | OAuth 设备授权流程；改为返回宿主的 `AuthData` |
 | `internal/vendors/workbuddy/credential.go` | `internal/auth/auth.go` | 保留双形态解析与加锁访问契约；写回改为「合并更新」以免丢失用户字段 |
 
 ## 2. CLIProxyAPI（宿主 ABI）

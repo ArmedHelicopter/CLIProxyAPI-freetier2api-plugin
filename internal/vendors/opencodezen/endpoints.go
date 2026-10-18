@@ -15,6 +15,9 @@ import (
 	"net/http"
 	"runtime"
 	"strings"
+
+	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 )
 
 const (
@@ -75,4 +78,21 @@ func ApplyModelsHeaders(req *http.Request, apiKey string) {
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("User-Agent", UserAgent())
 	req.Header.Set("x-opencode-client", "cli")
+}
+
+// 本文件解析 OpenCode ZEN 的供应商专属配置。
+
+var baseURLOverride core.URLOverride
+
+// Configure 解析 zen_base_url。
+func Configure(_ core.Settings, raw map[string]string) {
+	baseURLOverride.Set(raw["opencodezen_base_url"])
+}
+
+// BaseURLOverride 返回配置的上游基地址覆盖值；空表示用内置默认。
+func BaseURLOverride() string { return baseURLOverride.Raw() }
+
+// ConfigFields 声明 opencodezen 专属配置。
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{{Name: "opencodezen_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"}}
 }

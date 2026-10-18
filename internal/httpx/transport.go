@@ -25,7 +25,6 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
-	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/hostabi"
 )
 
@@ -40,7 +39,7 @@ func Client(ctx context.Context, timeout time.Duration) *http.Client {
 // StreamClient 返回经宿主 host.http.do_stream 出站的客户端（用于 SSE）。
 //
 // 超时设为 0：流式响应的总时长不可预期，首字节与空闲超时分别由上游
-// ResponseHeaderTimeout 与 idle 监控负责（见 cb 包的 idle 处理）。
+// ResponseHeaderTimeout 与 idle 监控负责（见 WorkBuddy 包的 idle 处理）。
 func StreamClient(ctx context.Context, timeout time.Duration) *http.Client {
 	return &http.Client{Transport: &transport{ctx: ctx, stream: true}, Timeout: timeout}
 }
@@ -336,6 +335,3 @@ func truncateForError(raw []byte) string {
 	}
 	return string(raw[:limit]) + "..."
 }
-
-// compile-time 断言：确保宿主 SDK 的类型仍存在（ABI 漂移时编译期即可发现）。
-var _ = pluginapi.HTTPRequest{}

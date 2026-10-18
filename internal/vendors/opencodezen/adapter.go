@@ -25,73 +25,51 @@ import (
 
 // adapter 是 core.Vendor 在 OpenCode ZEN 上的实现。
 type adapter struct {
-	core.Meta
-	// contextFallback 是模型缺上下文窗口时的兜底（由根层注入，保持原行为）。
+	*core.NativeAdapter[*Credential]
 	contextFallback func(string) int64
 }
 
 // Instances 构造 ZEN 实例（只有一个，没有区域之分）。
-//
-// contextFallback 为 nil 时使用 core 的通用兜底。
-func Instances(contextFallback func(string) int64) []core.Vendor {
+func Instances(env core.Env, contextFallback func(string) int64) []core.Vendor {
 	if contextFallback == nil {
 		contextFallback = core.DefaultContextWindow
 	}
 	return []core.Vendor{&adapter{
-		Meta: core.Meta{
-			VendorID:   VendorID,
-			VendorName: VendorName,
-		},
+		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+			Meta: core.Meta{VendorID: VendorID, VendorName: VendorName},
+			Env:  env,
+			Extract: func(c *core.Credential) (*Credential, bool) {
+				native, ok := c.Native.(*Credential)
+				return native, ok
+			},
+			ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+				native, errParse := ParseCredential(raw)
+				if errParse != nil {
+					return core.CredentialSeed{}, nil, errParse
+				}
+				label := native.Label
+				if label == "" {
+					label = MaskedKey(native.APIKey)
+				}
+				return core.CredentialSeed{
+					VendorID: VendorID, Label: label, FileID: core.FileIDFromFileName(fileName),
+					Token: native.APIKey, AuthMode: "apikey",
+				}, native, nil
+			},
+		}),
 		contextFallback: contextFallback,
 	}}
 }
 
 // AuthMode 报告本供应商的凭证形态。
-//
-// 页面据此决定账号列是否脱敏：API key 本身就是凭证，明文渲染进 HTML
-// 等于把它写进浏览器缓存与截图里。
 func (v *adapter) AuthMode() string { return "apikey" }
 
 // Configure 解析供应商专属配置。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
-	Configure(settings, raw)
-}
-
-// ---- 凭证 ----
+func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
 
 // Match 判断一份凭证是否属于本供应商。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	return LooksLikeCredential(raw, fileName, provider)
-}
-
-// Parse 把凭证 JSON 解析成 core.Credential。
-func (v *adapter) Parse(raw []byte, fileName string) (*core.Credential, error) {
-	native, errParse := ParseCredential(raw)
-	if errParse != nil {
-		return nil, errParse
-	}
-	// Label 兜底用**脱敏后**的 key：Label 会进日志、进管理接口响应、
-	// 进页面 HTML，绝不能是完整凭证。
-	label := native.Label
-	if label == "" {
-		label = MaskedKey(native.APIKey)
-	}
-	return &core.Credential{
-		VendorID: VendorID,
-		Label:    label,
-		FileID:   strings.TrimSuffix(strings.TrimSpace(fileName), ".json"),
-		Token:    native.APIKey,
-		AuthMode: "apikey",
-		Native:   native,
-	}, nil
-}
-
-// nativeCredential 取回协议层凭证对象。
-func (v *adapter) nativeCredential(cred *core.Credential) (*Credential, error) {
-	return core.NativeCredential(cred, VendorID, func(c *core.Credential) (*Credential, bool) {
-		native, okNative := c.Native.(*Credential)
-		return native, okNative
-	})
 }
 
 // ---- 模型 ----
@@ -102,7 +80,7 @@ func (v *adapter) nativeCredential(cred *core.Credential) (*Credential, error) {
 // 可用凭证去打；借不到就返回空清单——不编一份假清单，否则用户会看到
 // 调用必失败的模型。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	apiKey := probeAPIKey()
+	apiKey := v.probeAPIKey()
 	if apiKey == "" {
 		return nil, fmt.Errorf("no opencodezen credential available for model probe")
 	}
@@ -119,7 +97,7 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 // 但用**该凭证自己的 key** 去探测，这样 key 失效时该账号自然拿不到模型，
 // 宿主据此把它从选号里淘汰。
 func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -168,7 +146,7 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 
 // Execute 执行一次非流式对话。
 func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -191,7 +169,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 // 只投递上游的原生 SSE 数据载荷，不做 `data: ` 包装与分帧——包装由宿主
 // 按声明格式完成。插件侧重复分帧会与宿主产生不一致的行为。
 func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest, sink core.StreamSink) error {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return errNative
 	}
@@ -207,26 +185,9 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	return httpx.ForwardRawSSE(resp.Body, sink.Emit)
 }
 
-// Refresh 校验凭证是否仍然可用。
-//
-// API key 不会轮换，因此这里**只校验不写回**（refreshed 恒为 false）：
-// 列一次模型能验证 key 的有效性，成功即说明账号可用。
-func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
-	native, errNative := v.nativeCredential(cred)
-	if errNative != nil {
-		return nil, false, errNative
-	}
-	if _, errModels := FetchModels(ctx, BaseURLOverride(), native.APIKey); errModels != nil {
-		return nil, false, errModels
-	}
-	return cred, false, nil
-}
-
-// ---- 内部工具 ----
-
 // probeAPIKey 借一个本供应商的可用凭证取 API key（供模型探测用）。
-func probeAPIKey() string {
-	native, okNative := core.ProbeNativeCredential(VendorID, func(cred *core.Credential) (*Credential, bool) {
+func (v *adapter) probeAPIKey() string {
+	native, okNative := core.ProbeNativeCredential(v.Env, VendorID, func(cred *core.Credential) (*Credential, bool) {
 		value, okValue := cred.Native.(*Credential)
 		return value, okValue
 	})

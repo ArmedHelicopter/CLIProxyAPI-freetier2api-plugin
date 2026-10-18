@@ -8,27 +8,31 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
+	"freetier2api-plugin/internal/tasks"
 )
 
 type settingsUpdateRequest struct {
-	AutoCheckin    *bool  `json:"auto_checkin"`
-	AutoCheckinAt  string `json:"auto_checkin_at"`
-	AutoTasks      *bool  `json:"auto_tasks"`
-	PromptMode     string `json:"prompt_mode"`
-	CheckinHours   []int  `json:"checkin_hours"`
-	TravelHours    []int  `json:"travel_hours"`
-	ActivityHours  []int  `json:"activity_hours"`
-	KeepaliveHours []int  `json:"keepalive_hours"`
-	BlackcatHours  []int  `json:"blackcat_hours"`
+	AutoCheckin         *bool            `json:"auto_checkin"`
+	AutoCheckinAt       string           `json:"auto_checkin_at"`
+	AutoTasks           *bool            `json:"auto_tasks"`
+	WorkbuddyPromptMode string           `json:"workbuddy_prompt_mode"`
+	TaskSchedules       map[string][]int `json:"task_schedules"`
+
+	// Deprecated: 兼容旧版页面/脚本的固定字段。
+	CheckinHours   []int `json:"checkin_hours"`
+	TravelHours    []int `json:"travel_hours"`
+	ActivityHours  []int `json:"activity_hours"`
+	KeepaliveHours []int `json:"keepalive_hours"`
+	BlackcatHours  []int `json:"blackcat_hours"`
 }
 
-func handleSettingsRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body settingsUpdateRequest
 	if len(req.Body) > 0 {
 		_ = json.Unmarshal(req.Body, &body)
 	}
 	changed := map[string]any{}
-	deps.MutateState(func(current *state.State) {
+	s.deps.MutateState(func(current *state.State) {
 		if body.AutoCheckin != nil {
 			current.AutoCheckin = body.AutoCheckin
 			changed["auto_checkin"] = *body.AutoCheckin
@@ -43,39 +47,55 @@ func handleSettingsRequest(req pluginapi.ManagementRequest) pluginapi.Management
 			current.AutoTasks = body.AutoTasks
 			changed["auto_tasks"] = *body.AutoTasks
 		}
-		if mode := strings.ToLower(strings.TrimSpace(body.PromptMode)); mode != "" {
+		if mode := strings.ToLower(strings.TrimSpace(body.WorkbuddyPromptMode)); mode != "" {
 			switch mode {
-			case pluginconfig.PromptModePassThrough, pluginconfig.PromptModeCustom, pluginconfig.PromptModeAppend:
-				modeCopy := mode
-				current.PromptMode = &modeCopy
-				changed["prompt_mode"] = mode
+			case "passthrough", "custom", "append":
+				if current.VendorSettings == nil {
+					current.VendorSettings = map[string]string{}
+				}
+				current.VendorSettings["workbuddy_prompt_mode"] = mode
+				changed["workbuddy_prompt_mode"] = mode
 			}
 		}
-		for key, pair := range map[string]struct {
-			hours []int
-			dest  *[]int
-		}{
-			"checkin_hours":   {body.CheckinHours, &current.CheckinHours},
-			"travel_hours":    {body.TravelHours, &current.TravelHours},
-			"activity_hours":  {body.ActivityHours, &current.ActivityHours},
-			"keepalive_hours": {body.KeepaliveHours, &current.KeepaliveHours},
-			"blackcat_hours":  {body.BlackcatHours, &current.BlackcatHours},
+		if current.TaskSchedules == nil {
+			current.TaskSchedules = map[string][]int{}
+		}
+		for kind, hours := range body.TaskSchedules {
+			kind = strings.TrimSpace(kind)
+			if kind == "" {
+				continue
+			}
+			if _, known := s.catalog.SpecByKind(kind); !known {
+				continue
+			}
+			current.TaskSchedules[kind] = tasks.NormalizeHours(hours)
+			changed["task_schedules"] = current.TaskSchedules
+		}
+		for kind, hours := range map[string][]int{
+			"checkin":   body.CheckinHours,
+			"travel":    body.TravelHours,
+			"activity":  body.ActivityHours,
+			"keepalive": body.KeepaliveHours,
+			"blackcat":  body.BlackcatHours,
 		} {
-			if pair.hours != nil {
-				*pair.dest = pair.hours
-				changed[key] = pair.hours
+			if hours != nil {
+				current.TaskSchedules[kind] = tasks.NormalizeHours(hours)
+				changed["task_schedules"] = current.TaskSchedules
 			}
 		}
 	})
-	deps.PokeScheduler()
+	if errReconfigure := s.deps.Reconfigure(); errReconfigure != nil {
+		return ErrorResponse(errReconfigure)
+	}
+	s.deps.PokeScheduler()
 	return JSONResponse(http.StatusOK, map[string]any{
-		"ok": true, "changed": changed, "settings": deps.EffectiveSettings(),
+		"ok": true, "changed": changed, "settings": s.deps.EffectiveSettings(),
 	})
 }
 
 // handleScheduledRun 手动触发一个定时任务。
-func handleScheduledRun(_ pluginapi.ManagementRequest, kind string) pluginapi.ManagementResponse {
-	go deps.RunScheduled(kind)
+func (s *Service) handleScheduledRun(_ pluginapi.ManagementRequest, kind string) pluginapi.ManagementResponse {
+	go s.deps.RunScheduled(kind)
 	return JSONResponse(http.StatusOK, map[string]any{
 		"ok": true, "started": true, "task": kind,
 		"message": "任务已在后台开始执行，进度见插件日志",

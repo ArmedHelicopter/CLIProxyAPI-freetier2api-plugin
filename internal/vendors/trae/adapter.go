@@ -1,10 +1,8 @@
 package trae
 
-// 本文件把 Trae（国内版/国际版）适配成 core.Vendor。
+// 本文件把 Trae 国内版、Trae 国际版与 TRAE SOLO 适配成 core.Vendor。
 //
-// 注意：本包的协议实现（chat/credential/refresh/checkin/quota/catalog/
-// endpoints/login/callback）本身不做任何重构或共享；这里只把原先放在
-// 根层的适配代码搬进来。
+// 三个实例共享同一套协议实现，差异由 Config/profile 描述。
 
 import (
 	"context"
@@ -14,98 +12,91 @@ import (
 	"freetier2api-plugin/internal/core"
 )
 
-// adapter 是 core.Vendor 在 Trae 上的实现（每个区域一个实例）。
 type adapter struct {
-	core.Meta
-	region Region
+	*core.NativeAdapter[*Credential]
+	config Config
 }
 
-// Instances 构造两个区域实例。
-func Instances() []core.Vendor {
-	return []core.Vendor{
-		newInstance(RegionCN),
-		newInstance(RegionGlobal),
+// Instances 构造 Trae 家族的全部实例。
+func Instances(env core.Env) []core.Vendor {
+	configs := AllConfigs()
+	out := make([]core.Vendor, 0, len(configs))
+	for _, cfg := range configs {
+		out = append(out, newInstance(env, cfg))
 	}
+	return out
 }
 
-// vendorNameFor 返回区域的展示名。
-func vendorNameFor(region Region) string {
-	if region == RegionGlobal {
-		return VendorNameGlobal
-	}
-	return VendorNameCN
-}
-
-func newInstance(region Region) core.Vendor {
+func newInstance(env core.Env, cfg Config) core.Vendor {
 	return &adapter{
-		Meta: core.Meta{
-			VendorID:     VendorIDFor(region),
-			VendorName:   vendorNameFor(region),
-			VendorRegion: string(region),
-		},
-		region: region,
+		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+			Meta: core.Meta{VendorID: cfg.VendorID, VendorName: cfg.VendorName, VendorRegion: string(cfg.Region)},
+			Env:  env,
+			Extract: func(c *core.Credential) (*Credential, bool) {
+				native, ok := c.Native.(*Credential)
+				return native, ok
+			},
+			ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+				native, errParse := ParseCredentialFor(raw, cfg)
+				if errParse != nil {
+					return core.CredentialSeed{}, nil, errParse
+				}
+				native.Vendor = cfg.VendorID
+				label := native.Label
+				if label == "" {
+					prefix := "TraeCN-"
+					switch {
+					case cfg.Solo:
+						prefix = "TRAESOLO-"
+					case cfg.Region == RegionGlobal:
+						prefix = "TraeGlobal-"
+					}
+					if native.Nickname != "" {
+						label = prefix + native.Nickname
+					} else if native.UID != "" {
+						label = prefix + native.UID
+					} else {
+						label = prefix + "Account"
+					}
+				}
+				return core.CredentialSeed{
+					VendorID: cfg.VendorID, Region: string(cfg.Region), Label: label,
+					FileID: core.FileIDFromFileName(fileName), Token: native.AccessToken,
+					ExpiresAt: native.ExpiresAt, AuthMode: "oauth",
+				}, native, nil
+			},
+			RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
+				updated, refreshed, errRefresh := RefreshCredential(ctx, native, cfg)
+				if errRefresh != nil {
+					return core.NativeRefresh[*Credential]{}, errRefresh
+				}
+				return core.NativeRefresh[*Credential]{
+					Native: updated, Token: updated.AccessToken, RefreshToken: updated.RefreshToken,
+					ExpiresAt: updated.ExpiresAt, Changed: refreshed,
+				}, nil
+			},
+			MergeNative: func(original []byte, native *Credential) ([]byte, error) {
+				return MergeStorageJSON(original, native)
+			},
+		}),
+		config: cfg,
 	}
 }
 
-// ---- 凭证 ----
-
-// Match 判断一份凭证是否属于本区域。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
-	return LooksLikeCredential(raw, fileName, provider, v.region)
-}
-
-// Parse 把凭证 JSON 解析成 core.Credential。
-func (v *adapter) Parse(raw []byte, fileName string) (*core.Credential, error) {
-	native, errParse := ParseCredential(raw, v.region)
-	if errParse != nil {
-		return nil, errParse
-	}
-
-	label := native.Label
-	if label == "" {
-		prefix := "TraeCN-"
-		if v.region == RegionGlobal {
-			prefix = "TraeGlobal-"
-		}
-		if native.Nickname != "" {
-			label = prefix + native.Nickname
-		} else if native.UID != "" {
-			label = prefix + native.UID
-		} else {
-			label = prefix + "Account"
-		}
-	}
-
-	return &core.Credential{
-		VendorID:  VendorIDFor(v.region),
-		Region:    string(v.region),
-		Label:     label,
-		FileID:    strings.TrimSuffix(strings.TrimSpace(fileName), ".json"),
-		Token:     native.AccessToken,
-		ExpiresAt: native.ExpiresAt,
-		AuthMode:  "oauth",
-		Native:    native,
-	}, nil
-}
-
-// nativeCredential 取回协议层凭证对象。
-func (v *adapter) nativeCredential(cred *core.Credential) (*Credential, error) {
-	return core.NativeCredential(cred, VendorIDFor(v.region), func(c *core.Credential) (*Credential, bool) {
-		native, okNative := c.Native.(*Credential)
-		return native, okNative
-	})
+	return LooksLikeCredentialFor(raw, fileName, provider, v.config)
 }
 
 // ---- 模型 ----
 
-// StaticModels 返回本区域的模型清单。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	models, errModels := FetchModels(ctx, v.region)
+	models, errModels := FetchModels(ctx, nil, v.config)
 	if errModels != nil {
 		return nil, errModels
 	}
 	return modelsToPluginAPI(models), nil
 }
+
 func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		if strings.TrimSpace(model.ID) == "" {
@@ -125,14 +116,14 @@ func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 
 // ---- 执行 ----
 
-// Execute 执行一次非流式对话。
 func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
 	payload, errChat := Chat(ctx, "", ChatRequest{
 		Credential: native,
+		Profile:    v.config,
 		Body:       req.Payload,
 		Stream:     false,
 	})
@@ -145,43 +136,39 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	}, nil
 }
 
-// ExecuteStream 执行一次流式对话。
 func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest, sink core.StreamSink) error {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return errNative
 	}
 	return ChatStream(ctx, "", ChatRequest{
 		Credential: native,
+		Profile:    v.config,
 		Body:       req.Payload,
 		Stream:     true,
-	}, func(chunk []byte) error {
-		return sink.Emit(chunk)
-	})
+	}, sink.Emit)
 }
 
 // ---- 额度与签到 ----
 
-// Quota 查询账号额度。
 func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
-	response, errQuota := FetchQuota(ctx, native)
+	response, errQuota := FetchQuota(ctx, native, v.config)
 	if errQuota != nil {
 		return nil, core.ToPluginError(errQuota)
 	}
 	return response, nil
 }
 
-// Checkin 执行一次签到。
 func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.CheckinResult, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
-	result, errCheckin := Checkin(ctx, native)
+	result, errCheckin := Checkin(ctx, native, v.config)
 	if errCheckin != nil {
 		return nil, core.ToPluginError(errCheckin)
 	}
@@ -194,45 +181,16 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 
 // ---- 登录与续期 ----
 
-// LoginStart 发起一次授权登录。
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return LoginStart(ctx, v.region)
+	return LoginStart(ctx, v.config)
 }
 
-// LoginPoll 轮询一次登录状态。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
 	return LoginPoll(ctx, state)
 }
 
-// OwnsLoginSession 报告该会话是否由本区域创建（沿用本包既有会话表）。
 func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	return OwnsLoginSession(sessionID, v.region)
+	return OwnsLoginSession(sessionID, v.ID())
 }
 
-// Refresh 校验并刷新凭证。
-func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
-	native, errNative := v.nativeCredential(cred)
-	if errNative != nil {
-		return nil, false, errNative
-	}
-	updated, refreshed, errRefresh := RefreshCredential(ctx, native)
-	if errRefresh != nil {
-		return nil, false, errRefresh
-	}
-	if refreshed && updated != nil {
-		cred.ApplyTokenRefresh(updated.AccessToken, updated.RefreshToken, updated.ExpiresAt)
-		cred.Native = updated
-	}
-	return cred, refreshed, nil
-}
-
-// MergeStorageJSON 实现 core.StorageMerger。
-func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential) ([]byte, error) {
-	native, errNative := v.nativeCredential(credential)
-	if errNative != nil {
-		return original, errNative
-	}
-	return MergeStorageJSON(original, native)
-}
-
-func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.region) }
+func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.config) }

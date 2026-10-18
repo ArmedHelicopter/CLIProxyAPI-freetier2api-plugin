@@ -23,7 +23,7 @@ import (
 
 // adapter 是 core.Vendor 在 Cline 上的实现。
 type adapter struct {
-	core.Meta
+	*core.NativeAdapter[*Credential]
 	contextFallback func(string) int64
 }
 
@@ -33,15 +33,50 @@ type pendingLogin struct {
 }
 
 // Instances 构造 Cline 实例（只有一个，没有区域之分）。
-func Instances(contextFallback func(string) int64) []core.Vendor {
+func Instances(env core.Env, contextFallback func(string) int64) []core.Vendor {
 	if contextFallback == nil {
 		contextFallback = core.DefaultContextWindow
 	}
 	return []core.Vendor{&adapter{
-		Meta: core.Meta{
-			VendorID:   VendorID,
-			VendorName: VendorName,
-		},
+		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+			Meta: core.Meta{VendorID: VendorID, VendorName: VendorName},
+			Env:  env,
+			Extract: func(c *core.Credential) (*Credential, bool) {
+				native, ok := c.Native.(*Credential)
+				return native, ok
+			},
+			ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+				native, errParse := ParseCredential(raw)
+				if errParse != nil {
+					return core.CredentialSeed{}, nil, errParse
+				}
+				label := native.Label
+				if label == "" {
+					label = native.Email
+				}
+				if label == "" {
+					label = fileName
+				}
+				return core.CredentialSeed{
+					VendorID: VendorID, Label: label, FileID: core.FileIDFromFileName(fileName),
+					Token: native.AccessToken, RefreshToken: native.RefreshToken,
+					ExpiresAt: native.ExpiresAt, AuthMode: "oauth",
+				}, native, nil
+			},
+			RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
+				updated, refreshed, errRefresh := RefreshCredential(ctx, BaseURLOverride(), native)
+				if errRefresh != nil {
+					return core.NativeRefresh[*Credential]{}, errRefresh
+				}
+				return core.NativeRefresh[*Credential]{
+					Native: updated, Token: updated.AccessToken, RefreshToken: updated.RefreshToken,
+					ExpiresAt: updated.ExpiresAt, Changed: refreshed,
+				}, nil
+			},
+			MergeNative: func(original []byte, native *Credential) ([]byte, error) {
+				return MergeStorageJSON(original, native)
+			},
+		}),
 		contextFallback: contextFallback,
 	}}
 }
@@ -50,53 +85,11 @@ func Instances(contextFallback func(string) int64) []core.Vendor {
 func (v *adapter) AuthMode() string { return "oauth" }
 
 // Configure 解析供应商专属配置。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
-	Configure(settings, raw)
-}
-
-// ---- 凭证 ----
+func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
 
 // Match 判断一份凭证是否属于本供应商。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	return LooksLikeCredential(raw, fileName, provider)
-}
-
-// Parse 把凭证 JSON 解析成 core.Credential。
-func (v *adapter) Parse(raw []byte, fileName string) (*core.Credential, error) {
-	native, errParse := ParseCredential(raw)
-	if errParse != nil {
-		return nil, errParse
-	}
-	return newCoreCredential(native, fileName), nil
-}
-
-// newCoreCredential 把协议层凭证包装成 core.Credential。
-func newCoreCredential(native *Credential, fileName string) *core.Credential {
-	label := native.Label
-	if label == "" {
-		label = native.Email
-	}
-	if label == "" {
-		label = fileName
-	}
-	return &core.Credential{
-		VendorID:     VendorID,
-		Label:        label,
-		FileID:       strings.TrimSuffix(strings.TrimSpace(fileName), ".json"),
-		Token:        native.AccessToken,
-		RefreshToken: native.RefreshToken,
-		ExpiresAt:    native.ExpiresAt,
-		AuthMode:     "oauth",
-		Native:       native,
-	}
-}
-
-// nativeCredential 取回协议层凭证对象。
-func (v *adapter) nativeCredential(cred *core.Credential) (*Credential, error) {
-	return core.NativeCredential(cred, VendorID, func(c *core.Credential) (*Credential, bool) {
-		native, okNative := c.Native.(*Credential)
-		return native, okNative
-	})
 }
 
 // ---- 模型 ----
@@ -165,7 +158,7 @@ func describeModel(model Model) string {
 
 // Execute 执行一次非流式对话。
 func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -185,7 +178,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 
 // ExecuteStream 执行一次流式对话。
 func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest, sink core.StreamSink) error {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return errNative
 	}
@@ -272,7 +265,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 			Message: "构建凭证失败：" + errStorage.Error(),
 		}, nil
 	}
-	coreCredential := newCoreCredential(credential, "")
+	label := core.FirstNonEmpty(credential.Label, credential.Email, credential.AccountID)
 	logger.Info("completed cline login for %s", core.FirstNonEmpty(credential.Email, credential.AccountID))
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusSuccess,
@@ -280,7 +273,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 		Auth: pluginapi.AuthData{
 			Provider:    core.ProviderKey,
 			FileName:    core.FileNameFor(VendorID, core.FirstNonEmpty(credential.Email, credential.AccountID, loginsession.NewID(16))),
-			Label:       coreCredential.LabelValue(),
+			Label:       label,
 			StorageJSON: storageJSON,
 		},
 	}, nil
@@ -292,30 +285,4 @@ func (v *adapter) OwnsLoginSession(sessionID string) bool {
 		return vendorID == VendorID
 	}
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(sessionID)), "cline_")
-}
-
-// Refresh 校验并刷新凭证。
-func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
-	native, errNative := v.nativeCredential(cred)
-	if errNative != nil {
-		return nil, false, errNative
-	}
-	updated, refreshed, errRefresh := RefreshCredential(ctx, BaseURLOverride(), native)
-	if errRefresh != nil {
-		return nil, false, errRefresh
-	}
-	if refreshed && updated != nil {
-		cred.ApplyTokenRefresh(updated.AccessToken, updated.RefreshToken, updated.ExpiresAt)
-		cred.Native = updated
-	}
-	return cred, refreshed, nil
-}
-
-// MergeStorageJSON 实现 core.StorageMerger：把续期后的令牌合并回原凭证 JSON。
-func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential) ([]byte, error) {
-	native, errNative := v.nativeCredential(credential)
-	if errNative != nil {
-		return original, errNative
-	}
-	return MergeStorageJSON(original, native)
 }

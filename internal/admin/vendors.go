@@ -16,10 +16,10 @@ type vendorDescriptor struct {
 	SupportsLogin   bool   `json:"supports_login"`
 }
 
-func buildVendorsPayload() map[string]any {
-	cfg := deps.Config()
-	vendors := make([]vendorDescriptor, 0, len(core.Vendors()))
-	for _, vendor := range core.Vendors() {
+func (s *Service) buildVendorsPayload() map[string]any {
+	cfg := s.deps.Config()
+	vendors := make([]vendorDescriptor, 0, len(s.registry.Vendors()))
+	for _, vendor := range s.registry.Vendors() {
 		if !realmEnabled(cfg, vendor.Region()) {
 			continue
 		}

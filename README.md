@@ -38,24 +38,27 @@
 `type` 字段严格相等才认领该文件）。因此本插件用统一的 `providerKey = "freetier"`，
 **供应商的区分落在凭证文件名前缀与文件内的 `vendor` 字段上**。
 
-依赖方向始终单向：`main → internal/{admin,taskengine,hostabi} → internal/{vendors/*,modelconfig,...} → internal/core`。
-根层只做 ABI 翻译与进程级编排，领域规则全部在 internal。
+依赖方向始终单向：`main/cgo → internal/app → internal/{admin,taskengine,accountspool,hostabi} → internal/{vendors/*,modelconfig,...} → internal/core`。
+根层只做 ABI 翻译；插件生命周期、认证/模型/执行器/任务编排都在 `internal/app`。
 
 ```
-package main                    纯 ABI 适配层（8 个文件）
+package main                     C ABI 入口（main.go / cgo.go）
+internal/app               插件生命周期、RPC 分发、五类能力编排、组合根
   ├─ main.go                      插件身份、RPC 方法分发、注册响应、供应商注册表
-  ├─ cgo.go                       C ABI（cliproxy_plugin_init/call）与宿主回调
   ├─ host.go                      core.Host 端口、生命周期、管理路由入口
   ├─ config.go                    全局配置适配 + state.json/机器盐
   ├─ auth.go                      auth provider（解析/登录/刷新/凭证写回）
   ├─ models.go                    model provider（注册、隔离、别名、禁用）
   ├─ executor.go                  executor + quota provider
-  └─ tasks.go                     通用调度器 + 任务队列/扫描/一键完成
+  └─ tasks.go                     任务 HTTP 路由与调度编排
 
 internal/core                    供应商无关骨架：必需 Vendor 接口 + 可选能力接口
                                  （登录/续期/额度/签到/任务/配置/存储合并…）、
                                  注册表、Credential、模型 ID 协议、错误映射
 internal/admin                   管理接口实现（accounts/models/quota/settings/vendors）
+internal/tasks              任务目录、排程、队列与任务 HTTP 路由
+internal/accounts           账号枚举/去重/批量执行 + 额度格式化
+internal/upstream                共享上游错误分类与宿主状态码映射
 internal/modelconfig             模型禁用集合、别名、额外模型、同名合并与静态缓存
 internal/pluginconfig            全局配置解析/校验（供应商专属键保留在 Raw）
 internal/state                   state.json 的类型化读写与并发快照
@@ -64,7 +67,7 @@ internal/httpx                   出站 HTTP 桥（宿主代理/日志）与 SSE
 internal/loginsession            登录会话登记（TTL / 轮询节流 / 归属）
 internal/logger                  内存日志环与文件落盘
 internal/console                 内嵌控制台页面（console.html + go:embed）
-internal/testhost                测试用假宿主与上游桩（只被测试 import）
+tests/testhost                    测试用假宿主与上游桩
 
 internal/vendors/<name>          协议层 + 适配层同包：
   ├─ adapter.go                     core.Vendor 实现（嵌入 core.Meta）
@@ -74,7 +77,9 @@ internal/vendors/<name>          协议层 + 适配层同包：
 
 新增一个供应商：在 `internal/vendors/<name>` 写协议实现与 `adapter.go`
 （嵌入 `core.Meta`），只实现自己支持的能力接口（登录/额度/签到/任务等），
-在 `vendor_register.go` 加一行 `Instances()`，再在 README 的配置表里补一行。
+在 `internal/app/main.go` 的 `registerVendors()` 加一行 `Instances()`，
+再在 README 的配置表里补一行。需要任务中心的供应商实现
+`core.TaskCatalogProvider` 即可自动出现在排程与设置页。
 **不支持的能力不实现、不建文件**；根层五类处理器全部经 `core.Vendor` 与
 能力断言分发，没有任何 per-vendor switch。
 
@@ -107,6 +112,12 @@ internal/vendors/<name>          协议层 + 适配层同包：
   + 出站请求体指纹脱敏，两层叠加降低上游内容审核拦截率。
 - **敏感凭证脱敏与操作管理**：API key 类型账号在列表展示前4位与后4位、中间脱敏为 `***`，避免明文泄露；账号概览最后一列提供「操作」列，支持「删除」按钮直接删除本地凭证文件（带二次确认），宿主基于文件监听自动注销失效账号。
 - **零第三方依赖**：`go.mod` 只有 module 与 go 版本两行，构建不需要拉包。
+
+## 测试布局
+
+- 单元测试 `xxx_test.go` 与源码同目录。
+- 跨包集成测试在顶层 `tests/`。
+- E2E 在 `tests/e2e/`；实况探针在 `tests/live/`（需 `-tags live` 与 `MINIMAX_LIVE=1`）。
 
 ## 构建
 
@@ -450,16 +461,16 @@ Esc 取消；清空保存即清除别名。每个供应商的每个模型各自�
 | `state_dir` | string | `~/.freetier2api-plugin` | 状态目录（机器盐、模型缓存、任务记录、日志）；若检测到 `~/.cli-proxy-api` 则默认用其下的 `freetier2api` 子目录（适配 Docker 挂载卷） |
 | `log_level` | enum | `info` | `debug` / `info` / `error` |
 | `log_to_file` | bool | `false` | 是否把日志写入 `<state_dir>/logs` |
-| `prompt_mode` | enum | `passthrough` | `passthrough` 透传 / `custom` 替换 / `append` 追加（WorkBuddy） |
-| `prompt_file` | string | 空 | 自定义提示词文件；留空用内置（WorkBuddy） |
-| `sanitize_fingerprints` | bool | `true` | 出站请求体指纹脱敏（WorkBuddy） |
-| `passthrough_ip` | bool | `false` | 是否把客户端 IP 透传给上游 |
-| `user_agent` / `client_version` / `cli_version` | string | 空 | 出站标识覆盖（WorkBuddy） |
-| `device_token` / `device_token_file` | string | 空 | `X-Device-Token` 兜底（WorkBuddy） |
+| `workbuddy_prompt_mode` | enum | `passthrough` | `passthrough` 透传 / `custom` 替换 / `append` 追加（WorkBuddy） |
+| `workbuddy_prompt_file` | string | 空 | 自定义提示词文件；留空用内置（WorkBuddy） |
+| `workbuddy_sanitize_fingerprints` | bool | `true` | 出站请求体指纹脱敏（WorkBuddy） |
+| `workbuddy_passthrough_ip` | bool | `false` | 是否把客户端 IP 透传给上游 |
+| `workbuddy_user_agent` / `workbuddy_client_version` / `workbuddy_cli_version` | string | 空 | 出站标识覆盖（WorkBuddy） |
+| `workbuddy_device_token` / `workbuddy_device_token_file` | string | 空 | `X-Device-Token` 兜底（WorkBuddy） |
 | `machine_salt` | string | 自动生成 | 设备指纹盐；从旧插件迁移时填原值可保持指纹不变 |
 | `auto_checkin` / `auto_checkin_at` | bool / string | **`true`** / `10:00` | 每日自动任务（默认开启） |
 | `auto_tasks` | bool | **`true`** | 每日自动跑任务闭环（连登兑换、抽奖、旅行、夜猫子等） |
-| `zen_base_url` | string | 空 | 覆盖 OpenCode ZEN 上游基地址（默认 `https://opencode.ai/zen`） |
+| `opencodezen_base_url` | string | 空 | 覆盖 OpenCode ZEN 上游基地址（默认 `https://opencode.ai/zen`） |
 | `cline_base_url` | string | 空 | 覆盖 Cline 上游基地址（默认 `https://api.cline.bot/api/v1`） |
 | `zcode_base_url` | string | 空 | 覆盖 ZCode **对话**上游基地址（默认 `https://api.z.ai`） |
 

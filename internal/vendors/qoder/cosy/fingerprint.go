@@ -22,31 +22,10 @@ import (
 	"crypto/sha512"
 	"encoding/base64"
 	"fmt"
-	"sync"
 )
 
-var (
-	installSaltMu sync.RWMutex
-	installSalt   string
-)
-
-// SetInstallSalt 设置本机指纹盐。推荐由 settings.json 的 machine_salt 提供，
-// 由 account.EnsureMachineSalt() 首次启动时自动生成并落盘。
-func SetInstallSalt(salt string) {
-	installSaltMu.Lock()
-	installSalt = salt
-	installSaltMu.Unlock()
-}
-
-// saltedSeed 把本机盐混入派生种子；盐为空时原样返回（hub 兼容）。
-func saltedSeed(seed string) string {
-	installSaltMu.RLock()
-	defer installSaltMu.RUnlock()
-	if installSalt == "" {
-		return seed
-	}
-	return seed + "|salt:" + installSalt
-}
+// saltedSeed 保留接口；本实现不使用部署盐（与既有行为一致）。
+func saltedSeed(seed string) string { return seed }
 
 // FingerprintSeed 选择指纹种子：优先账号 UID；
 // UID 未知时（jobToken 交换发生在拿到 uid 之前）退回凭证令牌，
@@ -66,11 +45,6 @@ func deriveID(seed, salt string) string {
 // DeriveMachineID 派生稳定的 cosy-machineid（32 位十六进制）。
 func DeriveMachineID(seed string) string {
 	return deriveID(seed, "machine")
-}
-
-// DeriveSessionID 派生稳定的会话标识（与 hub derive_id(uid,"session") 同构）。
-func DeriveSessionID(seed string) string {
-	return deriveID(seed, "session")
 }
 
 // DeriveMachineType 派生稳定的 18 位 machine type（与 hub derive_machine_type 同构）。

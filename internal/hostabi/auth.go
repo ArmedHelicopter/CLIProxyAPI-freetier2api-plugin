@@ -29,7 +29,7 @@ import (
 //
 // 兜底依据：这些凭证文件的文件名仍是 workbuddy-*.json（本插件的命名约定），
 // 按名字也属于本插件，因此一并收下——否则用户的合法账号会在页面上凭空消失。
-func ListAuths(ctx context.Context, callbackID string) ([]core.HostAuth, error) {
+func ListAuths(ctx context.Context, callbackID string, registry *core.Registry) ([]core.HostAuth, error) {
 	raw, errCall := Call(callbackID, pluginabi.MethodHostAuthList, map[string]any{})
 	if errCall != nil {
 		return nil, fmt.Errorf("host.auth.list: %w", errCall)
@@ -37,7 +37,7 @@ func ListAuths(ctx context.Context, callbackID string) ([]core.HostAuth, error) 
 	// 宿主可能返回数组，也可能返回带包装的对象；两种都接受。
 	var entries []core.HostAuth
 	if errUnmarshal := json.Unmarshal(raw, &entries); errUnmarshal == nil {
-		return filterPluginAuths(entries), nil
+		return filterPluginAuths(entries, registry), nil
 	}
 	var wrapper struct {
 		Auths []core.HostAuth `json:"auths"`
@@ -49,7 +49,7 @@ func ListAuths(ctx context.Context, callbackID string) ([]core.HostAuth, error) 
 	// 宿主返回的 Auths 是内存运行时实例，Files 是磁盘物理文件。
 	// 按文件名将 Files 的文件属性（如 ModTime、Path）合入 Auths，避免将同一凭证重复展示。
 	entries = mergeAuthsAndFiles(wrapper.Auths, wrapper.Files)
-	return filterPluginAuths(entries), nil
+	return filterPluginAuths(entries, registry), nil
 }
 
 // mergeAuthsAndFiles 合并宿主 Auths 与 Files，避免同一凭证出现重复条目。
@@ -95,13 +95,13 @@ func mergeAuthsAndFiles(auths, files []core.HostAuth) []core.HostAuth {
 //     凭证。只看 provider 会让这些账号从页面上消失，而用户无从知道原因。
 //
 // 两层都不会误吞别家凭证：别家的文件名不含 workbuddy。
-func filterPluginAuths(entries []core.HostAuth) []core.HostAuth {
+func filterPluginAuths(entries []core.HostAuth, registry *core.Registry) []core.HostAuth {
 	out := make([]core.HostAuth, 0, len(entries))
 	indexByKey := make(map[string]int)
 
 	for _, entry := range entries {
 		provider := strings.TrimSpace(entry.Provider)
-		belongs := (provider != "" && strings.EqualFold(provider, core.ProviderKey)) || fileNameBelongsToPlugin(entry.Name)
+		belongs := (provider != "" && strings.EqualFold(provider, core.ProviderKey)) || fileNameBelongsToPlugin(entry.Name, registry)
 		if !belongs {
 			continue
 		}
@@ -197,7 +197,7 @@ func mergeHostAuthEntry(target *core.HostAuth, source core.HostAuth) {
 //
 // 兼容旧前缀 workbuddy：历史凭证文件是 workbuddy-<uid>.json，当时还没有
 // cn/global 之分。
-func fileNameBelongsToPlugin(name string) bool {
+func fileNameBelongsToPlugin(name string, registry *core.Registry) bool {
 	base := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(name), ".json"))
 	if base == "" {
 		return false
@@ -205,7 +205,7 @@ func fileNameBelongsToPlugin(name string) bool {
 	if base == "workbuddy" {
 		return true
 	}
-	for _, vendor := range core.Vendors() {
+	for _, vendor := range registry.Vendors() {
 		id := strings.ToLower(strings.TrimSpace(vendor.ID()))
 		if id == "" {
 			continue
@@ -234,7 +234,7 @@ func fileNameBelongsToPlugin(name string) bool {
 //
 // 宿主的 host.auth.get 只认 auth_index（按 id 查会失败），
 // 因此调用方若是从 id 出发，必须先经列表把 id 映射成 index。
-func FetchAuthJSON(ctx context.Context, callbackID, authID string) ([]byte, error) {
+func FetchAuthJSON(ctx context.Context, callbackID, authID string, registry *core.Registry) ([]byte, error) {
 	index := strings.TrimSpace(authID)
 	if index == "" {
 		return nil, fmt.Errorf("auth id is empty")
@@ -244,7 +244,7 @@ func FetchAuthJSON(ctx context.Context, callbackID, authID string) ([]byte, erro
 		return raw, nil
 	}
 	// 回退：把 id 映射成 index 再查。
-	entries, errList := ListAuths(ctx, callbackID)
+	entries, errList := ListAuths(ctx, callbackID, registry)
 	if errList != nil {
 		return nil, errList
 	}
@@ -290,8 +290,8 @@ func AuthJSON(ctx context.Context, callbackID, authIndex string) ([]byte, bool) 
 //
 // 用于模型列表过滤：如果某个供应商未添加 auth/key，模型列表既不去上游获取，
 // 也不在列表里展示该供应商的模型。
-func ActiveVendorSet(ctx context.Context, callbackID string) map[string]bool {
-	entries, errList := ListAuths(ctx, callbackID)
+func ActiveVendorSet(ctx context.Context, callbackID string, registry *core.Registry) map[string]bool {
+	entries, errList := ListAuths(ctx, callbackID, registry)
 	if errList != nil {
 		logger.Debug("activeVendorSet: list host auths failed: %v", errList)
 		return map[string]bool{}
@@ -311,7 +311,7 @@ func ActiveVendorSet(ctx context.Context, callbackID string) map[string]bool {
 		if !okRaw || len(raw) == 0 {
 			continue
 		}
-		if credential, okParse := core.ParseCredential(raw, entry.Name, nil); okParse {
+		if credential, okParse := registry.ParseCredential(raw, entry.Name, nil); okParse {
 			if id := credential.VendorIDValue(); id != "" {
 				active[id] = true
 			}

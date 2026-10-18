@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -32,11 +31,6 @@ type Config struct {
 	LogLevel string
 	// LogToFile 为 true 时把日志写入 <StateDir>/logs。
 	LogToFile bool
-
-	// SanitizeFingerprints 开启出站请求体黑名单指纹脱敏。
-	SanitizeFingerprints bool
-	// PassthroughIP 决定是否把客户端 IP 透传给上游。
-	PassthroughIP bool
 
 	// AutoCheckin 开启每日自动签到。
 	AutoCheckin bool
@@ -85,13 +79,12 @@ var listValuedConfigKeys = map[string]bool{
 // Default 返回内置默认配置（不含供应商默认值）。
 func Default() Config {
 	return Config{
-		EnabledRealms:        SplitList(DefaultRealmList),
-		StateDir:             DefaultStateDir(),
-		LogLevel:             DefaultLogLevel,
-		SanitizeFingerprints: true,
-		AutoCheckin:          true,
-		AutoCheckinAt:        DefaultCheckinAt,
-		AutoTasks:            true,
+		EnabledRealms: SplitList(DefaultRealmList),
+		StateDir:      DefaultStateDir(),
+		LogLevel:      DefaultLogLevel,
+		AutoCheckin:   true,
+		AutoCheckinAt: DefaultCheckinAt,
+		AutoTasks:     true,
 	}
 }
 
@@ -173,20 +166,6 @@ func applyConfigLine(cfg *Config, key, value string) error {
 		default:
 			return fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", value)
 		}
-	case "sanitize_fingerprints":
-		cfg.SanitizeFingerprints = ParseBool(value, cfg.SanitizeFingerprints)
-	case "passthrough_ip":
-		cfg.PassthroughIP = ParseBool(value, cfg.PassthroughIP)
-	case "user_agent":
-		// 供应商专属键：值已存入 Raw，由供应商自行解释。
-	case "client_version", "cli_version", "client_name":
-		// 供应商专属键：值已存入 Raw，由供应商自行解释。
-	case "device_token":
-		// 供应商专属键：值已存入 Raw，由供应商自行解释。
-	case "device_token_file":
-		// 供应商专属键：值已存入 Raw，由供应商自行解释。
-	case "machine_salt":
-		// 供应商专属键：值已存入 Raw，由供应商自行解释。
 	case "auto_checkin":
 		cfg.AutoCheckin = ParseBool(value, cfg.AutoCheckin)
 	case "auto_checkin_at":
@@ -195,8 +174,6 @@ func applyConfigLine(cfg *Config, key, value string) error {
 		}
 	case "auto_tasks":
 		cfg.AutoTasks = ParseBool(value, cfg.AutoTasks)
-	case "enabled", "priority":
-		// 宿主追加的插件启用开关与优先级：由宿主负责，这里只确认字段存在。
 	}
 	return nil
 }
@@ -242,22 +219,6 @@ func ParseRealms(raw string) ([]string, error) {
 		return nil, fmt.Errorf("enabled_realms is empty (want a subset of cn,global)")
 	}
 	return out, nil
-}
-
-// CollectDisabled 把配置里的禁用项去重排序，保持稳定输出。
-func CollectDisabled(items []string) []string {
-	set := make(map[string]bool, len(items))
-	for _, item := range items {
-		if trimmed := strings.TrimSpace(item); trimmed != "" {
-			set[trimmed] = true
-		}
-	}
-	out := make([]string, 0, len(set))
-	for item := range set {
-		out = append(out, item)
-	}
-	sort.Strings(out)
-	return out
 }
 
 // ParseBool 解析布尔值，无法解析时保留 fallback。

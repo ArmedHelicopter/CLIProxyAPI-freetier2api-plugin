@@ -14,12 +14,10 @@ import (
 	"freetier2api-plugin/internal/httpx"
 )
 
-func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool, error) {
+func RefreshCredential(ctx context.Context, cred *Credential, cfg Config) (*Credential, bool, error) {
 	if cred == nil || cred.RefreshToken == "" {
 		return cred, false, nil
 	}
-
-	cfg := ConfigFor(cred.Region)
 
 	payload := map[string]string{
 		"refreshToken": cred.RefreshToken,
@@ -27,12 +25,12 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 	}
 	bodyBytes, _ := json.Marshal(payload)
 
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, cfg.AuthHost+EpExchange, bytes.NewReader(bodyBytes))
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, cfg.RefreshHost+EpExchange, bytes.NewReader(bodyBytes))
 	if errReq != nil {
 		return nil, false, errReq
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Trae/"+cfg.IDEVersion)
+	req.Header.Set("User-Agent", cfg.clientUA())
 
 	client := httpx.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)

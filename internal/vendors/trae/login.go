@@ -1,20 +1,18 @@
 package trae
 
-// 本文件实现 Trae 授权登录链接生成与轮询状态检查。
+// 本文件实现 Trae 家族授权登录链接生成与轮询状态检查。
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"net/url"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 )
 
-// BuildLoginURL 构造 Trae 授权登录地址。
-func BuildLoginURL(r Region, machineID, deviceID, callbackURL string) string {
-	cfg := ConfigFor(r)
+// BuildLoginURL 构造某个 profile 的授权登录地址。
+func BuildLoginURL(cfg Config, machineID, deviceID, callbackURL string) string {
 	v := url.Values{}
 	v.Set("login_version", "1")
 	v.Set("auth_from", "solo")
@@ -41,22 +39,22 @@ func BuildLoginURL(r Region, machineID, deviceID, callbackURL string) string {
 }
 
 // LoginStart 启动登录流程。
-func LoginStart(ctx context.Context, r Region) (*pluginapi.AuthLoginStartResponse, error) {
+func LoginStart(ctx context.Context, cfg Config) (*pluginapi.AuthLoginStartResponse, error) {
 	EnsureCallbackServer()
 
-	machineID := randomHex(16)
-	deviceID := randomHex(16)
+	machineID := core.RandomHex(16)
+	deviceID := core.RandomHex(16)
 	traceID := MachineTraceID(machineID, deviceID)
 	callbackURL := "http://127.0.0.1:18080/authorize"
 
-	loginURL := BuildLoginURL(r, machineID, deviceID, callbackURL)
-	sessionID := "trae_" + string(r) + "_" + randomHex(8)
+	loginURL := BuildLoginURL(cfg, machineID, deviceID, callbackURL)
+	sessionID := cfg.VendorID + "_" + core.RandomHex(8)
 
 	RegisterPending(&PendingSession{
 		SessionID: sessionID,
-		VendorID:  VendorIDFor(r),
-		Region:    r,
-		IsSolo:    false,
+		VendorID:  cfg.VendorID,
+		Region:    cfg.Region,
+		IsSolo:    cfg.Solo,
 		MachineID: machineID,
 		DeviceID:  deviceID,
 		TraceID:   traceID,
@@ -114,13 +112,7 @@ func LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollRespo
 	}
 }
 
-// OwnsLoginSession 报告会话是否由本区域 Trae 拥有。
-func OwnsLoginSession(sessionID string, r Region) bool {
-	return OwnsSession(sessionID, VendorIDFor(r))
-}
-
-func randomHex(n int) string {
-	b := make([]byte, n)
-	_, _ = rand.Read(b)
-	return hex.EncodeToString(b)
+// OwnsLoginSession 报告会话是否由本 profile 拥有。
+func OwnsLoginSession(sessionID string, vendorID string) bool {
+	return OwnsSession(sessionID, vendorID)
 }

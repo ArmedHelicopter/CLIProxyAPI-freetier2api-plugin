@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/logger"
 )
@@ -106,17 +107,21 @@ func RemovePending(sessionID string) {
 // OwnsSession 检查会话是否归属于该供应商。
 func OwnsSession(sessionID, vendorID string) bool {
 	norm := strings.ToLower(strings.TrimSpace(sessionID))
-	normVendor := strings.ToLower(strings.TrimSpace(vendorID))
 
-	// 前缀匹配快速判定
-	if normVendor == "trae-cn" && strings.HasPrefix(norm, "trae_cn_") {
-		return true
-	}
-	if normVendor == "trae-global" && strings.HasPrefix(norm, "trae_global_") {
-		return true
-	}
-	if normVendor == "trae-solo" && (strings.HasPrefix(norm, "traesolo_") || strings.HasPrefix(norm, "trae_solo_")) {
-		return true
+	// 前缀匹配快速判定（兼容旧会话 id）。
+	switch strings.ToLower(strings.TrimSpace(vendorID)) {
+	case "traecn", "trae-cn":
+		if strings.HasPrefix(norm, "traecn_") || strings.HasPrefix(norm, "trae_cn_") {
+			return true
+		}
+	case "traeglobal", "trae-global":
+		if strings.HasPrefix(norm, "traeglobal_") || strings.HasPrefix(norm, "trae_global_") {
+			return true
+		}
+	case "traesolo", "trae-solo":
+		if strings.HasPrefix(norm, "traesolo_") || strings.HasPrefix(norm, "trae_solo_") {
+			return true
+		}
 	}
 
 	pendingStoreMu.Lock()
@@ -185,13 +190,13 @@ func ParseCallback(rawURL string) (*CallbackInfo, error) {
 	}
 
 	userInfo := parseJSONParam(q.Get("userInfo"))
-	info.UID = getString(userInfo, "UserID")
-	info.Nickname = getString(userInfo, "ScreenName")
-	info.EnterpriseID = getString(userInfo, "TenantID")
+	info.UID = core.GetString(userInfo, "UserID")
+	info.Nickname = core.GetString(userInfo, "ScreenName")
+	info.EnterpriseID = core.GetString(userInfo, "TenantID")
 
 	userJwt := parseJSONParam(q.Get("userJwt"))
-	jwtToken := getString(userJwt, "Token")
-	jwtRefresh := getString(userJwt, "RefreshToken")
+	jwtToken := core.GetString(userJwt, "Token")
+	jwtRefresh := core.GetString(userJwt, "RefreshToken")
 
 	if info.RefreshToken == "" {
 		info.RefreshToken = jwtRefresh
@@ -292,10 +297,13 @@ func handleAuthorizeCallback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 执行 Token 换取
-	authHost := "https://api.trae.com.cn"
+	authHost := HostOAuthSolo
 	clientID := "trae_login"
 	if !matched.IsSolo {
-		cfg := ConfigFor(matched.Region)
+		cfg, okConfig := ConfigForVendor(matched.VendorID)
+		if !okConfig {
+			cfg = ConfigFor(matched.Region)
+		}
 		authHost = cfg.AuthHost
 		clientID = cfg.ClientID
 	}

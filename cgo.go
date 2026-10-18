@@ -95,8 +95,8 @@ const (
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
-	stopBackgroundWork()
-	waitPluginStreams(shutdownWaitTimeout)
+	pluginApp.StopBackgroundWork()
+	pluginApp.WaitPluginStreams(shutdownWaitTimeout)
 	hostabi.WaitForShutdown(shutdownDiagnosticInterval)
 	C.clear_host_api()
 }

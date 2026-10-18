@@ -13,8 +13,8 @@ import (
 func (m *Manager) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
 	var all []pluginapi.ModelInfo
 	var firstErr error
-	active := hostabi.ActiveVendorSet(ctx, "")
-	for _, vendor := range core.Vendors() {
+	active := hostabi.ActiveVendorSet(ctx, "", m.registry)
+	for _, vendor := range m.registry.Vendors() {
 		if !m.RealmEnabled(vendor.Region()) || !active[vendor.ID()] {
 			continue
 		}
@@ -42,8 +42,8 @@ func (m *Manager) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 func (m *Manager) RefreshFromUpstream(ctx context.Context) (int, error) {
 	total := 0
 	var firstErr error
-	active := hostabi.ActiveVendorSet(ctx, "")
-	for _, vendor := range core.Vendors() {
+	active := hostabi.ActiveVendorSet(ctx, "", m.registry)
+	for _, vendor := range m.registry.Vendors() {
 		if !m.RealmEnabled(vendor.Region()) || !active[vendor.ID()] {
 			continue
 		}
@@ -74,14 +74,14 @@ func (m *Manager) ExtraModels() []pluginapi.ModelInfo {
 		if bare == "" {
 			continue
 		}
-		if vendorID, bareModel := core.SplitModelID(bare); vendorID != "" {
-			if vendor, okVendor := core.VendorByID(vendorID); okVendor &&
+		if vendorID, bareModel := m.registry.SplitModelID(bare); vendorID != "" {
+			if vendor, okVendor := m.registry.ByID(vendorID); okVendor &&
 				m.RealmEnabled(vendor.Region()) && !m.IsDisabled(vendor.ID(), bareModel) {
 				out = append(out, m.extraModelInfo(vendor.ID(), bareModel, settings))
 			}
 			continue
 		}
-		for _, vendor := range core.Vendors() {
+		for _, vendor := range m.registry.Vendors() {
 			if !m.RealmEnabled(vendor.Region()) || m.IsDisabled(vendor.ID(), bare) {
 				continue
 			}

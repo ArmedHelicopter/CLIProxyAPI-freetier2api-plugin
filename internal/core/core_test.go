@@ -42,45 +42,58 @@ func (v *fakeVendor) ExecuteStream(context.Context, *Credential, *ExecuteRequest
 	return nil
 }
 
-func TestResolveVendorPrefersVendorField(t *testing.T) {
-	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testfield"}})
-	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testsniff"}, marker: "sniff"})
+func newTestRegistry(t *testing.T, vendors ...Vendor) *Registry {
+	t.Helper()
+	registry := NewRegistry()
+	for _, vendor := range vendors {
+		if errRegister := registry.Register(vendor); errRegister != nil {
+			t.Fatalf("register %s: %v", vendor.ID(), errRegister)
+		}
+	}
+	return registry
+}
 
-	got, ok := ResolveVendor("whatever.json", "", map[string]any{VendorKey: "testfield"})
+func TestResolveVendorPrefersVendorField(t *testing.T) {
+	registry := newTestRegistry(t,
+		&fakeVendor{Meta: Meta{VendorID: "testfield"}},
+		&fakeVendor{Meta: Meta{VendorID: "testsniff"}, marker: "sniff"},
+	)
+
+	got, ok := registry.Resolve("whatever.json", "", map[string]any{VendorKey: "testfield"})
 	if !ok || got.ID() != "testfield" {
 		t.Fatalf("vendor field resolution = %v %v, want testfield", got, ok)
 	}
 }
 
 func TestResolveVendorFallsBackToFileNameThenSniff(t *testing.T) {
-	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testfile"}})
-	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testsniffonly"}, marker: "sniffonly"})
+	registry := newTestRegistry(t,
+		&fakeVendor{Meta: Meta{VendorID: "testfile"}},
+		&fakeVendor{Meta: Meta{VendorID: "testsniffonly"}, marker: "sniffonly"},
+	)
 
-	got, ok := ResolveVendor("testfile-abc.json", "", map[string]any{})
+	got, ok := registry.Resolve("testfile-abc.json", "", map[string]any{})
 	if !ok || got.ID() != "testfile" {
 		t.Fatalf("file name resolution = %v %v, want testfile", got, ok)
 	}
 
-	got, ok = ResolveVendor("acc.json", "", map[string]any{"test_marker": "sniffonly"})
+	got, ok = registry.Resolve("acc.json", "", map[string]any{"test_marker": "sniffonly"})
 	if !ok || got.ID() != "testsniffonly" {
 		t.Fatalf("sniff resolution = %v %v, want testsniffonly", got, ok)
 	}
 }
 
 func TestResolveVendorRejectsUnknown(t *testing.T) {
-	if _, ok := ResolveVendor("zzz.json", "", map[string]any{"foo": "bar"}); ok {
+	registry := newTestRegistry(t)
+	if _, ok := registry.Resolve("zzz.json", "", map[string]any{"foo": "bar"}); ok {
 		t.Fatal("unknown credential must not resolve")
 	}
 }
 
 func TestRegisterVendorRejectsDuplicate(t *testing.T) {
-	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testdup"}})
-	defer func() {
-		if recover() == nil {
-			t.Fatal("duplicate vendor registration must panic")
-		}
-	}()
-	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testdup"}})
+	registry := newTestRegistry(t, &fakeVendor{Meta: Meta{VendorID: "testdup"}})
+	if errDuplicate := registry.Register(&fakeVendor{Meta: Meta{VendorID: "testdup"}}); errDuplicate == nil {
+		t.Fatal("duplicate vendor registration must fail")
+	}
 }
 
 func TestFileNameForAndSanitize(t *testing.T) {
@@ -93,22 +106,22 @@ func TestFileNameForAndSanitize(t *testing.T) {
 }
 
 func TestSplitModelIDAndModelKey(t *testing.T) {
-	RegisterVendor(&fakeVendor{Meta: Meta{VendorID: "testmodel"}})
-	if prefix, bare := SplitModelID("testmodel:glm-5.2"); prefix != "testmodel" || bare != "glm-5.2" {
+	registry := newTestRegistry(t, &fakeVendor{Meta: Meta{VendorID: "testmodel"}})
+	if prefix, bare := registry.SplitModelID("testmodel:glm-5.2"); prefix != "testmodel" || bare != "glm-5.2" {
 		t.Fatalf("SplitModelID = %q %q", prefix, bare)
 	}
-	if prefix, bare := SplitModelID("gpt-5.5:turbo"); prefix != "" || bare != "gpt-5.5:turbo" {
+	if prefix, bare := registry.SplitModelID("gpt-5.5:turbo"); prefix != "" || bare != "gpt-5.5:turbo" {
 		t.Fatalf("unknown prefix must not split: %q %q", prefix, bare)
 	}
-	if got := ModelKeyFor("testmodel", "testmodel:glm-5.2"); got != "testmodel:glm-5.2" {
+	if got := registry.ModelKeyFor("testmodel", "testmodel:glm-5.2"); got != "testmodel:glm-5.2" {
 		t.Fatalf("ModelKeyFor = %q", got)
 	}
 }
 
 func TestParseCredentialFillsFileIDAndAttributes(t *testing.T) {
-	RegisterVendor(&noFileIDVendor{Meta: Meta{VendorID: "testnofileid"}})
+	registry := newTestRegistry(t, &noFileIDVendor{Meta: Meta{VendorID: "testnofileid"}})
 
-	credential, ok := ParseCredential([]byte(`{"vendor":"testnofileid"}`), "testnofileid-abc", map[string]string{"realm": "global"})
+	credential, ok := registry.ParseCredential([]byte(`{"vendor":"testnofileid"}`), "testnofileid-abc", map[string]string{"realm": "global"})
 	if !ok {
 		t.Fatal("credential should parse")
 	}

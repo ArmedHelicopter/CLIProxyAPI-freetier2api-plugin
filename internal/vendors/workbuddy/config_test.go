@@ -15,14 +15,14 @@ func TestConfigureAppliesPromptAndUADefaults(t *testing.T) {
 		t.Fatal(err)
 	}
 	Configure(core.Settings{
-		EnabledRealms:        []string{"cn"},
-		SanitizeFingerprints: false,
-		MachineSalt:          "salt-1",
-		StateDir:             dir,
+		EnabledRealms: []string{"cn"},
+		MachineSalt:   "salt-1",
+		StateDir:      dir,
 	}, map[string]string{
-		"prompt_mode":    "custom",
-		"prompt_file":    promptPath,
-		"client_version": "9.9.9",
+		"workbuddy_prompt_mode":           "custom",
+		"workbuddy_prompt_file":           promptPath,
+		"workbuddy_client_version":        "9.9.9",
+		"workbuddy_sanitize_fingerprints": "false",
 	})
 
 	runtimeMu.RLock()

@@ -7,14 +7,18 @@ import (
 	"testing"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/accounts"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/modelconfig"
 	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
+	"freetier2api-plugin/internal/tasks"
 )
 
 type stubDeps struct {
-	store *state.Store
+	store    *state.Store
+	registry *core.Registry
+	manager  *modelconfig.Manager
 }
 
 func (s stubDeps) Identity() Identity {
@@ -25,8 +29,8 @@ func (s stubDeps) State() state.State          { return s.store.Snapshot() }
 func (s stubDeps) MutateState(fn func(*state.State)) {
 	s.store.Mutate(fn)
 }
-func (s stubDeps) Model() *modelconfig.Manager       { return modelconfig.New(s.store) }
-func (s stubDeps) PromptMode() string                { return "passthrough" }
+func (s stubDeps) Model() *modelconfig.Manager       { return s.manager }
+func (s stubDeps) WorkbuddyPromptMode() string       { return "passthrough" }
 func (s stubDeps) SchedulerStatus() map[string]any   { return map[string]any{"running": false} }
 func (s stubDeps) EffectiveSettings() map[string]any { return map[string]any{} }
 func (s stubDeps) ResolveCredential(context.Context, string, []byte, string, map[string]string) (*core.Credential, core.Vendor, error) {
@@ -35,6 +39,7 @@ func (s stubDeps) ResolveCredential(context.Context, string, []byte, string, map
 func (s stubDeps) SaveRefreshedCredential(context.Context, string, core.Vendor, core.HostAuth, []byte, *core.Credential, string) {
 }
 func (s stubDeps) RefreshModels(context.Context) (int, error)          { return 0, nil }
+func (s stubDeps) Reconfigure() error                                  { return nil }
 func (s stubDeps) RecordCheckin(*core.Credential, *core.CheckinResult) {}
 func (s stubDeps) PokeScheduler()                                      {}
 func (s stubDeps) RunScheduled(string)                                 {}
@@ -49,12 +54,19 @@ func newStubDeps(t *testing.T) stubDeps {
 	if _, err := store.Load(); err != nil {
 		t.Fatal(err)
 	}
-	return stubDeps{store: store}
+	registry := core.NewRegistry()
+	return stubDeps{store: store, registry: registry, manager: modelconfig.New(store, registry)}
+}
+
+func newService(t *testing.T) *Service {
+	t.Helper()
+	deps := newStubDeps(t)
+	return New(deps, deps.registry, accounts.NewPool(deps.registry, deps.ResolveCredential), tasks.NewCatalog(deps.registry))
 }
 
 func TestRegistrationDeclaresRoutes(t *testing.T) {
-	Configure(newStubDeps(t))
-	registration := Registration()
+	service := newService(t)
+	registration := service.Registration()
 	found := false
 	for _, route := range registration.Routes {
 		if route.Path == "/plugins/freetier2api/status" {
@@ -70,9 +82,9 @@ func TestRegistrationDeclaresRoutes(t *testing.T) {
 }
 
 func TestHandleStatusAndUnknownRoute(t *testing.T) {
-	Configure(newStubDeps(t))
+	service := newService(t)
 
-	raw, err := Handle([]byte(`{"method":"GET","path":"/v0/management/plugins/freetier2api/status"}`))
+	raw, err := service.Handle([]byte(`{"method":"GET","path":"/v0/management/plugins/freetier2api/status"}`))
 	if err != nil {
 		t.Fatalf("handle status: %v", err)
 	}
@@ -84,7 +96,7 @@ func TestHandleStatusAndUnknownRoute(t *testing.T) {
 		t.Fatalf("unexpected envelope: %s", raw)
 	}
 
-	raw, err = Handle([]byte(`{"method":"GET","path":"/plugins/freetier2api/nope"}`))
+	raw, err = service.Handle([]byte(`{"method":"GET","path":"/plugins/freetier2api/nope"}`))
 	if err != nil {
 		t.Fatalf("handle unknown: %v", err)
 	}

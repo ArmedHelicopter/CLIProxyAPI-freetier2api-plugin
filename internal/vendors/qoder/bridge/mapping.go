@@ -11,15 +11,6 @@ type ModelMappingProvider func() (agentTables map[string]map[string]string, flat
 
 var modelMappingProvider atomic.Value // ModelMappingProvider
 
-// SetModelMappingProvider 注册映射来源；传 nil 表示回到内置默认映射。
-func SetModelMappingProvider(provider ModelMappingProvider) {
-	if provider == nil {
-		modelMappingProvider = atomic.Value{}
-		return
-	}
-	modelMappingProvider.Store(provider)
-}
-
 func currentModelMappings() (map[string]map[string]string, map[string]string) {
 	raw := modelMappingProvider.Load()
 	if raw == nil {

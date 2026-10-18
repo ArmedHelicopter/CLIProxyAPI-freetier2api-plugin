@@ -11,121 +11,101 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/loginsession"
+	"freetier2api-plugin/internal/state"
 )
 
 // adapter 是 core.Vendor 在 WorkBuddy 上的实现。
 type adapter struct {
-	core.Meta
+	*core.NativeAdapter[*Credential]
 	region Region
 }
 
 // Instances 构造 WorkBuddy 的两个区域实例。
-func Instances() []core.Vendor {
-	return []core.Vendor{
-		newInstance(RegionCN),
-		newInstance(RegionGlobal),
-	}
+func Instances(env core.Env) []core.Vendor {
+	setProbeEnv(env)
+	return []core.Vendor{newInstance(env, RegionCN), newInstance(env, RegionGlobal)}
 }
 
-func newInstance(region Region) core.Vendor {
+func newInstance(env core.Env, region Region) core.Vendor {
 	return &adapter{
-		Meta: core.Meta{
-			VendorID:     VendorIDFor(region),
-			VendorName:   VendorNameFor(region),
-			VendorRegion: string(region),
-		},
+		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+			Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
+			Env:  env,
+			Extract: func(c *core.Credential) (*Credential, bool) {
+				native, ok := c.Native.(*Credential)
+				return native, ok
+			},
+			ParseSeed: func(raw []byte, fileName string) (core.CredentialSeed, *Credential, error) {
+				native, errParse := ParseCredential(raw, region)
+				if errParse != nil {
+					return core.CredentialSeed{}, nil, errParse
+				}
+				if native.Realm() != region {
+					return core.CredentialSeed{}, nil, fmt.Errorf("credential realm %q does not match vendor %q", native.Realm(), VendorIDFor(region))
+				}
+				token := native.AccessTokenValue()
+				authMode := "oauth"
+				if token == "" {
+					token = native.DeviceTokenValue()
+					authMode = "device"
+				}
+				return core.CredentialSeed{
+					VendorID: VendorIDFor(region), Region: string(native.Realm()),
+					Label:  core.FirstNonEmpty(native.NicknameValue(), native.UIDValue(), fileName),
+					FileID: core.FileIDFromFileName(fileName), UID: native.UIDValue(),
+					Token: token, RefreshToken: native.RefreshTokenValue(),
+					ExpiresAt: native.ExpiresAt, AuthMode: authMode,
+				}, native, nil
+			},
+			RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
+				client, errClient := clientFor(ctx)
+				if errClient != nil {
+					return core.NativeRefresh[*Credential]{}, errClient
+				}
+				accessBefore, refreshBefore := native.Snapshot()
+				if errRefresh := client.RefreshToken(native); errRefresh != nil {
+					return core.NativeRefresh[*Credential]{}, errRefresh
+				}
+				refreshed := !native.UnchangedSince(accessBefore, refreshBefore)
+				return core.NativeRefresh[*Credential]{
+					Native: native, Token: native.AccessTokenValue(), RefreshToken: native.RefreshTokenValue(),
+					ExpiresAt: native.ExpiresAt, Changed: refreshed,
+				}, nil
+			},
+		}),
 		region: region,
 	}
 }
 
 // Configure 解析 WorkBuddy 专属配置（UA、设备令牌、提示词、机器盐）。
-func (v *adapter) Configure(settings core.Settings, raw map[string]string) {
-	Configure(settings, raw)
-}
-
-// ---- 凭证 ----
+func (v *adapter) Configure(settings core.Settings, raw map[string]string) { Configure(settings, raw) }
 
 // Match 判断一份凭证是否属于本区域。
-//
-// 严格要求区域一致：这是 CN 与 GLOBAL 两个实例之间唯一的区分依据，
-// 缺了它两个实例会互抢同一份凭证。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	if !LooksLikeCredential(raw, fileName, provider) {
 		return false
 	}
-	// 优先看文件内的 vendor 字段（插件自己写的，最可靠）。
 	if vendorID, okVendor := raw[core.VendorKey].(string); okVendor {
 		return strings.EqualFold(strings.TrimSpace(vendorID), v.ID())
 	}
-	// 其次按凭证自带的区域声明。无法判定时（扁平形手写凭证常常没有
-	// realm/domain）回落到配置的兜底区域——与解析时的兜底保持一致，
-	// 否则这类凭证会既不被 CN 也不被 GLOBAL 认领，等于加载不上。
 	if region := RegionForCredential(raw); region != "" {
 		return region == v.region
 	}
-	return defaultRegionForParse() == v.region
+	return v.defaultRegionForParse() == v.region
 }
 
-// defaultRegionForParse 决定解析无区域声明的凭证时使用的兜底域。
-//
-// 两个域都启用时兜底 cn（历史数据以 cn 为主）；只启用一个域时用它。
-func defaultRegionForParse() Region {
-	settings := core.HostSettings()
+func (v *adapter) defaultRegionForParse() Region {
+	settings := v.Env.Settings()
 	if settings.RealmEnabled(string(RegionCN)) {
 		return RegionCN
 	}
 	return RegionGlobal
-}
-
-// Parse 把凭证 JSON 解析成 core.Credential。
-func (v *adapter) Parse(raw []byte, fileName string) (*core.Credential, error) {
-	native, errParse := ParseCredential(raw, v.region)
-	if errParse != nil {
-		return nil, errParse
-	}
-	if native.Realm() != v.region {
-		return nil, fmt.Errorf("credential realm %q does not match vendor %q", native.Realm(), v.ID())
-	}
-	return newCoreCredential(native, v.ID(), fileName), nil
-}
-
-// newCoreCredential 把协议层凭证包装成 core.Credential。
-func newCoreCredential(native *Credential, vendorID, fileName string) *core.Credential {
-	token := native.AccessTokenValue()
-	authMode := "oauth"
-	if token == "" {
-		// 设备令牌形态的凭证没有 access/refresh token，靠 device token 出站。
-		token = native.DeviceTokenValue()
-		authMode = "device"
-	}
-	return &core.Credential{
-		VendorID:     vendorID,
-		Region:       string(native.Realm()),
-		Label:        core.FirstNonEmpty(native.NicknameValue(), native.UIDValue(), fileName),
-		UID:          native.UIDValue(),
-		Token:        token,
-		RefreshToken: native.RefreshTokenValue(),
-		ExpiresAt:    native.ExpiresAt,
-		AuthMode:     authMode,
-		Native:       native,
-	}
-}
-
-// nativeCredential 取回协议层凭证对象。
-//
-// 凭证经 core.Credential 传递时 Native 被保留，因此正常路径不重新解析。
-func (v *adapter) nativeCredential(cred *core.Credential) (*Credential, error) {
-	return core.NativeCredential(cred, VendorIDFor(v.region), func(c *core.Credential) (*Credential, bool) {
-		native, okNative := c.Native.(*Credential)
-		return native, okNative
-	})
 }
 
 // ---- 模型 ----
@@ -200,7 +180,7 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 
 // Execute 执行一次非流式对话。
 func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -226,7 +206,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 
 // ExecuteStream 执行一次流式对话。
 func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest, sink core.StreamSink) error {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return errNative
 	}
@@ -259,7 +239,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 
 // Quota 查询账号额度。
 func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -280,7 +260,7 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if !v.SupportsCheckin() {
 		return nil, nil
 	}
-	native, errNative := v.nativeCredential(cred)
+	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
@@ -398,48 +378,16 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 // OwnsLoginSession 报告该会话是否由本供应商持有且仍有效。
 func (v *adapter) OwnsLoginSession(sessionID string) bool { return OwnsLoginSession(sessionID) }
 
-// Refresh 校验并刷新凭证。
-//
-// refreshed 报告上游是否真的下发了新令牌：false 表示仅校验通过，
-// 调用方不应重写文件（否则 mtime 会无意义地变动，用户无法判断是否真的续期了）。
-func (v *adapter) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
-	native, errNative := v.nativeCredential(cred)
-	if errNative != nil {
-		return nil, false, errNative
-	}
-	client, errClient := clientFor(ctx)
-	if errClient != nil {
-		return nil, false, errClient
-	}
-	accessBefore, refreshBefore := native.Snapshot()
-	if errRefresh := client.RefreshToken(native); errRefresh != nil {
-		return nil, false, errRefresh
-	}
-	refreshed := !native.UnchangedSince(accessBefore, refreshBefore)
-	if refreshed {
-		cred.ApplyTokenRefresh(native.AccessTokenValue(), native.RefreshTokenValue(), native.ExpiresAt)
-	}
-	return cred, refreshed, nil
-}
-
 // MergeStorageJSON 实现 core.StorageMerger：把刷新后的令牌合并回原凭证 JSON。
 //
 // WorkBuddy 的凭证是嵌套的 auth/account 结构，通用合并会把顶层字段写乱，
 // 因此必须由本供应商自己做。
 func (v *adapter) MergeStorageJSON(original []byte, credential *core.Credential) ([]byte, error) {
-	native, errNative := v.nativeCredential(credential)
+	native, errNative := v.Native(credential)
 	if errNative != nil {
 		return original, errNative
 	}
 	return MergeStorageJSON(original, native)
-}
-
-// Tasks 返回本区域支持的任务动作。任务闭环是 CodeBuddy 国内版的活动。
-func (v *adapter) Tasks() []core.Task {
-	if v.region.IsGlobal() {
-		return nil
-	}
-	return TaskActions(v.region)
 }
 
 // ---- 内部工具 ----
@@ -455,6 +403,21 @@ func clientFor(ctx context.Context) (*Client, error) {
 }
 
 func (v *adapter) SupportsCheckin() bool { return !v.region.IsGlobal() }
+
+// LoadModelCache 实现 core.ModelCacheLoader：只加载本实例的缓存。
+func (v *adapter) LoadModelCache(cached []state.CachedModel) {
+	filtered := make([]state.CachedModel, 0, len(cached))
+	for _, item := range cached {
+		vendorID := strings.TrimSpace(item.VendorID)
+		if vendorID == "" {
+			vendorID = string(VendorIDFor(v.region))
+		}
+		if strings.EqualFold(vendorID, v.ID()) {
+			filtered = append(filtered, item)
+		}
+	}
+	LoadCachedModelsFromState(filtered)
+}
 
 // ConsoleModels 返回控制台模型页需要的展示明细（含积分倍率）。
 func (v *adapter) ConsoleModels() []core.ConsoleModel {
@@ -477,29 +440,8 @@ func (v *adapter) ConsoleModels() []core.ConsoleModel {
 	return out
 }
 
-var (
-	clientFactoryMu sync.RWMutex
-	clientFactory   func(context.Context) *Client
-)
-
-// SetClientFactory 注入上游客户端工厂（由根层在注册时调用）。
-func SetClientFactory(factory func(context.Context) *Client) {
-	clientFactoryMu.Lock()
-	clientFactory = factory
-	clientFactoryMu.Unlock()
-}
-
 // UpstreamClient 构造一个客户端。
-//
-// 优先使用注入的工厂（测试替换），否则用本包持有的配置快照自行构造：
-// 配置解析属于供应商，根层不再拼装 WorkBuddy 的 Options。
 func UpstreamClient(ctx context.Context) *Client {
-	clientFactoryMu.RLock()
-	factory := clientFactory
-	clientFactoryMu.RUnlock()
-	if factory != nil {
-		return factory(ctx)
-	}
 	return NewClient(currentOptions(ctx))
 }
 

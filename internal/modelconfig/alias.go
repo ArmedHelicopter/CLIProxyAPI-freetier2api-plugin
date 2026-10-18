@@ -4,7 +4,6 @@ import (
 	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
-	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/state"
 )
 
@@ -106,10 +105,7 @@ func (m *Manager) SetAlias(vendorID, bare, alias string) {
 	m.mu.Unlock()
 }
 
-// AliasKey 暴露规范化后的键（管理页写入时校验用）。
-func AliasKey(vendorID, modelID string) string { return aliasScopedKey(vendorID, modelID) }
-
 // VendorForAliasScope 解析 <vendor>:<model> 形式，供管理接口校验。
-func VendorForAliasScope(scope string) (string, string) {
-	return core.SplitModelID(strings.TrimSpace(scope))
+func (m *Manager) VendorForAliasScope(scope string) (string, string) {
+	return m.registry.SplitModelID(strings.TrimSpace(scope))
 }

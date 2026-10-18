@@ -25,7 +25,8 @@ type Settings struct {
 
 // Manager 持有模型相关的进程级缓存。
 type Manager struct {
-	store *state.Store
+	store    *state.Store
+	registry *core.Registry
 
 	mu       sync.RWMutex
 	settings Settings
@@ -36,9 +37,10 @@ type Manager struct {
 }
 
 // New 创建 Manager。
-func New(store *state.Store) *Manager {
+func New(store *state.Store, registry *core.Registry) *Manager {
 	return &Manager{
 		store:    store,
+		registry: registry,
 		disabled: map[string]bool{},
 		aliases:  map[string]string{},
 		cached:   map[string][]pluginapi.ModelInfo{},
@@ -88,7 +90,7 @@ func (m *Manager) reloadDisabledWith(stateDisabled []string) {
 	merged = append(merged, stateDisabled...)
 	set := make(map[string]bool, len(merged)*2)
 	for _, item := range merged {
-		for _, key := range ExpandKeys(item) {
+		for _, key := range m.ExpandKeys(item) {
 			if key != "" {
 				set[key] = true
 			}
@@ -100,27 +102,10 @@ func (m *Manager) reloadDisabledWith(stateDisabled []string) {
 
 // RealmEnabled 报告区域是否启用（空区域视为启用）。
 func (m *Manager) RealmEnabled(region string) bool {
-	if strings.TrimSpace(region) == "" {
-		return true
-	}
 	m.mu.RLock()
-	defer m.mu.RUnlock()
-	if len(m.settings.EnabledRealms) == 0 {
-		return true
-	}
-	for _, item := range m.settings.EnabledRealms {
-		if item == region {
-			return true
-		}
-	}
-	return false
-}
-
-// SnapshotSettings 返回当前设置副本。
-func (m *Manager) SnapshotSettings() Settings {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-	return m.settings
+	enabled := append([]string(nil), m.settings.EnabledRealms...)
+	m.mu.RUnlock()
+	return core.RealmEnabled(enabled, region)
 }
 
 // ExpandKeys 把模型标识展开成查询键。
@@ -128,22 +113,22 @@ func (m *Manager) SnapshotSettings() Settings {
 //   - 裸名：原样返回（对所有供应商生效）；
 //   - 供应商 ID 前缀：规范 vendorKey；
 //   - 区域别名：展开成该区域每家供应商的 vendorKey。
-func ExpandKeys(modelID string) []string {
+func (m *Manager) ExpandKeys(modelID string) []string {
 	trimmed := strings.TrimSpace(modelID)
 	if trimmed == "" {
 		return nil
 	}
-	prefix, bare := core.SplitModelID(trimmed)
+	prefix, bare := m.registry.SplitModelID(trimmed)
 	if prefix == "" {
 		return []string{bare}
 	}
-	if _, okVendor := core.VendorByID(prefix); okVendor {
-		return []string{core.ModelKeyFor(prefix, bare)}
+	if _, okVendor := m.registry.ByID(prefix); okVendor {
+		return []string{m.registry.ModelKeyFor(prefix, bare)}
 	}
 	keys := make([]string, 0, 4)
-	for _, vendor := range core.Vendors() {
+	for _, vendor := range m.registry.Vendors() {
 		if vendor.Region() == prefix {
-			keys = append(keys, core.ModelKeyFor(vendor.ID(), bare))
+			keys = append(keys, m.registry.ModelKeyFor(vendor.ID(), bare))
 		}
 	}
 	if len(keys) > 0 {
@@ -153,10 +138,10 @@ func ExpandKeys(modelID string) []string {
 }
 
 // ExpandDisabledList 展开配置里的禁用项并稳定排序。
-func ExpandDisabledList(items []string) []string {
+func (m *Manager) ExpandDisabledList(items []string) []string {
 	set := make(map[string]bool, len(items)*2)
 	for _, item := range items {
-		for _, key := range ExpandKeys(item) {
+		for _, key := range m.ExpandKeys(item) {
 			if key != "" {
 				set[key] = true
 			}
@@ -176,8 +161,8 @@ func (m *Manager) IsDisabled(vendorID, modelID string) bool {
 	if bare == "" {
 		return false
 	}
-	if prefix, rest := core.SplitModelID(bare); prefix != "" {
-		if vendor, okVendor := vendorForPrefix(prefix); okVendor && vendor.ID() != vendorID {
+	if prefix, rest := m.registry.SplitModelID(bare); prefix != "" {
+		if vendor, okVendor := m.vendorForPrefix(prefix); okVendor && vendor.ID() != vendorID {
 			return false
 		}
 		bare = rest
@@ -187,15 +172,15 @@ func (m *Manager) IsDisabled(vendorID, modelID string) bool {
 	if m.disabled[bare] {
 		return true
 	}
-	return m.disabled[core.ModelKeyFor(vendorID, bare)]
+	return m.disabled[m.registry.ModelKeyFor(vendorID, bare)]
 }
 
 // vendorForPrefix 把限定前缀（供应商 ID 或区域别名）解析成供应商实例。
-func vendorForPrefix(prefix string) (core.Vendor, bool) {
-	if vendor, okVendor := core.VendorByID(prefix); okVendor {
+func (m *Manager) vendorForPrefix(prefix string) (core.Vendor, bool) {
+	if vendor, okVendor := m.registry.ByID(prefix); okVendor {
 		return vendor, true
 	}
-	for _, vendor := range core.Vendors() {
+	for _, vendor := range m.registry.Vendors() {
 		if vendor.Region() == prefix {
 			return vendor, true
 		}
@@ -219,7 +204,7 @@ func (m *Manager) FilterForVendor(vendorID string, models []pluginapi.ModelInfo)
 func (m *Manager) SetDisabled(targets []string, disabled bool) []string {
 	normalized := make([]string, 0, len(targets))
 	for _, target := range targets {
-		normalized = append(normalized, ExpandKeys(target)...)
+		normalized = append(normalized, m.ExpandKeys(target)...)
 	}
 	if m.store == nil {
 		return normalized
@@ -286,29 +271,94 @@ func (m *Manager) Registered(vendorID string) []pluginapi.ModelInfo {
 	return append([]pluginapi.ModelInfo(nil), m.cached[vendorID]...)
 }
 
-// SnapshotCached 返回全部缓存的副本（管理页批量展示用）。
-func (m *Manager) SnapshotCached() map[string][]pluginapi.ModelInfo {
+// LoadCachedState 从 state.json 恢复全部供应商的模型缓存，并通知供应商预热。
+func (m *Manager) LoadCachedState(cached []state.CachedModel) {
+	byVendor := map[string][]pluginapi.ModelInfo{}
+	for _, item := range cached {
+		if strings.TrimSpace(item.ID) == "" {
+			continue
+		}
+		vendorID := strings.TrimSpace(item.VendorID)
+		if vendorID == "" {
+			// 旧状态没有 vendor_id：当时只有 WorkBuddy 写模型缓存。
+			switch item.Realm {
+			case "global":
+				vendorID = "workbuddyglobal"
+			default:
+				vendorID = "workbuddycn"
+			}
+		}
+		byVendor[vendorID] = append(byVendor[vendorID], pluginapi.ModelInfo{
+			ID: item.ID, Name: item.Name, DisplayName: item.Name,
+			Description: item.Description, ContextLength: item.ContextLength,
+			InputTokenLimit: item.ContextLength, MaxCompletionTokens: item.MaxOutputTokens,
+			OutputTokenLimit: item.MaxOutputTokens, Thinking: thinkingFromCached(item),
+		})
+	}
+	m.mu.Lock()
+	for vendorID, models := range byVendor {
+		m.cached[vendorID] = models
+	}
+	m.mu.Unlock()
+
+	for _, vendor := range m.registry.Vendors() {
+		loader, okLoader := core.As[core.ModelCacheLoader](vendor)
+		if !okLoader {
+			continue
+		}
+		loader.LoadModelCache(cachedForVendor(cached, vendor.ID()))
+	}
+}
+
+// CachedState 把当前各供应商的模型缓存拍平成 state.json 结构。
+func (m *Manager) CachedState() []state.CachedModel {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	out := make(map[string][]pluginapi.ModelInfo, len(m.cached))
+	out := make([]state.CachedModel, 0, 64)
 	for vendorID, models := range m.cached {
-		out[vendorID] = append([]pluginapi.ModelInfo(nil), models...)
+		for _, model := range models {
+			entry := state.CachedModel{
+				VendorID: vendorID, ID: model.ID, Name: model.Name,
+				Description: model.Description, ContextLength: model.ContextLength,
+				MaxOutputTokens: model.MaxCompletionTokens,
+			}
+			if vendor, okVendor := m.registry.ByID(vendorID); okVendor {
+				entry.Realm = vendor.Region()
+			}
+			if model.Thinking != nil {
+				entry.Efforts = append([]string(nil), model.Thinking.Levels...)
+				entry.DefaultEffort = model.Thinking.Levels[0]
+			}
+			entry.SupportsImages = core.ModelSupportsImages(model)
+			entry.SupportsTool = core.ModelSupportsTools(model)
+			out = append(out, entry)
+		}
 	}
 	return out
 }
 
-// ResetDisabledForTest 清空禁用集合（测试隔离用）。
-func (m *Manager) ResetDisabledForTest() {
-	m.mu.Lock()
-	m.disabled = map[string]bool{}
-	m.mu.Unlock()
+func cachedForVendor(cached []state.CachedModel, vendorID string) []state.CachedModel {
+	out := make([]state.CachedModel, 0, len(cached))
+	for _, item := range cached {
+		id := item.VendorID
+		if id == "" {
+			switch item.Realm {
+			case "global":
+				id = "workbuddyglobal"
+			default:
+				id = "workbuddycn"
+			}
+		}
+		if id == vendorID {
+			out = append(out, item)
+		}
+	}
+	return out
 }
 
-// ResetForTest 清空全部进程级缓存（测试隔离用）。
-func (m *Manager) ResetForTest() {
-	m.mu.Lock()
-	m.disabled = map[string]bool{}
-	m.aliases = map[string]string{}
-	m.cached = map[string][]pluginapi.ModelInfo{}
-	m.mu.Unlock()
+func thinkingFromCached(item state.CachedModel) *pluginapi.ThinkingSupport {
+	if len(item.Efforts) == 0 && item.DefaultEffort == "" {
+		return nil
+	}
+	return &pluginapi.ThinkingSupport{Levels: append([]string(nil), item.Efforts...), DynamicAllowed: item.DefaultEffort != ""}
 }

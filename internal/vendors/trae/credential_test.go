@@ -58,3 +58,41 @@ func TestLooksLikeCredential(t *testing.T) {
 		})
 	}
 }
+
+func TestSoloLooksLikeCredential(t *testing.T) {
+	solo := SoloConfig()
+	cases := []struct {
+		name     string
+		raw      map[string]any
+		fileName string
+		want     bool
+	}{
+		{"explicit vendor", map[string]any{"vendor": "traesolo", "access_token": "t"}, "any.json", true},
+		{"filename prefix", map[string]any{"access_token": "t"}, "traesolo-u1.json", true},
+		{"foreign vendor", map[string]any{"vendor": "workbuddycn"}, "traesolo-test.json", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := LooksLikeCredentialFor(tc.raw, tc.fileName, "", solo); got != tc.want {
+				t.Fatalf("want %v, got %v", tc.want, got)
+			}
+		})
+	}
+}
+
+func TestSoloParseCredentialNested(t *testing.T) {
+	raw := []byte(`{
+		"auth": {"accessToken": "atk_123", "refreshToken": "rtk_456", "expiresAt": 1700000000},
+		"account": {"uid": "user_789", "nickname": "Alice"}
+	}`)
+	cred, err := ParseCredentialFor(raw, SoloConfig())
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	if cred.AccessToken != "atk_123" || cred.RefreshToken != "rtk_456" || cred.UID != "user_789" {
+		t.Fatalf("unexpected parsed result: %+v", cred)
+	}
+	if cred.Vendor != VendorIDSolo || cred.Region != RegionCN {
+		t.Fatalf("vendor/region = %s/%s", cred.Vendor, cred.Region)
+	}
+}

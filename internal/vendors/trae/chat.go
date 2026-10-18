@@ -19,6 +19,7 @@ import (
 
 type ChatRequest struct {
 	Credential *Credential
+	Profile    Config
 	Body       []byte
 	Stream     bool
 }
@@ -32,7 +33,7 @@ func ApplyTraeHeaders(req *http.Request, cred *Credential, cfg Config, stream bo
 	} else {
 		req.Header.Set("Accept", "application/json")
 	}
-	req.Header.Set("User-Agent", "Trae/"+cfg.IDEVersion)
+	req.Header.Set("User-Agent", cfg.clientUA())
 	at := cred.AccessToken
 	req.Header.Set("Authorization", "Cloud-IDE-JWT "+at)
 	req.Header.Set("X-Cloudide-Token", at)
@@ -40,9 +41,18 @@ func ApplyTraeHeaders(req *http.Request, cred *Credential, cfg Config, stream bo
 	if cred.UID != "" {
 		req.Header.Set("X-Uid", cred.UID)
 	}
-	req.Header.Set("X-App-Id", AppID)
+	req.Header.Set("X-App-Id", cfg.AppID)
 	req.Header.Set("X-Ide-Version", cfg.IDEVersion)
 	req.Header.Set("X-Device-Type", "windows")
+	if cfg.Solo {
+		req.Header.Set("X-App-Version", "default")
+		req.Header.Set("X-Ide-Version-Code", cfg.IDEVersionCode)
+		req.Header.Set("X-App-Version-Code", cfg.IDEVersionCode)
+		req.Header.Set("X-Ide-Version-Type", "stable")
+		req.Header.Set("X-OS-Version", cfg.OSVersion)
+		req.Header.Set("X-Device-Brand", cfg.DeviceBrand)
+		req.Header.Set("Request-Traffic-Type", "prod")
+	}
 	if cred.MachineID != "" {
 		req.Header.Set("X-Machine-Id", cred.MachineID)
 	}
@@ -52,19 +62,19 @@ func ApplyTraeHeaders(req *http.Request, cred *Credential, cfg Config, stream bo
 }
 
 // PrepareBody 改写请求体为 Trae 格式。
-func PrepareBody(src []byte, defaultModel string) ([]byte, string, error) {
+func PrepareBody(src []byte, cfg Config) ([]byte, string, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(src, &obj); err != nil {
-		return src, defaultModel, err
+		return src, cfg.DefaultModel, err
 	}
 
 	model, _ := obj["model"].(string)
 	if model == "" {
-		model = defaultModel
+		model = cfg.DefaultModel
 	}
 
 	obj["stream"] = true
-	obj["function"] = "chat_v3"
+	obj["function"] = cfg.Function
 	obj["config_name"] = model
 	obj["model"] = model
 
@@ -255,13 +265,12 @@ func doTraeRequest(ctx context.Context, baseURL string, req ChatRequest) (io.Rea
 		return nil, "", fmt.Errorf("trae credential is nil")
 	}
 
-	cfg := ConfigFor(req.Credential.Region)
-	defaultModel := "glm-5.2"
-	if req.Credential.Region == RegionGlobal {
-		defaultModel = "gpt-5"
+	cfg := req.Profile
+	if cfg.VendorID == "" {
+		cfg = configForCredential(req.Credential)
 	}
 
-	body, model, errPrep := PrepareBody(req.Body, defaultModel)
+	body, model, errPrep := PrepareBody(req.Body, cfg)
 	if errPrep != nil {
 		return nil, "", errPrep
 	}

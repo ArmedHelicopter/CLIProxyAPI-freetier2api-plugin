@@ -57,10 +57,6 @@ type LoginProvider interface {
 }
 
 // LoginSessionOwner 由持有登录会话状态的供应商实现。
-type LoginSessionOwner interface {
-	OwnsLoginSession(sessionID string) bool
-}
-
 // Refresher 由需要校验/续期凭证的供应商实现。
 //
 // 未实现时调用方视为「已校验且无需写盘」（refreshed=false）。
@@ -80,21 +76,6 @@ type QuotaProvider interface {
 type CheckinProvider interface {
 	SupportsCheckin() bool
 	Checkin(ctx context.Context, cred *Credential) (*CheckinResult, error)
-}
-
-// TaskProvider 由提供任务体系的供应商实现。
-//
-// 任务执行与扫描在后续阶段扩充（RunTask/InspectTasks）；当前只需给出
-// 控制台展示用的动作清单。
-type TaskProvider interface {
-	Tasks() []Task
-}
-
-// CountTokenEstimator 由需要自定义 token 估算的供应商实现。
-//
-// 未实现时执行器使用 EstimateTokens（字节数/3），与既有行为一致。
-type CountTokenEstimator interface {
-	CountTokens(ctx context.Context, cred *Credential, req *ExecuteRequest) (int, error)
 }
 
 // AuthModeReporter 由「凭证本身就是敏感材料」的供应商实现。
@@ -131,6 +112,14 @@ type ConsoleModel struct {
 	Credits         string
 }
 
+// ModelCacheLoader 由需要预热自身模型目录的供应商实现。
+//
+// state.json 中的缓存按 VendorID 区分；Manager 在启动时把对应条目交给
+// 该供应商，避免根层直接依赖某个具体供应商包。
+type ModelCacheLoader interface {
+	LoadModelCache(cached []CachedModel)
+}
+
 // ConsoleModelProvider 由需要补充展示明细（如积分倍率）的供应商实现。
 //
 // 未实现时控制台从已注册的模型清单回读（缺少 Credits 等扩展信息）。
@@ -138,14 +127,23 @@ type ConsoleModelProvider interface {
 	ConsoleModels() []ConsoleModel
 }
 
-// Task 是一个可执行的任务动作。
-type Task struct {
-	// Code 是任务标识（供应商内唯一）。
-	Code string
-	// Desc 是任务说明（供管理页展示）。
-	Desc string
-	// UsesChat 标记该任务是否消耗真实对话额度。
-	UsesChat bool
+// TaskSpec 是供应商注册的一条任务规格。
+//
+// 调度器、管理页与状态文件都从 TaskSpec 生成，不再硬编码某家供应商的活动名。
+type TaskSpec struct {
+	Kind         string `json:"kind"`
+	Label        string `json:"label"`
+	Description  string `json:"description,omitempty"`
+	DefaultHours []int  `json:"default_hours,omitempty"`
+	AfterCheckin bool   `json:"after_checkin,omitempty"`
+	Manual       bool   `json:"manual,omitempty"`
+	UsesChat     bool   `json:"uses_chat,omitempty"`
+	Route        string `json:"route,omitempty"`
+}
+
+// TaskCatalogProvider 由需要注册任务族/排程的供应商实现。
+type TaskCatalogProvider interface {
+	TaskSpecs() []TaskSpec
 }
 
 // As 把供应商断言为某个可选能力接口。
@@ -183,12 +181,16 @@ func RefreshVendor(vendor Vendor, ctx context.Context, cred *Credential) (*Crede
 	return cred, false, nil
 }
 
-// EstimateTokens 估算 token 数（按字节数除以 3，不调上游）。
+// EstimateTokens 按字节数估算 token（偏保守，倾向高估）。
 func EstimateTokens(payload []byte) int {
 	if len(payload) == 0 {
 		return 0
 	}
-	return len(payload) / 3
+	tokens := len(payload) / 3
+	if tokens < 1 {
+		return 1
+	}
+	return tokens
 }
 
 // QuotaUnsupported 是「上游没有额度接口」的统一错误。
@@ -208,15 +210,10 @@ func LoginUnsupported(vendor Vendor) error {
 // 供应商只在支持任务/签到时实现这些接口；根层调度器按类型断言调用，
 // 不支持的供应商直接跳过，不需要任何占位实现。
 
-// 任务族标识（调度器的 kind 取值）。
+// 通用任务族标识。供应商专属任务族由各供应商的 TaskSpec 提供。
 const (
 	TaskKindCheckin   = "checkin"
-	TaskKindTravel    = "travel"
-	TaskKindActivity  = "activity"
 	TaskKindKeepalive = "keepalive"
-	TaskKindBlackcat  = "blackcat"
-	TaskKindSchool    = "school"
-	TaskKindStreak    = "streak"
 )
 
 // TaskItem 是一条待办任务（扫描结果）。
@@ -296,4 +293,14 @@ type ScheduledRunner interface {
 // TaskPreparer 由需要在执行前批量报名/准备的供应商实现。
 type TaskPreparer interface {
 	PrepareTasks(ctx context.Context, cred *Credential) int
+}
+
+// ConfigFieldsProvider 由需要声明 YAML 配置字段的供应商实现。
+type ConfigFieldsProvider interface {
+	ConfigFields() []pluginapi.ConfigField
+}
+
+// RuntimeFieldsProvider 由需要声明管理页可改字段的供应商实现。
+type RuntimeFieldsProvider interface {
+	RuntimeFields() []pluginapi.ConfigField
 }

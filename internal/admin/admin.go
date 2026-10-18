@@ -13,12 +13,14 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/accounts"
 	"freetier2api-plugin/internal/console"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/modelconfig"
 	"freetier2api-plugin/internal/pluginconfig"
 	"freetier2api-plugin/internal/state"
+	"freetier2api-plugin/internal/tasks"
 )
 
 const (
@@ -43,7 +45,7 @@ type Deps interface {
 	State() state.State
 	MutateState(func(*state.State))
 	Model() *modelconfig.Manager
-	PromptMode() string
+	WorkbuddyPromptMode() string
 	SchedulerStatus() map[string]any
 	EffectiveSettings() map[string]any
 	// ResolveCredential 取回凭证并解析出供应商。
@@ -51,6 +53,7 @@ type Deps interface {
 	// SaveRefreshedCredential 把续期后的凭证写回宿主与磁盘。
 	SaveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor, entry core.HostAuth, original []byte, updated *core.Credential, filePath string)
 	RefreshModels(ctx context.Context) (int, error)
+	Reconfigure() error
 	RecordCheckin(*core.Credential, *core.CheckinResult)
 	PokeScheduler()
 	RunScheduled(kind string)
@@ -58,44 +61,25 @@ type Deps interface {
 	TaskRoutes(req pluginapi.ManagementRequest, route string) (pluginapi.ManagementResponse, bool)
 }
 
-var deps Deps
+// Service 是管理接口的实例。
+type Service struct {
+	deps     Deps
+	registry *core.Registry
+	pool     *accounts.Pool
+	catalog  *tasks.Catalog
+}
 
-// Configure 注入依赖。由根层在 init 中调用一次。
-func Configure(d Deps) { deps = d }
-
-// Enabled 报告管理接口是否已注入依赖（测试未注入时返回 false）。
-func Enabled() bool { return deps != nil }
+// New 构造管理 Service。
+func New(deps Deps, registry *core.Registry, pool *accounts.Pool, catalog *tasks.Catalog) *Service {
+	return &Service{deps: deps, registry: registry, pool: pool, catalog: catalog}
+}
 
 // Registration 返回管理路由与资源页声明。
-func Registration() pluginapi.ManagementRegistrationResponse {
-	id := deps.Identity()
+func (s *Service) Registration() pluginapi.ManagementRegistrationResponse {
+	id := s.deps.Identity()
 	prefix := "/plugins/" + id.ID
 	return pluginapi.ManagementRegistrationResponse{
-		Routes: []pluginapi.ManagementRoute{
-			{Method: "GET", Path: prefix + "/status", Description: "账号、额度与任务状态概览。"},
-			{Method: "GET", Path: prefix + "/vendors", Description: "列出已启用的供应商（供添加账号下拉与分组展示）。"},
-			{Method: "POST", Path: prefix + "/checkin", Description: "对指定或全部账号执行签到。"},
-			{Method: "POST", Path: prefix + "/quotas", Description: "批量查询账号额度。"},
-			{Method: "POST", Path: prefix + "/accounts/delete", Description: "删除指定账号的凭证文件（宿主监听 auth 目录，会自动注销该账号）。"},
-			{Method: "POST", Path: prefix + "/accounts/add", Description: "添加 API Key 类账号。"},
-			{Method: "GET", Path: prefix + "/models", Description: "读取当前注册的模型清单。"},
-			{Method: "POST", Path: prefix + "/models/toggle", Description: "批量禁用/启用模型。"},
-			{Method: "POST", Path: prefix + "/models/alias", Description: "给模型设置/清除对外别名（跨供应商同名可合并路由）。"},
-			{Method: "POST", Path: prefix + "/models/refresh", Description: "从上游拉取模型清单并缓存。"},
-			{Method: "GET", Path: prefix + "/logs", Description: "读取插件日志（增量）。"},
-			{Method: "POST", Path: prefix + "/settings", Description: "更新插件运行期设置（自动签到、任务排程、提示词）。"},
-			{Method: "POST", Path: prefix + "/tasks/scan", Description: "扫描全部账号的待办任务。"},
-			{Method: "POST", Path: prefix + "/tasks/run", Description: "执行任务队列（账号内串行、账号间并发）。"},
-			{Method: "GET", Path: prefix + "/tasks/queue", Description: "查询任务队列进度。"},
-			{Method: "POST", Path: prefix + "/tasks/auto", Description: "对单个账号执行单个任务或一键完成。"},
-			{Method: "POST", Path: prefix + "/tasks/auto_all", Description: "对全部账号依次执行一键完成任务。"},
-			{Method: "GET", Path: prefix + "/school/status", Description: "开学季活动状态。"},
-			{Method: "POST", Path: prefix + "/school/run", Description: "执行开学季闭环。"},
-			{Method: "POST", Path: prefix + "/travel", Description: "手动执行猫猫旅行。"},
-			{Method: "POST", Path: prefix + "/activity", Description: "手动执行活跃上报。"},
-			{Method: "POST", Path: prefix + "/keepalive", Description: "手动执行 token 保活。"},
-			{Method: "POST", Path: prefix + "/blackcat", Description: "手动执行夜猫子补足。"},
-		},
+		Routes: s.managementRoutes(prefix),
 		Resources: []pluginapi.ResourceRoute{{
 			Path:        "/console",
 			Menu:        id.DisplayName,
@@ -104,9 +88,40 @@ func Registration() pluginapi.ManagementRegistrationResponse {
 	}
 }
 
+func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
+	routes := []pluginapi.ManagementRoute{
+		{Method: "GET", Path: prefix + "/status", Description: "账号、额度与任务状态概览。"},
+		{Method: "GET", Path: prefix + "/vendors", Description: "列出已启用的供应商（供添加账号下拉与分组展示）。"},
+		{Method: "POST", Path: prefix + "/checkin", Description: "对指定或全部账号执行签到。"},
+		{Method: "POST", Path: prefix + "/quotas", Description: "批量查询账号额度。"},
+		{Method: "POST", Path: prefix + "/accounts/delete", Description: "删除指定账号的凭证文件（宿主监听 auth 目录，会自动注销该账号）。"},
+		{Method: "POST", Path: prefix + "/accounts/add", Description: "添加 API Key 类账号。"},
+		{Method: "GET", Path: prefix + "/models", Description: "读取当前注册的模型清单。"},
+		{Method: "POST", Path: prefix + "/models/toggle", Description: "批量禁用/启用模型。"},
+		{Method: "POST", Path: prefix + "/models/alias", Description: "给模型设置/清除对外别名（跨供应商同名可合并路由）。"},
+		{Method: "POST", Path: prefix + "/models/refresh", Description: "从上游拉取模型清单并缓存。"},
+		{Method: "GET", Path: prefix + "/logs", Description: "读取插件日志（增量）。"},
+		{Method: "POST", Path: prefix + "/settings", Description: "更新插件运行期设置（自动签到、任务排程、提示词）。"},
+		{Method: "POST", Path: prefix + "/tasks/scan", Description: "扫描全部账号的待办任务。"},
+		{Method: "POST", Path: prefix + "/tasks/run", Description: "执行任务队列（账号内串行、账号间并发）。"},
+		{Method: "GET", Path: prefix + "/tasks/queue", Description: "查询任务队列进度。"},
+		{Method: "POST", Path: prefix + "/tasks/auto", Description: "对单个账号执行单个任务或一键完成。"},
+		{Method: "POST", Path: prefix + "/tasks/auto_all", Description: "对全部账号依次执行一键完成任务。"},
+		{Method: "GET", Path: prefix + "/school/status", Description: "开学季活动状态。"},
+		{Method: "POST", Path: prefix + "/keepalive", Description: "手动执行 token 保活。"},
+	}
+	for _, spec := range s.catalog.ManualSpecs() {
+		if spec.Route == "" {
+			continue
+		}
+		routes = append(routes, pluginapi.ManagementRoute{Method: "POST", Path: prefix + spec.Route, Description: spec.Description})
+	}
+	return routes
+}
+
 // Handle 是管理接口的总分发。
-func Handle(request []byte) ([]byte, error) {
-	if deps == nil {
+func (s *Service) Handle(request []byte) ([]byte, error) {
+	if s.deps == nil {
 		return nil, core.NewPluginError("admin_not_configured", "management deps are not configured", http.StatusInternalServerError)
 	}
 	var rpc pluginapi.ManagementRequest
@@ -119,78 +134,75 @@ func Handle(request []byte) ([]byte, error) {
 	if method == "" {
 		method = http.MethodGet
 	}
-	id := deps.Identity()
+	id := s.deps.Identity()
 
 	switch {
 	case method == http.MethodGet && matchesResourcePath(rpc.Path, id.ID, "/console"):
 		return core.OKEnvelope(HTMLResponse(http.StatusOK, []byte(console.Page("/plugins/"+id.ID))))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/status"):
-		return core.OKEnvelope(JSONResponse(http.StatusOK, buildStatusPayload(rpc)))
+		return core.OKEnvelope(JSONResponse(http.StatusOK, s.buildStatusPayload(rpc)))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/vendors"):
-		return core.OKEnvelope(JSONResponse(http.StatusOK, buildVendorsPayload()))
+		return core.OKEnvelope(JSONResponse(http.StatusOK, s.buildVendorsPayload()))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/logs"):
-		return core.OKEnvelope(JSONResponse(http.StatusOK, buildLogsPayload(rpc)))
+		return core.OKEnvelope(JSONResponse(http.StatusOK, s.buildLogsPayload(rpc)))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/checkin"):
-		return core.OKEnvelope(handleCheckinRequest(rpc))
+		return core.OKEnvelope(s.handleCheckinRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/quotas"):
-		return core.OKEnvelope(handleQuotasRequest(rpc))
+		return core.OKEnvelope(s.handleQuotasRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/accounts/delete"):
-		return core.OKEnvelope(handleAccountDeleteRequest(rpc))
+		return core.OKEnvelope(s.handleAccountDeleteRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/accounts/add"):
-		return core.OKEnvelope(handleAccountAddRequest(rpc))
+		return core.OKEnvelope(s.handleAccountAddRequest(rpc))
 
 	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/models"):
-		return core.OKEnvelope(handleModelsList(rpc))
+		return core.OKEnvelope(s.handleModelsList(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/models/toggle"):
-		return core.OKEnvelope(modelToggleHandler(rpc))
+		return core.OKEnvelope(s.modelToggleHandler(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/models/alias"):
-		return core.OKEnvelope(modelAliasHandler(rpc))
+		return core.OKEnvelope(s.modelAliasHandler(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/models/refresh"):
 		ctx, cancel := managementContext(rpc)
 		defer cancel()
-		count, errRefresh := deps.RefreshModels(ctx)
+		count, errRefresh := s.deps.RefreshModels(ctx)
 		if errRefresh != nil {
 			return core.OKEnvelope(ErrorResponse(errRefresh))
 		}
 		return core.OKEnvelope(JSONResponse(http.StatusOK, map[string]any{"ok": true, "models": count}))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/settings"):
-		return core.OKEnvelope(handleSettingsRequest(rpc))
-
-	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/school/run"):
-		return core.OKEnvelope(handleScheduledRun(rpc, core.TaskKindSchool))
-
-	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/travel"):
-		return core.OKEnvelope(handleScheduledRun(rpc, core.TaskKindTravel))
-
-	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/activity"):
-		return core.OKEnvelope(handleScheduledRun(rpc, core.TaskKindActivity))
-
-	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/blackcat"):
-		return core.OKEnvelope(handleScheduledRun(rpc, core.TaskKindBlackcat))
+		return core.OKEnvelope(s.handleSettingsRequest(rpc))
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/keepalive"):
-		return core.OKEnvelope(handleKeepaliveRequest(rpc))
+		return core.OKEnvelope(s.handleKeepaliveRequest(rpc))
+	}
+	if method == http.MethodPost {
+		if suffix, okSuffix := managementSuffix(rpc.Path, id.ID); okSuffix {
+			for _, spec := range s.catalog.ManualSpecs() {
+				if spec.Route != "" && suffix == spec.Route {
+					return core.OKEnvelope(s.handleScheduledRun(rpc, spec.Kind))
+				}
+			}
+		}
 	}
 
 	// 任务路由：扫描/队列/一键完成等需要与根层共享队列状态。
 	if suffix, okSuffix := managementSuffix(rpc.Path, id.ID); okSuffix && strings.HasPrefix(suffix, "/tasks/") {
-		if response, okResponse := deps.TaskRoutes(rpc, suffix); okResponse {
+		if response, okResponse := s.deps.TaskRoutes(rpc, suffix); okResponse {
 			return core.OKEnvelope(response)
 		}
 	}
 	if method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/school/status") {
-		if response, okResponse := deps.TaskRoutes(rpc, "/school/status"); okResponse {
+		if response, okResponse := s.deps.TaskRoutes(rpc, "/school/status"); okResponse {
 			return core.OKEnvelope(response)
 		}
 	}
@@ -307,18 +319,10 @@ func queryInt64(query map[string][]string, key string, fallback int64) int64 {
 // 供子文件使用的共享助手。
 
 func realmEnabled(cfg pluginconfig.Config, realm string) bool {
-	if strings.TrimSpace(realm) == "" {
-		return true
-	}
-	for _, item := range cfg.EnabledRealms {
-		if item == realm {
-			return true
-		}
-	}
-	return false
+	return core.RealmEnabled(cfg.EnabledRealms, realm)
 }
 
 // hostActiveVendors 返回有凭证的供应商集合。
-func hostActiveVendors(ctx context.Context, callbackID string) map[string]bool {
-	return hostabi.ActiveVendorSet(ctx, callbackID)
+func (s *Service) hostActiveVendors(ctx context.Context, callbackID string) map[string]bool {
+	return hostabi.ActiveVendorSet(ctx, callbackID, s.registry)
 }

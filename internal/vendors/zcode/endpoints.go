@@ -1,5 +1,10 @@
 package zcode
 
+import (
+	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
+)
+
 // 上游常量收口：URL、端点、客户端指纹与模型名。
 //
 // 约定与其它供应商一致：**禁止在别处硬编码上游常量**，一律引用本文件。
@@ -88,3 +93,20 @@ const (
 	CaptchaHeader       = "X-Aliyun-Captcha-Verify-Param"
 	CaptchaRegionHeader = "X-Aliyun-Captcha-Verify-Region"
 )
+
+// 本文件解析 ZCode 的供应商专属配置。
+
+var baseURLOverride core.URLOverride
+
+// Configure 解析 zcode_base_url。
+func Configure(_ core.Settings, raw map[string]string) {
+	baseURLOverride.Set(raw["zcode_base_url"])
+}
+
+// BaseURLOverride 返回配置的对话上游基地址覆盖值；空表示用内置默认。
+func BaseURLOverride() string { return baseURLOverride.Raw() }
+
+// ConfigFields 声明 zcode 专属配置。
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{{Name: "zcode_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"}}
+}

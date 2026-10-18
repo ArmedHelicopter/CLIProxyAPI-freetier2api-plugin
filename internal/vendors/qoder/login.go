@@ -24,7 +24,6 @@ import (
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/httpx"
 	"freetier2api-plugin/internal/loginsession"
-	"freetier2api-plugin/internal/vendors/qoder/bridge"
 	"freetier2api-plugin/internal/vendors/qoder/qoderapi"
 )
 
@@ -305,4 +304,3 @@ func summarizeBody(body []byte) string {
 }
 
 // 编译期确认 bridge 的凭证解析在本包可用（登录落盘要用它解回 token）。
-var _ = bridge.ParseOAuthSecret
