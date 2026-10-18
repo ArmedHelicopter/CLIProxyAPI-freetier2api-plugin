@@ -9,14 +9,19 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostabi"
@@ -388,4 +393,255 @@ func resolveVendorCredential(ctx context.Context, callbackID string, storageJSON
 			"credential has no resolvable vendor", http.StatusUnauthorized)
 	}
 	return credential, vendor, nil
+}
+
+// ---- 登录分发（原 auth_login.go） ----
+
+const (
+	// loginHTTPTimeout 是单次登录相关请求的上限。
+	loginHTTPTimeout = 30 * time.Second
+)
+
+// loginStartRPCRequest 与宿主的 auth.login.start 请求对齐。
+type loginStartRPCRequest struct {
+	pluginapi.AuthLoginStartRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// loginPollRPCRequest 与宿主的 auth.login.poll 请求对齐。
+type loginPollRPCRequest struct {
+	pluginapi.AuthLoginPollRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+// handleAuthLoginStart 开始一次登录，返回用户需要打开的授权链接。
+//
+// 登录协议由供应商实现，根层只做供应商路由与区域开关校验。
+func handleAuthLoginStart(request []byte) ([]byte, error) {
+	var rpc loginStartRPCRequest
+	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+	}
+	vendor, errVendor := vendorForLogin(rpc.Metadata)
+	if errVendor != nil {
+		return nil, errVendor
+	}
+
+	ctx, cancel := context.WithTimeout(hostabi.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
+	defer cancel()
+
+	login, okLogin := core.As[core.LoginProvider](vendor)
+	if !okLogin {
+		return nil, core.LoginUnsupported(vendor)
+	}
+	response, errStart := login.LoginStart(ctx, rpc.Metadata)
+	if errStart != nil {
+		return nil, core.ToPluginError(errStart)
+	}
+	// 供应商标识由根层统一注入，不交给各供应商自己记着。
+	//
+	// 宿主靠 metadata.vendor 把登录会话绑定回具体供应商；缺了它宿主拿不到
+	// 授权链接，页面只会看到「获取授权链接失败」。把这一步放在分发点而不是
+	// 各供应商的 LoginStart 里：新增供应商时没人会记得补，且漏掉时没有任何
+	// 编译期或运行期提示——本插件曾因此让 codearts / trae / traesolo 三个
+	// 供应商长期无法添加账号。
+	if response != nil {
+		if response.Metadata == nil {
+			response.Metadata = map[string]any{}
+		}
+		response.Metadata[core.VendorKey] = vendor.ID()
+		response.Metadata["region"] = vendor.Region()
+	}
+	logger.Info("started login (vendor=%s)", vendor.ID())
+	return core.OKEnvelope(response)
+}
+
+// handleAuthLoginPoll 轮询一次登录状态。
+//
+// 会话状态由供应商自己持有（各自的 state 结构不同），根层不参与。
+func handleAuthLoginPoll(request []byte) ([]byte, error) {
+	var rpc loginPollRPCRequest
+	if errDecode := decodeRequest(request, &rpc); errDecode != nil {
+		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+	}
+	sessionID := strings.TrimSpace(rpc.State)
+	if sessionID == "" {
+		return nil, core.NewPluginError("invalid_request", "login state is required", http.StatusBadRequest)
+	}
+	vendor, errVendor := vendorForLoginSession(sessionID)
+	if errVendor != nil {
+		return nil, errVendor
+	}
+
+	ctx, cancel := context.WithTimeout(hostabi.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
+	defer cancel()
+
+	login, okLogin := core.As[core.LoginProvider](vendor)
+	if !okLogin {
+		return nil, core.LoginUnsupported(vendor)
+	}
+	response, errPoll := login.LoginPoll(ctx, sessionID)
+	if errPoll != nil {
+		return nil, core.ToPluginError(errPoll)
+	}
+	return core.OKEnvelope(response)
+}
+
+// vendorForLogin 从登录请求的 Metadata 解析目标供应商。
+//
+// 控制台页把用户选的供应商标识放在 Metadata 的 vendor 字段里；
+// 缺失时回落到配置里启用的第一个供应商（兼容旧版页面只传 realm 的情况）。
+func vendorForLogin(metadata map[string]any) (core.Vendor, error) {
+	if metadata != nil {
+		if rawVendor, okVendor := metadata[core.VendorKey].(string); okVendor {
+			vendor, okLookup := core.VendorByID(rawVendor)
+			if !okLookup {
+				return nil, core.NewPluginError("invalid_request",
+					fmt.Sprintf("unknown vendor %q", rawVendor), http.StatusBadRequest)
+			}
+			if !vendorEnabled(vendor) {
+				return nil, core.NewPluginError("vendor_disabled",
+					fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
+			}
+			return vendor, nil
+		}
+		// 旧版页面只传 realm：按区域找第一个匹配的供应商。
+		if rawRegion, okRegion := metadata["region"].(string); okRegion && strings.TrimSpace(rawRegion) != "" {
+			if vendor, okFind := firstVendorForRegion(rawRegion); okFind {
+				return vendor, nil
+			}
+		}
+	}
+	if vendor, okDefault := firstEnabledVendor(); okDefault {
+		return vendor, nil
+	}
+	return nil, core.NewPluginError("vendor_disabled", "no vendor is enabled by plugin configuration", http.StatusBadRequest)
+}
+
+// vendorForLoginSession 按登录会话找供应商。
+//
+// 会话归属由持有会话表的供应商自证（loginSessionOwner 接口）。重构前这里
+// 还有一段「按 session id 前缀猜供应商」的兜底（trae_solo_ / workbuddy_ /
+// copilot_），那是会话登记不统一时的补丁；现在每个持有会话的供应商都实现了
+// 归属查询，猜前缀只会把会话错误路由给别家，因此删除。
+func vendorForLoginSession(sessionID string) (core.Vendor, error) {
+	for _, vendor := range core.Vendors() {
+		if !vendorEnabled(vendor) {
+			continue
+		}
+		if owner, okOwner := core.As[core.LoginSessionOwner](vendor); okOwner && owner.OwnsLoginSession(sessionID) {
+			return vendor, nil
+		}
+	}
+	return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
+}
+
+// vendorEnabled 报告供应商的区域是否被配置启用。
+func vendorEnabled(vendor core.Vendor) bool {
+	return realmEnabled(loadedConfig(), vendor.Region())
+}
+
+// firstEnabledVendor 返回配置里第一个启用的供应商。
+func firstEnabledVendor() (core.Vendor, bool) {
+	for _, vendor := range core.Vendors() {
+		if vendorEnabled(vendor) {
+			return vendor, true
+		}
+	}
+	return nil, false
+}
+
+// firstVendorForRegion 返回某个区域第一个启用的供应商。
+func firstVendorForRegion(region string) (core.Vendor, bool) {
+	normalized := strings.ToLower(strings.TrimSpace(region))
+	for _, vendor := range core.Vendors() {
+		if vendor.Region() == normalized && vendorEnabled(vendor) {
+			return vendor, true
+		}
+	}
+	return nil, false
+}
+
+// newHexID 生成 n 字节的随机十六进制串（2n 个字符）。
+//
+// 随机源不可用时退回基于时间与计数的确定性串：登录会话 id 只影响
+// 会话查找的唯一性，退化的熵在这种场景下可接受——比返回空串让整个
+// 登录链路崩掉好。
+func newHexID(n int) string {
+	buf := make([]byte, n)
+	if _, errRand := rand.Read(buf); errRand != nil {
+		return fmt.Sprintf("fallback-%d-%d", time.Now().UnixNano(), atomic.AddInt64(&hexIDCounter, 1))
+	}
+	return hex.EncodeToString(buf)
+}
+
+var hexIDCounter int64
+
+// ---- 凭证写回（原 credentials.go） ----
+
+// recordCheckinResult 把一次签到结果写进状态（供页面展示）。
+//
+// 接收中立的 core.CheckinResult：各家的签到结果字段不同，状态里只记
+// 两家都有的部分。
+func recordCheckinResult(credential *core.Credential, result *core.CheckinResult) {
+	if credential == nil || result == nil {
+		return
+	}
+	uid := credential.FileIDValue()
+	if uid == "" {
+		return
+	}
+	today := todayString()
+	mutateState(func(state *pluginState) {
+		record := state.Checkin[uid]
+		record.LastDate = today
+		if result.Credit > 0 {
+			record.Credit = result.Credit
+		}
+		if result.Energy > 0 {
+			record.Energy = result.Energy
+		}
+		state.Checkin[uid] = record
+	})
+}
+
+// saveRefreshedCredential 把续期后的凭证写回宿主与磁盘。
+//
+// 写两处是刻意的双保险：
+//   - host.auth.save 让宿主热更新内存注册表；
+//   - 直接写文件兜住 host.auth.save 不可用的场景。
+func saveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor,
+	entry core.HostAuth, original []byte, updated *core.Credential, filePath string) {
+	payload, okPayload := refreshedStorageJSON(vendor, original, updated)
+	if okPayload {
+		if _, errSave := hostabi.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
+			Name: entry.Name,
+			JSON: payload,
+		}); errSave != nil {
+			logger.Debug("keepalive %s: host.auth.save failed: %v", entry.Name, errSave)
+		}
+	}
+	targetPath := filePath
+	if targetPath == "" {
+		targetPath = entry.Path
+	}
+	if targetPath == "" {
+		return
+	}
+	if errWrite := os.WriteFile(targetPath, payload, 0o600); errWrite != nil {
+		logger.Debug("keepalive %s: write credential file failed: %v", entry.Name, errWrite)
+	}
+}
+
+// refreshedStorageJSON 用供应商自己的合并逻辑更新凭证 JSON。
+func refreshedStorageJSON(vendor core.Vendor, original []byte, updated *core.Credential) ([]byte, bool) {
+	merger, okMerger := vendor.(core.StorageMerger)
+	if !okMerger {
+		return original, false
+	}
+	merged, errMerge := merger.MergeStorageJSON(original, updated)
+	if errMerge != nil {
+		return original, false
+	}
+	return merged, true
 }

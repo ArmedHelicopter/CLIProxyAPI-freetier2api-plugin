@@ -9,9 +9,11 @@ package main
 import (
 	"context"
 	"net/http"
+	"strings"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/admin"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
@@ -159,3 +161,51 @@ func modelSupportsTools(model pluginapi.ModelInfo) bool {
 
 // extraModels 返回当前配置的额外模型条目（管理页展示用）。
 func extraModels(_ pluginConfig) []pluginapi.ModelInfo { return modelCatalog.ExtraModels() }
+
+// ---- 模型别名（原 modelalias.go） ----
+
+func modelAliasFor(vendorID, modelID string) string {
+	return modelCatalog.AliasFor(vendorID, modelID)
+}
+
+func resolveOutboundModel(vendorID, model string) string {
+	return modelCatalog.ResolveOutboundModel(vendorID, model)
+}
+
+func applyModelAliases(vendorID string, models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	return modelCatalog.ApplyAliases(vendorID, models)
+}
+
+// handleModelAlias 保留旧调用点（测试直接调用）。
+func handleModelAlias(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	return admin.ModelAlias(req)
+}
+
+// ---- 模型禁用/启用（原 modeldisable.go） ----
+
+// refreshDisabledModelCache 重算禁用集合（配置声明 ∪ 状态记录）。
+func refreshDisabledModelCache() { modelCatalog.RefreshFromState() }
+
+// reloadDisabledModelCache 仅供测试/初始化清空缓存。
+func reloadDisabledModelCache(disabled []string) {
+	_ = disabled
+	modelCatalog.ResetDisabledForTest()
+}
+
+func isModelDisabled(vendorID, modelID string) bool {
+	return modelCatalog.IsDisabled(vendorID, modelID)
+}
+
+func filterDisabledModelsForVendor(vendorID string, models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
+	return modelCatalog.FilterForVendor(vendorID, models)
+}
+
+// handleModelsToggle 保留旧调用点（测试直接调用）。
+func handleModelsToggle(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	return admin.ModelToggle(req)
+}
+
+// normalizeModelKeyForStorage 把待禁用的模型标识归一成存储键。
+func normalizeModelKeyForStorage(modelID string) string {
+	return strings.Join(modelconfig.ExpandKeys(modelID), "\n")
+}
