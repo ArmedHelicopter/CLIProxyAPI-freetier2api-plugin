@@ -307,7 +307,7 @@ func handleModelsList(req pluginapi.ManagementRequest) pluginapi.ManagementRespo
 	cfg := loadedConfig()
 	models := make([]consoleModel, 0, 128)
 
-	active := activeVendorSet(ctx, callbackID)
+	active := hostabi.ActiveVendorSet(ctx, callbackID)
 
 	// 逐个供应商取模型。如果供应商没有添加 auth/key，不要展示该供应商的模型。
 	for _, vendor := range core.Vendors() {
@@ -528,7 +528,7 @@ func cacheQuotaResult(q quotaResult, keys ...string) {
 
 // listAccountSummaries 列出本插件名下的账号概览。
 func listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
-	entries, errList := listHostAuths(ctx, callbackID)
+	entries, errList := hostabi.ListAuths(ctx, callbackID)
 	if errList != nil {
 		logger.Debug("list host auths failed: %v", errList)
 		return nil
@@ -560,14 +560,14 @@ func listAccountSummaries(ctx context.Context, callbackID string) []accountSumma
 		// 不能拿固定的解析器去解所有凭证——Qoder 的凭证用 WorkBuddy 的
 		// 解析器会失败，表现为页面上「凭证解析失败」。
 		var accountUID string
-		if raw, filePath, okRaw := getAuthJSONAndPathByIndex(ctx, callbackID, entry.AuthIndex); okRaw {
+		if raw, filePath, okRaw := hostabi.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex); okRaw {
 			if modTime.IsZero() && filePath != "" {
 				if fi, err := os.Stat(filePath); err == nil {
 					modTime = fi.ModTime()
 				}
 			}
 			// 按凭证归属解析；解不出时保留宿主给的 provider 作为兜底展示。
-			if credential, okParse := core.ParseCredential(raw, accountIdentity(entry), nil); okParse {
+			if credential, okParse := core.ParseCredential(raw, hostabi.AccountIdentity(entry), nil); okParse {
 				summary.VendorID = credential.VendorIDValue()
 				summary.Realm = credential.RegionValue()
 				if vendor, okVendor := core.VendorByID(summary.VendorID); okVendor {
@@ -701,7 +701,7 @@ func handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.Manag
 	defer cancel()
 	callbackID := hostCallbackID(req)
 
-	entries, errList := listHostAuths(ctx, callbackID)
+	entries, errList := hostabi.ListAuths(ctx, callbackID)
 	if errList != nil {
 		return jsonResponse(http.StatusOK, map[string]any{
 			"ok": false, "error": "读取账号列表失败：" + errList.Error(),
@@ -741,11 +741,11 @@ func handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.Manag
 // deleteAuthFile 删除一个账号的凭证文件。
 func deleteAuthFile(ctx context.Context, callbackID string, entry core.HostAuth) error {
 	// 先解析凭证，确认它确实归本插件——避免误删别家插件的凭证文件。
-	raw, filePath, okRaw := getAuthJSONAndPathByIndex(ctx, callbackID, entry.AuthIndex)
+	raw, filePath, okRaw := hostabi.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
 	if !okRaw {
 		return fmt.Errorf("读取凭证失败，无法确认归属")
 	}
-	if _, okParse := core.ParseCredential(raw, accountIdentity(entry), nil); !okParse {
+	if _, okParse := core.ParseCredential(raw, hostabi.AccountIdentity(entry), nil); !okParse {
 		return fmt.Errorf("该凭证不属于本插件，拒绝删除")
 	}
 
@@ -1004,7 +1004,7 @@ func handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 	defer cancel()
 	callbackID := hostCallbackID(req)
 
-	entries, errList := listHostAuths(ctx, callbackID)
+	entries, errList := hostabi.ListAuths(ctx, callbackID)
 	if errList != nil {
 		return jsonResponse(http.StatusOK, map[string]any{
 			"ok": false, "results": []any{},
@@ -1032,7 +1032,7 @@ func handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 		}
 		var raw []byte
 		if entry.AuthIndex != "" {
-			if r, ok := getAuthJSONByIndex(ctx, callbackID, entry.AuthIndex); ok {
+			if r, ok := hostabi.AuthJSON(ctx, callbackID, entry.AuthIndex); ok {
 				raw = r
 			}
 		}
@@ -1052,7 +1052,7 @@ func handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 		}
 		if len(raw) == 0 {
 			targetID := core.FirstNonEmpty(entry.AuthIndex, entry.ID, entry.Name)
-			if r, err := fetchAuthJSON(ctx, callbackID, targetID); err == nil && len(r) > 0 {
+			if r, err := hostabi.FetchAuthJSON(ctx, callbackID, targetID); err == nil && len(r) > 0 {
 				raw = r
 			}
 		}
@@ -1067,7 +1067,7 @@ func handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementRe
 		}
 		// 按凭证归属分发解析：拿固定解析器解所有凭证会让另一家的凭证
 		// 报「凭证解析失败」（例如 Qoder 的凭证用 WorkBuddy 的结构去解）。
-		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, accountIdentity(entry), nil)
+		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, hostabi.AccountIdentity(entry), nil)
 		if errResolve != nil {
 			preResults = append(preResults, quotaResult{
 				AuthID:  core.FirstNonEmpty(entry.ID, entry.Name),
@@ -1184,7 +1184,7 @@ func runForAccounts(
 	filter func(core.Vendor, *core.Credential) bool,
 	action func(context.Context, core.Vendor, *core.Credential) (string, error),
 ) []accountActionResult {
-	entries, errList := listHostAuths(ctx, callbackID)
+	entries, errList := hostabi.ListAuths(ctx, callbackID)
 	if errList != nil {
 		return []accountActionResult{{OK: false, Message: "读取账号列表失败：" + errList.Error()}}
 	}
@@ -1210,12 +1210,12 @@ func runForAccounts(
 		if entry.Disabled || entry.Unavailable {
 			continue
 		}
-		raw, okRaw := getAuthJSONByIndex(ctx, callbackID, entry.AuthIndex)
+		raw, okRaw := hostabi.AuthJSON(ctx, callbackID, entry.AuthIndex)
 		if !okRaw {
 			continue
 		}
 		// 按归属分发：拿固定解析器解所有凭证会让另一家的凭证被静默跳过。
-		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, accountIdentity(entry), nil)
+		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, hostabi.AccountIdentity(entry), nil)
 		if errResolve != nil {
 			continue
 		}
@@ -1375,7 +1375,7 @@ func handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.Managemen
 	defer cancel()
 	callbackID := hostCallbackID(req)
 
-	entries, errList := listHostAuths(ctx, callbackID)
+	entries, errList := hostabi.ListAuths(ctx, callbackID)
 	if errList != nil {
 		return jsonResponse(http.StatusOK, map[string]any{
 			"ok": false, "error": "读取账号列表失败：" + errList.Error(),
@@ -1394,12 +1394,12 @@ func handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.Managemen
 		if entry.Disabled || entry.Unavailable {
 			continue
 		}
-		raw, filePath, okRaw := getAuthJSONAndPathByIndex(ctx, callbackID, entry.AuthIndex)
+		raw, filePath, okRaw := hostabi.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
 		if !okRaw {
 			continue
 		}
 		// 按归属分发：续期链路各家不同（WorkBuddy 换 token，Qoder jobToken 交换）。
-		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, accountIdentity(entry), nil)
+		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, hostabi.AccountIdentity(entry), nil)
 		if errResolve != nil {
 			continue
 		}

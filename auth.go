@@ -339,7 +339,7 @@ func credentialForAuth(ctx context.Context, callbackID string, storageJSON []byt
 		if cached, okCache := cachedCredential(trimmed); okCache {
 			return cached, nil
 		}
-		raw, errFetch := fetchAuthJSON(ctx, callbackID, trimmed)
+		raw, errFetch := hostabi.FetchAuthJSON(ctx, callbackID, trimmed)
 		if errFetch == nil && len(raw) > 0 {
 			if credential, okParse := core.ParseCredential(raw, trimmed, attributes); okParse {
 				storeCredential(trimmed, credential)

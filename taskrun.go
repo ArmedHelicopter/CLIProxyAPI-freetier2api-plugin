@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/vendors/workbuddy"
 )
@@ -274,7 +275,7 @@ func sleepCtx(ctx context.Context, d time.Duration) bool {
 // 统一的遍历入口：过滤掉已禁用、已不可用、域被关闭的账号，
 // 并跳过没有 refresh token 的账号（它们无法参与任何需要鉴权的操作）。
 func forEachAccount(ctx context.Context, callbackID string, fn func(context.Context, *accountContext) error) {
-	entries, errList := listHostAuths(ctx, callbackID)
+	entries, errList := hostabi.ListAuths(ctx, callbackID)
 	if errList != nil {
 		logger.Error("list accounts failed: %v", errList)
 		return
@@ -284,11 +285,11 @@ func forEachAccount(ctx context.Context, callbackID string, fn func(context.Cont
 		if entry.Disabled || entry.Unavailable {
 			continue
 		}
-		raw, okRaw := getAuthJSONByIndex(ctx, callbackID, entry.AuthIndex)
+		raw, okRaw := hostabi.AuthJSON(ctx, callbackID, entry.AuthIndex)
 		if !okRaw {
 			continue
 		}
-		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, accountIdentity(entry), nil)
+		credential, vendor, errResolve := resolveVendorCredential(ctx, callbackID, raw, hostabi.AccountIdentity(entry), nil)
 		if errResolve != nil {
 			logger.Debug("skip account %s: %v", entry.Name, errResolve)
 			continue

@@ -1,4 +1,4 @@
-package main
+package hostabi
 
 // 本文件封装宿主提供的凭证回调（host.auth.list / host.auth.get）。
 
@@ -12,12 +12,8 @@ import (
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostabi"
 	"freetier2api-plugin/internal/logger"
 )
-
-// pluginAuthName 是本插件凭证在宿主里的类型名（对应宿主 auth 记录的 Type）。
-const pluginAuthName = providerKey
 
 // listHostAuths 列出本插件名下的全部凭证。
 //
@@ -33,8 +29,8 @@ const pluginAuthName = providerKey
 //
 // 兜底依据：这些凭证文件的文件名仍是 workbuddy-*.json（本插件的命名约定），
 // 按名字也属于本插件，因此一并收下——否则用户的合法账号会在页面上凭空消失。
-func listHostAuths(ctx context.Context, callbackID string) ([]core.HostAuth, error) {
-	raw, errCall := hostabi.Call(callbackID, pluginabi.MethodHostAuthList, map[string]any{})
+func ListAuths(ctx context.Context, callbackID string) ([]core.HostAuth, error) {
+	raw, errCall := Call(callbackID, pluginabi.MethodHostAuthList, map[string]any{})
 	if errCall != nil {
 		return nil, fmt.Errorf("host.auth.list: %w", errCall)
 	}
@@ -105,7 +101,7 @@ func filterPluginAuths(entries []core.HostAuth) []core.HostAuth {
 
 	for _, entry := range entries {
 		provider := strings.TrimSpace(entry.Provider)
-		belongs := (provider != "" && strings.EqualFold(provider, pluginAuthName)) || fileNameBelongsToPlugin(entry.Name)
+		belongs := (provider != "" && strings.EqualFold(provider, core.ProviderKey)) || fileNameBelongsToPlugin(entry.Name)
 		if !belongs {
 			continue
 		}
@@ -153,7 +149,7 @@ func logHostCallFailure(method string, err error) {
 //
 // 取值优先级：Name（磁盘文件名，登录落盘时生成，可读且稳定）→ ID（宿主
 // 稳定标识，运行时账号没有 Name）→ AuthIndex（最后兜底，仅保证非空）。
-func accountIdentity(entry core.HostAuth) string {
+func AccountIdentity(entry core.HostAuth) string {
 	for _, candidate := range []string{entry.Name, entry.ID, entry.AuthIndex} {
 		if trimmed := strings.TrimSuffix(strings.TrimSpace(candidate), ".json"); trimmed != "" {
 			return trimmed
@@ -238,17 +234,17 @@ func fileNameBelongsToPlugin(name string) bool {
 //
 // 宿主的 host.auth.get 只认 auth_index（按 id 查会失败），
 // 因此调用方若是从 id 出发，必须先经列表把 id 映射成 index。
-func fetchAuthJSON(ctx context.Context, callbackID, authID string) ([]byte, error) {
+func FetchAuthJSON(ctx context.Context, callbackID, authID string) ([]byte, error) {
 	index := strings.TrimSpace(authID)
 	if index == "" {
 		return nil, fmt.Errorf("auth id is empty")
 	}
 	// 先直接按 index 查（多数调用方传进来的就是 index）。
-	if raw, okFound := getAuthJSONByIndex(ctx, callbackID, index); okFound {
+	if raw, okFound := AuthJSON(ctx, callbackID, index); okFound {
 		return raw, nil
 	}
 	// 回退：把 id 映射成 index 再查。
-	entries, errList := listHostAuths(ctx, callbackID)
+	entries, errList := ListAuths(ctx, callbackID)
 	if errList != nil {
 		return nil, errList
 	}
@@ -256,7 +252,7 @@ func fetchAuthJSON(ctx context.Context, callbackID, authID string) ([]byte, erro
 		if entry.ID != index && entry.Name != index {
 			continue
 		}
-		if raw, okFound := getAuthJSONByIndex(ctx, callbackID, entry.AuthIndex); okFound {
+		if raw, okFound := AuthJSON(ctx, callbackID, entry.AuthIndex); okFound {
 			return raw, nil
 		}
 	}
@@ -264,12 +260,12 @@ func fetchAuthJSON(ctx context.Context, callbackID, authID string) ([]byte, erro
 }
 
 // getAuthJSONAndPathByIndex 按 auth_index 取凭证 JSON 和物理文件路径。
-func getAuthJSONAndPathByIndex(ctx context.Context, callbackID, authIndex string) ([]byte, string, bool) {
+func AuthJSONAndPath(ctx context.Context, callbackID, authIndex string) ([]byte, string, bool) {
 	trimmed := strings.TrimSpace(authIndex)
 	if trimmed == "" {
 		return nil, "", false
 	}
-	raw, errCall := hostabi.Call(callbackID, pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: trimmed})
+	raw, errCall := Call(callbackID, pluginabi.MethodHostAuthGet, pluginapi.HostAuthGetRequest{AuthIndex: trimmed})
 	if errCall != nil {
 		logHostCallFailure(pluginabi.MethodHostAuthGet, errCall)
 		return nil, "", false
@@ -285,8 +281,8 @@ func getAuthJSONAndPathByIndex(ctx context.Context, callbackID, authIndex string
 }
 
 // getAuthJSONByIndex 按 auth_index 取凭证 JSON。
-func getAuthJSONByIndex(ctx context.Context, callbackID, authIndex string) ([]byte, bool) {
-	raw, _, ok := getAuthJSONAndPathByIndex(ctx, callbackID, authIndex)
+func AuthJSON(ctx context.Context, callbackID, authIndex string) ([]byte, bool) {
+	raw, _, ok := AuthJSONAndPath(ctx, callbackID, authIndex)
 	return raw, ok
 }
 
@@ -294,8 +290,8 @@ func getAuthJSONByIndex(ctx context.Context, callbackID, authIndex string) ([]by
 //
 // 用于模型列表过滤：如果某个供应商未添加 auth/key，模型列表既不去上游获取，
 // 也不在列表里展示该供应商的模型。
-func activeVendorSet(ctx context.Context, callbackID string) map[string]bool {
-	entries, errList := listHostAuths(ctx, callbackID)
+func ActiveVendorSet(ctx context.Context, callbackID string) map[string]bool {
+	entries, errList := ListAuths(ctx, callbackID)
 	if errList != nil {
 		logger.Debug("activeVendorSet: list host auths failed: %v", errList)
 		return map[string]bool{}
@@ -305,7 +301,7 @@ func activeVendorSet(ctx context.Context, callbackID string) map[string]bool {
 		if entry.Disabled || entry.Unavailable {
 			continue
 		}
-		raw, _, okRaw := getAuthJSONAndPathByIndex(ctx, callbackID, entry.AuthIndex)
+		raw, _, okRaw := AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
 		if !okRaw && entry.Path != "" {
 			if r, err := os.ReadFile(entry.Path); err == nil && len(r) > 0 {
 				raw = r

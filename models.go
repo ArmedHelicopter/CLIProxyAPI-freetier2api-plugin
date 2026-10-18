@@ -107,7 +107,7 @@ func handleModelForAuth(request []byte) ([]byte, error) {
 func staticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
 	var all []pluginapi.ModelInfo
 	var firstErr error
-	active := activeVendorSet(ctx, "")
+	active := hostabi.ActiveVendorSet(ctx, "")
 	for _, vendor := range core.Vendors() {
 		if !realmEnabled(loadedConfig(), vendor.Region()) {
 			continue
@@ -318,7 +318,7 @@ func applyModelCatalog(cfg pluginConfig) {
 // 取不到就放弃（探测失败会退回静态兜底表，不影响可用性）。
 func probeCredentialForRealm(region workbuddy.Region) *workbuddy.Credential {
 	ctx := context.Background()
-	entries, errList := listHostAuths(ctx, "")
+	entries, errList := hostabi.ListAuths(ctx, "")
 	if errList != nil {
 		logger.Debug("list host auths for model probe failed: %v", errList)
 		return nil
@@ -327,7 +327,7 @@ func probeCredentialForRealm(region workbuddy.Region) *workbuddy.Credential {
 		if entry.Disabled || entry.Unavailable {
 			continue
 		}
-		stored, okStored := getAuthJSONByIndex(ctx, "", entry.AuthIndex)
+		stored, okStored := hostabi.AuthJSON(ctx, "", entry.AuthIndex)
 		if !okStored {
 			continue
 		}
@@ -412,7 +412,7 @@ func refreshModelsFromUpstream(ctx context.Context) (int, error) {
 
 	total := 0
 	var firstErr error
-	active := activeVendorSet(ctx, "")
+	active := hostabi.ActiveVendorSet(ctx, "")
 	for _, vendor := range core.Vendors() {
 		if !realmEnabled(loadedConfig(), vendor.Region()) {
 			continue

@@ -9,6 +9,7 @@ import (
 	"context"
 
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostabi"
 )
 
 // hostBridge 实现 core.Host。
@@ -16,12 +17,12 @@ type hostBridge struct{}
 
 // ListAuths 复用根层的凭证枚举（含「被前置插件抢走但仍按文件名归属」的兜底）。
 func (hostBridge) ListAuths(ctx context.Context) ([]core.HostAuth, error) {
-	return listHostAuths(ctx, "")
+	return hostabi.ListAuths(ctx, "")
 }
 
 // AuthJSON 复用根层的 host.auth.get 封装。
 func (hostBridge) AuthJSON(ctx context.Context, authIndex string) ([]byte, bool) {
-	return getAuthJSONByIndex(ctx, "", authIndex)
+	return hostabi.AuthJSON(ctx, "", authIndex)
 }
 
 // Settings 把根层配置映射成中立快照。

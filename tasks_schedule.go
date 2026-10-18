@@ -120,7 +120,7 @@ func runKeepaliveAll(ctx context.Context) {
 			logger.Error("keepalive %s: %v", account.label(), errRefresh)
 			return nil
 		}
-		raw, okRaw := getAuthJSONByIndex(ctx, account.callbackID, account.entry.AuthIndex)
+		raw, okRaw := hostabi.AuthJSON(ctx, account.callbackID, account.entry.AuthIndex)
 		if okRaw {
 			if updated, errMerge := workbuddy.MergeStorageJSON(raw, accountNative(account)); errMerge == nil {
 				if _, errSave := hostabi.Call(account.callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
