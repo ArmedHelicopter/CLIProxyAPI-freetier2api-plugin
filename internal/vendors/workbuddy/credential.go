@@ -435,12 +435,14 @@ func SaveCredentialFile(path string, cred *Credential) error {
 // 注意：本函数只判断「属于本协议」，**不判断区域**——区域由 core.ResolveVendor
 // 的文件名前缀与 vendor 字段决定，或由具体 vendor 实例的 Match 二次确认。
 func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
-	// 1) 显式声明（最可靠，也是推荐的写法）。
-	if strings.EqualFold(strings.TrimSpace(provider), ProviderKey) {
-		return true
-	}
-	if typeValue, okType := raw["type"].(string); okType && strings.EqualFold(strings.TrimSpace(typeValue), ProviderKey) {
-		return true
+	// 1) 显式声明（最可靠，也是推荐的写法：支持当前 freetier 及历史 workbuddy / codebuddy 标识）。
+	for _, expected := range []string{ProviderKey, "workbuddy", "codebuddy"} {
+		if strings.EqualFold(strings.TrimSpace(provider), expected) {
+			return true
+		}
+		if typeValue, okType := raw["type"].(string); okType && strings.EqualFold(strings.TrimSpace(typeValue), expected) {
+			return true
+		}
 	}
 
 	// 2) 文件名约定。
@@ -456,6 +458,12 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
 		if hasAccess && hasRefresh {
 			return true
 		}
+	}
+
+	// 4) 域名特征：workbuddy.ai 或 codebuddy.cn 域名。
+	domain := core.FirstNonEmpty(core.GetString(raw, "domain"), core.GetString(core.GetMap(raw, "auth"), "domain"))
+	if d := strings.ToLower(domain); strings.Contains(d, "workbuddy.ai") || strings.Contains(d, "codebuddy.cn") {
+		return true
 	}
 	return false
 }

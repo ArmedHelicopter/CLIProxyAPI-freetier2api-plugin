@@ -120,3 +120,62 @@ func TestAuthParseVendorOwnershipDiscrimination(t *testing.T) {
 		})
 	}
 }
+
+// TestLegacyWorkBuddyAccountNotClaimedByCline 验证安装 FreeTier 2API 前添加的 CodeBuddy/WorkBuddy 账号
+// 不会被 Cline 抢先误吞，且国内版和国际版分别归属到 workbuddycn 和 workbuddyglobal。
+func TestLegacyWorkBuddyAccountNotClaimedByCline(t *testing.T) {
+	installFakeHost(t)
+	setupTestPlugin(t)
+
+	cases := []struct {
+		name       string
+		fileName   string
+		body       string
+		wantVendor string
+	}{
+		{
+			name:       "workbuddy global flat legacy file",
+			fileName:   "workbuddy-fb0e95d.json",
+			body:       `{"accessToken":"at_123","refreshToken":"rt_456","domain":"www.workbuddy.ai","uid":"fb0e95d"}`,
+			wantVendor: "workbuddyglobal",
+		},
+		{
+			name:       "workbuddy global legacy with device token",
+			fileName:   "workbuddy-user1.json",
+			body:       `{"accessToken":"at_123","refreshToken":"rt_456","domain":"workbuddy.ai","device_token":"dt_789"}`,
+			wantVendor: "workbuddyglobal",
+		},
+		{
+			name:       "workbuddy cn flat legacy file",
+			fileName:   "workbuddy-user2.json",
+			body:       `{"accessToken":"at_123","refreshToken":"rt_456","domain":"www.codebuddy.cn","uid":"user2"}`,
+			wantVendor: "workbuddycn",
+		},
+		{
+			name:       "workbuddy cn default legacy file",
+			fileName:   "workbuddy-user3.json",
+			body:       `{"accessToken":"at_123","refreshToken":"rt_456","uid":"user3"}`,
+			wantVendor: "workbuddycn",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			result := callMethod(t, pluginabi.MethodAuthParse, pluginapi.AuthParseRequest{
+				FileName: tc.fileName,
+				RawJSON:  []byte(tc.body),
+			})
+			var response pluginapi.AuthParseResponse
+			if errUnmarshal := json.Unmarshal(result, &response); errUnmarshal != nil {
+				t.Fatalf("decode parse response: %v", errUnmarshal)
+			}
+			if !response.Handled {
+				t.Fatalf("expected account %s to be handled", tc.fileName)
+			}
+			gotVendor := response.Auth.Attributes[core.VendorKey]
+			if gotVendor != tc.wantVendor {
+				t.Fatalf("vendor = %q, want %q (must not be claimed by cline)", gotVendor, tc.wantVendor)
+			}
+		})
+	}
+}

@@ -115,13 +115,17 @@ func ParseCredential(raw []byte) (*Credential, error) {
 // 误吞别家的会让宿主用本插件的结构覆盖对方账号（且是静默的）。
 //
 // 只接受 Cline 特有的证据：
-//  1. 令牌带 workos: 前缀（Cline 独有）；
-//  2. 文件名含 cline 段；
-//  3. 同时有 refreshToken 与 Cline 特有的字段组合。
-//
-// 刻意不用 "token" / "access_token" 这类通用字段名做判据：Qoder 与
-// WorkBuddy 的凭证也有这些字段，拿它们当判据必然跨供应商误吞。
+//  1. 显式声明了别的 vendor 则绝不认领；
+//  2. 令牌带 workos: 前缀（Cline 独有）；
+//  3. 文件名含 cline 段；
+//  4. 绝不认领明显属于其它供应商的文件名（如 workbuddy-*.json 等）；
+//  5. 绝不认领含其它供应商特征（domain, device_token, auth/account 对象等）的凭证；
+//  6. 在排除全部其它供应商特征后，才允许无异义的 refreshToken 兜底。
 func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
+	// 显式 vendor 字段优先：声明了别家就绝不认领。
+	if decided, claimed := core.VendorFieldVerdict(raw, VendorID); decided {
+		return claimed
+	}
 	if core.FileNameMatchesConvention(fileName, VendorID) {
 		return true
 	}
@@ -131,12 +135,59 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
 	if hasWorkOSPrefix(raw) {
 		return true
 	}
-	// 驼峰 refreshToken 是 Cline 与 cline2api 导出格式的写法：
-	// 别家供应商（Qoder / WorkBuddy）用的是下划线 refresh_token。
+	// 跨供应商误吞防护：若文件名或字段带有其它供应商的特征，绝不认领。
+	if isForeignFileName(fileName) || hasForeignMarker(raw) {
+		return false
+	}
+	// 驼峰 refreshToken 在排除全部别家特征后作为通用兜底。
 	if _, okRefresh := raw["refreshToken"]; okRefresh {
 		return true
 	}
 	_ = provider
+	return false
+}
+
+// isForeignFileName 报告文件名是否符合其它已知供应商的命名约定。
+func isForeignFileName(fileName string) bool {
+	return core.FileNameMatchesConvention(fileName,
+		"workbuddy", "workbuddycn", "workbuddyglobal", "codebuddy",
+		"qoder", "qodercn", "qoderglobal",
+		"trae", "traecn", "traeglobal", "traesolo",
+		"minimax", "minimaxcode", "minimaxcodecn", "minimaxcodeglobal",
+		"opencode", "opencodezen", "zen",
+		"zcode", "codearts",
+	)
+}
+
+// hasForeignMarker 报告凭证里是否带有其它供应商的专属或特征字段。
+func hasForeignMarker(raw map[string]any) bool {
+	if raw == nil {
+		return false
+	}
+	for _, key := range []string{
+		"device_token", "enterpriseId", "enterprise_id",
+		"domain", "realm", "region", "secret", "zen_key",
+		"agent_id", "agentId", "realUserID", "real_user_id",
+		"access_key_id", "secret_access_key", "dpop_private_key",
+	} {
+		if val, exists := raw[key]; exists && val != nil && val != "" {
+			return true
+		}
+	}
+	// WorkBuddy 的嵌套形态：auth 或 account 是对象。
+	if authMap, ok := raw["auth"].(map[string]any); ok && len(authMap) > 0 {
+		return true
+	}
+	if accountMap, ok := raw["account"].(map[string]any); ok && len(accountMap) > 0 {
+		return true
+	}
+	// 其它供应商的 type 声明。
+	if typeVal, ok := raw["type"].(string); ok {
+		trimmed := strings.ToLower(strings.TrimSpace(typeVal))
+		if trimmed != "" && trimmed != "freetier" && trimmed != "cline" {
+			return true
+		}
+	}
 	return false
 }
 

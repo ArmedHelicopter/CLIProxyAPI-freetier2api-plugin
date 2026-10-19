@@ -135,6 +135,11 @@ func TestLooksLikeCredential(t *testing.T) {
 		{"host provider hint", map[string]any{}, "x.json", ProviderKey, true},
 		{"type field", map[string]any{"type": ProviderKey}, "x.json", "", true},
 		{"type field uppercase", map[string]any{"type": "FreeTier"}, "x.json", "", true},
+		{"legacy workbuddy type", map[string]any{"type": "workbuddy"}, "x.json", "", true},
+		{"legacy codebuddy type", map[string]any{"type": "codebuddy"}, "x.json", "", true},
+		{"domain workbuddy.ai", map[string]any{"domain": "www.workbuddy.ai"}, "x.json", "", true},
+		{"domain codebuddy.cn", map[string]any{"domain": "www.codebuddy.cn"}, "x.json", "", true},
+		{"nested domain workbuddy.ai", map[string]any{"auth": map[string]any{"domain": "api.workbuddy.ai"}}, "x.json", "", true},
 
 		// 文件名约定。CN 与 GLOBAL 是独立供应商，两者都要被本协议认出
 		// （具体区域由 core.ResolveVendor 的前缀匹配决定）。

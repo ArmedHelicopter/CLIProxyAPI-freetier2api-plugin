@@ -18,6 +18,13 @@ func TestLooksLikeCredential_Cline(t *testing.T) {
 		{"snake refresh_token alone is not enough", "x.json", map[string]any{"refresh_token": "rt"}, false},
 		{"qoder style pt prefix", "x.json", map[string]any{"access_token": "pt-abc"}, false},
 		{"workbuddy device token", "x.json", map[string]any{"device_token": "dt-abc", "account": map[string]any{}}, false},
+		{"workbuddy filename rejected", "workbuddy-fb0e95d.json", map[string]any{"refreshToken": "rt", "accessToken": "at"}, false},
+		{"workbuddy domain rejected", "acc.json", map[string]any{"refreshToken": "rt", "domain": "www.workbuddy.ai"}, false},
+		{"workbuddy device token with refresh rejected", "acc.json", map[string]any{"refreshToken": "rt", "device_token": "dt-123"}, false},
+		{"workbuddy enterprise rejected", "acc.json", map[string]any{"refreshToken": "rt", "enterpriseId": "ent-1"}, false},
+		{"workbuddy type rejected", "acc.json", map[string]any{"type": "workbuddy", "refreshToken": "rt"}, false},
+		{"foreign vendor rejected", "acc.json", map[string]any{"vendor": "workbuddyglobal", "refreshToken": "rt"}, false},
+		{"qoder filename rejected", "qoder-abc.json", map[string]any{"refreshToken": "rt"}, false},
 		{"empty", "x.json", nil, false},
 	}
 	for _, tc := range cases {
