@@ -65,6 +65,10 @@ tr:last-child td { border-bottom: none; }
 label { display: inline-flex; align-items: center; gap: 6px; }
 input[type=text], input[type=number] { padding: 6px 8px; border: 1px solid var(--border);
         border-radius: 6px; background: var(--bg); color: var(--fg); font-size: 13px; }
+/* 回调链接很长，用等宽字体 + 手动换行才看得出参数有没有粘全。 */
+textarea { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
+        background: var(--bg); color: var(--fg); font-size: 13px; width: 100%;
+        font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
 /* 表格内联输入：点击别名后出现，贴合表格行高。 */
 input.aliasinput { padding: 3px 6px; width: 100%; min-width: 96px; font-size: 13px;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -159,6 +163,17 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
           <button class="act" id="btnCopyUrl">复制</button>
         </div>
         <div class="hint" id="loginStatus">等待授权…</div>
+        <details id="loginPasteBox" hidden>
+          <summary>回调没到插件？粘贴回调链接</summary>
+          <div class="hint" id="loginPasteHint"></div>
+          <textarea id="loginPasteUrl" rows="3"
+            placeholder="把浏览器地址栏里的整条 localhost 链接粘贴到这里"></textarea>
+          <div class="row" style="margin-top:8px">
+            <button class="act" id="btnSubmitCallback">提交回调链接</button>
+            <a id="loginPasteRedirect" target="_blank" rel="noopener" hidden>打开华为云登录页</a>
+            <span class="hint" id="loginPasteStatus"></span>
+          </div>
+        </details>
       </div>
 
       <div class="card" id="apiKeyBox" hidden>
@@ -1437,6 +1452,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   }
 
   var currentApiKeyVendor = null;
+  // currentLoginState 记着本次登录的 state：粘贴回调链接时要带回去，
+  // 插件据此认出是哪一个会话的回调。
+  var currentLoginState = "";
 
   // startVendorAdd 根据供应商能力决定「添加账号」的动作。
   //
@@ -1449,7 +1467,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
     if (vendor.supports_login !== false && vendor.auth_mode !== "apikey") {
       if (apiKeyBox) apiKeyBox.hidden = true;
-      startLogin(vendor.id);
+      startLogin(vendor);
       return;
     }
 
@@ -1466,19 +1484,37 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     }
   }
 
-  function startLogin(vendorID) {
+  function startLogin(vendor) {
     stopLoginPolling();
+    currentLoginState = "";
     var box = document.getElementById("loginBox");
     var urlField = document.getElementById("loginUrl");
     var status = document.getElementById("loginStatus");
+    var pasteBox = document.getElementById("loginPasteBox");
     box.hidden = false;
     urlField.value = "";
     status.textContent = "正在获取授权链接…";
 
+    // 粘贴兜底只对「上游只认 localhost 回调」的供应商有意义（Trae / CodeArts）：
+    // 别的供应商没有本机回调，展开它只会让人以为可以往这里贴东西。
+    var canPaste = !!(vendor && vendor.paste_callback);
+    pasteBox.hidden = !canPaste;
+    document.getElementById("loginPasteRedirect").hidden = true;
+    if (canPaste) {
+      var hint = ((vendor && vendor.callback_hint) || "").trim() || "http://127.0.0.1/";
+      document.getElementById("loginPasteHint").textContent =
+        "上游只认本机回调地址 " + hint +
+        "。与插件同一台机器时直接点「打开链接」即可；远程 / Docker 部署时浏览器会停在该地址上，" +
+        "把地址栏里的整条链接复制后粘贴到下面提交。";
+      document.getElementById("loginPasteUrl").value = "";
+      document.getElementById("loginPasteStatus").textContent = "";
+      document.getElementById("btnSubmitCallback").disabled = false;
+    }
+
     // 供应商经 metadata 传给插件：宿主按路径解析 provider（/freetier-auth-url），
     // 插件再按 vendor 参数选具体供应商实例。路径里不能带 vendor——
     // 宿主会把它当成 provider 名去校验，直接 404。
-    api("GET", hostPath("/freetier-auth-url?vendor=" + encodeURIComponent(vendorID))).then(function (data) {
+    api("GET", hostPath("/freetier-auth-url?vendor=" + encodeURIComponent(vendor.id))).then(function (data) {
       if (!data || !data.url) {
         status.textContent = "获取授权链接失败：" + ((data && data.error) || "响应缺少 url");
         return;
@@ -1486,6 +1522,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       urlField.value = data.url;
       status.textContent = "请打开下面的链接完成授权，页面会自动检测结果。";
       var state = data.state || "";
+      currentLoginState = state;
       if (state) pollLogin(state);
     }).catch(function (err) {
       status.textContent = "获取授权链接失败：" + err.message;
@@ -1508,6 +1545,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         var value = (data && data.status) || "";
         if (value === "ok") {
           stopLoginPolling();
+          currentLoginState = "";
           status.textContent = "授权成功，账号已写入 CPA。";
           banner("ok", "账号添加成功，正在查询该账号额度…");
           // 串行：先把新账号拉进账号表，再查额度（新账号不在已有结果里，
@@ -1549,6 +1587,57 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       document.getElementById("loginStatus").textContent = "复制失败，请手动选中复制。";
     }
   });
+
+  // submitLoginCallback 提交用户粘贴的 localhost 回调链接。
+  //
+  // 远程 / Docker 部署时，浏览器跳转不到插件监听的 127.0.0.1，授权后会停在
+  // 「无法访问此网站」；把地址栏里的整条链接粘回来，插件在本地解析完成登录。
+  // 链接里带着授权票据，页面不显示、不记录，只发给插件。
+  function submitLoginCallback() {
+    var pasteStatus = document.getElementById("loginPasteStatus");
+    var redirect = document.getElementById("loginPasteRedirect");
+    var btn = document.getElementById("btnSubmitCallback");
+    var raw = document.getElementById("loginPasteUrl").value.trim();
+    if (!currentLoginState) {
+      pasteStatus.textContent = "登录会话已结束，请重新发起登录后再粘贴。";
+      return;
+    }
+    if (!raw) {
+      pasteStatus.textContent = "请先粘贴浏览器地址栏里的整条链接。";
+      return;
+    }
+    btn.disabled = true;
+    btn.textContent = "提交中…";
+    redirect.hidden = true;
+    api("POST", "/login/callback", { state: currentLoginState, url: raw }).then(function (data) {
+      btn.disabled = false;
+      btn.textContent = "提交回调链接";
+      var value = (data && data.status) || "";
+      var message = (data && data.message) || "";
+      if (value === "success") {
+        stopLoginPolling();
+        // 回调链接里有授权票据，成功后立刻从页面里清掉，不留在 DOM 与剪贴板历史里。
+        document.getElementById("loginPasteUrl").value = "";
+        pasteStatus.textContent = message || "解析成功，正在写入账号…";
+        document.getElementById("loginStatus").textContent = "授权成功，账号已写入 CPA。";
+        banner("ok", "账号添加成功，正在查询该账号额度…");
+        loadStatus().then(function () { loadQuotas(true); });
+        return;
+      }
+      pasteStatus.textContent = message || "回调链接暂时无法完成登录，请稍后重试。";
+      // CodeArts：票据尚未换到凭证，需要在能联网的浏览器里打开门户登录页。
+      if (data && data.redirect_url) {
+        redirect.href = data.redirect_url;
+        redirect.hidden = false;
+      }
+    }).catch(function (err) {
+      btn.disabled = false;
+      btn.textContent = "提交回调链接";
+      pasteStatus.textContent = "提交失败：" + err.message;
+    });
+  }
+
+  document.getElementById("btnSubmitCallback").addEventListener("click", submitLoginCallback);
 
   document.getElementById("btnCancelApiKey").addEventListener("click", function () {
     document.getElementById("apiKeyBox").hidden = true;

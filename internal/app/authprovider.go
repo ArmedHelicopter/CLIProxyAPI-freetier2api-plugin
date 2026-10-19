@@ -503,18 +503,61 @@ func (a *App) vendorForLogin(metadata map[string]any) (core.Vendor, error) {
 
 // vendorForLoginSession 按登录会话找供应商。
 //
-// 会话归属由持有会话表的供应商自证（loginSessionOwner 接口）。重构前这里
-// 还有一段「按 session id 前缀猜供应商」的兜底（trae_solo_ / workbuddy_ /
-// copilot_），那是会话登记不统一时的补丁；现在每个持有会话的供应商都实现了
-// 归属查询，猜前缀只会把会话错误路由给别家，因此删除。
+// 两条归属路径：先查公共会话登记表（core.LoginSessions）；查不到再逐个问
+// 供应商「这个会话是不是你的」（core.LoginSessionOwner）。
+//
+// 第二条是 Trae 家族的前提：它们把会话存在自己的 SessionStore（回调监听要
+// 求实例隔离），没有登记进公共表。少了这条自证，Trae 的登录轮询一律被判成
+// 「会话不存在」，用户在控制台看到的却是「授权失败：登录会话不存在或已过期」。
+// 这里仍然不按 session id 前缀猜供应商——前缀猜错会把会话路由给别家。
 func (a *App) vendorForLoginSession(sessionID string) (core.Vendor, error) {
-	vendorID, okOwns := a.logins.Owns(sessionID)
-	if okOwns {
+	if vendorID, okOwns := a.logins.Owns(sessionID); okOwns {
 		if vendor, okVendor := a.registry.ByID(vendorID); okVendor {
 			return vendor, nil
 		}
 	}
+	for _, vendor := range a.registry.Vendors() {
+		owner, okOwner := core.As[core.LoginSessionOwner](vendor)
+		if okOwner && owner.OwnsLoginSession(sessionID) {
+			return vendor, nil
+		}
+	}
 	return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
+}
+
+// SubmitLoginCallback 处理控制台粘贴回来的 localhost 回调链接。
+//
+// 只有实现 core.CallbackSubmitter 的供应商支持（Trae 家族与 CodeArts）：上游
+// 只认 localhost 回调，插件与浏览器不在同一台机器时那条回调永远到不了，
+// 用户把浏览器停住的整条链接粘回来，插件就地解析完成登录。
+func (a *App) SubmitLoginCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
+	sessionID := strings.TrimSpace(state)
+	if sessionID == "" {
+		return nil, core.NewPluginError("invalid_request", "缺少登录会话 state，请重新发起登录", http.StatusBadRequest)
+	}
+	vendor, errVendor := a.vendorForLoginSession(sessionID)
+	if errVendor != nil {
+		return nil, errVendor
+	}
+	submitter, okSubmit := core.As[core.CallbackSubmitter](vendor)
+	if !okSubmit {
+		return nil, core.NewPluginError("callback_unsupported",
+			vendor.Name()+" 的登录不依赖本机回调，无需粘贴回调链接", http.StatusBadRequest)
+	}
+
+	trimmed := strings.TrimSpace(rawURL)
+	if trimmed == "" {
+		return nil, core.NewPluginError("invalid_request", "请粘贴浏览器地址栏里的完整回调链接", http.StatusBadRequest)
+	}
+
+	result, errSubmit := submitter.SubmitCallback(ctx, sessionID, trimmed)
+	if errSubmit != nil {
+		return nil, core.ToPluginError(errSubmit)
+	}
+	if result == nil {
+		return nil, core.NewPluginError("login_failed", "回调处理失败，请重新发起登录", http.StatusInternalServerError)
+	}
+	return result, nil
 }
 
 // vendorEnabled 报告供应商的区域是否被配置启用。

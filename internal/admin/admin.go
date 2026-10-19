@@ -45,6 +45,8 @@ type Deps interface {
 	Model() *Catalog
 	WorkbuddyPromptMode() string
 	RefreshModels(ctx context.Context) (int, error)
+	// SubmitLoginCallback 处理用户粘贴回来的 localhost 授权回调链接。
+	SubmitLoginCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error)
 	Reconfigure() error
 }
 
@@ -104,6 +106,7 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "POST", Path: prefix + "/keepalive", Description: "手动执行 token 保活。"},
 		{Method: "POST", Path: prefix + "/plans/preview", Description: "查询账号当前可领套餐与人机验证控件参数。"},
 		{Method: "POST", Path: prefix + "/plans/claim", Description: "提交人机验证令牌并领取套餐。"},
+		{Method: "POST", Path: prefix + "/login/callback", Description: "提交用户粘贴的 localhost 授权回调链接（远程部署下的登录兜底）。"},
 	}
 	for _, spec := range s.tasks.Catalog().ManualSpecs() {
 		if spec.Route == "" {
@@ -197,6 +200,8 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 		return core.OKEnvelope(s.handlePlansPreview(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/plans/claim"):
 		return core.OKEnvelope(s.handlePlansClaim(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/callback"):
+		return core.OKEnvelope(s.handleLoginCallbackRequest(rpc))
 	}
 	if method == http.MethodPost {
 		if suffix, okSuffix := managementSuffix(rpc.Path, id.ID); okSuffix {

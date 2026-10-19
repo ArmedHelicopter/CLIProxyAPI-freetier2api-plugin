@@ -171,6 +171,11 @@ func (d adminDeps) RefreshModels(ctx context.Context) (int, error) {
 
 func (d adminDeps) Reconfigure() error { return d.app.ApplyConfig(d.app.Config()) }
 
+// SubmitLoginCallback 把页面粘回来的 localhost 回调链接交给对应供应商处理。
+func (d adminDeps) SubmitLoginCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
+	return d.app.SubmitLoginCallback(ctx, state, rawURL)
+}
+
 func (a *App) managementRegistration() pluginapi.ManagementRegistrationResponse {
 	return a.admin.Registration()
 }

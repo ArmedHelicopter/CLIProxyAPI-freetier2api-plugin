@@ -14,6 +14,10 @@ type vendorDescriptor struct {
 	SupportsCheckin bool   `json:"supports_checkin"`
 	AuthMode        string `json:"auth_mode"`
 	SupportsLogin   bool   `json:"supports_login"`
+	// PasteCallback 报告该供应商的登录是否需要（也支持）「粘贴 localhost 回调链接」兜底。
+	PasteCallback bool `json:"paste_callback"`
+	// CallbackHint 是页面要展示的本机回调地址（仅 PasteCallback 为真时有值）。
+	CallbackHint string `json:"callback_hint,omitempty"`
 }
 
 func (s *Service) buildVendorsPayload() map[string]any {
@@ -23,14 +27,19 @@ func (s *Service) buildVendorsPayload() map[string]any {
 		if !core.RealmEnabled(cfg.EnabledRealms, vendor.Region()) {
 			continue
 		}
-		vendors = append(vendors, vendorDescriptor{
+		descriptor := vendorDescriptor{
 			ID:              vendor.ID(),
 			Name:            vendor.Name(),
 			Region:          vendor.Region(),
 			SupportsCheckin: core.SupportsCheckin(vendor),
 			AuthMode:        vendorAuthMode(vendor),
 			SupportsLogin:   vendorSupportsLogin(vendor),
-		})
+		}
+		if submitter, okSubmit := core.As[core.CallbackSubmitter](vendor); okSubmit {
+			descriptor.PasteCallback = true
+			descriptor.CallbackHint = strings.TrimSpace(submitter.LocalCallbackHint())
+		}
+		vendors = append(vendors, descriptor)
 	}
 	return map[string]any{"ok": true, "vendors": vendors}
 }

@@ -191,4 +191,20 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 	return LoginPoll(ctx, state, v.sessions)
 }
 
+// OwnsLoginSession 报告该登录会话是否由本实例持有。
+//
+// Trae 的会话表自持（回调监听要求实例隔离），没有登记到公共 LoginSessions，
+// 根层路由登录请求时靠这个自证接口把 state 认回来。
+func (v *adapter) OwnsLoginSession(sessionID string) bool {
+	return v.sessions.owns(sessionID, v.config.VendorID)
+}
+
+// LocalCallbackHint 返回控制台要展示的本机回调地址。
+func (v *adapter) LocalCallbackHint() string { return v.sessions.callbackHint() }
+
+// SubmitCallback 解析用户粘贴的 localhost 回调链接并完成登录。
+func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
+	return v.sessions.SubmitCallback(ctx, state, rawURL)
+}
+
 func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.config) }

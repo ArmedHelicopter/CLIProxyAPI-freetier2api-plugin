@@ -327,3 +327,26 @@ func TestTaskScheduleFoldedByDefault(t *testing.T) {
 		t.Error("任务排程折叠箭头未放大到 22px")
 	}
 }
+
+// TestConsolePageWiresLoginCallbackPasteBox 验证控制台把「粘贴回调链接」接到了插件
+// 自己的管理路由上。
+//
+// 远程 / Docker 部署时上游只认 localhost 回调，浏览器到不了插件的监听；页面若
+// 没有这条兜底通道，Trae / CodeArts 的登录就永远停在「等待授权中…」。这里同时
+// 锁住三件事：折叠块存在、提交按钮存在、请求打的是插件自有路由（不能是宿主路由
+// ——宿主没有这个端点，打过去只会 404）。
+func TestConsolePageWiresLoginCallbackPasteBox(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+	for _, marker := range []string{
+		`id="loginPasteBox"`,
+		`id="loginPasteUrl"`,
+		`id="btnSubmitCallback"`,
+		`api("POST", "/login/callback"`,
+		"paste_callback",
+		"callback_hint",
+	} {
+		if !strings.Contains(page, marker) {
+			t.Fatalf("console page missing %q", marker)
+		}
+	}
+}

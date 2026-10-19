@@ -56,6 +56,44 @@ type LoginProvider interface {
 	LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error)
 }
 
+// LoginSessionOwner 由「会话表自持、不登记到公共 LoginSessions」的供应商实现。
+//
+// 根层按 state 路由登录请求时先查公共登记表；查不到就逐个问供应商「这个会话
+// 是不是你的」。Trae 家族把会话存在自己的 SessionStore（回调监听与实例隔离
+// 要求如此），没有登记进公共表；缺了这层自证，它的轮询会被路由层当成
+// 「会话不存在」拒绝——登录走到一半就报「登录会话不存在或已过期」。
+type LoginSessionOwner interface {
+	OwnsLoginSession(sessionID string) bool
+}
+
+// CallbackSubmitResult 是「粘贴 localhost 回调链接」的处理结果。
+//
+// 刻意不复用 pluginapi.AuthLoginPollResponse：那个结构是对宿主契约的响应，
+// 里面没有位置放「用户还得去点开的那个上游登录页」（CodeArts 的回调里带着它）。
+type CallbackSubmitResult struct {
+	// Status 是本次提交后的登录状态（成功 / 仍在等待 / 失败）。
+	Status pluginapi.AuthLoginStatus
+	// Message 是给用户看的进度或错误说明。
+	Message string
+	// Auth 是登录成功时产出的凭证记录。
+	Auth pluginapi.AuthData
+	// RedirectURL 是用户还需要在新标签页打开的上游登录页（CodeArts 专用）。
+	RedirectURL string
+}
+
+// CallbackSubmitter 由「上游只认 localhost 回调」的供应商实现。
+//
+// 上游授权成功后浏览器会跳向 127.0.0.1，插件与浏览器不在同一台机器时（远程
+// 主机、Docker、WSL）这条回调永远到不了，登录会一直卡在等待。这类供应商把
+// 回调链接原样交给用户：控制台展示本机回调地址，用户把浏览器停住的那条链接
+// 粘回来，插件在本地解析完成登录，而不是干等一个不会到达的 HTTP 请求。
+type CallbackSubmitter interface {
+	// LocalCallbackHint 返回页面应展示的 localhost 回调地址（供用户辨认）。
+	LocalCallbackHint() string
+	// SubmitCallback 解析用户粘贴的回调链接并推进当前登录会话。
+	SubmitCallback(ctx context.Context, state, rawURL string) (*CallbackSubmitResult, error)
+}
+
 // Refresher 由需要校验/续期凭证的供应商实现。
 //
 // 未实现时调用方视为「已校验且无需写盘」（refreshed=false）。

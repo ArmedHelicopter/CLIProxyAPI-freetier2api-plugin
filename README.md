@@ -142,6 +142,13 @@ internal/vendors/<name>            协议层 + 适配层同包，文件名是**�
 Trae 的授权回调监听也随实例：优先 `127.0.0.1:18080`，端口被占用时退回系统
 分配的空闲端口，并把**实际**端口写进登录链接（否则回调永远到不了本进程）。
 
+Trae 与 CodeArts 的上游**只认 localhost 回调**。插件与浏览器不在同一台机器时
+（远程主机、Docker、WSL），那条回调永远到不了：Trae 的会话会一直停在等待，
+CodeArts 更是拿不到上游签发的票据（浏览器回调里的 ticket_id / secret 是华为云
+签发的，不是 LoginStart 送进 authorize 的那一对）。因此这两家实现了
+core.CallbackSubmitter：控制台明示本机回调地址，用户把浏览器停住的那条整条链接
+粘回来，插件就地解析完成登录——同机部署照旧走自动回调，远程部署不再卡住。
+
 ### 新增 / 删除供应商
 
 新增：
@@ -318,6 +325,12 @@ plugins:
 
 **文件名必须以供应商 ID 开头**（如 `workbuddycn-myaccount.json`、
 `qodercn-login-abc.json`），否则插件只能靠内容嗅探归属。
+
+> **Trae / CodeArts 卡在「等待授权中…」怎么办**：这两家的上游只认本机回调地址
+> （Trae `http://127.0.0.1:18080/authorize`、CodeArts `http://127.0.0.1/oauth/callback`）。
+> 若 CPA 与你的浏览器**不在同一台机器**（远程主机、Docker、WSL），浏览器授权后会停在
+> 那个打不开的地址上。展开登录框里的「回调没到插件？粘贴回调链接」，把地址栏里的
+> **整条**链接粘进去提交即可，插件在本地解析完成登录；与插件同机时点「打开链接」就行。
 
 也可以在文件里加两个显式字段，这样文件名就不受限制：
 
@@ -684,6 +697,7 @@ python3 scripts/migrate_auths.py /path/to/cpa/auths --apply  # 执行
 | POST | `/tasks/auto_all` | 全部账号依次一键完成（控制台页的批量按钮用它） |
 | GET | `/school/status` | 开学季活动状态 |
 | POST | `/travel` `/activity` `/keepalive` `/blackcat` `/school/run` | 手动触发定时任务 |
+| POST | `/login/callback` | 提交用户粘贴的 localhost 授权回调链接（body 含 state 与 url 两个字段，详见 core.CallbackSubmitter） |
 | GET | `/v0/resource/plugins/freetier2api/console` | 内嵌控制台页 |
 
 控制台页是纯静态 HTML，**不含任何账号或凭证数据**；所有数据都通过上面的管理接口按需拉取。

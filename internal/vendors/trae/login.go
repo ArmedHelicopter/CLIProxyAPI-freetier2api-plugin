@@ -91,7 +91,7 @@ func LoginPoll(ctx context.Context, state string, store *SessionStore) (*plugina
 	if !ok || time.Since(session.CreatedAt) > 15*time.Minute {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
-			Message: "登录会话不存在或已过期，请重新发起登录",
+			Message: "登录会话不存在或已过期，请重新发起登录并在浏览器授权后立即粘贴回调链接",
 		}, nil
 	}
 
@@ -311,6 +311,15 @@ func (s *SessionStore) callbackURL() string {
 	return s.serverAddr + "/authorize"
 }
 
+// callbackHint 返回页面应当展示的回调地址：监听没起来时给默认端口，
+// 起来了就给真实端口（18080 被占用时是随机端口，提示必须跟着变）。
+func (s *SessionStore) callbackHint() string {
+	if addr := s.callbackURL(); addr != "" {
+		return addr
+	}
+	return "http://127.0.0.1:18080/authorize"
+}
+
 // MachineTraceID 从 machineID+deviceID 派生 16 位 trace ID。
 func MachineTraceID(machineID, deviceID string) string {
 	h := machineID + deviceID
@@ -435,6 +444,19 @@ func (s *SessionStore) handleAuthorizeCallback(w http.ResponseWriter, r *http.Re
 		return
 	}
 
+	if _, errComplete := s.completeLogin(r.Context(), matched, info); errComplete != nil {
+		renderCallbackHTML(w, http.StatusInternalServerError, "授权回调处理失败", errComplete.Error())
+		return
+	}
+
+	renderCallbackHTML(w, http.StatusOK, "授权成功", "账号已成功授权！现在可以关闭此窗口返回管理面板。")
+}
+
+// completeLogin 用回调里带出的凭证完成登录：换 access token、拼凭证、置会话成功。
+//
+// HTTP 回调与控制台「粘贴回调链接」共用这一段——两条路径只差「怎么拿到回调
+// 链接」，完成逻辑必须一致，否则同一次登录会因为入口不同产出不同凭证。
+func (s *SessionStore) completeLogin(ctx context.Context, matched *PendingSession, info *CallbackInfo) (*pluginapi.AuthData, error) {
 	// 执行 Token 换取
 	authHost := HostOAuthSolo
 	clientID := "trae_login"
@@ -452,7 +474,7 @@ func (s *SessionStore) handleAuthorizeCallback(w http.ResponseWriter, r *http.Re
 	expiresAt := info.ExpiresAt
 
 	if refreshToken != "" {
-		newAccess, newRefresh, exp, errEx := exchangeTraeToken(r.Context(), authHost, clientID, refreshToken)
+		newAccess, newRefresh, exp, errEx := exchangeTraeToken(ctx, authHost, clientID, refreshToken)
 		if errEx != nil {
 			logger.Error("trae: callback exchange token warning: %v, falling back to original", errEx)
 		} else {
@@ -500,23 +522,82 @@ func (s *SessionStore) handleAuthorizeCallback(w http.ResponseWriter, r *http.Re
 	rawStorage, errJSON := json.MarshalIndent(storageMap, "", "  ")
 	if errJSON != nil {
 		matched.State = "failed"
-		matched.ErrMsg = "生成凭证失败: " + errJSON.Error()
-		renderCallbackHTML(w, http.StatusInternalServerError, "生成凭证失败", errJSON.Error())
-		return
+		matched.ErrMsg = "生成凭证失败"
+		return nil, fmt.Errorf("生成凭证失败: %w", errJSON)
 	}
 
 	fileName := matched.VendorID + "-" + uid + ".json"
-	matched.AuthData = &pluginapi.AuthData{
+	authData := &pluginapi.AuthData{
 		Provider:    "freetier",
 		ID:          matched.VendorID + "-" + uid,
 		FileName:    fileName,
 		Label:       label,
 		StorageJSON: rawStorage,
 	}
+	matched.AuthData = authData
 	matched.State = "success"
 
 	logger.Info("trae: 授权成功，账号=%s (%s), vendor=%s", uid, nickname, matched.VendorID)
-	renderCallbackHTML(w, http.StatusOK, "授权成功", "账号已成功授权！现在可以关闭此窗口返回管理面板。")
+	return authData, nil
+}
+
+// SubmitCallback 接受用户粘贴的 localhost 回调链接。
+//
+// 上游只认 127.0.0.1 回调，插件与浏览器不在同一台机器时那条 HTTP 回调永远
+// 到不了；控制台把浏览器停住的地址原样送回来，这里就地解析完成登录。
+//
+// 与 HTTP 回调不同，粘贴**只按 loginTraceID / machine_id 精确认领**：宁可报
+// 不匹配，也不能把一条链接认到别的会话上（HTTP 回调还有 latestPending 兜底，
+// 那是同机场景的便利；粘贴必须严格）。
+func (s *SessionStore) SubmitCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
+	trimmed := strings.TrimSpace(state)
+	if trimmed == "" {
+		return nil, core.NewPluginError("invalid_request", "缺少登录会话 state，请重新发起登录", http.StatusBadRequest)
+	}
+
+	session, ok := s.get(trimmed)
+	if !ok {
+		return nil, core.NewPluginError("session_not_found",
+			"登录会话不存在或已过期，请重新发起登录并在浏览器授权后立即粘贴回调链接", http.StatusNotFound)
+	}
+	if session.State == "success" && session.AuthData != nil {
+		return &core.CallbackSubmitResult{
+			Status:  pluginapi.AuthLoginStatusSuccess,
+			Message: "登录成功",
+			Auth:    *session.AuthData,
+		}, nil
+	}
+	if session.State != "pending" {
+		msg := session.ErrMsg
+		if msg == "" {
+			msg = "授权登录失败"
+		}
+		return &core.CallbackSubmitResult{Status: pluginapi.AuthLoginStatusError, Message: msg}, nil
+	}
+
+	// 解析失败时不回显原始链接：里面带 refreshToken / userJwt。
+	info, errParse := ParseCallback(rawURL)
+	if errParse != nil {
+		return nil, core.NewPluginError("callback_parse_failed",
+			"回调链接解析失败，请确认粘贴的是浏览器地址栏里的完整链接（含 http:// 与后面的参数）",
+			http.StatusBadRequest)
+	}
+
+	matched := s.matchExact(info)
+	if matched == nil || matched.SessionID != session.SessionID {
+		return nil, core.NewPluginError("callback_mismatch",
+			"回调链接与当前登录会话不匹配，请重新发起登录后重新授权", http.StatusBadRequest)
+	}
+
+	authData, errComplete := s.completeLogin(ctx, matched, info)
+	if errComplete != nil {
+		return nil, core.ToPluginError(errComplete)
+	}
+	return &core.CallbackSubmitResult{
+		Status:  pluginapi.AuthLoginStatusSuccess,
+		Message: "登录成功",
+		Auth:    *authData,
+	}, nil
 }
 
 func exchangeTraeToken(ctx context.Context, authHost, clientID, refreshToken string) (string, string, int64, error) {

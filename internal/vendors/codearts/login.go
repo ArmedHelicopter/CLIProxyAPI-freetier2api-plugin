@@ -27,6 +27,9 @@ type pendingLogin struct {
 	Secret         string
 	Verifier       string
 	DPoPPrivateKey map[string]string
+	// TicketURL 覆盖票据端点。空值表示 SnapManagerHost+EpLoginTicket；
+	// 单测把它指向 httptest 服务，避免测试真的打到华为云。
+	TicketURL string
 }
 
 // LoginStart 发起华为云 CodeArts 授权登录。
@@ -75,7 +78,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 	if pollState == core.PollMissing {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
-			Message: "登录会话不存在或已过期",
+			Message: "登录会话不存在或已过期，请重新发起登录并在浏览器授权后立即粘贴回调链接",
 		}, nil
 	}
 	pending, okPending := session.Data.(*pendingLogin)
@@ -85,75 +88,41 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 			Message: "登录会话数据已损坏，请重新发起登录",
 		}, nil
 	}
+	return pollLoginTicket(ctx, logins, sessionID, pending)
+}
 
-	path := SnapManagerHost + EpLoginTicket + "?ticket_id=" + url.QueryEscape(pending.TicketID) + "&secret=" + url.QueryEscape(pending.Secret)
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
-	if errReq != nil {
-		return nil, errReq
+// pollLoginTicket 用会话里当前的 ticket/secret 换一次凭证。
+//
+// ticket/secret 会被 SubmitCallback 换成上游签发的那一对，因此普通轮询与
+// 粘贴回调共用这一段——区别只在「ticket 从哪来」。
+func pollLoginTicket(ctx context.Context, logins core.LoginSessions, sessionID string, pending *pendingLogin) (*pluginapi.AuthLoginPollResponse, error) {
+	ticketURL := strings.TrimSpace(pending.TicketURL)
+	if ticketURL == "" {
+		ticketURL = SnapManagerHost + EpLoginTicket
 	}
-	req.Header.Set("plugin-name", "snap_AIIDE")
-	req.Header.Set("plugin-version", "5.2.0")
-
-	client := hostbridge.Client(ctx, 30*time.Second)
-	resp, errDo := client.Do(req)
-	if errDo != nil {
-		return nil, fmt.Errorf("poll login ticket failed: %w", errDo)
+	creds, ready, errFetch := fetchTicketCredentials(ctx, ticketURL, pending.TicketID, pending.Secret)
+	if errFetch != nil {
+		return nil, errFetch
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if resp.StatusCode >= 400 {
+	if !ready {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "等待用户在华为云网页端完成授权...",
-		}, nil
-	}
-
-	var res struct {
-		UserName     string `json:"user_name"`
-		UserID       string `json:"user_id"`
-		DomainID     string `json:"domain_id"`
-		RefreshToken string `json:"refresh_token"`
-		Credential   struct {
-			Access        string `json:"access"`
-			Secret        string `json:"secret"`
-			SecurityToken string `json:"security_token"`
-			ExpiresAt     string `json:"expires_at"`
-		} `json:"credential"`
-		Credentials struct {
-			AccessKeyID     string `json:"access_key_id"`
-			SecretAccessKey string `json:"secret_access_key"`
-			SecurityToken   string `json:"security_token"`
-			Expiration      string `json:"expiration"`
-		} `json:"credentials"`
-	}
-	if err := json.Unmarshal(body, &res); err != nil {
-		return nil, fmt.Errorf("decode ticket response: %w", err)
-	}
-
-	ak := core.FirstNonEmpty(res.Credentials.AccessKeyID, res.Credential.Access)
-	sk := core.FirstNonEmpty(res.Credentials.SecretAccessKey, res.Credential.Secret)
-	st := core.FirstNonEmpty(res.Credentials.SecurityToken, res.Credential.SecurityToken)
-
-	if ak == "" || sk == "" {
-		return &pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "等待用户完成华为云登录...",
+			Message: "等待用户完成华为云登录…",
 		}, nil
 	}
 
 	logins.Delete(sessionID)
 
-	uid := core.FirstNonEmpty(res.UserID, res.UserName, "codearts-user")
+	uid := core.FirstNonEmpty(creds.UserID, creds.UserName, "codearts-user")
 	cred := &Credential{
 		Vendor:          VendorID,
-		UserID:          res.UserID,
-		UserName:        res.UserName,
-		DomainID:        res.DomainID,
-		AccessKeyID:     ak,
-		SecretAccessKey: sk,
-		SecurityToken:   st,
-		RefreshToken:    res.RefreshToken,
+		UserID:          creds.UserID,
+		UserName:        creds.UserName,
+		DomainID:        creds.DomainID,
+		AccessKeyID:     creds.AccessKeyID,
+		SecretAccessKey: creds.SecretAccessKey,
+		SecurityToken:   creds.SecurityToken,
+		RefreshToken:    creds.RefreshToken,
 		CodeVerifier:    pending.Verifier,
 		ClientID:        ClientID,
 		DPoPPrivateKey:  pending.DPoPPrivateKey,
@@ -175,6 +144,187 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 			StorageJSON: storageJSON,
 		},
 	}, nil
+}
+
+// ticketCredentials 是华为云登录票据换取到的临时凭证。
+type ticketCredentials struct {
+	UserName        string
+	UserID          string
+	DomainID        string
+	RefreshToken    string
+	AccessKeyID     string
+	SecretAccessKey string
+	SecurityToken   string
+	Expiration      string
+}
+
+// fetchTicketCredentials 用 ticket/secret 调登录票据接口换 AK/SK。
+//
+// ready=false 表示上游还没准备好（票据未签发、HTTP 4xx/5xx、或响应里还没给
+// AK/SK），调用方应当继续轮询；只有传输层与解码错误才返回 error。
+func fetchTicketCredentials(ctx context.Context, ticketURL, ticketID, secret string) (*ticketCredentials, bool, error) {
+	path := ticketURL + "?ticket_id=" + url.QueryEscape(ticketID) + "&secret=" + url.QueryEscape(secret)
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
+	if errReq != nil {
+		return nil, false, errReq
+	}
+	req.Header.Set("plugin-name", "snap_AIIDE")
+	req.Header.Set("plugin-version", "5.2.0")
+
+	client := hostbridge.Client(ctx, 30*time.Second)
+	resp, errDo := client.Do(req)
+	if errDo != nil {
+		return nil, false, fmt.Errorf("poll login ticket failed: %w", errDo)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return nil, false, nil
+	}
+
+	var res struct {
+		UserName     string `json:"user_name"`
+		UserID       string `json:"user_id"`
+		DomainID     string `json:"domain_id"`
+		RefreshToken string `json:"refresh_token"`
+		Credential   struct {
+			Access        string `json:"access"`
+			Secret        string `json:"secret"`
+			SecurityToken string `json:"security_token"`
+			ExpiresAt     string `json:"expires_at"`
+		} `json:"credential"`
+		Credentials struct {
+			AccessKeyID     string `json:"access_key_id"`
+			SecretAccessKey string `json:"secret_access_key"`
+			SecurityToken   string `json:"security_token"`
+			Expiration      string `json:"expiration"`
+		} `json:"credentials"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		return nil, false, fmt.Errorf("decode ticket response: %w", err)
+	}
+
+	ak := core.FirstNonEmpty(res.Credentials.AccessKeyID, res.Credential.Access)
+	sk := core.FirstNonEmpty(res.Credentials.SecretAccessKey, res.Credential.Secret)
+	if ak == "" || sk == "" {
+		return nil, false, nil
+	}
+
+	return &ticketCredentials{
+		UserName:        res.UserName,
+		UserID:          res.UserID,
+		DomainID:        res.DomainID,
+		RefreshToken:    res.RefreshToken,
+		AccessKeyID:     ak,
+		SecretAccessKey: sk,
+		SecurityToken:   core.FirstNonEmpty(res.Credentials.SecurityToken, res.Credential.SecurityToken),
+		Expiration:      core.FirstNonEmpty(res.Credentials.Expiration, res.Credential.ExpiresAt),
+	}, true, nil
+}
+
+// CallbackInfo 是华为云 localhost 回调里带回来的信息。
+type CallbackInfo struct {
+	// TicketID 与 Secret 是上游签发的登录票据凭据。
+	TicketID string
+	Secret   string
+	// Redirect 是回调指向的华为云登录页（票据还没换到凭证时，用户要再去点它）。
+	Redirect string
+}
+
+// ParseCallback 解析用户粘贴的 localhost 回调链接。
+//
+// 实际回调形如：
+//
+//	http://127.0.0.1/oauth/callback?secret=<票据密钥>&
+//		redirect=<encoded codearts.huaweicloud.com/portal/login?...&ticket_id=<票据 ID>...>
+//
+// 关键点：这里的 ticket_id/secret 是**华为云签发**的，不是 LoginStart 送进
+// /authorize 的那一对。所以必须从回调里取——继续拿自造值轮询，永远查不到凭证。
+func ParseCallback(rawURL string) (*CallbackInfo, error) {
+	rawURL = strings.TrimSpace(rawURL)
+	if rawURL == "" {
+		return nil, fmt.Errorf("empty callback url")
+	}
+	if !strings.HasPrefix(rawURL, "http") {
+		rawURL = "http://127.0.0.1" + rawURL
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("parse callback url: %w", err)
+	}
+
+	q := u.Query()
+	info := &CallbackInfo{Secret: q.Get("secret"), Redirect: q.Get("redirect")}
+	if info.Redirect != "" {
+		if portal, errPortal := url.Parse(info.Redirect); errPortal == nil {
+			pq := portal.Query()
+			info.TicketID = pq.Get("ticket_id")
+			// 内层 secret 是门户登录页真正使用的那一个，缺失时回落到外层。
+			if secret := pq.Get("secret"); secret != "" {
+				info.Secret = secret
+			}
+		}
+	}
+	// 容错：用户可能粘的是解码后的链接（参数直接摊在回调上）。
+	if info.TicketID == "" {
+		info.TicketID = q.Get("ticket_id")
+	}
+
+	if info.TicketID == "" || info.Secret == "" {
+		return nil, fmt.Errorf("callback missing ticket_id or secret")
+	}
+	return info, nil
+}
+
+// SubmitCallback 接受用户粘贴的 localhost 回调链接。
+//
+// 浏览器跳回 127.0.0.1 时，插件与浏览器不在同一台机器（远程主机 / Docker /
+// WSL）就收不到这条回调，登录会永久停在「等待授权中」。用户把地址栏里的
+// 整条链接粘回来，这里取出上游签发的 ticket/secret 覆盖自造值，随即换一次凭证。
+func SubmitCallback(ctx context.Context, logins core.LoginSessions, state, rawURL string) (*core.CallbackSubmitResult, error) {
+	sessionID := strings.TrimSpace(state)
+	if sessionID == "" {
+		return nil, core.NewPluginError("invalid_request", "缺少登录会话 state，请重新发起登录", http.StatusBadRequest)
+	}
+	session, pollState := logins.Poll(sessionID)
+	if pollState == core.PollMissing {
+		return nil, core.NewPluginError("session_not_found",
+			"登录会话不存在或已过期，请重新发起登录并在浏览器授权后立即粘贴回调链接", http.StatusNotFound)
+	}
+	pending, okPending := session.Data.(*pendingLogin)
+	if !okPending {
+		return nil, core.NewPluginError("login_session_broken", "登录会话数据已损坏，请重新发起登录", http.StatusBadRequest)
+	}
+
+	// 解析失败时不回显原始链接：里面带着票据密钥。
+	info, errParse := ParseCallback(rawURL)
+	if errParse != nil {
+		return nil, core.NewPluginError("callback_parse_failed",
+			"回调链接解析失败，请确认粘贴的是浏览器地址栏里的完整链接（含 http:// 与后面的参数）",
+			http.StatusBadRequest)
+	}
+
+	// 只有上游签发的这对值能换到凭证，覆盖掉 LoginStart 的自造值。
+	pending.TicketID = info.TicketID
+	pending.Secret = info.Secret
+
+	response, errPoll := pollLoginTicket(ctx, logins, sessionID, pending)
+	if errPoll != nil {
+		return nil, core.ToPluginError(errPoll)
+	}
+
+	result := &core.CallbackSubmitResult{
+		Status:  response.Status,
+		Message: response.Message,
+	}
+	if response.Status == pluginapi.AuthLoginStatusSuccess {
+		result.Auth = response.Auth
+		return result, nil
+	}
+	// 票据还没换到凭证：把门户登录页给用户，让他在能联网的浏览器里点开完成授权。
+	result.RedirectURL = info.Redirect
+	return result, nil
 }
 
 func generateDPoPJWK() (map[string]string, error) {

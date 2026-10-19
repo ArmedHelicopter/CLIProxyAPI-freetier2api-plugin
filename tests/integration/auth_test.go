@@ -3,13 +3,18 @@ package tests
 // 本文件覆盖 auth 能力：登录分发与跨供应商凭证归属判定。
 
 import (
+	"context"
 	"encoding/json"
+	"net/url"
+	"strings"
 	"testing"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/app"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/tests/testhost"
 )
 
 // 登录会话绑定的回归测试。
@@ -177,5 +182,147 @@ func TestLegacyWorkBuddyAccountNotClaimedByCline(t *testing.T) {
 				t.Fatalf("vendor = %q, want %q (must not be claimed by cline)", gotVendor, tc.wantVendor)
 			}
 		})
+	}
+}
+
+// ---- localhost 回调粘贴兜底 ----
+//
+// 下面三条守卫覆盖用户实际遇到的两种卡死：
+//
+//  1. Trae 的会话表自持在 SessionStore，根层按公共登记表找不到它，轮询一律被判成
+//     「登录会话不存在或已过期」——用户看到的正是「授权失败：登录会话不存在…」。
+//  2. 两家的上游都只认 localhost 回调，插件与浏览器不在同一台机器时收不到，
+//     用户把地址栏里的整条链接粘回来即可完成登录。
+
+// startVendorLogin 发起一次登录并返回带 state 的响应。
+func startVendorLogin(t *testing.T, vendorID string) pluginapi.AuthLoginStartResponse {
+	t.Helper()
+	raw := callMethod(t, pluginabi.MethodAuthLoginStart, map[string]any{
+		"metadata": map[string]any{core.VendorKey: vendorID},
+	})
+	var response pluginapi.AuthLoginStartResponse
+	if errUnmarshal := json.Unmarshal(raw, &response); errUnmarshal != nil {
+		t.Fatalf("decode login start: %v (raw=%s)", errUnmarshal, raw)
+	}
+	if response.State == "" {
+		t.Fatalf("%s 登录未返回 state：%s", vendorID, raw)
+	}
+	return response
+}
+
+// codeartsPastedCallback 是浏览器授权后停在 127.0.0.1 上的真实回调链接样本。
+//
+// 关键证据：ticket_id / secret 均为**华为云签发**，不是 LoginStart 送进
+// /authorize 的那一对；插件此前拿自造值轮询，控制台因此永远停在「等待授权中…」。
+const codeartsPastedCallback = "http://127.0.0.1/oauth/callback?secret=d55df9259e688e2a71b93f058c748349782ca1a30440473980961ef6833ee280" +
+	"&redirect=https%3A%2F%2Fcodearts.huaweicloud.com%2Fportal%2Flogin%3Ftheme%3Dlight%26locale%3Dzh-cn" +
+	"%26ticket_id%3D657abbb247eab363d1a461285fc50145%26authorizationAvailable%3Dfalse" +
+	"%26secret%3Dd55df9259e688e2a71b93f058c748349782ca1a30440473980961ef6833ee280"
+
+const codeartsUpstreamTicketID = "657abbb247eab363d1a461285fc50145"
+
+// TestTraeLoginPollReachesVendorSession 锁定 Trae 的登录轮询能找回自己的会话。
+//
+// 回归的是「会话表自持 + 根层只查公共登记表」的组合：两者凑在一起，Trae 的每一次
+// 轮询都会被判成「登录会话不存在或已过期」，登录根本走不到浏览器那一步。
+func TestTraeLoginPollReachesVendorSession(t *testing.T) {
+	installFakeHost(t)
+	setupTestPlugin(t)
+
+	started := startVendorLogin(t, "traecn")
+	raw := callMethod(t, pluginabi.MethodAuthLoginPoll, map[string]any{"state": started.State})
+	var polled pluginapi.AuthLoginPollResponse
+	if errUnmarshal := json.Unmarshal(raw, &polled); errUnmarshal != nil {
+		t.Fatalf("decode poll: %v (raw=%s)", errUnmarshal, raw)
+	}
+	if polled.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("status = %q, want pending（message=%q）", polled.Status, polled.Message)
+	}
+}
+
+// TestSubmitLoginCallbackCompletesTraeLogin 端到端验证 Trae 的粘贴兜底：从登录链接里
+// 取出 trace/machine 构造浏览器回调，提交后应当拿到凭证。
+func TestSubmitLoginCallbackCompletesTraeLogin(t *testing.T) {
+	installFakeHost(t)
+	setupTestPlugin(t)
+
+	started := startVendorLogin(t, "traecn")
+	parsed, errParse := url.Parse(started.URL)
+	if errParse != nil {
+		t.Fatalf("parse login url: %v", errParse)
+	}
+	query := parsed.Query()
+	trace, machine := query.Get("login_trace_id"), query.Get("machine_id")
+	if trace == "" || machine == "" {
+		t.Fatalf("登录链接缺少 trace/machine: %s", started.URL)
+	}
+
+	// 回调里刻意不带 refreshToken：带的话插件会去上游换 token，用例就得联网。
+	callback := "http://127.0.0.1:18080/authorize?loginTraceID=" + trace + "&machine_id=" + machine +
+		"&userJwt=" + url.QueryEscape(`{"Token":"jwt-access","TokenExpireAt":1793607527194}`) +
+		"&userInfo=" + url.QueryEscape(`{"UserID":"user-1","ScreenName":"tester","TenantID":"tenant-1"}`)
+
+	result, errSubmit := testApp.SubmitLoginCallback(context.Background(), started.State, callback)
+	if errSubmit != nil {
+		t.Fatalf("submit callback: %v", errSubmit)
+	}
+	if result.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("status = %q, want success（message=%q）", result.Status, result.Message)
+	}
+	if result.Auth.Label != "Trae-tester" || result.Auth.FileName != "traecn-user-1.json" {
+		t.Fatalf("凭证标识不对: label=%q file=%q", result.Auth.Label, result.Auth.FileName)
+	}
+}
+
+// TestSubmitLoginCallbackCompletesCodeArtsLogin 端到端验证 CodeArts 的粘贴兜底：
+// 票据查询必须用回调里**上游签发**的 ticket/secret，否则永远换不到 AK/SK。
+func TestSubmitLoginCallbackCompletesCodeArtsLogin(t *testing.T) {
+	host := testhost.New()
+	host.SetUpstream(func(method, url, body string) testhost.UpstreamResponse {
+		if !strings.Contains(url, "/v1/login/ticket") {
+			return testhost.UpstreamResponse{Status: 404, Body: `{"code":404,"msg":"not stubbed"}`}
+		}
+		if !strings.Contains(url, "ticket_id="+codeartsUpstreamTicketID) {
+			t.Errorf("票据查询用的是自造 ticket，不是上游签发的那个: %s", url)
+		}
+		return testhost.UpstreamResponse{
+			Status: 200,
+			Header: map[string][]string{"Content-Type": {"application/json"}},
+			Body: `{"user_id":"user-1","user_name":"tester","refresh_token":"refresh-1",` +
+				`"credentials":{"access_key_id":"AK-test","secret_access_key":"SK-test",` +
+				`"security_token":"ST-test","expiration":"2026-10-19T18:00:00Z"}}`,
+		}
+	})
+	hostbridge.Configure(host.Call)
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+	setupTestPlugin(t)
+
+	started := startVendorLogin(t, "codearts")
+	result, errSubmit := testApp.SubmitLoginCallback(context.Background(), started.State, codeartsPastedCallback)
+	if errSubmit != nil {
+		t.Fatalf("submit callback: %v", errSubmit)
+	}
+	if result.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("status = %q, want success（message=%q）", result.Status, result.Message)
+	}
+	if result.Auth.FileName != "codearts-user-1.json" {
+		t.Fatalf("file name = %q, want codearts-user-1.json", result.Auth.FileName)
+	}
+	if !strings.Contains(string(result.Auth.StorageJSON), "AK-test") {
+		t.Fatalf("凭证未落盘: %s", result.Auth.StorageJSON)
+	}
+}
+
+// TestSubmitLoginCallbackRejectsSessionlessVendor 守住边界：设备码类供应商没有本地
+// 回调，粘贴入口必须明确拒绝，而不是给一个让人摸不着头脑的失败。
+func TestSubmitLoginCallbackRejectsSessionlessVendor(t *testing.T) {
+	installFakeHost(t)
+	setupTestPlugin(t)
+
+	// Qoder 国内版是设备码登录：LoginStart 纯本地构造，且没有本地回调可粘。
+	started := startVendorLogin(t, "qodercn")
+	if _, errSubmit := testApp.SubmitLoginCallback(
+		context.Background(), started.State, "http://127.0.0.1/authorize?a=1"); errSubmit == nil {
+		t.Fatal("没有本地回调的供应商必须拒绝粘贴")
 	}
 }

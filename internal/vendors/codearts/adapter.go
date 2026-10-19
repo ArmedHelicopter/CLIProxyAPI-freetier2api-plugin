@@ -187,3 +187,14 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
 	return LoginPoll(ctx, v.Env.Logins, state)
 }
+
+// LocalCallbackHint 返回控制台要展示的本机回调地址。
+//
+// 华为云授权成功后浏览器停在这个地址上：插件与浏览器不在同一台机器时收不到，
+// 用户把整条链接粘回控制台即可继续登录。
+func (v *adapter) LocalCallbackHint() string { return LocalCallbackURL }
+
+// SubmitCallback 解析用户粘贴的 localhost 回调链接并完成登录。
+func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
+	return SubmitCallback(ctx, v.Env.Logins, state, rawURL)
+}

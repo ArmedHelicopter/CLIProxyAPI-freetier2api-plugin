@@ -217,6 +217,13 @@ const (
 
 	ClientID = "codearts-agent"
 
+	// LocalCallbackURL 是华为云授权成功后浏览器停住的本机地址。
+	//
+	// 上游只认 localhost 回调，且真正下发的地址是这个不带端口的 http://
+	// 127.0.0.1/oauth/callback——插件与浏览器不在同一台机器时收不到，只能让
+	// 用户把这条链接粘回控制台（见 SubmitCallback）。
+	LocalCallbackURL = "http://127.0.0.1/oauth/callback"
+
 	// 端点路径
 	EpChatV2        = "/api/v2/chat/completions"
 	EpModelBuiltin  = "/v1/model/builtin"

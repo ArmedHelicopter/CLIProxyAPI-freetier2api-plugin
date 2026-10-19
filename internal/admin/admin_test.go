@@ -19,6 +19,9 @@ type stubDeps struct {
 	store    *state.Store
 	registry *core.Registry
 	manager  *Catalog
+
+	callbackResult *core.CallbackSubmitResult
+	callbackErr    error
 }
 
 func (s stubDeps) Identity() Identity {
@@ -37,6 +40,14 @@ func (s stubDeps) ResolveCredential(context.Context, string, []byte, string, map
 func (s stubDeps) RefreshModels(context.Context) (int, error) { return 0, nil }
 func (s stubDeps) Reconfigure() error                         { return nil }
 
+// callbackResult / callbackErr 让用例能驱动「粘贴回调链接」的返回分支。
+func (s stubDeps) SubmitLoginCallback(context.Context, string, string) (*core.CallbackSubmitResult, error) {
+	if s.callbackErr != nil {
+		return nil, s.callbackErr
+	}
+	return s.callbackResult, nil
+}
+
 func newStubDeps(t *testing.T) stubDeps {
 	t.Helper()
 	store := state.NewStore()
@@ -50,7 +61,11 @@ func newStubDeps(t *testing.T) stubDeps {
 
 func newService(t *testing.T) *Service {
 	t.Helper()
-	deps := newStubDeps(t)
+	return newServiceWithDeps(t, newStubDeps(t))
+}
+
+func newServiceWithDeps(t *testing.T, deps stubDeps) *Service {
+	t.Helper()
 	pool := auth.NewPool(deps.registry, deps.ResolveCredential)
 	return New(deps, deps.registry, pool, tasks.New(stubTaskDeps{deps: deps, pool: pool}))
 }
