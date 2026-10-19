@@ -1,7 +1,9 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -11,6 +13,13 @@ import (
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/state"
 )
+
+// quotaJob 是额度查询里的一个账号任务。
+type quotaJob struct {
+	entry      core.HostAuth
+	vendor     core.Vendor
+	credential *core.Credential
+}
 
 // quotaResult 是单个账号的额度结果。
 type quotaResult struct {
@@ -44,11 +53,6 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 		Targets:       body.AccountIDs,
 		EnabledRealms: cfg.EnabledRealms,
 	})
-	type job struct {
-		entry      core.HostAuth
-		vendor     core.Vendor
-		credential *core.Credential
-	}
 	var preResults []quotaResult
 	for _, failure := range failures {
 		preResults = append(preResults, quotaResult{
@@ -58,14 +62,14 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 			Message: failure.Message,
 		})
 	}
-	jobs := make([]job, 0, len(loaded))
+	jobs := make([]quotaJob, 0, len(loaded))
 	for _, account := range loaded {
-		jobs = append(jobs, job{entry: account.Entry, vendor: account.Vendor, credential: account.Credential})
+		jobs = append(jobs, quotaJob{entry: account.Entry, vendor: account.Vendor, credential: account.Credential})
 	}
 	// 领取状态跟着额度一起刷新，但**批末才落盘**：Mutate 每次都会写一遍
 	// state.json，逐账号写等于把一次「查询额度」放大成 N 次磁盘写。
 	claims := map[string]state.ClaimRecord{}
-	jobResults := accountpkg.RunBatch(jobs, batchConcurrency, func(current job) quotaResult {
+	jobResults := accountpkg.RunBatch(jobs, batchConcurrency, func(current quotaJob) quotaResult {
 		result := quotaResult{
 			AuthID:     core.FirstNonEmpty(current.entry.ID, current.entry.Name),
 			AuthIndex:  current.entry.AuthIndex,
@@ -82,6 +86,14 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 			return result
 		}
 		quota, errQuota := quotaProvider.Quota(ctx, current.credential)
+		if errQuota != nil && isAuthExpired(errQuota) {
+			// 凭证过期类错误：先保活刷新一次再重试。MiniMax 的 access token 只有
+			// 1 小时有效期，不刷新的话额度列会一直挂着 401，用户只能自己想到去点
+			// 「一键保活」——那条路还要求他先认出这是凭证问题。
+			if refreshed := s.refreshedCredential(ctx, callbackID, current); refreshed != nil {
+				quota, errQuota = quotaProvider.Quota(ctx, refreshed)
+			}
+		}
 		if errQuota != nil {
 			result.Message = errQuota.Error()
 			return result
@@ -107,4 +119,43 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 		})
 	}
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": append(preResults, jobResults...)})
+}
+
+// isAuthExpired 判断错误是否属于「凭证已过期/失效」类（401）。
+//
+// 只认 401：403/404 往往意味着账号没这个权限或上游改版，刷新不会变好，
+// 盲目刷新只会白白多打一次上游。
+func isAuthExpired(err error) bool {
+	var failure *core.Failure
+	if errors.As(err, &failure) {
+		return failure.Kind == core.FailureKindCredential || failure.HTTPStatus() == http.StatusUnauthorized
+	}
+	var pluginErr *core.PluginError
+	if errors.As(err, &pluginErr) {
+		return pluginErr.HTTPStatus == http.StatusUnauthorized
+	}
+	return false
+}
+
+// refreshedCredential 对单个账号跑一次保活，并返回刷新后的凭证。
+//
+// 复用保活那条既有通道（它负责刷新 + 写盘 + 热更新宿主），额度查询因此不需要
+// 自己再造一套刷新逻辑。保活失败或账号消失时返回 nil，由调用方按原错误上报。
+func (s *Service) refreshedCredential(ctx context.Context, callbackID string, target quotaJob) *core.Credential {
+	authID := core.FirstNonEmpty(target.entry.ID, target.entry.Name)
+	if authID == "" {
+		return nil
+	}
+	s.tasks.Keepalive(ctx, callbackID, []string{authID}, 1)
+
+	loaded, _ := s.pool.Load(ctx, callbackID, accountpkg.Options{
+		Targets:       []string{authID},
+		EnabledRealms: s.deps.Config().EnabledRealms,
+	})
+	for _, account := range loaded {
+		if account.Vendor.ID() == target.vendor.ID() {
+			return account.Credential
+		}
+	}
+	return nil
 }

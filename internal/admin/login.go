@@ -10,7 +10,6 @@ package admin
 import (
 	"encoding/json"
 	"net/http"
-	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/hostbridge"
@@ -38,13 +37,8 @@ func (s *Service) handleLoginCallbackRequest(req pluginapi.ManagementRequest) pl
 			})
 		}
 	}
-	if strings.TrimSpace(body.State) == "" {
-		return JSONResponse(http.StatusOK, map[string]any{
-			"ok": false, "status": string(pluginapi.AuthLoginStatusError),
-			"message": "登录会话已丢失，请重新发起登录",
-		})
-	}
-
+	// 入参校验（state 非空、URL 非空）统一由 App.SubmitLoginCallback 负责：
+	// 它是唯一调用供应商的地方，校验放在这里就得再抄一份。
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
 
@@ -66,6 +60,25 @@ func (s *Service) handleLoginCallbackRequest(req pluginapi.ManagementRequest) pl
 	if result.RedirectURL != "" {
 		payload["redirect_url"] = result.RedirectURL
 	}
-	logger.Info("login callback submitted (state=%s status=%s)", body.State, status)
+
+	if status == pluginapi.AuthLoginStatusSuccess {
+		// 粘贴路径的凭证只回到**页面**，没人替它落盘——正常轮询路径是宿主在
+		// auth.login.poll 之后写文件的，这里没有那个宿主环节。不补这一下，页面
+		// 显示「登录成功」而 auth 目录里什么都没有。
+		if errSave := saveAuthFile(hostbridge.RequestCallbackID(req), result.Auth.FileName, result.Auth.StorageJSON); errSave != nil {
+			payload["ok"] = false
+			payload["status"] = string(pluginapi.AuthLoginStatusError)
+			payload["message"] = "登录已完成，但保存凭证失败：" + errSave.Error()
+			logger.Error("login callback persist failed (state=%s): %v", body.State, errSave)
+			return JSONResponse(http.StatusOK, payload)
+		}
+		payload["auth_id"] = result.Auth.FileName
+		payload["label"] = result.Auth.Label
+	}
+
+	// 落盘成功时 saveAuthFile 已经记过一笔，这里只补非成功分支的审计行。
+	if status != pluginapi.AuthLoginStatusSuccess {
+		logger.Info("login callback handled (state=%s status=%s)", body.State, status)
+	}
 	return JSONResponse(http.StatusOK, payload)
 }

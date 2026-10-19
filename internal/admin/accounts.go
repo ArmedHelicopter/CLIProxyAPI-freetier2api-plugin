@@ -10,7 +10,6 @@ import (
 	"strings"
 	"time"
 
-	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
@@ -317,25 +316,8 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 	fileName := core.FileNameFor(vendor.ID(), seed)
 	callbackID := hostbridge.RequestCallbackID(req)
 
-	saved := false
-	if _, errSave := hostbridge.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
-		Name: fileName, JSON: rawJSON,
-	}); errSave == nil {
-		saved = true
-	} else {
-		logger.Debug("host.auth.save failed for %s: %v", fileName, errSave)
-	}
-	for _, dir := range []string{"/root/.cli-proxy-api", "."} {
-		dst := filepath.Join(dir, fileName)
-		if fi, err := os.Stat(dir); err == nil && fi.IsDir() {
-			if errWrite := os.WriteFile(dst, rawJSON, 0o600); errWrite == nil {
-				saved = true
-				break
-			}
-		}
-	}
-	if !saved {
-		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": "保存凭证文件失败"})
+	if errSave := saveAuthFile(callbackID, fileName, rawJSON); errSave != nil {
+		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errSave.Error()})
 	}
 	logger.Info("added auth file %s for vendor %s", fileName, vendor.ID())
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "auth_id": fileName, "message": "账号保存成功"})

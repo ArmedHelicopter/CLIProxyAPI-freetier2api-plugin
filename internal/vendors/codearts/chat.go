@@ -21,6 +21,11 @@ type ChatRequest struct {
 	Credential *Credential
 	Body       []byte
 	Stream     bool
+	// Benefit 走每日免费福利额度通道（请求头带 maas_type: benefit）。
+	//
+	// 本插件只服务免费福利通道：上游把每日免费额度与订阅积分分成两条通道，
+	// 同一个模型名两边都有，区别就是这个头。要接积分通道时在这里分开即可。
+	Benefit bool
 }
 
 // Chat 执行一次非流式对话。
@@ -84,6 +89,11 @@ func doCodeArtsRequest(ctx context.Context, baseURL string, req ChatRequest) (*h
 	}
 	httpReq.Header.Set("Agent-Type", "PromptCenter")
 	httpReq.Header.Set("User-Agent", "CodeArtsAgent/5.2.0")
+	if req.Benefit {
+		// 必须放在签名之前：签名覆盖该头，晚设就不生效，
+		// 请求会被判成积分通道并按积分计费。
+		httpReq.Header.Set(HeaderMaasType, MaasBenefit)
+	}
 
 	// 签名
 	signHuaweiRequest(httpReq, req.Body, req.Credential)
@@ -213,22 +223,38 @@ const (
 	SnapEngineApiHost = "https://snap-access.cn-north-4.myhuaweicloud.com"
 	SnapManagerHost   = SnapEngineApiHost + "/snap-manager"
 	PortalHost        = "https://codearts.huaweicloud.com/portal"
-	BenefitHost       = "https://opengw.developer.huaweicloud.com"
+	// STSHost 临时 AK/SK 与令牌服务。**不是** snap-manager：把 /v1/oauth2/tokens
+	// 打到 snap-manager 会得到 404 APIG.0101（实测），续期与授权码换 token 都在这里。
+	STSHost     = "https://sts.cn-north-4.myhuaweicloud.com"
+	BenefitHost = "https://opengw.developer.huaweicloud.com"
 
 	ClientID = "codearts-agent"
 
-	// LocalCallbackURL 是华为云授权成功后浏览器停住的本机地址。
+	// 授权链接里的 plugin-name / plugin-version：门户按这两个头识别调用方，
+	// 与官方 CodeArts Agent 插件保持一致（逆向自 huaweicloud.authentication）。
+	PluginName    = "snap_AIIDE"
+	PluginVersion = "5.2.0"
+
+	// 本机回调：门户按授权链接里的 port 拼出 http://127.0.0.1:<port>/oauth/callback。
 	//
-	// 上游只认 localhost 回调，且真正下发的地址是这个不带端口的 http://
-	// 127.0.0.1/oauth/callback——插件与浏览器不在同一台机器时收不到，只能让
-	// 用户把这条链接粘回控制台（见 SubmitCallback）。
-	LocalCallbackURL = "http://127.0.0.1/oauth/callback"
+	// 插件与浏览器不在同一台机器时收不到，只能让用户把这条链接粘回控制台。
+	LocalCallbackPort = 7866
+	LocalCallbackPath = "/oauth/callback"
+	LocalCallbackURL  = "http://127.0.0.1:7866" + LocalCallbackPath
 
 	// 端点路径
 	EpChatV2        = "/api/v2/chat/completions"
 	EpModelBuiltin  = "/v1/model/builtin"
 	EpBenefitConfig = "/api/v1/gateway/config"
 	EpBenefitClaim  = "/api/v1/benefit/claim"
-	EpLoginTicket   = "/v1/login/ticket"
-	EpOAuthTokens   = "/v1/oauth2/tokens"
+	// EpBenefitGateway 报告福利通道是否开放（注意在 snap 主机上，不是 benefit 主机）。
+	EpBenefitGateway = "/v1/benefit-gateway-config"
+	// EpBenefitBalance 查询每日 / 每月福利 Token 额度。
+	EpBenefitBalance = "/api/v1/user/tokens/balance"
+
+	// HeaderMaasType 区分推理通道：带 benefit 走每日免费额度，不带则按订阅积分计费。
+	HeaderMaasType = "maas_type"
+	MaasBenefit    = "benefit"
+	EpLoginTicket  = "/v1/login/ticket"
+	EpOAuthTokens  = "/v1/oauth2/tokens"
 )

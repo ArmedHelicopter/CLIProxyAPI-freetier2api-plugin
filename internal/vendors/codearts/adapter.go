@@ -118,6 +118,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 		Credential: native,
 		Body:       req.Payload,
 		Stream:     false,
+		Benefit:    true,
 	})
 	if errChat != nil {
 		return nil, core.ToPluginError(errChat)
@@ -138,6 +139,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		Credential: native,
 		Body:       req.Payload,
 		Stream:     true,
+		Benefit:    true,
 	})
 	if errStream != nil {
 		return core.ToPluginError(errStream)

@@ -103,36 +103,36 @@ func TestParseCallbackTakesUpstreamTicket(t *testing.T) {
 // 当成有效回调（否则用户只会看到一句莫名其妙的上游报错）。
 func TestParseCallbackRejectsLinkWithoutTicket(t *testing.T) {
 	if _, errParse := ParseCallback("http://127.0.0.1/oauth/callback?secret=only-secret"); errParse == nil {
-		t.Fatal("缺 ticket_id 的链接必须解析失败")
+		t.Fatal("只有 secret、没有 code/redirect 的链接必须解析失败")
 	}
 }
 
-// TestSubmitCallbackSwapsInUpstreamTicket 是本文件的核心守卫：提交粘贴链接后，
-// 票据查询必须用**上游签发**的 ticket/secret，且凭证能落到返回值里。
-func TestSubmitCallbackSwapsInUpstreamTicket(t *testing.T) {
+// TestSubmitCallbackKeepsSessionTicket 锁定票据通道最容易错的一点：
+//
+// 回调里那个 ticket_id 是门户的中间票，拿它去查票据接口必然得到「无效ticketId」
+// （实测 TM.00001001）。真正要换的只有 secret——ticket_id 必须仍是本会话自己那个。
+func TestSubmitCallbackKeepsSessionTicket(t *testing.T) {
 	useLoopbackHost(t)
 	var gotTicket, gotSecret string
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotTicket = r.URL.Query().Get("ticket_id")
 		gotSecret = r.URL.Query().Get("secret")
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"user_id":       "user-1",
-			"user_name":     "tester",
-			"refresh_token": "refresh-1",
-			"credentials": map[string]string{
-				"access_key_id":     "AK-test",
-				"secret_access_key": "SK-test",
-				"security_token":    "ST-test",
-				"expiration":        "2026-10-19T18:00:00Z",
-			},
-		})
+		_, _ = w.Write([]byte(`{"user_id":"user-1","user_name":"tester","refresh_token":"refresh-1",` +
+			`"credentials":{"access_key_id":"AK-test","secret_access_key":"SK-test",` +
+			`"security_token":"ST-test","expiration":"2026-10-19T18:00:00Z"}}`))
 	}))
 	defer server.Close()
 
+	// 本会话的票据号必须与回调 redirect 里的一致，这里就取回调里那个当会话票据号。
+	info, errParse := ParseCallback(pastedCallback)
+	if errParse != nil {
+		t.Fatalf("parse callback: %v", errParse)
+	}
 	logins := auth.NewSessionRegistry()
 	logins.Register(VendorID, "codearts_paste", 15*time.Minute, 0, &pendingLogin{
-		TicketID: "self-made-ticket", Secret: "self-made-secret",
+		TicketID:  info.TicketID,
+		Secret:    "self-made-secret",
 		TicketURL: server.URL,
 	})
 
@@ -143,22 +143,37 @@ func TestSubmitCallbackSwapsInUpstreamTicket(t *testing.T) {
 	if result.Status != pluginapi.AuthLoginStatusSuccess {
 		t.Fatalf("status = %q, want success (message=%q)", result.Status, result.Message)
 	}
-	if gotTicket != upstreamTicketID || gotSecret != upstreamSecret {
-		t.Fatalf("票据查询用了 %q/%q，want 上游签发的 %q/%q", gotTicket, gotSecret, upstreamTicketID, upstreamSecret)
+	if gotTicket != info.TicketID {
+		t.Fatalf("票据查询用了 %q，want 本会话的 %q（不能换成门户的中间票）", gotTicket, info.TicketID)
 	}
-	if result.Auth.Label != "CodeArts-user-1" {
-		t.Fatalf("label = %q, want CodeArts-user-1", result.Auth.Label)
+	if gotSecret != upstreamSecret {
+		t.Fatalf("票据查询用了 secret %q，want 门户下发的 %q", gotSecret, upstreamSecret)
+	}
+	if result.Auth.FileName != "codearts-user-1.json" {
+		t.Fatalf("file name = %q, want codearts-user-1.json", result.Auth.FileName)
 	}
 
 	var storage map[string]any
 	if err := json.Unmarshal(result.Auth.StorageJSON, &storage); err != nil {
 		t.Fatalf("decode storage json: %v", err)
 	}
-	if storage["access_key_id"] != "AK-test" || storage["secret_access_key"] != "SK-test" {
-		t.Fatalf("凭证未落盘: %v / %v", storage["access_key_id"], storage["secret_access_key"])
+	if storage["access_key_id"] != "AK-test" {
+		t.Fatalf("凭证未落盘: %v", storage["access_key_id"])
 	}
-	if storage["refresh_token"] != "refresh-1" {
-		t.Fatalf("refresh_token = %v, want refresh-1（续期要用它）", storage["refresh_token"])
+}
+
+// TestSubmitCallbackRejectsForeignTicket 守住归属：回调里的票据号与本会话不一致时
+// 不能改会话状态，否则一次误粘贴就能把凭证写进别人的登录会话。
+func TestSubmitCallbackRejectsForeignTicket(t *testing.T) {
+	logins := auth.NewSessionRegistry()
+	logins.Register(VendorID, "codearts_foreign", 15*time.Minute, 0, &pendingLogin{
+		TicketID: "00000000000000000000000000000000",
+		Secret:   "self-made-secret",
+	})
+
+	_, errSubmit := SubmitCallback(context.Background(), logins, "codearts_foreign", pastedCallback)
+	if errSubmit == nil {
+		t.Fatal("票据号不属于本会话时必须报错")
 	}
 }
 
@@ -191,5 +206,75 @@ func TestSubmitCallbackKeepsPortalURLWhilePending(t *testing.T) {
 func TestSubmitCallbackRejectsUnknownSession(t *testing.T) {
 	if _, errSubmit := SubmitCallback(context.Background(), auth.NewSessionRegistry(), "codearts_missing", pastedCallback); errSubmit == nil {
 		t.Fatal("未知会话必须报错")
+	}
+}
+
+// TestSubmitCallbackKeepsWaitingOnInvalidTicket 锁定一个反直觉但必须如此的行为：
+//
+// 上游对「票据还没生效」和「票据号不存在」回的是同一句 TM.00001001 无效ticketId
+// （实测：随便编一个 ticket_id 也是这句）。所以这句话**不能**当终态——判成失败
+// 就等于把「用户还没点完授权」永远钉死成「票据已失效，请重新发起登录」。
+func TestSubmitCallbackKeepsWaitingOnInvalidTicket(t *testing.T) {
+	useLoopbackHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error_code":"TM.00001001","error_msg":"无效ticketId: ` + upstreamTicketID + `"}`))
+	}))
+	defer server.Close()
+
+	info, errParse := ParseCallback(pastedCallback)
+	if errParse != nil {
+		t.Fatalf("parse callback: %v", errParse)
+	}
+	logins := auth.NewSessionRegistry()
+	logins.Register(VendorID, "codearts_wait", 15*time.Minute, 0, &pendingLogin{
+		TicketID: info.TicketID, TicketURL: server.URL,
+	})
+
+	result, errSubmit := SubmitCallback(context.Background(), logins, "codearts_wait", pastedCallback)
+	if errSubmit != nil {
+		t.Fatalf("票据未生效属于等待，不该报错: %v", errSubmit)
+	}
+	if result.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("status = %q, want pending", result.Status)
+	}
+	if !strings.Contains(result.Message, "TM.00001001") {
+		t.Fatalf("等待提示里没有上游原因: %q", result.Message)
+	}
+	if result.RedirectURL == "" {
+		t.Fatal("等待时必须带回门户登录页，否则用户没有下一步")
+	}
+}
+
+// TestSubmitCallbackSurfacesUpstreamNote 锁定诊断信息透传：还在等的时候，页面必须
+// 能看到上游到底说了什么，否则「等待中」既没法自查也没法上报。
+func TestSubmitCallbackSurfacesUpstreamNote(t *testing.T) {
+	useLoopbackHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error_code":"TM.00001002","error_msg":"用户尚未完成授权"}`))
+	}))
+	defer server.Close()
+
+	logins := auth.NewSessionRegistry()
+	info, errParse := ParseCallback(pastedCallback)
+	if errParse != nil {
+		t.Fatalf("parse callback: %v", errParse)
+	}
+	logins.Register(VendorID, "codearts_waiting", 15*time.Minute, 0,
+		&pendingLogin{TicketID: info.TicketID, TicketURL: server.URL})
+
+	result, errSubmit := SubmitCallback(context.Background(), logins, "codearts_waiting", pastedCallback)
+	if errSubmit != nil {
+		t.Fatalf("未授权属于等待，不该报错: %v", errSubmit)
+	}
+	if result.Status != pluginapi.AuthLoginStatusPending {
+		t.Fatalf("status = %q, want pending", result.Status)
+	}
+	if !strings.Contains(result.Message, "TM.00001002") {
+		t.Fatalf("pending 提示里没有上游原因: %q", result.Message)
+	}
+	if result.RedirectURL == "" {
+		t.Fatal("pending 时仍需带回门户登录地址")
 	}
 }

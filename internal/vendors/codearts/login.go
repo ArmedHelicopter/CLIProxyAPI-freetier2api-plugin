@@ -12,23 +12,34 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/logger"
 )
 
+// pendingLogin 是一次进行中的 CodeArts 登录。
 type pendingLogin struct {
-	TicketID       string
-	Secret         string
+	// TicketID 由本插件生成，授权链接与后续票据查询都用它。
+	//
+	// **不能**被回调里的 ticket_id 覆盖：门户回调里那个是它自己的中间票，
+	// 拿它去查票据接口会被判「无效ticketId」（实测 TM.00001001）。
+	TicketID string
+	// Secret 初始是自造值；收到浏览器回调后换成门户下发的那个。
+	Secret string
+	// TicketFallback 标记「门户 secret 已就位」。之前不查票据接口——用自造
+	// secret 查只会一直拿到无效票据，白白轮询。
+	TicketFallback bool
 	Verifier       string
 	DPoPPrivateKey map[string]string
-	// TicketURL 覆盖票据端点。空值表示 SnapManagerHost+EpLoginTicket；
-	// 单测把它指向 httptest 服务，避免测试真的打到华为云。
+	// TicketURL 仅供单测注入票据端点；空表示 SnapManagerHost+EpLoginTicket。
 	TicketURL string
 }
 
@@ -45,18 +56,7 @@ func LoginStart(ctx context.Context, logins core.LoginSessions) (*pluginapi.Auth
 		return nil, fmt.Errorf("generate dpop jwk: %w", err)
 	}
 
-	redirectURI := "http://127.0.0.1:7866/oauth/callback"
-	v := url.Values{}
-	v.Set("client_id", ClientID)
-	v.Set("response_type", "code")
-	v.Set("ticket_id", ticketID)
-	v.Set("code_challenge", challenge)
-	v.Set("code_challenge_method", "S256")
-	v.Set("redirect_uri", redirectURI)
-
-	authURL := PortalHost + "/authorize?" + v.Encode()
 	sessionID := "codearts_" + core.RandomHex(8)
-
 	logins.Register(VendorID, sessionID, 15*time.Minute, 0, &pendingLogin{
 		TicketID:       ticketID,
 		Secret:         secret,
@@ -66,10 +66,30 @@ func LoginStart(ctx context.Context, logins core.LoginSessions) (*pluginapi.Auth
 
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  "freetier",
-		URL:       authURL,
+		URL:       buildAuthorizeURL(ticketID, challenge),
 		State:     sessionID,
 		ExpiresAt: time.Now().Add(15 * time.Minute),
 	}, nil
+}
+
+// buildAuthorizeURL 拼门户授权链接。
+//
+// 参数集与官方 CodeArts Agent 插件一致（逆向自 huaweicloud.authentication）：
+// 关键在 port —— 门户按它拼出回调地址 http://127.0.0.1:<port>/oauth/callback。
+// 少了这个参数，门户回落到默认端口，回调就打到 80 端口去了。
+func buildAuthorizeURL(ticketID, challenge string) string {
+	v := url.Values{}
+	v.Set("theme", "2")
+	v.Set("locale", "zh-cn")
+	v.Set("uri_scheme", ClientID)
+	v.Set("client_id", ClientID)
+	v.Set("port", strconv.Itoa(LocalCallbackPort))
+	v.Set("code_challenge", challenge)
+	v.Set("code_challenge_method", "SHA-256")
+	v.Set("ticket_id", ticketID)
+	v.Set("plugin-name", PluginName)
+	v.Set("plugin-version", PluginVersion)
+	return PortalHost + "/authorize?" + v.Encode()
 }
 
 // LoginPoll 轮询华为云 ticket 登录结果。
@@ -93,26 +113,40 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 
 // pollLoginTicket 用会话里当前的 ticket/secret 换一次凭证。
 //
-// ticket/secret 会被 SubmitCallback 换成上游签发的那一对，因此普通轮询与
-// 粘贴回调共用这一段——区别只在「ticket 从哪来」。
+// ticket/secret 会被 SubmitCallback 换成「本插件的 ticket + 门户的 secret」，
+// 因此普通轮询与粘贴回调共用这一段——区别只在「secret 从哪来」。
 func pollLoginTicket(ctx context.Context, logins core.LoginSessions, sessionID string, pending *pendingLogin) (*pluginapi.AuthLoginPollResponse, error) {
+	if !pending.TicketFallback {
+		// 门户还没下发 secret：此刻查票据只会拿到「无效ticketId」，
+		// 不是「用户在慢慢登录」。把两种等待分开，用户才知道下一步做什么。
+		return &pluginapi.AuthLoginPollResponse{
+			Status:  pluginapi.AuthLoginStatusPending,
+			Message: "等待浏览器完成华为云授权…完成后请把回调链接粘回控制台",
+		}, nil
+	}
+
 	ticketURL := strings.TrimSpace(pending.TicketURL)
 	if ticketURL == "" {
 		ticketURL = SnapManagerHost + EpLoginTicket
 	}
-	creds, ready, errFetch := fetchTicketCredentials(ctx, ticketURL, pending.TicketID, pending.Secret)
+	result, errFetch := fetchTicketCredentials(ctx, ticketURL, pending.TicketID, pending.Secret)
 	if errFetch != nil {
-		return nil, errFetch
+		return nil, core.ToPluginError(errFetch)
 	}
-	if !ready {
-		return &pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "等待用户完成华为云登录…",
-		}, nil
+	if !result.Ready {
+		message := "等待用户在新的浏览器标签页里完成华为云登录…"
+		if result.Note != "" {
+			message += "（上游：" + result.Note + "）"
+		}
+		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending, Message: message}, nil
 	}
 
 	logins.Delete(sessionID)
+	return successResponse(result.Credentials, pending), nil
+}
 
+// successResponse 把票据/令牌返回的凭证转成宿主认识的登录成功响应。
+func successResponse(creds *ticketCredentials, pending *pendingLogin) *pluginapi.AuthLoginPollResponse {
 	uid := core.FirstNonEmpty(creds.UserID, creds.UserName, "codearts-user")
 	cred := &Credential{
 		Vendor:          VendorID,
@@ -128,12 +162,10 @@ func pollLoginTicket(ctx context.Context, logins core.LoginSessions, sessionID s
 		DPoPPrivateKey:  pending.DPoPPrivateKey,
 		Label:           "CodeArts-" + uid,
 	}
-
 	storageJSON, errStorage := cred.StorageJSON()
 	if errStorage != nil {
-		return nil, errStorage
+		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: errStorage.Error()}
 	}
-
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "华为云账号登录成功",
@@ -143,10 +175,10 @@ func pollLoginTicket(ctx context.Context, logins core.LoginSessions, sessionID s
 			Label:       cred.Label,
 			StorageJSON: storageJSON,
 		},
-	}, nil
+	}
 }
 
-// ticketCredentials 是华为云登录票据换取到的临时凭证。
+// ticketCredentials 是登录票据或令牌接口返回的临时凭证。
 type ticketCredentials struct {
 	UserName        string
 	UserID          string
@@ -158,89 +190,101 @@ type ticketCredentials struct {
 	Expiration      string
 }
 
-// fetchTicketCredentials 用 ticket/secret 调登录票据接口换 AK/SK。
+// ticketPollResult 是一次票据查询的结果。
+type ticketPollResult struct {
+	Credentials *ticketCredentials
+	// Ready 表示上游已经下发可用的 AK/SK + security_token。
+	Ready bool
+	// Note 是上游原话（不含票据与密钥），用于回答「到底卡在哪一步」。
+	Note string
+}
+
+// fetchTicketCredentials 用 ticket/secret 查登录票据，换 AK/SK。
 //
-// ready=false 表示上游还没准备好（票据未签发、HTTP 4xx/5xx、或响应里还没给
-// AK/SK），调用方应当继续轮询；只有传输层与解码错误才返回 error。
-func fetchTicketCredentials(ctx context.Context, ticketURL, ticketID, secret string) (*ticketCredentials, bool, error) {
+// 上游一律用「没准备好」回应未完成的授权（实测是 TM.00001001 无效ticketId，
+// 与乱填的 ticket 得到的回答一样），所以这里一律当等待处理，不当成终态失败——
+// 终态只由会话过期决定，用户重新发起即可。
+func fetchTicketCredentials(ctx context.Context, ticketURL, ticketID, secret string) (ticketPollResult, error) {
 	path := ticketURL + "?ticket_id=" + url.QueryEscape(ticketID) + "&secret=" + url.QueryEscape(secret)
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, path, nil)
 	if errReq != nil {
-		return nil, false, errReq
+		return ticketPollResult{}, errReq
 	}
-	req.Header.Set("plugin-name", "snap_AIIDE")
-	req.Header.Set("plugin-version", "5.2.0")
+	req.Header.Set("plugin-name", PluginName)
+	req.Header.Set("plugin-version", PluginVersion)
 
 	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return nil, false, fmt.Errorf("poll login ticket failed: %w", errDo)
+		return ticketPollResult{}, fmt.Errorf("poll login ticket failed: %w", errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, false, nil
+		note := describeUpstream(resp.StatusCode, body)
+		logger.Debug("codearts: 票据未就绪 %s", note)
+		return ticketPollResult{Note: note}, nil
 	}
 
-	var res struct {
-		UserName     string `json:"user_name"`
-		UserID       string `json:"user_id"`
-		DomainID     string `json:"domain_id"`
-		RefreshToken string `json:"refresh_token"`
-		Credential   struct {
-			Access        string `json:"access"`
-			Secret        string `json:"secret"`
-			SecurityToken string `json:"security_token"`
-			ExpiresAt     string `json:"expires_at"`
-		} `json:"credential"`
-		Credentials struct {
-			AccessKeyID     string `json:"access_key_id"`
-			SecretAccessKey string `json:"secret_access_key"`
-			SecurityToken   string `json:"security_token"`
-			Expiration      string `json:"expiration"`
-		} `json:"credentials"`
+	creds, errParse := decodeTokenResponse(body)
+	if errParse != nil {
+		return ticketPollResult{}, errParse
 	}
-	if err := json.Unmarshal(body, &res); err != nil {
-		return nil, false, fmt.Errorf("decode ticket response: %w", err)
+	if creds.AccessKeyID == "" || creds.SecretAccessKey == "" || creds.SecurityToken == "" {
+		return ticketPollResult{Note: describeUpstream(resp.StatusCode, body)}, nil
 	}
+	return ticketPollResult{Ready: true, Credentials: creds}, nil
+}
 
-	ak := core.FirstNonEmpty(res.Credentials.AccessKeyID, res.Credential.Access)
-	sk := core.FirstNonEmpty(res.Credentials.SecretAccessKey, res.Credential.Secret)
-	if ak == "" || sk == "" {
-		return nil, false, nil
+// describeUpstream 把上游回应压成一句可展示的话。
+//
+// 优先取云厂商标准的 error_code / error_msg；非 JSON 正文截断到 160 字。
+// 正文里不含票据与密钥（那是请求参数），可以安全展示给用户。
+func describeUpstream(status int, body []byte) string {
+	var envelope struct {
+		Code string `json:"error_code"`
+		Msg  string `json:"error_msg"`
 	}
-
-	return &ticketCredentials{
-		UserName:        res.UserName,
-		UserID:          res.UserID,
-		DomainID:        res.DomainID,
-		RefreshToken:    res.RefreshToken,
-		AccessKeyID:     ak,
-		SecretAccessKey: sk,
-		SecurityToken:   core.FirstNonEmpty(res.Credentials.SecurityToken, res.Credential.SecurityToken),
-		Expiration:      core.FirstNonEmpty(res.Credentials.Expiration, res.Credential.ExpiresAt),
-	}, true, nil
+	if err := json.Unmarshal(body, &envelope); err == nil && (envelope.Msg != "" || envelope.Code != "") {
+		joined := core.FirstNonEmpty(envelope.Msg, envelope.Code)
+		if envelope.Code != "" && envelope.Msg != "" {
+			joined = envelope.Code + " " + envelope.Msg
+		}
+		return "HTTP " + strconv.Itoa(status) + " " + joined
+	}
+	trimmed := strings.TrimSpace(string(body))
+	if len(trimmed) > 160 {
+		trimmed = trimmed[:160] + "…"
+	}
+	if trimmed == "" {
+		return "HTTP " + strconv.Itoa(status)
+	}
+	return "HTTP " + strconv.Itoa(status) + " " + trimmed
 }
 
 // CallbackInfo 是华为云 localhost 回调里带回来的信息。
 type CallbackInfo struct {
-	// TicketID 与 Secret 是上游签发的登录票据凭据。
+	// TicketID 是回调里那个 URL 所携带的票据号（门户中间票，**不是**本会话的票）。
 	TicketID string
-	Secret   string
-	// Redirect 是回调指向的华为云登录页（票据还没换到凭证时，用户要再去点它）。
+	// Secret 是门户下发的票据密钥：要拿它替换本会话自造的 secret。
+	Secret string
+	// Code 是 OAuth2 授权码（较新的门户会带；带它就不必再走票据通道）。
+	Code string
+	// Redirect 是用户接下来要在浏览器里打开的门户登录页。
 	Redirect string
 }
 
 // ParseCallback 解析用户粘贴的 localhost 回调链接。
 //
-// 实际回调形如：
+// 两种形态：
 //
-//	http://127.0.0.1/oauth/callback?secret=<票据密钥>&
-//		redirect=<encoded codearts.huaweicloud.com/portal/login?...&ticket_id=<票据 ID>...>
+//	旧票据通道：http://127.0.0.1:7866/oauth/callback?secret=<门户密钥>&
+//		redirect=<门户登录页?...&ticket_id=<票据号>&...>
 //
-// 关键点：这里的 ticket_id/secret 是**华为云签发**的，不是 LoginStart 送进
-// /authorize 的那一对。所以必须从回调里取——继续拿自造值轮询，永远查不到凭证。
+//	新授权码通道：http://127.0.0.1:7866/oauth/callback?code=<授权码>
+//
+// 只接受回环地址与该路径：别的地址不是本次登录的回调，粘错了不该改会话状态。
 func ParseCallback(rawURL string) (*CallbackInfo, error) {
 	rawURL = strings.TrimSpace(rawURL)
 	if rawURL == "" {
@@ -253,35 +297,47 @@ func ParseCallback(rawURL string) (*CallbackInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse callback url: %w", err)
 	}
+	if !strings.EqualFold(u.Scheme, "http") || !isLoopbackHost(u.Hostname()) || u.Path != LocalCallbackPath {
+		return nil, fmt.Errorf("不是本机回调地址（应为 http://127.0.0.1<port>%s）", LocalCallbackPath)
+	}
 
 	q := u.Query()
-	info := &CallbackInfo{Secret: q.Get("secret"), Redirect: q.Get("redirect")}
+	info := &CallbackInfo{
+		Code:     strings.TrimSpace(q.Get("code")),
+		Secret:   strings.TrimSpace(q.Get("secret")),
+		Redirect: strings.TrimSpace(q.Get("redirect")),
+	}
 	if info.Redirect != "" {
 		if portal, errPortal := url.Parse(info.Redirect); errPortal == nil {
-			pq := portal.Query()
-			info.TicketID = pq.Get("ticket_id")
-			// 内层 secret 是门户登录页真正使用的那一个，缺失时回落到外层。
-			if secret := pq.Get("secret"); secret != "" {
-				info.Secret = secret
-			}
+			info.TicketID = strings.TrimSpace(portal.Query().Get("ticket_id"))
 		}
 	}
-	// 容错：用户可能粘的是解码后的链接（参数直接摊在回调上）。
-	if info.TicketID == "" {
-		info.TicketID = q.Get("ticket_id")
-	}
-
-	if info.TicketID == "" || info.Secret == "" {
-		return nil, fmt.Errorf("callback missing ticket_id or secret")
+	// 两种可用形态：授权码，或「secret + 门户登录页」。
+	// 只有 secret 没有 redirect 时无法核对票据号，不敢认领——宁可让用户重发。
+	if info.Code == "" && (info.Secret == "" || info.Redirect == "") {
+		return nil, fmt.Errorf("回调链接里既没有 code，也没有 secret + redirect")
 	}
 	return info, nil
+}
+
+// isLoopbackHost 报告 host 是否是本机回环地址。
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }
 
 // SubmitCallback 接受用户粘贴的 localhost 回调链接。
 //
 // 浏览器跳回 127.0.0.1 时，插件与浏览器不在同一台机器（远程主机 / Docker /
-// WSL）就收不到这条回调，登录会永久停在「等待授权中」。用户把地址栏里的
-// 整条链接粘回来，这里取出上游签发的 ticket/secret 覆盖自造值，随即换一次凭证。
+// WSL）就收不到这条回调，登录会永远停在等待。用户把地址栏里的整条链接粘回来，
+// 这里就地续完登录：
+//
+//   - 带 code：直接用授权码换 STS 凭证，一次到位；
+//   - 带 secret/redirect：记下门户下发的 secret（**保留本会话自己的 ticket_id**），
+//     再查一次票据；用户点开 redirect 完成授权后，后续轮询就会换到凭证。
 func SubmitCallback(ctx context.Context, logins core.LoginSessions, state, rawURL string) (*core.CallbackSubmitResult, error) {
 	sessionID := strings.TrimSpace(state)
 	if sessionID == "" {
@@ -297,34 +353,57 @@ func SubmitCallback(ctx context.Context, logins core.LoginSessions, state, rawUR
 		return nil, core.NewPluginError("login_session_broken", "登录会话数据已损坏，请重新发起登录", http.StatusBadRequest)
 	}
 
-	// 解析失败时不回显原始链接：里面带着票据密钥。
+	// 解析失败时不回显原始链接：里面带着票据密钥与授权码。
 	info, errParse := ParseCallback(rawURL)
 	if errParse != nil {
 		return nil, core.NewPluginError("callback_parse_failed",
-			"回调链接解析失败，请确认粘贴的是浏览器地址栏里的完整链接（含 http:// 与后面的参数）",
+			"回调链接解析失败，请确认粘贴的是浏览器地址栏里的完整链接（本机 127.0.0.1 开头、路径 /oauth/callback）",
 			http.StatusBadRequest)
 	}
 
-	// 只有上游签发的这对值能换到凭证，覆盖掉 LoginStart 的自造值。
-	pending.TicketID = info.TicketID
-	pending.Secret = info.Secret
+	if info.Code != "" {
+		creds, errExchange := exchangeAuthorizationCode(ctx, info.Code, pending)
+		if errExchange != nil {
+			return nil, core.ToPluginError(errExchange)
+		}
+		logins.Delete(sessionID)
+		polled := successResponse(creds, pending)
+		return &core.CallbackSubmitResult{
+			Status: polled.Status, Message: polled.Message, Auth: polled.Auth,
+		}, nil
+	}
 
-	response, errPoll := pollLoginTicket(ctx, logins, sessionID, pending)
+	// 票据通道：门户 secret 才是能用的那把，ticket_id 仍用本会话的。
+	if info.TicketID != "" && pending.TicketID != "" && info.TicketID != pending.TicketID {
+		return nil, core.NewPluginError("callback_mismatch",
+			"回调链接里的票据号与当前登录会话不一致，请重新发起登录后重新授权", http.StatusBadRequest)
+	}
+	pending.Secret = info.Secret
+	pending.TicketFallback = true
+
+	polled, errPoll := pollLoginTicket(ctx, logins, sessionID, pending)
 	if errPoll != nil {
 		return nil, core.ToPluginError(errPoll)
 	}
-
-	result := &core.CallbackSubmitResult{
-		Status:  response.Status,
-		Message: response.Message,
-	}
-	if response.Status == pluginapi.AuthLoginStatusSuccess {
-		result.Auth = response.Auth
+	result := &core.CallbackSubmitResult{Status: polled.Status, Message: polled.Message}
+	if polled.Status == pluginapi.AuthLoginStatusSuccess {
+		result.Auth = polled.Auth
 		return result, nil
 	}
-	// 票据还没换到凭证：把门户登录页给用户，让他在能联网的浏览器里点开完成授权。
+	//票据还没换到凭证：把门户登录页交给用户去完成授权，插件继续轮询。
 	result.RedirectURL = info.Redirect
 	return result, nil
+}
+
+// exchangeAuthorizationCode 用 OAuth2 授权码换 STS 凭证。
+func exchangeAuthorizationCode(ctx context.Context, code string, pending *pendingLogin) (*ticketCredentials, error) {
+	form := url.Values{}
+	form.Set("grant_type", "authorization_code")
+	form.Set("client_id", ClientID)
+	form.Set("code", code)
+	form.Set("code_verifier", pending.Verifier)
+	form.Set("redirect_uri", LocalCallbackURL)
+	return requestTokenCredentials(ctx, form, pending.DPoPPrivateKey)
 }
 
 func generateDPoPJWK() (map[string]string, error) {
@@ -347,29 +426,20 @@ func generateDPoPJWK() (map[string]string, error) {
 	}, nil
 }
 
-// Token 续期：使用 refresh_token 与 DPoP 签名换取新 STS 凭证。
-// 参考：/Users/jiandan/Workspaces/codearts2api/internal/upstream/client.go 与 dpop.go
-
-// RefreshCredential 执行 Token 续期。
-func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool, error) {
-	if cred == nil || cred.RefreshToken == "" {
-		return cred, false, nil
-	}
-
-	tokenURL := SnapManagerHost + EpOAuthTokens
-	proof, errProof := buildDPoPProof(cred.DPoPPrivateKey, tokenURL)
+// requestTokenCredentials 向 STS 令牌端点提交表单（带 DPoP 证明）并解析凭证。
+//
+// 授权码换 token 与 refresh_token 续期是同一个端点的两种 grant_type，共用这一份
+// 请求与解析逻辑：DPoP 私钥是绑定的，两条通道必须用同一把，否则上游拒。
+func requestTokenCredentials(ctx context.Context, form url.Values, dpopJWK map[string]string) (*ticketCredentials, error) {
+	tokenURL := STSHost + EpOAuthTokens
+	proof, errProof := buildDPoPProof(dpopJWK, tokenURL)
 	if errProof != nil {
-		return nil, false, fmt.Errorf("build dpop proof: %w", errProof)
+		return nil, fmt.Errorf("build dpop proof: %w", errProof)
 	}
-
-	form := url.Values{}
-	form.Set("grant_type", "refresh_token")
-	form.Set("client_id", core.FirstNonEmpty(cred.ClientID, ClientID))
-	form.Set("refresh_token", cred.RefreshToken)
 
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, tokenURL, strings.NewReader(form.Encode()))
 	if errReq != nil {
-		return nil, false, errReq
+		return nil, errReq
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("DPoP", proof)
@@ -377,18 +447,42 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
-		return nil, false, fmt.Errorf("refresh token request failed: %w", errDo)
+		return nil, fmt.Errorf("token request failed: %w", errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, false, Classify(resp.StatusCode, string(body))
+		return nil, Classify(resp.StatusCode, string(body))
 	}
+	creds, errParse := decodeTokenResponse(body)
+	if errParse != nil {
+		return nil, errParse
+	}
+	if creds.AccessKeyID == "" || creds.SecretAccessKey == "" || creds.SecurityToken == "" {
+		return nil, fmt.Errorf("token response missing credentials")
+	}
+	return creds, nil
+}
 
+// decodeTokenResponse 解析令牌/票据响应。
+//
+// 上游有两种字段形态：新通道用 credentials.{access_key_id, secret_access_key,
+// security_token}，旧的票据通道用 credential.{access, secret, securitytoken}。
+// 两种都认，否则升级后凭证字段读空。
+func decodeTokenResponse(body []byte) (*ticketCredentials, error) {
 	var res struct {
+		UserName     string `json:"user_name"`
+		UserID       string `json:"user_id"`
+		DomainID     string `json:"domain_id"`
 		RefreshToken string `json:"refresh_token"`
-		Credentials  struct {
+		Credential   struct {
+			Access        string `json:"access"`
+			Secret        string `json:"secret"`
+			SecurityToken string `json:"securitytoken"`
+			ExpiresAt     string `json:"expires_at"`
+		} `json:"credential"`
+		Credentials struct {
 			AccessKeyID     string `json:"access_key_id"`
 			SecretAccessKey string `json:"secret_access_key"`
 			SecurityToken   string `json:"security_token"`
@@ -396,22 +490,52 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 		} `json:"credentials"`
 	}
 	if err := json.Unmarshal(body, &res); err != nil {
-		return nil, false, fmt.Errorf("decode refresh response: %w", err)
+		return nil, fmt.Errorf("decode token response: %w", err)
+	}
+	return &ticketCredentials{
+		UserName:        res.UserName,
+		UserID:          res.UserID,
+		DomainID:        res.DomainID,
+		RefreshToken:    res.RefreshToken,
+		AccessKeyID:     core.FirstNonEmpty(res.Credentials.AccessKeyID, res.Credential.Access),
+		SecretAccessKey: core.FirstNonEmpty(res.Credentials.SecretAccessKey, res.Credential.Secret),
+		SecurityToken:   core.FirstNonEmpty(res.Credentials.SecurityToken, res.Credential.SecurityToken),
+		Expiration:      core.FirstNonEmpty(res.Credentials.Expiration, res.Credential.ExpiresAt),
+	}, nil
+}
+
+// RefreshCredential 用 refresh_token 换新的 STS 凭证。
+//
+// DPoP 私钥与 refresh_token 是绑定的：必须用签发它的那一把，否则上游报
+// InvalidDPoPHeader，表现为「凭证失效」而被错误停用。
+func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool, error) {
+	if cred == nil || cred.RefreshToken == "" {
+		return cred, false, nil
 	}
 
-	if res.Credentials.AccessKeyID == "" || res.Credentials.SecretAccessKey == "" {
-		return nil, false, fmt.Errorf("refresh token response missing ak/sk")
+	form := url.Values{}
+	form.Set("grant_type", "refresh_token")
+	form.Set("client_id", core.FirstNonEmpty(cred.ClientID, ClientID))
+	form.Set("refresh_token", cred.RefreshToken)
+	if cred.CodeVerifier != "" {
+		form.Set("code_verifier", cred.CodeVerifier)
+	}
+
+	creds, errRefresh := requestTokenCredentials(ctx, form, cred.DPoPPrivateKey)
+	if errRefresh != nil {
+		return nil, false, errRefresh
 	}
 
 	updated := *cred
-	updated.AccessKeyID = res.Credentials.AccessKeyID
-	updated.SecretAccessKey = res.Credentials.SecretAccessKey
-	updated.SecurityToken = res.Credentials.SecurityToken
-	if res.RefreshToken != "" {
-		updated.RefreshToken = res.RefreshToken
+	updated.AccessKeyID = creds.AccessKeyID
+	updated.SecretAccessKey = creds.SecretAccessKey
+	updated.SecurityToken = creds.SecurityToken
+	if creds.RefreshToken != "" {
+		updated.RefreshToken = creds.RefreshToken
 	}
-	updated.Expiration = res.Credentials.Expiration
-
+	if creds.Expiration != "" {
+		updated.Expiration = creds.Expiration
+	}
 	return &updated, true, nil
 }
 

@@ -457,24 +457,27 @@ func (s *SessionStore) handleAuthorizeCallback(w http.ResponseWriter, r *http.Re
 // HTTP 回调与控制台「粘贴回调链接」共用这一段——两条路径只差「怎么拿到回调
 // 链接」，完成逻辑必须一致，否则同一次登录会因为入口不同产出不同凭证。
 func (s *SessionStore) completeLogin(ctx context.Context, matched *PendingSession, info *CallbackInfo) (*pluginapi.AuthData, error) {
-	// 执行 Token 换取
-	authHost := HostOAuthSolo
-	clientID := "trae_login"
-	if !matched.IsSolo {
-		cfg, okConfig := ConfigForVendor(matched.VendorID)
-		if !okConfig {
-			cfg = ConfigFor(matched.Region)
-		}
-		authHost = cfg.AuthHost
-		clientID = cfg.ClientID
+	// 执行 Token 换取：host/clientID 一律按实例 profile 取（国内版与 SOLO 同为
+	// api.trae.cn + en1oxy7wnw8j9n，国际版为 growsg-normal.trae.ai + ono9krqynydwx5）。
+	cfg, okConfig := ConfigForVendor(matched.VendorID)
+	if !okConfig {
+		cfg = ConfigFor(matched.Region)
 	}
+	authHost := cfg.AuthHost
+	clientID := cfg.ClientID
 
 	accessToken := info.AccessToken
 	refreshToken := info.RefreshToken
 	expiresAt := info.ExpiresAt
 
+	// uid 要在换 token 之前算好：上游的换 token 接口要求带 UserID。
+	uid := info.UID
+	if uid == "" {
+		uid = "user_" + matched.MachineID[:min(8, len(matched.MachineID))]
+	}
+
 	if refreshToken != "" {
-		newAccess, newRefresh, exp, errEx := exchangeTraeToken(ctx, authHost, clientID, refreshToken)
+		newAccess, newRefresh, exp, errEx := exchangeTraeToken(ctx, authHost, clientID, uid, refreshToken)
 		if errEx != nil {
 			logger.Error("trae: callback exchange token warning: %v, falling back to original", errEx)
 		} else {
@@ -486,10 +489,6 @@ func (s *SessionStore) completeLogin(ctx context.Context, matched *PendingSessio
 		}
 	}
 
-	uid := info.UID
-	if uid == "" {
-		uid = "user_" + matched.MachineID[:min(8, len(matched.MachineID))]
-	}
 	nickname := info.Nickname
 	if nickname == "" {
 		nickname = uid
@@ -600,19 +599,26 @@ func (s *SessionStore) SubmitCallback(ctx context.Context, state, rawURL string)
 	}, nil
 }
 
-func exchangeTraeToken(ctx context.Context, authHost, clientID, refreshToken string) (string, string, int64, error) {
+// exchangeTraeToken 用 refreshToken 换 accessToken（Trae OAuth ExchangeToken）。
+//
+// 协议（已联调验证）：POST {host}/cloudide/api/v3/trae/oauth/ExchangeToken，
+// PascalCase 载荷，响应取 Result.Token / Result.RefreshToken / Result.TokenExpireAt。
+// host/clientID 由调用方按实例 profile 给出（国内版与 SOLO 同为 api.trae.cn +
+// en1oxy7wnw8j9n，国际版为 growsg-normal.trae.ai + ono9krqynydwx5）。
+func exchangeTraeToken(ctx context.Context, authHost, clientID, userID, refreshToken string) (string, string, int64, error) {
 	payload := map[string]string{
-		"refreshToken": refreshToken,
-		"client_id":    clientID,
+		"ClientID":     clientID,
+		"RefreshToken": refreshToken,
+		"ClientSecret": "-",
+		"UserID":       userID,
 	}
 	bodyBytes, _ := json.Marshal(payload)
 
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, authHost+"/api/v1/auth/exchange", bytes.NewReader(bodyBytes))
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, authHost+EpExchange, bytes.NewReader(bodyBytes))
 	if errReq != nil {
 		return "", "", 0, errReq
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", "Trae/1.0.0")
 
 	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
@@ -627,31 +633,29 @@ func exchangeTraeToken(ctx context.Context, authHost, clientID, refreshToken str
 	}
 
 	var res struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-		Data struct {
-			AccessToken         string `json:"accessToken"`
-			RefreshToken        string `json:"refreshToken"`
-			TokenExpireAt       int64  `json:"tokenExpireAt"`
-			TokenExpireDuration int64  `json:"tokenExpireDuration"`
-		} `json:"data"`
+		Result struct {
+			Token               string `json:"Token"`
+			RefreshToken        string `json:"RefreshToken"`
+			TokenExpireAt       int64  `json:"TokenExpireAt"`
+			TokenExpireDuration int64  `json:"TokenExpireDuration"`
+		} `json:"Result"`
 	}
 	if err := json.Unmarshal(body, &res); err != nil {
 		return "", "", 0, err
 	}
-	if res.Code != 0 || res.Data.AccessToken == "" {
-		return "", "", 0, fmt.Errorf("exchange error code=%d msg=%s", res.Code, res.Msg)
+	if res.Result.Token == "" {
+		return "", "", 0, fmt.Errorf("exchange token failed: %s", string(body))
 	}
 
-	exp := res.Data.TokenExpireAt
+	exp := res.Result.TokenExpireAt
 	if exp > 1e12 {
 		exp /= 1000
 	}
-	if exp <= 0 && res.Data.TokenExpireDuration > 0 {
-		exp = time.Now().Unix() + res.Data.TokenExpireDuration
+	if exp <= 0 && res.Result.TokenExpireDuration > 0 {
+		exp = time.Now().Unix() + res.Result.TokenExpireDuration
 	}
 
-	return res.Data.AccessToken, res.Data.RefreshToken, exp, nil
+	return res.Result.Token, res.Result.RefreshToken, exp, nil
 }
 
 func renderCallbackHTML(w http.ResponseWriter, code int, title, message string) {
@@ -693,14 +697,19 @@ func renderCallbackHTML(w http.ResponseWriter, code int, title, message string) 
 
 // Token 续期：调用 ExchangeToken 轮换 accessToken 与 refreshToken。
 
+// RefreshCredential 用 refreshToken 轮换 accessToken（Trae OAuth ExchangeToken）。
+//
+// 协议与 exchangeTraeToken 相同：PascalCase 载荷，响应取 Result.Token。
 func RefreshCredential(ctx context.Context, cred *Credential, cfg Config) (*Credential, bool, error) {
 	if cred == nil || cred.RefreshToken == "" {
 		return cred, false, nil
 	}
 
 	payload := map[string]string{
-		"refreshToken": cred.RefreshToken,
-		"client_id":    cfg.ClientID,
+		"ClientID":     cfg.ClientID,
+		"RefreshToken": cred.RefreshToken,
+		"ClientSecret": "-",
+		"UserID":       cred.UID,
 	}
 	bodyBytes, _ := json.Marshal(payload)
 
@@ -709,7 +718,6 @@ func RefreshCredential(ctx context.Context, cred *Credential, cfg Config) (*Cred
 		return nil, false, errReq
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", cfg.clientUA())
 
 	client := hostbridge.Client(ctx, 30*time.Second)
 	resp, errDo := client.Do(req)
@@ -724,41 +732,37 @@ func RefreshCredential(ctx context.Context, cred *Credential, cfg Config) (*Cred
 	}
 
 	var result struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-		Data struct {
-			AccessToken         string `json:"accessToken"`
-			RefreshToken        string `json:"refreshToken"`
-			TokenExpireAt       int64  `json:"tokenExpireAt"`
-			TokenExpireDuration int64  `json:"tokenExpireDuration"`
-		} `json:"data"`
+		Result struct {
+			Token               string `json:"Token"`
+			RefreshToken        string `json:"RefreshToken"`
+			TokenExpireAt       int64  `json:"TokenExpireAt"`
+			TokenExpireDuration int64  `json:"TokenExpireDuration"`
+		} `json:"Result"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, false, fmt.Errorf("decode exchange token response: %w", err)
 	}
-
-	if result.Code != 0 || result.Data.AccessToken == "" {
-		return nil, false, fmt.Errorf("exchange token failed: code=%d msg=%s", result.Code, result.Msg)
+	if result.Result.Token == "" {
+		return nil, false, fmt.Errorf("exchange token failed: %s", string(body))
 	}
 
-	expiresAt := result.Data.TokenExpireAt
+	expiresAt := result.Result.TokenExpireAt
 	if expiresAt > 1e12 {
 		expiresAt /= 1000
 	}
-	if expiresAt <= 0 && result.Data.TokenExpireDuration > 0 {
-		expiresAt = time.Now().Unix() + result.Data.TokenExpireDuration
+	if expiresAt <= 0 && result.Result.TokenExpireDuration > 0 {
+		expiresAt = time.Now().Unix() + result.Result.TokenExpireDuration
 	}
 
 	updated := *cred
-	updated.AccessToken = result.Data.AccessToken
-	if result.Data.RefreshToken != "" {
-		updated.RefreshToken = result.Data.RefreshToken
+	updated.AccessToken = result.Result.Token
+	if result.Result.RefreshToken != "" {
+		updated.RefreshToken = result.Result.RefreshToken
 	}
 	updated.ExpiresAt = expiresAt
 
 	return &updated, true, nil
 }
-
 func MergeStorageJSON(original []byte, updated *Credential) ([]byte, error) {
 	if updated == nil {
 		return original, nil

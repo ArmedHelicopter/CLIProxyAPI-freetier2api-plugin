@@ -2,12 +2,16 @@ package admin
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // postLoginCallback 调用管理路由并解出响应体。
@@ -102,5 +106,88 @@ func TestHandleLoginCallbackRejectsMissingState(t *testing.T) {
 	payload := postLoginCallback(t, newServiceWithDeps(t, deps), "", "http://127.0.0.1/oauth/callback?secret=s")
 	if payload["ok"] != false {
 		t.Fatalf("缺 state 时不应成功: %v", payload)
+	}
+}
+
+// TestHandleLoginCallbackPersistsCredential 锁定「登录成功 → 凭证真的落盘」。
+//
+// 粘贴路径的凭证只回到**页面**：正常轮询路径是宿主在 auth.login.poll 之后写
+// 文件，粘贴路径没有那个宿主环节。少了这一步，页面显示「登录成功」而 auth
+// 目录里什么都没有、账号概览也不会多出新账号。
+func TestHandleLoginCallbackPersistsCredential(t *testing.T) {
+	var savedName string
+	var savedJSON []byte
+	hostbridge.Configure(func(callbackID, method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostAuthSave {
+			return nil, fmt.Errorf("unexpected host method %s", method)
+		}
+		raw, errMarshal := json.Marshal(payload)
+		if errMarshal != nil {
+			return nil, errMarshal
+		}
+		var request pluginapi.HostAuthSaveRequest
+		if errUnmarshal := json.Unmarshal(raw, &request); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		savedName, savedJSON = request.Name, request.JSON
+		return json.RawMessage("{}"), nil
+	})
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+
+	deps := newStubDeps(t)
+	deps.callbackResult = &core.CallbackSubmitResult{
+		Status:  pluginapi.AuthLoginStatusSuccess,
+		Message: "登录成功",
+		Auth: pluginapi.AuthData{
+			Provider:    "freetier",
+			FileName:    "traecn-user-1.json",
+			Label:       "Trae-tester",
+			StorageJSON: []byte("{\"type\":\"freetier\",\"vendor\":\"traecn\"}"),
+		},
+	}
+	payload := postLoginCallback(t, newServiceWithDeps(t, deps), "traecn_x",
+		"http://127.0.0.1:18080/authorize?loginTraceID=t")
+
+	if payload["ok"] != true {
+		t.Fatalf("落盘成功后应回报成功: %v", payload)
+	}
+	if savedName != "traecn-user-1.json" {
+		t.Fatalf("host.auth.save 的文件名 = %q, want traecn-user-1.json", savedName)
+	}
+	if !strings.Contains(string(savedJSON), "traecn") {
+		t.Fatalf("落盘内容缺少归属字段: %s", savedJSON)
+	}
+	if payload["auth_id"] != "traecn-user-1.json" {
+		t.Fatalf("响应未回报 auth_id: %v", payload)
+	}
+}
+
+// TestHandleLoginCallbackReportsPersistFailure 锁定保存失败要说实话：宿主回调与
+// 落盘都失败时，不能页面显示「登录成功」而磁盘上什么都没有。
+func TestHandleLoginCallbackReportsPersistFailure(t *testing.T) {
+	hostbridge.Configure(func(callbackID, method string, payload any) (json.RawMessage, error) {
+		return nil, fmt.Errorf("host unavailable")
+	})
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+
+	// 兜底目录指向不存在的路径，让落盘必然失败（不写进测试包目录）。
+	original := authFileDirs
+	authFileDirs = []string{filepath.Join(t.TempDir(), "missing")}
+	t.Cleanup(func() { authFileDirs = original })
+
+	deps := newStubDeps(t)
+	deps.callbackResult = &core.CallbackSubmitResult{
+		Status: pluginapi.AuthLoginStatusSuccess,
+		Auth:   pluginapi.AuthData{FileName: "traecn-x.json", StorageJSON: []byte("{}")},
+	}
+	payload := postLoginCallback(t, newServiceWithDeps(t, deps), "traecn_x",
+		"http://127.0.0.1:18080/authorize?loginTraceID=t")
+
+	if payload["ok"] != false {
+		t.Fatalf("保存失败时不应回报成功: %v", payload)
+	}
+	message, _ := payload["message"].(string)
+	if !strings.Contains(message, "保存凭证失败") {
+		t.Fatalf("message = %q, want 说明保存失败", message)
 	}
 }

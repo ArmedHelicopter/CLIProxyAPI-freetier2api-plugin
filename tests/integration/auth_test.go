@@ -219,7 +219,7 @@ const codeartsPastedCallback = "http://127.0.0.1/oauth/callback?secret=d55df9259
 	"%26ticket_id%3D657abbb247eab363d1a461285fc50145%26authorizationAvailable%3Dfalse" +
 	"%26secret%3Dd55df9259e688e2a71b93f058c748349782ca1a30440473980961ef6833ee280"
 
-const codeartsUpstreamTicketID = "657abbb247eab363d1a461285fc50145"
+const codeartsUpstreamSecret = "0628ec6bf686e409a532e813dc1a0140e49d1dcef1f96e2252f5a67e01d715d9"
 
 // TestTraeLoginPollReachesVendorSession 锁定 Trae 的登录轮询能找回自己的会话。
 //
@@ -274,16 +274,25 @@ func TestSubmitLoginCallbackCompletesTraeLogin(t *testing.T) {
 	}
 }
 
-// TestSubmitLoginCallbackCompletesCodeArtsLogin 端到端验证 CodeArts 的粘贴兜底：
-// 票据查询必须用回调里**上游签发**的 ticket/secret，否则永远换不到 AK/SK。
+// TestSubmitLoginCallbackCompletesCodeArtsLogin 端到端验证 CodeArts 的粘贴兜底。
+//
+// 关键点：票据号必须仍是**本会话自己那个**（从授权链接里取），只有 secret 才换成
+// 门户下发的。拿回调里那个门户中间票去查票据接口，上游只会回「无效ticketId」。
 func TestSubmitLoginCallbackCompletesCodeArtsLogin(t *testing.T) {
+	var gotTicket string
 	host := testhost.New()
-	host.SetUpstream(func(method, url, body string) testhost.UpstreamResponse {
-		if !strings.Contains(url, "/v1/login/ticket") {
+	host.SetUpstream(func(method, rawURL, body string) testhost.UpstreamResponse {
+		if !strings.Contains(rawURL, "/v1/login/ticket") {
 			return testhost.UpstreamResponse{Status: 404, Body: `{"code":404,"msg":"not stubbed"}`}
 		}
-		if !strings.Contains(url, "ticket_id="+codeartsUpstreamTicketID) {
-			t.Errorf("票据查询用的是自造 ticket，不是上游签发的那个: %s", url)
+		// 入参 url 遮蔽了 net/url 包，这里按字符串解析回查询参数。
+		query, errQuery := url.Parse(rawURL)
+		if errQuery != nil {
+			return testhost.UpstreamResponse{Status: 400, Body: `{"code":400,"msg":"bad url"}`}
+		}
+		gotTicket = query.Query().Get("ticket_id")
+		if query.Query().Get("secret") != codeartsUpstreamSecret {
+			t.Errorf("票据查询没用门户下发的 secret: %s", rawURL)
 		}
 		return testhost.UpstreamResponse{
 			Status: 200,
@@ -298,12 +307,29 @@ func TestSubmitLoginCallbackCompletesCodeArtsLogin(t *testing.T) {
 	setupTestPlugin(t)
 
 	started := startVendorLogin(t, "codearts")
-	result, errSubmit := testApp.SubmitLoginCallback(context.Background(), started.State, codeartsPastedCallback)
+	parsed, errParse := url.Parse(started.URL)
+	if errParse != nil {
+		t.Fatalf("parse login url: %v", errParse)
+	}
+	sessionTicket := parsed.Query().Get("ticket_id")
+	if sessionTicket == "" {
+		t.Fatalf("授权链接缺少 ticket_id: %s", started.URL)
+	}
+
+	// 按本会话票据号拼一条真实形状的回调：顶层 secret + redirect 里的门户登录页。
+	portal := "https://codearts.huaweicloud.com/portal/login?theme=light&locale=zh-cn&ticket_id=" + sessionTicket
+	callback := "http://127.0.0.1:7866/oauth/callback?secret=" + codeartsUpstreamSecret +
+		"&redirect=" + url.QueryEscape(portal)
+
+	result, errSubmit := testApp.SubmitLoginCallback(context.Background(), started.State, callback)
 	if errSubmit != nil {
 		t.Fatalf("submit callback: %v", errSubmit)
 	}
 	if result.Status != pluginapi.AuthLoginStatusSuccess {
 		t.Fatalf("status = %q, want success（message=%q）", result.Status, result.Message)
+	}
+	if gotTicket != sessionTicket {
+		t.Fatalf("票据查询用了 %q，want 本会话的 %q", gotTicket, sessionTicket)
 	}
 	if result.Auth.FileName != "codearts-user-1.json" {
 		t.Fatalf("file name = %q, want codearts-user-1.json", result.Auth.FileName)
