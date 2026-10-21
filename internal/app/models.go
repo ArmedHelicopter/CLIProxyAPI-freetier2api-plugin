@@ -67,6 +67,11 @@ func (a *App) handleModelForAuth(request []byte) ([]byte, error) {
 		logger.Debug("model.for_auth: probe models for %s failed: %v", vendor.ID(), errModels)
 		return core.OKEnvelope(pluginapi.ModelResponse{Provider: providerKey})
 	}
+	// 顺手写入控制台回读缓存（官方 ID，未过滤/未换别名）。
+	//
+	// 宿主加载每个凭证文件都会走这条 RPC，因此插件启动后不再依赖 static 探测
+	// 的时序：控制台列表不会因为探测还没跑完而缺整家供应商。
+	a.models.CacheStatic(vendor.ID(), models)
 	return core.OKEnvelope(pluginapi.ModelResponse{
 		Provider: providerKey,
 		Models:   a.models.ApplyAliases(vendor.ID(), a.models.FilterForVendor(vendor.ID(), models)),

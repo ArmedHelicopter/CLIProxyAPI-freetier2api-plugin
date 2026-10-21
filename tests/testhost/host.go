@@ -42,6 +42,8 @@ type Host struct {
 	authJSON map[string]string
 	// upstream 是出站请求的应答函数（按 method + url 匹配）。
 	upstream func(method, url, body string) UpstreamResponse
+	// upstreamCalls 记录出站请求次数（供 singleflight 类断言）。
+	upstreamCalls int
 
 	streams    map[string]*Stream
 	nextStream int
@@ -116,6 +118,22 @@ func (h *Host) SetUpstream(fn func(method, url, body string) UpstreamResponse) {
 	h.upstream = fn
 }
 
+// UpstreamCalls 返回已发生的出站请求次数。
+func (h *Host) UpstreamCalls() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.upstreamCalls
+}
+
+// doUpstream 计一次出站请求并取应答。
+func (h *Host) doUpstream(method, url, body string) UpstreamResponse {
+	h.mu.Lock()
+	h.upstreamCalls++
+	fn := h.upstream
+	h.mu.Unlock()
+	return fn(method, url, body)
+}
+
 // EmittedChunks 返回已投递的流分片。
 func (h *Host) EmittedChunks() []string {
 	h.mu.Lock()
@@ -139,7 +157,7 @@ func (h *Host) ClosedStreams() []string {
 
 func (h *Host) handleHTTPDo(payload any) (json.RawMessage, error) {
 	req := decodeRequest(payload)
-	response := h.upstream(req.method, req.url, string(req.body))
+	response := h.doUpstream(req.method, req.url, string(req.body))
 	// 与真实宿主同形：host.http.do 回的是**无 json tag** 的 pluginapi.HTTPResponse。
 	return marshalJSON(map[string]any{
 		"StatusCode": response.Status,
@@ -150,7 +168,7 @@ func (h *Host) handleHTTPDo(payload any) (json.RawMessage, error) {
 
 func (h *Host) handleHTTPDoStream(payload any) (json.RawMessage, error) {
 	req := decodeRequest(payload)
-	response := h.upstream(req.method, req.url, string(req.body))
+	response := h.doUpstream(req.method, req.url, string(req.body))
 
 	h.mu.Lock()
 	h.nextStream++

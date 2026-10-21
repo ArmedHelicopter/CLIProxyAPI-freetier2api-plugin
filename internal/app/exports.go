@@ -53,6 +53,16 @@ func (a *App) HandleModelsToggle(req pluginapi.ManagementRequest) pluginapi.Mana
 	return a.admin.ModelToggle(req)
 }
 
+// CacheStaticModels 记录某供应商的官方模型清单（测试与回读用）。
+func (a *App) CacheStaticModels(vendorID string, models []pluginapi.ModelInfo) {
+	a.models.CacheStatic(vendorID, models)
+}
+
+// RegisteredModels 返回某供应商的控制台清单缓存（测试与回读用）。
+func (a *App) RegisteredModels(vendorID string) []pluginapi.ModelInfo {
+	return a.models.Registered(vendorID)
+}
+
 func (a *App) HandleModelAlias(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	return a.admin.ModelAlias(req)
 }

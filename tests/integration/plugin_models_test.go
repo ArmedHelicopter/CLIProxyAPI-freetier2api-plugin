@@ -259,6 +259,40 @@ disabled_models: [workbuddyglobal:glm-5.2]
 	}
 }
 
+// TestStaleAliasDoesNotDisableCurrentModel 复现升级后的真实故障：
+//
+// 供应商换了对外模型 ID（Qoder 从上游 key 改为规范化 slug），用户状态里仍留着
+// 旧键别名（qodercn:dfmodel → deepseek-flash）与旧键禁用项（qodercn:dfmodel）。
+// 若照旧还原，别名会把请求翻回 dfmodel 再撞上禁用，报「model is disabled by
+// plugin configuration」——而列表里它明明是启用的。
+// 期望：陈旧键对当前模型失效，但状态里的配置保留（清单探测失败时不能丢）。
+func TestStaleAliasDoesNotDisableCurrentModel(t *testing.T) {
+	installFakeHost(t)
+	setupTestPlugin(t)
+
+	testApp.HandleModelAlias(pluginapi.ManagementRequest{
+		Method: "POST", Path: "/models/alias",
+		Body: []byte(`{"model":"qodercn:dfmodel","alias":"deepseek-flash"}`),
+	})
+	testApp.HandleModelsToggle(pluginapi.ManagementRequest{
+		Method: "POST", Path: "/models/toggle",
+		Body: []byte(`{"models":["qodercn:dfmodel"],"disabled":true}`),
+	})
+	// 上游清单只含新的规范化 ID：dfmodel 已不存在。
+	testApp.CacheStaticModels("qodercn", []pluginapi.ModelInfo{{ID: "deepseek-flash"}})
+
+	if got := testApp.ResolveOutboundModel("qodercn", "deepseek-flash"); got != "deepseek-flash" {
+		t.Fatalf("stale alias must be ignored, resolve = %q", got)
+	}
+	if testApp.IsModelDisabled("qodercn", "deepseek-flash") {
+		t.Fatal("stale disabled key must not disable the current model id")
+	}
+	// 配置保留：清单拿不到时不能把用户设置清掉。
+	if testApp.ModelAliasFor("qodercn", "dfmodel") != "deepseek-flash" {
+		t.Fatal("stale alias must stay in state")
+	}
+}
+
 // TestConfigAndStateDisabledModelsUnion 验证配置声明与页面操作取并集：
 // 页面「启用」不能放开配置里声明的禁用项。
 func TestConfigAndStateDisabledModelsUnion(t *testing.T) {
@@ -308,13 +342,13 @@ func TestModelAliasScopedAndRouting(t *testing.T) {
 	})
 	testApp.HandleModelAlias(pluginapi.ManagementRequest{
 		Method: "POST", Path: "/models/alias",
-		Body: []byte(`{"model":"qodercn:gmodel","alias":"glm-max"}`),
+		Body: []byte(`{"model":"qodercn:glm-5.3","alias":"glm-max"}`),
 	})
 
 	if got := testApp.ModelAliasFor("workbuddycn", "glm-5.2"); got != "glm-max" {
 		t.Fatalf("workbuddycn alias = %q, want glm-max", got)
 	}
-	if got := testApp.ModelAliasFor("qodercn", "gmodel"); got != "glm-max" {
+	if got := testApp.ModelAliasFor("qodercn", "glm-5.3"); got != "glm-max" {
 		t.Fatalf("qodercn alias = %q, want glm-max", got)
 	}
 	// 作用域是单个模型 ID：同供应商的其它模型不受影响。
@@ -326,12 +360,12 @@ func TestModelAliasScopedAndRouting(t *testing.T) {
 	if got := testApp.ResolveOutboundModel("workbuddycn", "glm-max"); got != "glm-5.2" {
 		t.Fatalf("testApp.ResolveOutboundModel(workbuddycn) = %q, want glm-5.2", got)
 	}
-	if got := testApp.ResolveOutboundModel("qodercn", "glm-max"); got != "gmodel" {
-		t.Fatalf("testApp.ResolveOutboundModel(qodercn) = %q, want gmodel", got)
+	if got := testApp.ResolveOutboundModel("qodercn", "glm-max"); got != "glm-5.3" {
+		t.Fatalf("testApp.ResolveOutboundModel(qodercn) = %q, want glm-5.3", got)
 	}
-	// 未设别名的名字原样返回（Qoder 等直接以上游 key 注册时无需翻译）。
-	if got := testApp.ResolveOutboundModel("qodercn", "gmodel"); got != "gmodel" {
-		t.Fatalf("passthrough = %q, want gmodel", got)
+	// 未设别名的名字原样返回（Qoder 以规范化 display_name 注册）。
+	if got := testApp.ResolveOutboundModel("qodercn", "glm-5.3"); got != "glm-5.3" {
+		t.Fatalf("passthrough = %q, want glm-5.3", got)
 	}
 
 	// 同供应商内别名唯一：把别名换绑到另一个模型，旧绑定被清掉。
@@ -362,12 +396,12 @@ func TestModelAliasSwapRegistersAliasID(t *testing.T) {
 	setupTestPlugin(t)
 
 	in := []pluginapi.ModelInfo{
-		{ID: "qmodel_38max", Name: "Qwen3.8-Max", DisplayName: "Qwen3.8-Max"},
-		{ID: "gmodel", Name: "GLM-5.3", DisplayName: "GLM-5.3"},
+		{ID: "qwen3.8-max", Name: "Qwen3.8-Max", DisplayName: "Qwen3.8-Max"},
+		{ID: "glm-5.3", Name: "GLM-5.3", DisplayName: "GLM-5.3"},
 	}
 	testApp.HandleModelAlias(pluginapi.ManagementRequest{
 		Method: "POST", Path: "/models/alias",
-		Body: []byte(`{"model":"qodercn:qmodel_38max","alias":"qwen-max"}`),
+		Body: []byte(`{"model":"qodercn:qwen3.8-max","alias":"qwen-max"}`),
 	})
 
 	out := testApp.ApplyModelAliases("qodercn", in)
@@ -375,7 +409,7 @@ func TestModelAliasSwapRegistersAliasID(t *testing.T) {
 		t.Fatalf("aliased model must expose the alias as ID/Name: %+v", out[0])
 	}
 	// 未设别名的模型原样保留官方 ID。
-	if out[1].ID != "gmodel" || out[1].Name != "GLM-5.3" {
+	if out[1].ID != "glm-5.3" || out[1].Name != "GLM-5.3" {
 		t.Fatalf("unaliased model must keep official ID: %+v", out[1])
 	}
 }

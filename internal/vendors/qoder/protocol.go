@@ -148,6 +148,9 @@ type Bridge struct {
 	client       *BearerClient
 	region       Region
 	templateBase map[string]interface{}
+	// models 是所属 adapter 实例的模型索引：把对外 slug 还原成上游 key。
+	// 为 nil 时（仅测试可构造）退回内置映射表。
+	models *modelIndex
 	// chatStreamURL 测试注入用：非空时覆盖 region 对应的上游 chat 流地址
 	chatStreamURL string
 }
@@ -169,7 +172,10 @@ type Model struct {
 // 支持两种认证方式：
 //  1. OAuth device token (dt-xxx): 直接使用，调用 /api/v1/userinfo 获取用户信息
 //  2. Personal Access Token (PAT): 调用 ExchangeJobToken 转换为 session token
-func NewBridge(ctx context.Context, pat string, region Region, templateBase map[string]interface{}) (*Bridge, error) {
+//
+// models 是所属 adapter 实例的模型索引，用于出站时把对外 slug 还原成上游 key；
+// 传 nil 时 Bridge 退回内置映射表（尚无索引的测试场景）。
+func NewBridge(ctx context.Context, pat string, region Region, templateBase map[string]interface{}, models *modelIndex) (*Bridge, error) {
 	// 注意：不要在这里打印凭证（哪怕是前缀）。插件日志会进入 CPA 进程日志，
 	// 账号标识只允许出现在成功建立会话后的非敏感字段里。
 	var identity AuthIdentity
@@ -231,6 +237,7 @@ func NewBridge(ctx context.Context, pat string, region Region, templateBase map[
 		client:       client,
 		region:       region,
 		templateBase: templateBase,
+		models:       models,
 	}, nil
 }
 
@@ -376,10 +383,11 @@ func deltaDispatcher(onDelta func(Delta), upstreamErr *error) func(string) bool 
 }
 
 func (b *Bridge) CallQoderWithOpts(ctx context.Context, agent string, messages []interface{}, model string, tools interface{}, opts CallOpts, onDelta func(Delta)) error {
-	// 将客户端模型名（claude-sonnet-4-6 等）映射成 Qoder 上游内部 model.key（auto/qmodel_38max/gmodel/dmodel 等）。
-	// 上游对未知 key 会走兜底返回内容，但不会把这次调用计入 quota，这是「请求成功但 dashboard 无用量」的根因。
+	// 客户端发来的是插件注册的对外 slug（deepseek-v4-pro），先还原成 Qoder 上游
+	// 内部 model.key（dmodel）。上游对未知 key 会走兜底返回内容但不计 quota，
+	// 所以这一步失败即等于「请求成功、dashboard 无用量」。
 	originalModel := model
-	model = MapModel(agent, model)
+	model = b.resolveModel(agent, model)
 	if model != originalModel {
 		logger.Debug("mapModel %s/%s -> %s", agent, originalModel, model)
 	}
@@ -647,10 +655,32 @@ var defaultModelMapping = map[string]string{
 	"gemini": "gmodel",
 }
 
-// MapModel 解析顺序（当前仅使用静态映射）：
+// resolveModel 把客户端传来的模型名解析成上游 model_config.key。
+//
+// 解析顺序：
+//  1. 本实例的模型索引精确命中（对外 slug "deepseek-v4-pro"，或兼容的旧上游
+//     key "dmodel"）；
+//  2. MapModel 处理「客户端发的是别家模型名」的场景（claude-sonnet-4-6 → gmodel，
+//     以及中文档位 display_name 的大小写归一）。
+//
+// 未命中时 MapModel 会 ToLower 原样返回——上游照常回内容但不计 quota，
+// 因此这里留一条 Debug，便于排查「dashboard 没用量」。
+func (b *Bridge) resolveModel(agent, model string) string {
+	if b.models != nil {
+		if key, okKey := b.models.UpstreamKey(model); okKey {
+			return key
+		}
+	}
+	return MapModel(agent, model)
+}
+
+// MapModel 把外部模型名映射成上游 key 的兜底规则：
 //  1. defaultModelMapping 精确命中
 //  2. defaultModelMapping 双向 substring 模糊匹配（按 source 长度倒序，最长优先）
 //  3. ToLower 兜底（如客户端传 "Performance" 这种 display_name 大小写）
+//
+// 只处理「索引未命中」的情况；本插件自己注册的模型由 Bridge.resolveModel
+// 先走 modelIndex 精确解析。
 //
 // agent 由 handler 入口传入并保留用于未来按 agent 区分的扩展；当前不参与映射。
 //

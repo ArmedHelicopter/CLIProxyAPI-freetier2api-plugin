@@ -21,6 +21,20 @@ type quotaJob struct {
 	credential *core.Credential
 }
 
+// identity 返回该任务的账号身份字段（结果与缓存共用）。
+func (j quotaJob) identity() quotaResult {
+	return quotaResult{
+		AuthID:     core.FirstNonEmpty(j.entry.ID, j.entry.Name),
+		AuthIndex:  j.entry.AuthIndex,
+		Name:       j.entry.Name,
+		UID:        j.credential.FileIDValue(),
+		Label:      core.FirstNonEmpty(j.credential.LabelValue(), j.entry.Label, j.entry.Name),
+		VendorID:   j.vendor.ID(),
+		VendorName: j.vendor.Name(),
+		Realm:      j.credential.RegionValue(),
+	}
+}
+
 // quotaResult 是单个账号的额度结果。
 type quotaResult struct {
 	AuthID     string `json:"auth_id"`
@@ -41,6 +55,15 @@ type quotaResult struct {
 	Metrics   []pluginapi.QuotaMetric `json:"metrics,omitempty"`
 }
 
+// quotaBatchOutcome 是一轮批量查询里单个账号的产出。
+//
+// 领取状态与额度结果分开携带：额度结果会进缓存并被多次读，领取状态只在
+// 批末统一落盘一次，两者生命周期不同。
+type quotaBatchOutcome struct {
+	result quotaResult
+	claim  *pluginapi.ClaimStatus
+}
+
 func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body accountBatchRequest
 	if len(req.Body) > 0 {
@@ -55,70 +78,119 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 		Targets:       body.AccountIDs,
 		EnabledRealms: cfg.EnabledRealms,
 	})
-	var preResults []quotaResult
+	results := make([]quotaResult, 0, len(failures)+len(loaded))
 	for _, failure := range failures {
-		preResults = append(preResults, quotaResult{
+		results = append(results, quotaResult{
 			AuthID:  core.FirstNonEmpty(failure.Entry.ID, failure.Entry.Name),
 			Label:   core.FirstNonEmpty(failure.Entry.Label, failure.Entry.Name, failure.Entry.ID),
-			OK:      false,
 			Message: failure.Message,
 		})
 	}
+	if len(loaded) == 0 {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": results})
+	}
+
+	// 查询跑在**后台作用域**（空 callback ID + 独立超时），不跟随本次管理 RPC：
+	// 页面刷新/关闭会让宿主取消这条 RPC，若查询挂在它的 context 上，这一轮
+	// 一个账号都写不进缓存，账号表就只能显示「查询中…」。
+	// 已有一轮在跑时不重复打上游：等它结束，再回读缓存。
 	jobs := make([]quotaJob, 0, len(loaded))
 	for _, account := range loaded {
 		jobs = append(jobs, quotaJob{entry: account.Entry, vendor: account.Vendor, credential: account.Credential})
 	}
-	// 领取状态跟着额度一起刷新，但**批末才落盘**：Mutate 每次都会写一遍
-	// state.json，逐账号写等于把一次「查询额度」放大成 N 次磁盘写。
-	claims := map[string]state.ClaimRecord{}
-	jobResults := accountpkg.RunBatch(jobs, batchConcurrency, func(current quotaJob) (result quotaResult) {
-		result = quotaResult{
-			AuthID:     core.FirstNonEmpty(current.entry.ID, current.entry.Name),
-			AuthIndex:  current.entry.AuthIndex,
-			Name:       current.entry.Name,
-			UID:        current.credential.FileIDValue(),
-			Label:      core.FirstNonEmpty(current.credential.LabelValue(), current.entry.Label, current.entry.Name),
-			VendorID:   current.vendor.ID(),
-			VendorName: current.vendor.Name(),
-			Realm:      current.credential.RegionValue(),
+	done, owner := s.acquireQuotaRun()
+	if owner {
+		go s.runQuotaBatch(done, jobs)
+	}
+	select {
+	case <-done:
+	case <-ctx.Done():
+		// 页面已走开：不阻塞后台那一轮，直接回当前缓存（可能只完成了一部分）。
+	}
+
+	for _, job := range jobs {
+		identity := job.identity()
+		if cached := s.getCachedQuota(identity.UID, identity.AuthID, identity.AuthIndex, identity.Name, identity.Label); cached != nil {
+			results = append(results, *cached)
+			continue
 		}
+		identity.Message = "额度查询尚未完成，请稍后刷新"
+		results = append(results, identity)
+	}
+	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": results})
+}
+
+// acquireQuotaRun 取得「额度查询轮次」的执行权。
+//
+// 返回本轮完成信号与是否为发起者。已有一轮在跑时返回它的完成信号，
+// 调用方等同一轮结束即可，避免刷新页面时把同一批账号重复打向上游。
+func (s *Service) acquireQuotaRun() (chan struct{}, bool) {
+	s.quotaRunMu.Lock()
+	defer s.quotaRunMu.Unlock()
+	if s.quotaRun != nil {
+		return s.quotaRun, false
+	}
+	s.quotaRun = make(chan struct{})
+	return s.quotaRun, true
+}
+
+// finishQuotaRun 结束本轮：先关完成信号，再交出执行权。
+func (s *Service) finishQuotaRun(done chan struct{}) {
+	s.quotaRunMu.Lock()
+	if s.quotaRun == done {
+		s.quotaRun = nil
+	}
+	s.quotaRunMu.Unlock()
+	close(done)
+}
+
+// runQuotaBatch 在后台作用域里查询全部账号额度，逐个写缓存。
+//
+// 每个账号完成即写缓存（成功与失败都写），因此页面在轮次中途刷新也能
+// 看到已完成的账号，而不是整批退回「查询中」。
+func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
+	defer s.finishQuotaRun(done)
+
+	ctx, cancel := context.WithTimeout(hostbridge.WithCallbackID(context.Background(), ""), requestTimeout)
+	defer cancel()
+
+	outcomes := accountpkg.RunBatch(jobs, batchConcurrency, func(current quotaJob) (outcome quotaBatchOutcome) {
+		outcome.result = current.identity()
 		// **成功与失败都要缓存**：缓存是账号表唯一的数据源。只缓存成功结果会让
 		// 失败账号在下次 /status 时退回「没有结果」，页面于是永远停在「查询中…」——
 		// 而「上游没有额度接口」这类结论早已确定，不存在还会变。
 		defer func() {
+			result := outcome.result
 			s.cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
 		}()
-		quotaProvider, okQuota := core.As[core.QuotaProvider](current.vendor)
-		if !okQuota {
-			result.Message = core.QuotaUnsupported(current.vendor).Error()
-			return result
-		}
-		quota, errQuota := quotaProvider.Quota(ctx, current.credential)
-		if errQuota != nil && isAuthExpired(errQuota) {
-			// 凭证过期类错误：先保活刷新一次再重试。MiniMax 的 access token 只有
-			// 1 小时有效期，不刷新的话额度列会一直挂着 401，用户只能自己想到去点
-			// 「一键保活」——那条路还要求他先认出这是凭证问题。
-			if refreshed := s.refreshedCredential(ctx, callbackID, current); refreshed != nil {
-				quota, errQuota = quotaProvider.Quota(ctx, refreshed)
-			}
-		}
+		quota, errQuota := s.queryQuota(ctx, current)
 		if errQuota != nil {
-			result.Message = errQuota.Error()
-			return result
+			outcome.result.Message = errQuota.Error()
+			return outcome
 		}
+		result := &outcome.result
 		if quota.Claim != nil {
-			claims[result.UID] = state.ClaimRecord{
-				ClaimStatus: *quota.Claim,
-				CheckedAt:   time.Now().Format(time.RFC3339),
-			}
+			outcome.claim = quota.Claim
 		}
 		result.OK = true
 		result.Summary = accountpkg.Summary(quota)
 		totals := accountpkg.Totals(quota)
 		result.Remain, result.Total, result.Unlimited = totals.Remaining, totals.Total, totals.Unlimited
 		result.Metrics = quota.Summary
-		return result
+		return outcome
 	})
+
+	// 领取状态跟着额度一起刷新，但**批末才落盘**：Mutate 每次都会写一遍
+	// state.json，逐账号写等于把一次「查询额度」放大成 N 次磁盘写。
+	claims := map[string]state.ClaimRecord{}
+	for _, outcome := range outcomes {
+		if outcome.claim != nil {
+			claims[outcome.result.UID] = state.ClaimRecord{
+				ClaimStatus: *outcome.claim,
+				CheckedAt:   time.Now().Format(time.RFC3339),
+			}
+		}
+	}
 	if len(claims) > 0 {
 		s.deps.MutateState(func(current *state.State) {
 			for uid, record := range claims {
@@ -126,7 +198,26 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 			}
 		})
 	}
-	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": append(preResults, jobResults...)})
+}
+
+// queryQuota 查询单个账号的额度（含一次过期凭证的保活重试）。
+//
+// 只负责取数；缓存、领取状态落盘由 runQuotaBatch 统一负责。
+func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.QuotaFetchResponse, error) {
+	quotaProvider, okQuota := core.As[core.QuotaProvider](job.vendor)
+	if !okQuota {
+		return nil, core.QuotaUnsupported(job.vendor)
+	}
+	quota, errQuota := quotaProvider.Quota(ctx, job.credential)
+	if errQuota != nil && isAuthExpired(errQuota) {
+		// 凭证过期类错误：先保活刷新一次再重试。MiniMax 的 access token 只有
+		// 1 小时有效期，不刷新的话额度列会一直挂着 401，用户只能自己想到去点
+		// 「一键保活」——那条路还要求他先认出这是凭证问题。
+		if refreshed := s.refreshedCredential(ctx, "", job); refreshed != nil {
+			quota, errQuota = quotaProvider.Quota(ctx, refreshed)
+		}
+	}
+	return quota, errQuota
 }
 
 // isAuthExpired 判断错误是否属于「凭证已过期/失效」类（401）。

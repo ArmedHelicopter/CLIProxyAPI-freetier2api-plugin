@@ -40,6 +40,10 @@ type adapter struct {
 	region Region
 	// bridges 按凭证指纹缓存 cosy 会话（建会话要一次 jobToken 交换，很贵）。
 	bridges sync.Map
+	// models 是「对外模型 ID → 上游 key」索引，随每次模型清单刷新整体替换。
+	//
+	// 必须挂在实例上：国内版与国际版的同名上游 key 可能对应不同模型。
+	models modelIndex
 }
 
 // Instances 构造 Qoder 的两个区域实例。
@@ -48,7 +52,7 @@ func Instances(env core.Env) []core.Vendor {
 }
 
 func newInstance(env core.Env, region Region) core.Vendor {
-	return &adapter{
+	instance := &adapter{
 		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
 			Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
 			Env:  env,
@@ -89,6 +93,7 @@ func newInstance(env core.Env, region Region) core.Vendor {
 		}),
 		region: region,
 	}
+	return instance
 }
 
 // Match 判断一份凭证是否属于本区域。
@@ -120,12 +125,12 @@ func (v *adapter) defaultRegionForParse() Region {
 // StaticModels 返回本区域的模型清单。
 //
 // 需要一次上游调用（列可用模型），因此借一个同区域的账号建 Bridge。
-// 建不起来时退回内置兜底清单——没有模型注册比注册一份静态清单更糟。
+// 失败时返回错误而不是编造清单：注册一份写死的模型目录只会随上游过时，
+// 让客户端看到并不存在的模型。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
 	models, errModels := v.fetchModels(ctx)
 	if errModels != nil {
-		logger.Debug("qoder: list models failed for %s, using bundled list: %v", v.ID(), errModels)
-		models = bundledModels()
+		return nil, errModels
 	}
 	return v.modelsToPluginAPI(models), nil
 }
@@ -147,6 +152,9 @@ func (v *adapter) fetchModels(ctx context.Context) ([]Model, error) {
 }
 
 // ModelsForAuth 返回该凭证可用的模型。
+//
+// 失败时返回错误而不是兜底清单：宿主会跳过该凭证，比让客户端看到一个
+// 写死的、可能已不存在的模型目录更诚实。
 func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
 	if cred == nil || cred.RegionValue() != string(v.region) {
 		// 区域不符时返回空清单而不是报错：宿主会因此跳过该凭证，
@@ -159,13 +167,11 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 	}
 	b, errBridge := v.bridgeFor(ctx, native)
 	if errBridge != nil {
-		// 建桥失败同样退回兜底清单：账号本身可能是好的，只是暂时连不上。
-		logger.Debug("qoder: bridge for model list failed: %v", errBridge)
-		return v.modelsToPluginAPI(bundledModels()), nil
+		return nil, errBridge
 	}
 	models, errModels := b.ListAvailableModels(ctx)
 	if errModels != nil {
-		return v.modelsToPluginAPI(bundledModels()), nil
+		return nil, errModels
 	}
 	return v.modelsToPluginAPI(models), nil
 }
@@ -363,7 +369,7 @@ func (v *adapter) bridgeFor(ctx context.Context, cred *Credential) (*Bridge, err
 	if errTemplate != nil {
 		return nil, errTemplate
 	}
-	b, errBridge := NewBridge(createCtx, BridgeSecret(cred), v.region, templateBase)
+	b, errBridge := NewBridge(createCtx, BridgeSecret(cred), v.region, templateBase, &v.models)
 	if errBridge != nil {
 		return nil, ClassifyCredentialError(errBridge)
 	}
@@ -383,18 +389,23 @@ func (v *adapter) bridgeCacheKey(cred *Credential) string {
 
 // modelsToPluginAPI 把上游模型条目转成宿主契约类型。
 //
-// 模型 ID 用上游的 key（gmodel / qmodel_38max …）——它就是 Qoder 网关真正
-// 接受的标识符，出站无需再翻译；display_name 只作展示名。想换一个更顺手的
-// ID 就在控制台给该模型设别名（别名是注册给宿主的对外 ID）。
+// 对外模型 ID 用 display_name 规范化后的 slug（DeepSeek-V4-Pro → deepseek-v4-pro），
+// 同时重建本实例的 slug → 上游 key 索引，出站时由 Bridge 精确还原成
+// Qoder 加密网关要求的 model_config.key / x-model-key。
 func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
+	slugByKey := v.models.replace(models)
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
-		id := strings.TrimSpace(model.Key)
-		if id == "" {
+		key := strings.TrimSpace(model.Key)
+		if key == "" {
+			return core.ModelDescriptor{}, false
+		}
+		id, okSlug := slugByKey[key]
+		if !okSlug {
 			return core.ModelDescriptor{}, false
 		}
 		name := strings.TrimSpace(model.DisplayName)
 		if name == "" {
-			name = id
+			name = key
 		}
 		return core.ModelDescriptor{
 			ID:                 id,

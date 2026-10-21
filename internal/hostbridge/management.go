@@ -13,8 +13,11 @@ import (
 )
 
 // ManagementContext 为管理接口里的上游调用构造带超时与回调 ID 的上下文。
+//
+// 父上下文取 req.RequestContext()：它代表这次管理请求的生命周期（宿主取消
+// 时结束），因此随请求取消而上游调用一起结束。
 func ManagementContext(req pluginapi.ManagementRequest, timeout time.Duration) (context.Context, context.CancelFunc) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(req.RequestContext(), timeout)
 	return WithCallbackID(ctx, RequestCallbackID(req)), cancel
 }
 

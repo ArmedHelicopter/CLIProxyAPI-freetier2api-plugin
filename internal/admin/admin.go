@@ -25,7 +25,8 @@ const (
 	// requestTimeout 是管理接口里上游调用的上限。
 	requestTimeout = 3 * time.Minute
 	// batchConcurrency 是批量操作的默认并发度上限。
-	batchConcurrency = 4
+	// 额度查询按账号并发，6 路可以避免排在末尾的账号（如 Trae）拖慢整轮。
+	batchConcurrency = 6
 )
 
 // Identity 是插件的对外身份。
@@ -59,6 +60,11 @@ type Service struct {
 
 	quotaMu    sync.RWMutex
 	quotaCache map[string]quotaResult
+
+	// quotaRunMu 保护 quotaRun：非 nil 表示有一轮额度查询正在后台执行。
+	// 页面刷新会取消自己的管理 RPC，但后台这一轮要照常跑完（见 quota.go）。
+	quotaRunMu sync.Mutex
+	quotaRun   chan struct{}
 }
 
 // New 构造管理 Service。

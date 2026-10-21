@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
@@ -43,6 +44,12 @@ type Catalog struct {
 	aliases  map[string]string
 	// cached 是最近一次拿到的**官方 ID** 静态清单（控制台回读用）。
 	cached map[string][]pluginapi.ModelInfo
+
+	// probing 记录正在进行中的按供应商探测（singleflight）。
+	// probeMu 保护它；probeAt 是上次探测时间，用于 TTL 内不重复打上游。
+	probeMu sync.Mutex
+	probing map[string]chan struct{}
+	probeAt map[string]time.Time
 }
 
 // New 创建 Catalog。
@@ -53,6 +60,8 @@ func NewCatalog(store *state.Store, registry *core.Registry) *Catalog {
 		disabled: map[string]bool{},
 		aliases:  map[string]string{},
 		cached:   map[string][]pluginapi.ModelInfo{},
+		probing:  map[string]chan struct{}{},
+		probeAt:  map[string]time.Time{},
 	}
 }
 
@@ -165,6 +174,14 @@ func (c *Catalog) ExpandDisabledList(items []string) []string {
 }
 
 // IsDisabled 判断某供应商下的模型是否被禁用。
+//
+// **只对当前清单里存在的模型生效**：禁用键由某个官方 ID 派生（`vendor:id`），
+// 供应商换掉对外 ID 后旧键就指向一个不存在的模型。若不加这一步，旧键会把
+// 同名的新模型误判成已禁用——真实事故：Qoder 从上游 key 改为规范化 slug 后，
+// 遗留的 `qodercn:dfmodel` 让新的 `deepseek-flash` 报「model is disabled」。
+//
+// 刻意**不删除**状态里的旧键：清单可能因为探测失败而暂时拿不到，删除会让
+// 用户配置永久丢失。保留它们只让判定失效，清单恢复后自动重新生效。
 func (c *Catalog) IsDisabled(vendorID, modelID string) bool {
 	bare := strings.TrimSpace(modelID)
 	if bare == "" {
@@ -178,10 +195,27 @@ func (c *Catalog) IsDisabled(vendorID, modelID string) bool {
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.disabled[bare] {
+	if !c.disabled[bare] && !c.disabled[c.registry.ModelKeyFor(vendorID, bare)] {
+		return false
+	}
+	return c.registeredLocked(vendorID, bare)
+}
+
+// registeredLocked 报告某供应商的当前清单里是否还有这个官方 ID。
+//
+// 清单为空表示还没拉到（冷启动或探测失败），此时无从判定「模型已消失」，
+// 按「存在」处理——一次网络抖动不能改变鉴权语义。调用方须持有读锁。
+func (c *Catalog) registeredLocked(vendorID, modelID string) bool {
+	models := c.cached[vendorID]
+	if len(models) == 0 {
 		return true
 	}
-	return c.disabled[c.registry.ModelKeyFor(vendorID, bare)]
+	for _, model := range models {
+		if strings.EqualFold(strings.TrimSpace(model.ID), modelID) {
+			return true
+		}
+	}
+	return false
 }
 
 // vendorForPrefix 把限定前缀（供应商 ID 或区域别名）解析成供应商实例。
@@ -266,6 +300,7 @@ func (c *Catalog) ClearRestartPending() {
 }
 
 // CacheStatic 记录某供应商的官方模型清单（控制台回读用）。
+// CacheStatic 记录某供应商的官方模型清单（控制台回读用）。
 func (c *Catalog) CacheStatic(vendorID string, models []pluginapi.ModelInfo) {
 	copied := append([]pluginapi.ModelInfo(nil), models...)
 	c.mu.Lock()
@@ -278,6 +313,106 @@ func (c *Catalog) Registered(vendorID string) []pluginapi.ModelInfo {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return append([]pluginapi.ModelInfo(nil), c.cached[vendorID]...)
+}
+
+const (
+	// modelProbeTTL 是「缓存为空时补探测」的冷却时间：探测失败后 30 秒内
+	// 不再重复打上游，避免页面反复刷新把失败放大成上游压力。
+	modelProbeTTL = 30 * time.Second
+	// modelProbeWait 是列表请求等待补探测的上限：超时先渲染已有缓存，
+	// 探测在后台继续跑完，下一次刷新即可看到。
+	modelProbeWait = 3 * time.Second
+	// modelProbeTimeout 是补探测自身的上游调用上限。
+	modelProbeTimeout = 30 * time.Second
+)
+
+// EnsureModels 在缓存为空时为某供应商触发一次补探测（不等待完成）。
+//
+// 为什么需要这一步：控制台清单只读这里的内存缓存，而它原先只在 static
+// 探测与「从上游刷新」时写入。宿主加载凭证走的是 model.for_auth，插件重启
+// 后若 static 探测还没跑完，页面就会整家供应商缺模型——表现为「有时有、
+// 有时没有」。这里在缓存为空时主动补一次，并用 singleflight + 冷却保证
+// 一次页面加载最多发起一次上游请求。
+//
+// 只启动不等待：调用方在收集完所有供应商后再统一 WaitProbes，避免逐个
+// 串行等待把页面拖慢成 N 倍的上游延迟。
+func (c *Catalog) EnsureModels(vendor core.Vendor) {
+	vendorID := vendor.ID()
+	if len(c.Registered(vendorID)) > 0 {
+		return
+	}
+
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	if c.probing[vendorID] != nil {
+		return
+	}
+	if last, ok := c.probeAt[vendorID]; ok && time.Since(last) < modelProbeTTL {
+		return
+	}
+	pending := make(chan struct{})
+	c.probing[vendorID] = pending
+	c.probeAt[vendorID] = time.Now()
+	go c.probeVendor(vendor, pending)
+}
+
+// WaitProbes 等待所有进行中的补探测，最多等 timeout。
+//
+// 超时后探测仍在后台跑完并写缓存，下一次刷新即可看到。
+func (c *Catalog) WaitProbes(timeout time.Duration) {
+	c.probeMu.Lock()
+	pending := make([]chan struct{}, 0, len(c.probing))
+	for _, done := range c.probing {
+		pending = append(pending, done)
+	}
+	c.probeMu.Unlock()
+	if len(pending) == 0 {
+		return
+	}
+	deadline := time.After(timeout)
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// ProbesRunning 返回当前进行中的补探测数量。
+func (c *Catalog) ProbesRunning() int {
+	c.probeMu.Lock()
+	defer c.probeMu.Unlock()
+	return len(c.probing)
+}
+
+// probeVendor 在后台拉一次供应商清单并写入控制台缓存。
+//
+// 用后台 context 而不是管理请求的 context：页面刷新会取消管理 RPC，
+// 探测不该因此半途而废（同一类问题见额度查询）。
+func (c *Catalog) probeVendor(vendor core.Vendor, done chan struct{}) {
+	vendorID := vendor.ID()
+	defer func() {
+		c.probeMu.Lock()
+		if c.probing[vendorID] == done {
+			delete(c.probing, vendorID)
+		}
+		c.probeMu.Unlock()
+		close(done)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), modelProbeTimeout)
+	defer cancel()
+	models, errModels := vendor.StaticModels(ctx)
+	if errModels != nil {
+		logger.Info("models: %s console probe failed: %v", vendorID, errModels)
+		return
+	}
+	if len(models) == 0 {
+		return
+	}
+	c.CacheStatic(vendorID, models)
+	logger.Info("models: %s console probe cached %d model(s)", vendorID, len(models))
 }
 
 // LoadCachedState 从 state.json 恢复全部供应商的模型缓存，并通知供应商预热。
@@ -418,6 +553,13 @@ func (c *Catalog) ApplyAliases(vendorID string, models []pluginapi.ModelInfo) []
 }
 
 // ResolveOutboundModel 把客户端请求的模型名还原成上游的官方 ID。
+//
+// 只有**指向当前注册模型**的别名才生效。供应商换掉对外 ID 后（Qoder 从上游
+// key 改为规范化 slug），旧别名会指向一个不存在的 ID；照样还原会让后续的
+// 禁用判定与出站都落在那个陈旧 ID 上，表现为「列表里启用、调用却报已禁用」。
+//
+// 与 IsDisabled 同理，这里不删除旧别名：清单可能因为探测失败而暂时拿不到，
+// 删掉会让用户配置永久丢失。忽略它即可，清单恢复后自动生效。
 func (c *Catalog) ResolveOutboundModel(vendorID, model string) string {
 	requested := strings.TrimSpace(model)
 	if requested == "" {
@@ -427,9 +569,14 @@ func (c *Catalog) ResolveOutboundModel(vendorID, model string) string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for key, alias := range c.aliases {
-		if strings.EqualFold(alias, requested) && strings.HasPrefix(key, prefix) {
-			return strings.TrimPrefix(key, prefix)
+		if !strings.EqualFold(alias, requested) || !strings.HasPrefix(key, prefix) {
+			continue
 		}
+		bare := strings.TrimPrefix(key, prefix)
+		if c.registeredLocked(vendorID, bare) {
+			return bare
+		}
+		logger.Debug("models: ignoring alias %q -> %q (%s no longer registers it)", alias, bare, vendorID)
 	}
 	return model
 }

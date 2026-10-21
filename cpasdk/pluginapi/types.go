@@ -1378,6 +1378,7 @@ type ManagementHandler interface {
 }
 
 // ManagementRequest describes an authenticated Management API request.
+// ManagementRequest describes a plugin Management API request.
 type ManagementRequest struct {
 	// Method is the HTTP method.
 	Method string
@@ -1389,6 +1390,17 @@ type ManagementRequest struct {
 	Query url.Values
 	// Body contains the raw request body.
 	Body []byte
+	// Context 承载宿主请求的生命周期（仅测试注入使用；线上由宿主 ABI 的
+	// 回调取消语义表达，不走 JSON 传输，因此不参与序列化）。
+	Context context.Context `json:"-"`
+}
+
+// RequestContext 返回请求上下文；未注入时退回 Background。
+func (r ManagementRequest) RequestContext() context.Context {
+	if r.Context != nil {
+		return r.Context
+	}
+	return context.Background()
 }
 
 // ManagementResponse describes a plugin Management API response.

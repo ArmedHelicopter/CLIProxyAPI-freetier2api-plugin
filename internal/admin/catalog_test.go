@@ -79,6 +79,81 @@ func TestAliasUniquenessAndResolve(t *testing.T) {
 	}
 }
 
+// TestResolveOutboundAliasRoundTrip 验证别名正向设置与反向还原是对称的。
+func TestResolveOutboundAliasRoundTrip(t *testing.T) {
+	c := newTestCatalog(t)
+	c.SetAlias("qodercn", "glm-5.3", "qoder-glm")
+	if got := c.ResolveOutboundModel("qodercn", "qoder-glm"); got != "glm-5.3" {
+		t.Fatalf("alias resolve = %q, want glm-5.3", got)
+	}
+	// 未设别名的官方 ID 原样返回。
+	if got := c.ResolveOutboundModel("qodercn", "deepseek-flash"); got != "deepseek-flash" {
+		t.Fatalf("passthrough = %q, want deepseek-flash", got)
+	}
+}
+
+// TestStaleModelStateIsIgnoredNotDeleted 覆盖升级后的陈旧键语义：
+//
+// 供应商换了对外模型 ID（Qoder 从上游 key 改为规范化 slug），用户状态里仍留着
+// 旧键别名与旧键禁用项。它们必须对当前模型失效（否则请求被翻回旧 ID 再撞上
+// 禁用），但**不能被删除**——清单可能因为探测失败而暂时拿不到，删除会让
+// 用户配置永久丢失。
+func TestStaleModelStateIsIgnoredNotDeleted(t *testing.T) {
+	c := newTestCatalog(t)
+	c.SetAlias("qodercn", "dfmodel", "deepseek-flash")
+	c.SetAlias("qodercn", "glm-5.3", "qoder-glm")
+	c.SetDisabled([]string{"qodercn:dfmodel", "qodercn:glm-5.3"}, true)
+	c.CacheStatic("qodercn", []pluginapi.ModelInfo{{ID: "deepseek-flash"}, {ID: "glm-5.3"}})
+
+	// 旧 ID 不再注册：别名与禁用都不作用于请求。
+	if got := c.ResolveOutboundModel("qodercn", "deepseek-flash"); got != "deepseek-flash" {
+		t.Fatalf("stale alias must be ignored, resolve = %q", got)
+	}
+	if c.IsDisabled("qodercn", "deepseek-flash") {
+		t.Fatal("stale disabled key must not disable the current model id")
+	}
+
+	// 仍然注册着的官方 ID 不受影响。
+	if got := c.ResolveOutboundModel("qodercn", "qoder-glm"); got != "glm-5.3" {
+		t.Fatalf("live alias resolve = %q, want glm-5.3", got)
+	}
+	if !c.IsDisabled("qodercn", "glm-5.3") {
+		t.Fatal("live disabled key must still apply")
+	}
+
+	// 状态原样保留：清单恢复后旧配置能自动重新生效。
+	if c.AliasFor("qodercn", "dfmodel") != "deepseek-flash" {
+		t.Fatal("stale alias must be kept in state, only ignored at resolution")
+	}
+	for _, key := range c.store.Snapshot().DisabledModels {
+		if key == "qodercn:dfmodel" {
+			return
+		}
+	}
+	t.Fatal("stale disabled key must be kept in state, only ignored at lookup")
+}
+
+// TestFallbackModelListDoesNotUnlockDisabledModels 覆盖「清单暂时拿不全」的风险：
+//
+// 某次上游清单拉取可能只拿到部分模型（探测失败、降级或上游抖动）。此时绝不能
+// 放开用户禁用的模型，也不能丢掉禁用配置——一次抖动不能改变鉴权语义。
+func TestFallbackModelListDoesNotUnlockDisabledModels(t *testing.T) {
+	c := newTestCatalog(t)
+	c.SetDisabled([]string{"qodercn:kimi-k3"}, true)
+
+	// 兜底/不完整清单里没有 kimi-k3（不能据此判定它已消失）。
+	c.CacheStatic("qodercn", []pluginapi.ModelInfo{{ID: "deepseek-flash"}})
+	if c.IsDisabled("qodercn", "kimi-k3") {
+		t.Fatal("a model missing from a partial list must not be treated as registered")
+	}
+
+	// 清单为空（全部探测失败）：再保守一层，禁用照旧生效，不放行。
+	c.CacheStatic("qodercn", nil)
+	if !c.IsDisabled("qodercn", "kimi-k3") {
+		t.Fatal("with no model list at all, disabled models must stay disabled")
+	}
+}
+
 func TestDisabledUnionConfigAndState(t *testing.T) {
 	c := newTestCatalog(t)
 	c.Configure(ModelSettings{EnabledRealms: []string{"cn", "global"}, DisabledModels: []string{"cn:glm-5.2"}})

@@ -123,12 +123,13 @@ jobs:
             -goarch ${{ matrix.goarch }} \
             -out-dir dist
 
+      # 只发布商店归档：裸动态库不再单独上传（手动安装者解压 zip 即可）。
+      # 非 tag 运行没有 zip，因此这里必须限定在 tag 上，否则 if-no-files-found 会让构建失败。
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/v')
         with:
           name: freetier2api-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: |
-            dist/freetier2api-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}
-            dist/freetier2api_*_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+          path: dist/freetier2api_*_${{ matrix.goos }}_${{ matrix.goarch }}.zip
           if-no-files-found: error
 
   release:
@@ -164,19 +165,6 @@ jobs:
           # 导致部分 zip 的校验和丢失、宿主安装时直接报 checksum not found。
           go run ./scripts/packstore -checksums-dir assets
 
-      - name: 生成裸文件校验和（SHA256SUMS.txt，供手动安装者核对）
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd assets
-          ls -la
-          shopt -s nullglob
-          libraries=(./*.so ./*.dylib ./*.dll)
-          if [ ${#libraries[@]} -gt 0 ]; then
-            sha256sum "${libraries[@]}" > SHA256SUMS.txt
-            cat SHA256SUMS.txt
-          fi
-
       - name: 生成 Release 正文（安装说明 + tag 注解）
         shell: bash
         env:
@@ -186,30 +174,24 @@ jobs:
           {
             echo '## 通过 CPA 插件商店安装（推荐）'
             echo
-            echo '在 CPA 的 `config.yaml` 里把本仓库的 `registry.json` 加为三方源：'
-            echo
-            echo '```yaml'
-            echo 'plugins:'
-            echo '  enabled: true'
-            echo '  store-sources:'
-            echo '    - "https://raw.githubusercontent.com/'"${GITHUB_REPOSITORY}"$'/main/registry.json"'
-            echo '```'
-            echo
-            echo '重启 CPA 后，在管理面板的插件商店里搜 **FreeTier 2API** 一键安装。'
+            echo '本插件已收录进 CPA 官方插件源，无需额外配置三方源。'
+            echo '在管理面板的插件商店里直接搜 **FreeTier 2API** 一键安装即可。'
             echo
             echo '## 手动安装'
             echo
-            echo '下载对应平台的文件，**重命名成宿主认识的插件名**后放进 CPA 的 `plugins/` 目录：'
+            echo '下载对应平台的 `freetier2api_<版本>_<goos>_<goarch>.zip`，解压后把其中的'
+            echo '`freetier2api` 动态库放进 CPA 的 `plugins/` 目录。'
+            echo '归档里已经用的是宿主要求的 `freetier2api{ext}` 文件名，解压后无需改名。'
             echo
-            echo '| 平台 | 下载文件 | 放进去时改名为 |'
-            echo '| --- | --- | --- |'
-            echo '| Linux x86_64 | `freetier2api-linux-amd64.so` | `freetier2api.so` |'
-            echo '| Linux arm64 | `freetier2api-linux-arm64.so` | `freetier2api.so` |'
-            echo '| macOS Apple Silicon | `freetier2api-darwin-arm64.dylib` | `freetier2api.dylib` |'
-            echo '| macOS Intel | `freetier2api-darwin-amd64.dylib` | `freetier2api.dylib` |'
-            echo '| Windows x64 | `freetier2api-windows-amd64.dll` | `freetier2api.dll` |'
+            echo '| 平台 | 下载归档 |'
+            echo '| --- | --- |'
+            echo '| Linux x86_64 | `freetier2api_<版本>_linux_amd64.zip` |'
+            echo '| Linux arm64 | `freetier2api_<版本>_linux_arm64.zip` |'
+            echo '| macOS Apple Silicon | `freetier2api_<版本>_darwin_arm64.zip` |'
+            echo '| macOS Intel | `freetier2api_<版本>_darwin_amd64.zip` |'
+            echo '| Windows x64 | `freetier2api_<版本>_windows_amd64.zip` |'
             echo
-            echo '`SHA256SUMS.txt` 可用于校验完整性；配置与账号导入见仓库 README。'
+            echo '`checksums.txt` 可用于核对归档完整性；配置与账号导入见仓库 README。'
             echo
             echo '## 本版要点'
             echo

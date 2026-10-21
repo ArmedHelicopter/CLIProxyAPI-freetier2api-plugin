@@ -2,29 +2,89 @@ package qoder
 
 // 本文件实现 Qoder 的模型清单。
 //
-// 与 WorkBuddy 的多路探测不同，Qoder 的模型清单只有一条来源：上游的
-// model/list 接口（需要 cosy 会话）。探测失败时退回内置清单——
-// 没有模型注册比注册一份可能过时的清单更糟（客户端会看不到任何模型）。
+// 清单只有一条来源：上游 model/list 接口（需要 cosy 会话）。**不维护内置
+// 兜底清单**——写死的模型名会随上游变化而过时，反而让客户端看到一份
+// 并不存在的目录。拉不到就返回空清单，由控制台提示「刷新模型」。
 
-// bundledModels 是内置的兜底模型清单。
+import (
+	"strings"
+	"sync"
+
+	"freetier2api-plugin/internal/logger"
+)
+
+// modelIndex 是某区域实例的「对外模型 ID / 上游 key → 上游 key」索引。
 //
-// 来源：移植自 qoder2api 的 HandleListModels 兜底清单，不是凭空构造的；
-// 真实可用集合以「刷新模型」拉到的实时清单为准。
-func bundledModels() []Model {
-	return []Model{
-		{Key: "auto", DisplayName: "Auto", Enable: true, IsDefault: true},
-		{Key: "ultimate", DisplayName: "Ultimate", Enable: true},
-		{Key: "performance", DisplayName: "Performance", Enable: true},
-		{Key: "efficient", DisplayName: "Efficient", Enable: true},
-		{Key: "qmodel_38max", DisplayName: "Qwen3.8-Max", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
-		{Key: "qmodel_latest", DisplayName: "Qwen3.7-Max", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
-		{Key: "qmodel", DisplayName: "Qwen3.7-Plus", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
-		{Key: "kmodel_latest", DisplayName: "Kimi-K3", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
-		{Key: "kmodel", DisplayName: "Kimi-K2.8-Preview", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
-		{Key: "gmodel", DisplayName: "GLM-5.3", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
-		{Key: "gfmodel", DisplayName: "GLM-5.3-Flash", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
-		{Key: "dmodel", DisplayName: "DeepSeek-V4-Pro", Enable: true, IsReasoning: true, ContextWindow: 180000, MaxOutputTokens: 32768},
-		{Key: "dfmodel", DisplayName: "DeepSeek-Flash", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
-		{Key: "mmodel", DisplayName: "MiniMax-M3", Enable: true, ContextWindow: 180000, MaxOutputTokens: 16384},
+// 为什么是实例状态而不是包级表：Qoder 国内版与国际版是两个 adapter 实例，
+// 同一个上游 key 在两个区域可能对应不同模型（如 mmodel 在国内是
+// MiniMax-M2.7、国际是 MiniMax-M3）。放进实例里，两边各自维护，
+// 与仓库「实例隔离」的约定一致。
+//
+// 为什么是动态建立而不是写死静态表：slug → key 的对应关系只存在于上游
+// 清单的 {key, display_name} 配对里。写死一张表意味着上游每换一个模型就要
+// 改代码，而且容易把两个不同模型误绑到同一个名字；从清单推导则天然跟随上游。
+type modelIndex struct {
+	mu     sync.RWMutex
+	byName map[string]string
+}
+
+// replace 用一批上游模型条目重建索引，返回「上游 key → 对外 ID」。
+//
+// 重复 ID（上游出现同名 display_name）时只有第一条保留，其余不出现在返回值里，
+// 由调用方跳过——宿主按 ID 匹配模型，注册两个相同 ID 只会让其中一个永远选不到。
+func (i *modelIndex) replace(models []Model) map[string]string {
+	byName := make(map[string]string, len(models)*2)
+	slugByKey := make(map[string]string, len(models))
+	for _, model := range models {
+		key := strings.TrimSpace(model.Key)
+		if key == "" {
+			continue
+		}
+		id := canonicalModelID(model.DisplayName, key)
+		if id == "" {
+			continue
+		}
+		if _, exists := byName[id]; exists {
+			logger.Info("qoder: duplicate model id %q (key %s), skipping", id, key)
+			continue
+		}
+		slugByKey[key] = id
+		byName[id] = key
+		// 老客户端仍可能直接发上游 key（dmodel / gmodel …）：一并接受。
+		// 对外 ID 优先——万一某个 slug 恰好等于另一个模型的上游 key，
+		// 以清单里声明的 slug 为准。
+		lowerKey := strings.ToLower(key)
+		if _, exists := byName[lowerKey]; !exists {
+			byName[lowerKey] = key
+		}
 	}
+	i.mu.Lock()
+	i.byName = byName
+	i.mu.Unlock()
+	return slugByKey
+}
+
+// UpstreamKey 把对外模型名解析成上游 model_config.key。大小写不敏感。
+func (i *modelIndex) UpstreamKey(name string) (string, bool) {
+	trimmed := strings.ToLower(strings.TrimSpace(name))
+	if trimmed == "" {
+		return "", false
+	}
+	i.mu.RLock()
+	defer i.mu.RUnlock()
+	key, ok := i.byName[trimmed]
+	return key, ok
+}
+
+// canonicalModelID 把上游 display_name 规范成对外模型 ID：
+// 小写，空白折叠成单个 "-"（"DeepSeek-V4-Pro" -> "deepseek-v4-pro"）。
+//
+// display_name 缺失时退回上游 key 的小写形式，保证总能拿到一个可用 ID。
+func canonicalModelID(displayName, key string) string {
+	slug := strings.ToLower(strings.TrimSpace(displayName))
+	slug = strings.Join(strings.Fields(slug), "-")
+	if slug == "" {
+		slug = strings.ToLower(strings.TrimSpace(key))
+	}
+	return slug
 }

@@ -1271,6 +1271,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
   // modelsLoaded 标记是否已尝试过拉取，避免自动刷新与手动刷新互相触发。
   var modelsLoaded = false;
+  // modelsPollLeft 是等待后端补探测完成的剩余轮询次数。
+  var modelsPollLeft = 2;
 
   // loadModels 读取模型清单；本地缓存为空时自动触发一次上游刷新。
   //
@@ -1282,6 +1284,13 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       allModels = (data && data.models) || [];
       renderModels();
       setText("modelCount", allModels.length ? "（" + allModels.length + "）" : "");
+      // 后端仍在为缺缓存的供应商补探测：最多等二轮（约 6 秒）再收手，
+      // 避免页面停在「少了几家」的半成品状态，也不会无限轮询。
+      if (data && data.pending_probes && modelsPollLeft > 0) {
+        modelsPollLeft--;
+        setTimeout(function () { loadModels(false); }, 3000);
+        return;
+      }
       if (allModels.length || !autoRefresh || modelsLoaded) return;
       modelsLoaded = true;
       // 缓存为空：自动从上游拉一次（只做一次，避免失败时反复打上游）。

@@ -50,6 +50,16 @@ func (s *Service) handleModelsList(req pluginapi.ManagementRequest) pluginapi.Ma
 		if !core.RealmEnabled(cfg.EnabledRealms, vendor.Region()) || !active[vendor.ID()] {
 			continue
 		}
+		// 缓存为空的供应商先发起补探测（不等待），收集完再统一等一次，
+		// 这样 N 家缺模型时总等待仍是单次上游延迟，而不是 N 倍。
+		manager.EnsureModels(vendor)
+	}
+	manager.WaitProbes(modelProbeWait)
+
+	for _, vendor := range s.registry.Vendors() {
+		if !core.RealmEnabled(cfg.EnabledRealms, vendor.Region()) || !active[vendor.ID()] {
+			continue
+		}
 		models = append(models, s.consoleModelsForVendor(manager, vendor)...)
 	}
 
@@ -85,6 +95,12 @@ func (s *Service) handleModelsList(req pluginapi.ManagementRequest) pluginapi.Ma
 	payload := map[string]any{"ok": true, "models": models, "count": len(models)}
 	if len(models) == 0 {
 		payload["error"] = "本地暂无模型缓存，正在从上游获取；也可点「从上游刷新」立即拉取。"
+	} else {
+		// 有供应商仍在后台补探测时告知前端，让它稍后再拉一次；
+		// 否则用户会以为缺的那几家就是没有模型。
+		if missing := manager.ProbesRunning(); missing > 0 {
+			payload["pending_probes"] = missing
+		}
 	}
 	return JSONResponse(http.StatusOK, payload)
 }
