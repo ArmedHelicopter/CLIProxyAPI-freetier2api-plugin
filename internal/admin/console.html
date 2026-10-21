@@ -1766,9 +1766,22 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         banner("ok", "当前没有需要签到的账号", 5000);
         return;
       }
-      var successCount = results.filter(function (r) { return r.ok; }).length;
+      // skipped 表示「请求成功但本次没真正领到」（上游窗口未开启、领取被拒、
+      // 未确认发放）。它不能算成功——否则会显示「签到完成」而积分没到账。
+      var doneCount = results.filter(function (r) { return r.ok && !r.skipped; }).length;
+      var skippedCount = results.filter(function (r) { return r.ok && r.skipped; }).length;
+      var failedCount = results.filter(function (r) { return !r.ok; }).length;
       var total = results.length;
-      banner(successCount === total ? "ok" : "warn", "签到完成：" + successCount + " / " + total + " 成功", 5000);
+      if (skippedCount > 0) {
+        // 把跳过原因逐条说出来，别只给一个数字。
+        var reasons = results.filter(function (r) { return r.ok && r.skipped; })
+          .map(function (r) { return (r.label || r.auth_id) + "：" + (r.message || "未完成"); });
+        banner("warn", "签到完成：" + doneCount + " / " + total + " 成功" +
+          (skippedCount > 0 ? "，" + skippedCount + " 个未完成（" + reasons.join("；") + "）" : "") +
+          (failedCount > 0 ? "，" + failedCount + " 个失败" : ""), 12000);
+      } else {
+        banner(doneCount === total ? "ok" : "warn", "签到完成：" + doneCount + " / " + total + " 成功", 5000);
+      }
       loadStatus(true);
     }).catch(function (err) {
       banner("err", "签到失败：" + err.message, 8000);

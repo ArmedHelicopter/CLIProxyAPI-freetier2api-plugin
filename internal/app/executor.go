@@ -451,5 +451,11 @@ func (a *App) handleQuotaReset(request []byte) ([]byte, error) {
 	if result == nil {
 		return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: false, Message: "签到未返回结果"})
 	}
+	// NotRecorded 表示这次签到没有真正完成（上游窗口未开启、领取被拒、
+	// 未确认发放）。此时不能报成功——否则宿主与控制台都会显示「已重置」
+	// 而额度并没有因为签到而恢复。
+	if result.NotRecorded {
+		return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: false, Message: result.Message})
+	}
 	return core.OKEnvelope(pluginapi.QuotaResetResponse{Success: true, Message: result.Message})
 }

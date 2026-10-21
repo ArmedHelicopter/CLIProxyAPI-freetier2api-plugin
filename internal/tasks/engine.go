@@ -239,9 +239,15 @@ func (s *Service) runCheckinAll(ctx context.Context) {
 			return nil
 		}
 		s.recordCheckinResult(account.credential, result)
-		if result.Already {
+		switch {
+		case result.NotRecorded:
+			// 本次没真正领到（窗口未开启 / 领取被拒 / 未确认发放）。
+			// 用 Info 而不是 Error：上游窗口未开启是正常状态，不是故障；
+			// 但措辞要如实，别让它看起来像签到成功了。
+			logger.Info("checkin %s: not completed: %s", account.label(), result.Message)
+		case result.Already:
 			logger.Info("checkin %s: already checked in today", account.label())
-		} else {
+		default:
 			logger.Info("checkin %s: %s", account.label(), result.Message)
 		}
 		count++
@@ -752,6 +758,12 @@ func (s *Service) recordCheckinResult(credential *core.Credential, result *core.
 	}
 	uid := credential.FileIDValue()
 	if uid == "" {
+		return
+	}
+	// 供应商显式声明「本次未完成今日签到」时不落库：把「上游窗口未开启」
+	// 之类的状态记成今日已签到，会让页面显示假性成功，而上游窗口错过
+	// 不补领——用户以为领到了，实际积分永远拿不到。
+	if result.NotRecorded {
 		return
 	}
 	today := s.todayString()

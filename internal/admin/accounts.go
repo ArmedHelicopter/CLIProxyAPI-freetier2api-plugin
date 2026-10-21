@@ -344,20 +344,23 @@ func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginap
 	defer cancel()
 	results := s.runForAccounts(ctx, hostbridge.RequestCallbackID(req), body.AccountIDs,
 		func(vendor core.Vendor, _ *core.Credential) bool { return core.SupportsCheckin(vendor) },
-		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (string, error) {
+		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (accountActionOutcome, error) {
 			checkin, okCheckin := core.As[core.CheckinProvider](vendor)
 			if !okCheckin {
-				return "", fmt.Errorf("本供应商不提供签到")
+				return accountActionOutcome{}, fmt.Errorf("本供应商不提供签到")
 			}
 			result, errCheckin := checkin.Checkin(ctx, credential)
 			if errCheckin != nil {
-				return "", errCheckin
+				return accountActionOutcome{}, errCheckin
 			}
 			if result == nil {
-				return "", fmt.Errorf("签到未返回结果")
+				return accountActionOutcome{}, fmt.Errorf("签到未返回结果")
 			}
 			s.tasks.RecordCheckin(credential, result)
-			return result.Message, nil
+			// NotRecorded 表示这次签到**没有真正完成**（上游窗口未开启、
+			// 领取被拒、未确认发放）。如实标成「跳过」而不是成功，控制台
+			// 就不会显示「签到完成」而用户实际没拿到积分。
+			return accountActionOutcome{Message: result.Message, Skipped: result.NotRecorded}, nil
 		})
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": results})
 }
@@ -369,6 +372,20 @@ type accountActionResult struct {
 	Realm    string `json:"realm"`
 	OK       bool   `json:"ok"`
 	Message  string `json:"message"`
+	// Skipped 报告本次动作「没有真正完成」。
+	//
+	// 它与 OK 区分开：签到类动作可能请求成功但**什么都没领到**（上游窗口
+	// 未开启、领取被风控拒绝、未能确认发放）。把这类结果算作成功会让
+	// 控制台显示「签到完成」，用户以为领到了而实际没到账。
+	Skipped bool `json:"skipped,omitempty"`
+}
+
+// accountActionOutcome 是一次账号动作的结果。
+type accountActionOutcome struct {
+	// Message 是可读说明。
+	Message string
+	// Skipped 报告动作「请求成功但没有真正完成」。
+	Skipped bool
 }
 
 func (s *Service) runForAccounts(
@@ -376,7 +393,7 @@ func (s *Service) runForAccounts(
 	callbackID string,
 	targets []string,
 	filter func(core.Vendor, *core.Credential) bool,
-	action func(context.Context, core.Vendor, *core.Credential) (string, error),
+	action func(context.Context, core.Vendor, *core.Credential) (accountActionOutcome, error),
 ) []accountActionResult {
 	cfg := s.deps.Config()
 	loaded, failures := s.pool.Load(ctx, callbackID, auth.Options{
@@ -401,13 +418,14 @@ func (s *Service) runForAccounts(
 			VendorID: current.Vendor.ID(),
 			Realm:    current.Credential.RegionValue(),
 		}
-		message, errAction := action(ctx, current.Vendor, current.Credential)
+		outcome, errAction := action(ctx, current.Vendor, current.Credential)
 		if errAction != nil {
 			result.OK = false
 			result.Message = errAction.Error()
 		} else {
 			result.OK = true
-			result.Message = message
+			result.Skipped = outcome.Skipped
+			result.Message = outcome.Message
 		}
 		return result
 	})

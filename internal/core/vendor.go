@@ -112,6 +112,16 @@ type CheckinResult struct {
 	Energy int64
 	// Message 是可读说明。
 	Message string
+	// NotRecorded 报告本次结果**不应**被记入签到历史。
+	//
+	// 它是 opt-out 字段（零值 false = 正常记录），因为 CheckinResult 普遍以
+	// 零值结构体构造：若用「Recorded bool」正向声明，所有未显式赋值的现有
+	// 供应商都会变成「不记录」，那是一次静默的行为回归。
+	//
+	// 供应商只在「本次什么都没做成」时置位——例如上游领取窗口尚未开启、
+	// 或领取后未能确认发放。把这类情况也记成「今日已签到」会让页面显示
+	// 假性成功，而上游窗口错过不补领，积分就此永久丢失。
+	NotRecorded bool
 }
 
 // 本文件定义供应商运行时环境与组合根工厂。

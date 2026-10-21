@@ -234,9 +234,13 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 		return nil, errCheckin
 	}
 	return &core.CheckinResult{
-		Already: result.Status == CheckinAlreadyClaimed,
-		Credit:  int64(result.Amount),
-		Message: result.Message,
+		// 「今日已领取」由协议层判定：它只在**今天 10:00 开启的那一轮**
+		// 已经领取时才成立。9 点那一轮看到的是上一轮已领，协议层会返回
+		// CheckinWindowNotOpen（窗口未开启），不会走到这里。
+		Already:     result.Status == CheckinAlreadyClaimed,
+		Credit:      int64(result.Amount),
+		Message:     result.Message,
+		NotRecorded: result.NotRecorded,
 	}, nil
 }
 
