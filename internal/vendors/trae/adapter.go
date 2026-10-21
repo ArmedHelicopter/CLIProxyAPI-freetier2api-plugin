@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
@@ -15,8 +16,31 @@ import (
 
 type adapter struct {
 	*core.NativeAdapter[*Credential]
-	config   Config
-	sessions *SessionStore
+	// config 是构造期的 profile，只读。
+	config Config
+	// ideVersion 是 IDE 版本号的配置覆盖；空串表示沿用 config 的编译期默认值。
+	// 三个实例的版本线互不相同（CN 3.3.x / global 3.3.x / SOLO 0.1.x），
+	// 所以配置键按实例 ID 区分（见 Configure），不能共用族级键。
+	ideVersionMu   sync.RWMutex
+	ideVersion     string
+	ideVersionCode string
+	sessions       *SessionStore
+}
+
+// profile 返回当前 profile 快照（编译期 profile + 运行期版本覆盖）。
+//
+// 版本号决定上游下发的模型目录，可在运行期改写，所以所有读取点都必须走这里。
+func (v *adapter) profile() Config {
+	v.ideVersionMu.RLock()
+	defer v.ideVersionMu.RUnlock()
+	cfg := v.config
+	if v.ideVersion != "" {
+		cfg.IDEVersion = v.ideVersion
+	}
+	if v.ideVersionCode != "" {
+		cfg.IDEVersionCode = v.ideVersionCode
+	}
+	return cfg
 }
 
 // Instances 构造 Trae 家族的全部实例。
@@ -87,7 +111,23 @@ func newInstance(env core.Env, cfg Config, sessions *SessionStore) core.Vendor {
 }
 
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
-	return LooksLikeCredentialFor(raw, fileName, provider, v.config)
+	return LooksLikeCredentialFor(raw, fileName, provider, v.profile())
+}
+
+// Configure 解析 Trae 专属配置。
+//
+// 上游按 X-Ide-Version-Code 下发不同模型目录：国内版构建号低于 20260806 时
+// 拿不到 deepseek-v4.1-flash。门控再抬高时用户改配置即可，不必等发版。
+// 键名按实例加前缀（traecn_ide_version / traeglobal_ide_version / …），
+// 因为三条产品线的版本号体系不同，共用一个键会互相踩。
+func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
+	prefix := v.config.VendorID + "_"
+	version := strings.TrimSpace(raw[prefix+"ide_version"])
+	versionCode := strings.TrimSpace(raw[prefix+"ide_version_code"])
+	v.ideVersionMu.Lock()
+	v.ideVersion = version
+	v.ideVersionCode = versionCode
+	v.ideVersionMu.Unlock()
 }
 
 // ---- 模型 ----
@@ -101,7 +141,7 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	if !okCred || cred == nil {
 		return nil, fmt.Errorf("trae: 无可用凭证，无法拉取模型目录")
 	}
-	models, errModels := FetchModels(ctx, cred, v.config)
+	models, errModels := FetchModels(ctx, cred, v.profile())
 	if errModels != nil {
 		return nil, errModels
 	}
@@ -134,7 +174,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	}
 	payload, errChat := Chat(ctx, "", ChatRequest{
 		Credential: native,
-		Profile:    v.config,
+		Profile:    v.profile(),
 		Body:       req.Payload,
 		Stream:     false,
 	})
@@ -154,7 +194,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	}
 	return ChatStream(ctx, "", ChatRequest{
 		Credential: native,
-		Profile:    v.config,
+		Profile:    v.profile(),
 		Body:       req.Payload,
 		Stream:     true,
 	}, sink.Emit)
@@ -167,7 +207,7 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 	if errNative != nil {
 		return nil, errNative
 	}
-	response, errQuota := FetchQuota(ctx, native, v.config)
+	response, errQuota := FetchQuota(ctx, native, v.profile())
 	if errQuota != nil {
 		return nil, core.ToPluginError(errQuota)
 	}
@@ -179,7 +219,7 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if errNative != nil {
 		return nil, errNative
 	}
-	result, errCheckin := Checkin(ctx, native, v.config)
+	result, errCheckin := Checkin(ctx, native, v.profile())
 	if errCheckin != nil {
 		return nil, core.ToPluginError(errCheckin)
 	}
@@ -193,7 +233,7 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 // ---- 登录与续期 ----
 
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return LoginStart(ctx, v.config, v.sessions)
+	return LoginStart(ctx, v.profile(), v.sessions)
 }
 
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
@@ -205,7 +245,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 // Trae 的会话表自持（回调监听要求实例隔离），没有登记到公共 LoginSessions，
 // 根层路由登录请求时靠这个自证接口把 state 认回来。
 func (v *adapter) OwnsLoginSession(sessionID string) bool {
-	return v.sessions.owns(sessionID, v.config.VendorID)
+	return v.sessions.owns(sessionID, v.profile().VendorID)
 }
 
 // LocalCallbackHint 返回控制台要展示的本机回调地址。
@@ -216,4 +256,4 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	return v.sessions.SubmitCallback(ctx, state, rawURL)
 }
 
-func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.config) }
+func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.profile()) }

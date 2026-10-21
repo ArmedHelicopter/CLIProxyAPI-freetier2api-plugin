@@ -271,6 +271,9 @@ func FetchQuota(ctx context.Context, cred *Credential, cfg Config) (*pluginapi.Q
 		plan, tier = "TRAE SOLO 权益包", "SOLO"
 	}
 
+	// 键名必须落在 auth.Totals 的词表内（credit_remain / credit_total /
+	// credit_used），否则控制台的「剩余 / 总额」会静默显示 0 / 0。
+	// 供应商包不能 import auth（分层约定），所以这里按约定手写同名键。
 	response := &pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{
 			Plan:     plan,
@@ -278,14 +281,13 @@ func FetchQuota(ctx context.Context, cred *Credential, cfg Config) (*pluginapi.Q
 			TierID:   cfg.VendorID,
 		},
 		Summary: []pluginapi.QuotaMetric{
-			{Key: "remaining_credit", Label: "剩余积分", Value: total - used, Unit: "credits"},
-			{Key: "total_credit", Label: "总额度", Value: total, Unit: "credits"},
-			{Key: "used_credit", Label: "已用积分", Value: used, Unit: "credits"},
+			{Key: "credit_remain", Label: "剩余积分", Value: total - used, Unit: "credits"},
+			{Key: "credit_total", Label: "总额度", Value: total, Unit: "credits"},
+			{Key: "credit_used", Label: "已用积分", Value: used, Unit: "credits"},
 		},
 	}
 	if unlimited {
-		response.Summary[0].Value = -1
-		response.Summary[0].Unit = "unlimited"
+		response.Summary[0] = pluginapi.QuotaMetric{Key: "credit_remain", Label: "剩余积分", Value: -1, Unit: "unlimited"}
 	}
 	return response, nil
 }

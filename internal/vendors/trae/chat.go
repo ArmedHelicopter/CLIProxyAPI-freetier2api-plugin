@@ -5,7 +5,7 @@ package trae
 //
 // 协议基线：TraeCode CN 桌面端 llm_raw_chat（与 Trae2api-cn 参考实现对齐），
 // 三个实例共享同一套协议实现，差异由 Config/profile 描述：
-//   - 国内版（traecn）：raw_chat_function=chat_v3，IDE 版本 3.3.105
+//   - 国内版（traecn）：raw_chat_function=chat_v3，IDE 版本 3.3.104
 //   - TRAE SOLO（traesolo）：raw_chat_function=solo_agent，SOLO 版本 0.1.52
 //   - 国际版（traeglobal）：与国内版同协议，仅域名与 client_id 不同；
 //     国际版无签到/额度活动（上游 404），由 tasks.go 区分处理。
@@ -46,9 +46,13 @@ const (
 	HostAuthCN    = "https://api.trae.cn"
 	HostConsoleCN = "https://www.trae.cn"
 	ClientIDCN    = "en1oxy7wnw8j9n"
-	IDEVersionCN  = "3.3.105"
+	// 国内版 IDE 版本号。上游按构建号（X-Ide-Version-Code）下发不同模型目录：
+	// 20260806 起才有 deepseek-v4.1-flash，更早的构建号会被降级成旧清单。
+	// 这两个值可用 <实例ID>_ide_version / <实例ID>_ide_version_code 覆盖（见 adapter.Configure），
+	// 例如 traecn_ide_version_code；三条产品线版本体系不同，必须按实例配置。
+	IDEVersionCN = "3.3.104"
 	// IDEVersionCodeCN 是国内版 IDE 的构建号，与 X-Ide-Version-Code 一起下发。
-	IDEVersionCodeCN = "20260609"
+	IDEVersionCodeCN = "20260922"
 
 	// 国际版（新加坡）
 	HostChatGlobal       = "https://coresg-normal.trae.ai"

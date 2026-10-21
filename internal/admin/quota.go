@@ -23,20 +23,22 @@ type quotaJob struct {
 
 // quotaResult 是单个账号的额度结果。
 type quotaResult struct {
-	AuthID     string                  `json:"auth_id"`
-	AuthIndex  string                  `json:"auth_index,omitempty"`
-	Name       string                  `json:"name,omitempty"`
-	UID        string                  `json:"uid,omitempty"`
-	Label      string                  `json:"label"`
-	VendorID   string                  `json:"vendor_id,omitempty"`
-	VendorName string                  `json:"vendor_name,omitempty"`
-	Realm      string                  `json:"realm"`
-	OK         bool                    `json:"ok"`
-	Message    string                  `json:"message,omitempty"`
-	Summary    string                  `json:"summary,omitempty"`
-	Remain     int64                   `json:"remain"`
-	Total      int64                   `json:"total"`
-	Metrics    []pluginapi.QuotaMetric `json:"metrics,omitempty"`
+	AuthID     string `json:"auth_id"`
+	AuthIndex  string `json:"auth_index,omitempty"`
+	Name       string `json:"name,omitempty"`
+	UID        string `json:"uid,omitempty"`
+	Label      string `json:"label"`
+	VendorID   string `json:"vendor_id,omitempty"`
+	VendorName string `json:"vendor_name,omitempty"`
+	Realm      string `json:"realm"`
+	OK         bool   `json:"ok"`
+	Message    string `json:"message,omitempty"`
+	Summary    string `json:"summary,omitempty"`
+	Remain     int64  `json:"remain"`
+	Total      int64  `json:"total"`
+	// Unlimited 报告剩余额度无上限，展示层据此显示「无限」。
+	Unlimited bool                    `json:"unlimited,omitempty"`
+	Metrics   []pluginapi.QuotaMetric `json:"metrics,omitempty"`
 }
 
 func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
@@ -69,8 +71,8 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	// 领取状态跟着额度一起刷新，但**批末才落盘**：Mutate 每次都会写一遍
 	// state.json，逐账号写等于把一次「查询额度」放大成 N 次磁盘写。
 	claims := map[string]state.ClaimRecord{}
-	jobResults := accountpkg.RunBatch(jobs, batchConcurrency, func(current quotaJob) quotaResult {
-		result := quotaResult{
+	jobResults := accountpkg.RunBatch(jobs, batchConcurrency, func(current quotaJob) (result quotaResult) {
+		result = quotaResult{
 			AuthID:     core.FirstNonEmpty(current.entry.ID, current.entry.Name),
 			AuthIndex:  current.entry.AuthIndex,
 			Name:       current.entry.Name,
@@ -80,6 +82,12 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 			VendorName: current.vendor.Name(),
 			Realm:      current.credential.RegionValue(),
 		}
+		// **成功与失败都要缓存**：缓存是账号表唯一的数据源。只缓存成功结果会让
+		// 失败账号在下次 /status 时退回「没有结果」，页面于是永远停在「查询中…」——
+		// 而「上游没有额度接口」这类结论早已确定，不存在还会变。
+		defer func() {
+			s.cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
+		}()
 		quotaProvider, okQuota := core.As[core.QuotaProvider](current.vendor)
 		if !okQuota {
 			result.Message = core.QuotaUnsupported(current.vendor).Error()
@@ -106,9 +114,9 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 		}
 		result.OK = true
 		result.Summary = accountpkg.Summary(quota)
-		result.Remain, result.Total = accountpkg.Totals(quota)
+		totals := accountpkg.Totals(quota)
+		result.Remain, result.Total, result.Unlimited = totals.Remaining, totals.Total, totals.Unlimited
 		result.Metrics = quota.Summary
-		s.cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
 		return result
 	})
 	if len(claims) > 0 {

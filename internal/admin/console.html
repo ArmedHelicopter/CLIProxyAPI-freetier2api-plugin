@@ -584,10 +584,11 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
   // ---- 账号视图 ----
 
-  // lastStatus / quotaByAuth 让额度查询结果能并入账号表，
-  // 而不必再单独占一张表。
+  // lastStatus 是最近一次 /status 的响应，供重渲染账号表使用。
+  //
+  // **额度不在这里再存一份**：/status 的 accounts[].quota 是后端缓存的权威值，
+  // 页面另存一份会让两套键逐渐分叉（后端按账号身份，页面得靠候选键猜测）。
   var lastStatus = null;
-  var quotaByAuth = {};
 
   // maskAccount 对 API key 类账号做脱敏：保留前四位与后四位，中间用 *** 代替。
   //
@@ -679,18 +680,28 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         }
       }
 
-      // 额度列：优先使用账号自带的缓存额度，或多键匹配避免格式差异
-      var aid = account.auth_id || "";
-      var quota = account.quota || quotaByAuth[aid] || quotaByAuth[aid.replace(/\.json$/i, "")] || quotaByAuth[account.auth_index] || quotaByAuth[account.name] || quotaByAuth[account.uid] || quotaByAuth[account.label];
+      // 额度列。数据源只有一个：后端 /status 给的 account.quota。
+      // 没有结果时按静态能力区分两种截然不同的状态——供应商根本不提供额度
+      // 接口（OpenCode ZEN 等）就是「-- / --」，只有「支持但还没查到」才是
+      // 「查询中…」。用「结果里有没有这条」反推会让前者永久卡在查询中。
+      var quota = account.quota;
       if (!quota) {
-        // 该账号还没有额度结果（首次进入或刚添加）。进入页面会自动查一次，
-        // 添加账号与手动刷新也会重查，所以这里只是短暂状态。
-        var cell = el("td", "查询中…", "muted");
-        cell.colSpan = 2;
-        row.appendChild(cell);
+        if (account.supports_quota) {
+          // 首次进入或刚添加的短暂状态：进入页面会自动查一次，添加与手动
+          // 刷新也会重查。
+          var cell = el("td", "查询中…", "muted");
+          cell.colSpan = 2;
+          row.appendChild(cell);
+        } else {
+          row.appendChild(el("td", "-- / --", "muted"));
+          row.appendChild(el("td", "--", "muted"));
+        }
       } else if (!quota.ok) {
         row.appendChild(el("td", "-- / --", "muted"));
         row.appendChild(el("td", "--", "muted"));
+      } else if (quota.unlimited) {
+        row.appendChild(el("td", "无限"));
+        row.appendChild(el("td", "—", "muted"));
       } else {
         row.appendChild(el("td", quota.remain + " / " + quota.total));
         var ratio = quota.total > 0 ? (quota.remain / quota.total) : 0;
@@ -825,7 +836,12 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
   // ---- 额度 ----
 
-  // loadQuotas 查询全部账号额度，结果并入账号表（不再单独一张表）。
+  // loadQuotas 查询全部账号额度。
+  //
+  // 结果**不由页面截留**：后端查询时就把每个账号的结果写进自己的缓存，
+  // /status 下一次返回的 accounts[].quota 即是权威数据。页面若再存一份，
+  // 就会出现两套键（后端按账号身份、页面按 5 个候选键猜测），两边不一致时
+  // 表现为额度永久消失。这里只需在查询完成后重拉账号表。
   //
   // quiet 为 true 时不弹横幅——进入页面会自动跑一次，那时不需要打扰用户；
   // 手动点按钮时才给反馈。
@@ -834,23 +850,12 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     return api("POST", "/quotas", {}).then(function (data) {
       if (!data) return;
       var results = (data && data.results) || [];
-      results.forEach(function (entry) {
-        var keys = [entry.auth_id, entry.name, entry.auth_index, entry.uid, entry.label];
-        keys.forEach(function (k) {
-          if (k) {
-            var s = String(k).trim();
-            if (s) {
-              quotaByAuth[s] = entry;
-              quotaByAuth[s.replace(/\.json$/i, "")] = entry;
-            }
-          }
-        });
-      });
-      if (lastStatus) renderAccounts(lastStatus);
-      if (quiet) return;
       var failed = results.filter(function (r) { return !r.ok; }).length;
-      banner(failed ? "warn" : "ok",
-        "额度查询完成：" + results.length + " 个账号" + (failed ? "，" + failed + " 个失败" : ""), 5000);
+      if (!quiet) {
+        banner(failed ? "warn" : "ok",
+          "额度查询完成：" + results.length + " 个账号" + (failed ? "，" + failed + " 个失败" : ""), 5000);
+      }
+      return loadStatus(true);
     }).catch(function (err) {
       if (!quiet) banner("err", err.message, 8000);
       throw err;
@@ -1548,9 +1553,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
           currentLoginState = "";
           status.textContent = "授权成功，账号已写入 CPA。";
           banner("ok", "账号添加成功，正在查询该账号额度…");
-          // 串行：先把新账号拉进账号表，再查额度（新账号不在已有结果里，
-          // 不重查就会一直停在"查询中"）。
-          loadStatus().then(function () { loadQuotas(true); });
+          // loadQuotas 结束时会自己重拉账号表（新账号只有查过额度才不在
+          // 「查询中」），因此这里不再额外 loadStatus。
+          loadQuotas(true);
           return;
         }
         if (value === "error") {
@@ -1621,7 +1626,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         pasteStatus.textContent = message || "解析成功，正在写入账号…";
         document.getElementById("loginStatus").textContent = "授权成功，账号已写入 CPA。";
         banner("ok", "账号添加成功，正在查询该账号额度…");
-        loadStatus().then(function () { loadQuotas(true); });
+        loadQuotas(true);
         return;
       }
       pasteStatus.textContent = message || "回调链接暂时无法完成登录，请稍后重试。";
@@ -1782,7 +1787,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       } else {
         banner(doneCount === total ? "ok" : "warn", "签到完成：" + doneCount + " / " + total + " 成功", 5000);
       }
-      loadStatus(true);
+      // 签到手上有新积分，但账号表读的是后端额度缓存（上一次 /quotas 的
+      // 结果），不重查就会一直显示签到前的数字。loadQuotas 结束时会重拉账号表。
+      loadQuotas(true);
     }).catch(function (err) {
       banner("err", "签到失败：" + err.message, 8000);
     }).then(function () {
@@ -1865,6 +1872,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   function startConsole() {
     loadVendors().then(function () {
       // 单步失败不应阻断后续模块；鉴权失败时 api() 闸门会挡下所有后续请求。
+      // loadQuotas 结束时会自己重拉账号表，首屏因此不必先 loadStatus：
+      // 先渲染一次「查询中」，再带着额度结果重渲染。
       return loadStatus().catch(function () { return null; });
     }).then(function () {
       return loadQuotas(true).catch(function () { return null; });

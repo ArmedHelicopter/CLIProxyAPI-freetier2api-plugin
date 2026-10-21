@@ -7,9 +7,9 @@ package trae
 //   - wire id：目录 model_detail_list[].model_name（如 glm-5.2__dev），
 //     请求体 model_name 字段，且按大小写敏感匹配。
 //
-// 目录唯一来源：POST /api/ide/v1/get_detail_param（function=solo_work_lite，
-// 其响应含 chat_v3 与 solo_agent 共享条目）。按账号缓存；缓存过期后重新
-// 拉取，拉取失败时沿用旧条目（stale-while-error），没有旧条目才报错。
+// 目录唯一来源：POST /api/ide/v1/get_detail_param（function 与对话侧一致，
+// 见 fetchCatalog）。按账号缓存；缓存过期后重新拉取，拉取失败时沿用旧条目
+// （stale-while-error），没有旧条目才报错。
 // usage=custom_model/summary 的条目是路由配置，不作为可选对话模型。
 
 import (
@@ -22,7 +22,9 @@ import (
 	"sync"
 	"time"
 
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/logger"
 )
 
 type Model struct {
@@ -76,8 +78,11 @@ func resolveModelWithCatalog(ctx context.Context, model string, cfg Config, cred
 }
 
 // loadCatalog 读取账号的模型目录缓存；过期则重新拉取，拉取失败沿用旧条目。
+//
+// 缓存键带上 function 与构建号：目录内容由这两者共同决定，只按账号缓存会在
+// 版本号被配置改写后继续命中旧清单（最长 catalogTTL）。
 func loadCatalog(ctx context.Context, cred *Credential, cfg Config) (catalogEntry, bool) {
-	key := cfg.VendorID + "|" + cred.UID
+	key := strings.Join([]string{cfg.VendorID, cred.UID, cfg.Function, cfg.IDEVersionCode}, "|")
 	catalogMu.Lock()
 	entry, okCached := catalogCache[key]
 	catalogMu.Unlock()
@@ -126,7 +131,8 @@ type catalogDetail struct {
 }
 
 // selectWireModel 从 model_detail_list 里挑 wire id：优先 __dev 档位，
-// 没有 __dev 的配置（如 DeepSeek-V4-Pro -> deepseek_v4_pro__dev）取第一条。
+// 没有 __dev 的配置取第一条。注意 wire id 属于某个 function 的命名空间，
+// 返回值只在该 function 下有效（见 fetchCatalog）。
 func selectWireModel(details []catalogDetail) (string, int) {
 	fallback := ""
 	fallbackTokens := 0
@@ -148,11 +154,17 @@ func selectWireModel(details []catalogDetail) (string, int) {
 
 // fetchCatalog 调用上游 get_detail_param 拉取账号可用模型目录。
 //
-// 请求方法与头集合对齐 Trae2api-cn 的 _fetch_solo_model_configs：POST +
-// function=solo_work_lite + SOLO 版头。
+// 关键约束：**function 必须与对话侧一致**（cfg.Function）。上游按 function
+// 维护两套命名空间，同一个模型在不同 function 下的 wire id 不同：
+//   - chat_v3：        DeepSeek-V4-Pro -> DeepSeek-V4-Pro__dev
+//   - solo_work_lite： DeepSeek-V4-Pro -> deepseek_v4_pro__dev
+//
+// 目录取 solo_work_lite 的 wire id 再去 chat_v3 对话会被上游判成
+// 4023 model is unknown。因此请求体、X-App-Function、X-Ide-Function 三处
+// 都下发 cfg.Function。
 func fetchCatalog(ctx context.Context, cred *Credential, cfg Config) (catalogEntry, bool) {
 	body, errBody := json.Marshal(map[string]any{
-		"function":            "solo_work_lite",
+		"function":            cfg.Function,
 		"config_names":        nil,
 		"need_prompt":         false,
 		"current_config_info": nil,
@@ -182,6 +194,8 @@ func fetchCatalog(ctx context.Context, cred *Credential, cfg Config) (catalogEnt
 	req.Header.Set("X-Ide-Version", cfg.IDEVersion)
 	req.Header.Set("X-Ide-Version-Code", cfg.IDEVersionCode)
 	req.Header.Set("X-Ide-Version-Type", "stable")
+	req.Header.Set("X-App-Function", cfg.Function)
+	req.Header.Set("X-Ide-Function", cfg.Function)
 	req.Header.Set("X-Device-Brand", cfg.DeviceBrand)
 	req.Header.Set("X-Device-Type", "windows")
 	req.Header.Set("Request-Traffic-Type", "prod")
@@ -189,19 +203,22 @@ func fetchCatalog(ctx context.Context, cred *Credential, cfg Config) (catalogEnt
 	client := hostbridge.Client(ctx, 15*time.Second)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
+		logger.Info("trae catalog: %s request failed: %v", cfg.VendorID, errDo)
 		return catalogEntry{}, false
 	}
 	defer func() { _ = resp.Body.Close() }()
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if resp.StatusCode != http.StatusOK {
+		logger.Info("trae catalog: %s status=%d body=%s", cfg.VendorID, resp.StatusCode, core.Truncate(string(raw), 512))
 		return catalogEntry{}, false
 	}
-
-	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	if errRead != nil {
+		logger.Info("trae catalog: %s read body failed: %v", cfg.VendorID, errRead)
 		return catalogEntry{}, false
 	}
 	var parsed catalogResponse
 	if errJSON := json.Unmarshal(raw, &parsed); errJSON != nil {
+		logger.Info("trae catalog: %s decode failed: %v body=%s", cfg.VendorID, errJSON, core.Truncate(string(raw), 512))
 		return catalogEntry{}, false
 	}
 
@@ -242,9 +259,29 @@ func fetchCatalog(ctx context.Context, cred *Credential, cfg Config) (catalogEnt
 		}
 	}
 	if len(entry.models) == 0 {
+		// 上游偶尔会整体降级（例如构建号低于门控时只回旧清单）。把条目摘要
+		// 打出来，才能区分「目录结构变了」和「版本号被降级」。
+		logger.Info("trae catalog: %s 过滤后为空（function=%s code=%s，原始 %d 条）: %s",
+			cfg.VendorID, cfg.Function, cfg.IDEVersionCode, len(parsed.ConfigInfoList),
+			summarizeCatalog(parsed.ConfigInfoList))
 		return catalogEntry{}, false
 	}
 	return entry, true
+}
+
+// summarizeCatalog 生成原始条目摘要，只含分类字段、不涉及凭证。
+func summarizeCatalog(items []catalogItem) string {
+	const limit = 20
+	parts := make([]string, 0, min(len(items), limit))
+	for index, item := range items {
+		if index >= limit {
+			parts = append(parts, fmt.Sprintf("...(+%d)", len(items)-limit))
+			break
+		}
+		parts = append(parts, fmt.Sprintf("%s[usage=%s,switch=%t,custom=%t]",
+			item.ConfigName, item.Usage, item.ConfigSwitch, item.CustomModels != nil))
+	}
+	return strings.Join(parts, ", ")
 }
 
 // FetchModels 返回该凭证账号可用模型清单（直接来自上游目录）。

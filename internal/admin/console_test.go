@@ -350,3 +350,25 @@ func TestConsolePageWiresLoginCallbackPasteBox(t *testing.T) {
 		}
 	}
 }
+
+// TestConsoleQuotaCellUsesCapability 锁定账号表额度列的状态判定。
+//
+// 「查询中…」只能表示**确实在查**。上游没有额度接口的供应商（OpenCode ZEN）
+// 永远不会有结果，若页面把「没有结果」一律当成查询中，那一行就会永久卡在
+// 「查询中…」，而正确展示是「-- / --」。因此分支必须读后端给的能力标志
+// supports_quota，而不是靠结果是否存在反推。
+func TestConsoleQuotaCellUsesCapability(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+
+	if !strings.Contains(page, "account.supports_quota") {
+		t.Fatal("quota cell must branch on account.supports_quota")
+	}
+	// 页面不得再维护自己的额度缓存：它是后端缓存的第二份副本，键还靠猜测。
+	if strings.Contains(page, "quotaByAuth") {
+		t.Fatal("console must not keep a second quota cache (quotaByAuth); /status is the source of truth")
+	}
+	// 「查询中…」必须出现在 supports_quota 为真的分支里。
+	if !regexp.MustCompile(`supports_quota[\s\S]{0,400}查询中`).MatchString(page) {
+		t.Fatal("「查询中…」must be shown only when the vendor supports quota")
+	}
+}

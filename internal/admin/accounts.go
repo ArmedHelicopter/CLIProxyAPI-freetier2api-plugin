@@ -67,6 +67,9 @@ type accountSummary struct {
 	Checkin         *state.CheckinRecord `json:"checkin,omitempty"`
 	Quota           *quotaResult         `json:"quota,omitempty"`
 	SupportsCheckin bool                 `json:"supports_checkin"`
+	// SupportsQuota 是「该供应商能否查出额度」的静态能力，与 Quota（查询结果）
+	// 是两件事：没有结果时它区分「还没查」与「永远查不出来」。
+	SupportsQuota bool `json:"supports_quota"`
 	// Claim 是该账号的套餐领取状态；SupportsClaim 为 false 时前端不渲染入口。
 	Claim         *state.ClaimRecord `json:"claim,omitempty"`
 	SupportsClaim bool               `json:"supports_claim"`
@@ -117,6 +120,7 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 			Status:          entry.Status,
 			Disabled:        entry.Disabled,
 			SupportsCheckin: core.SupportsCheckin(vendor),
+			SupportsQuota:   supportsQuota(vendor),
 			SupportsClaim:   supportsClaim(vendor),
 		}
 		var modTime time.Time
@@ -146,6 +150,15 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 		out = append(out, summary)
 	}
 	return out
+}
+
+// supportsQuota 报告该供应商是否提供额度查询。
+//
+// 能力来自接口断言，而不是「查询结果里有没有这一条」——后者会让「不支持」
+// 和「还没查」看起来一样，页面于是永远分不清该显示「-- / --」还是「查询中…」。
+func supportsQuota(vendor core.Vendor) bool {
+	_, okQuota := core.As[core.QuotaProvider](vendor)
+	return okQuota
 }
 
 // supportsClaim 报告该供应商是否提供套餐领取。

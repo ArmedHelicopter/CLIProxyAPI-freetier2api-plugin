@@ -202,16 +202,19 @@ func executorStreamPayload(payload []byte) []byte {
 
 // handleResponseNormalizeBefore 仅在跨协议流式转换前补上转换器需要的 SSE 信封。
 // 同格式 OpenAI 响应直接交给 handler，不能在 executor 出口提前包装。
+//
+// 宿主对每一条 SSE 行都调一次，参数里带着完整客户端请求与上游请求（可达数 MB）。
+// 因此这里绝不整包解码 ResponseTransformRequest，取值走 scanResponseTransform
+// 的单次线性扫描（见 responsegate.go 的说明）。
+//
+// 返回空 PayloadResponse 表示「未修改」——宿主对此明确按 no-op 处理
+// （callResponseNormalizer 在 len(Body)==0 时保留原 body）。
 func (a *App) handleResponseNormalizeBefore(request []byte) ([]byte, error) {
-	var req pluginapi.ResponseTransformRequest
-	if errDecode := decodeRequest(request, &req); errDecode != nil {
-		return nil, core.NewPluginError("invalid_request", errDecode.Error(), http.StatusBadRequest)
+	body, okChunk := normalizeResponseChunk(request)
+	if !okChunk || !json.Valid(bytes.TrimSpace(body)) {
+		return core.OKEnvelope(pluginapi.PayloadResponse{})
 	}
-	body := req.Body
-	if req.Stream && isChatFormat(req.FromFormat) && req.ToFormat != "" && !isChatFormat(req.ToFormat) && json.Valid(bytes.TrimSpace(body)) {
-		body = formatSSEChunk(body)
-	}
-	return core.OKEnvelope(pluginapi.PayloadResponse{Body: body})
+	return core.OKEnvelope(pluginapi.PayloadResponse{Body: formatSSEChunk(body)})
 }
 
 // formatSSEChunk 只供转换前适配使用；executor 分片不能调用它。

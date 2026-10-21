@@ -40,36 +40,75 @@ func FormatValue(value float64) string {
 	return strconv.FormatFloat(value, 'f', 2, 64)
 }
 
+// QuotaTotals 是「剩余 / 总额」的折算结果。
+type QuotaTotals struct {
+	Remaining int64
+	Total     int64
+	// Unlimited 报告剩余额度无上限（上游以 -1 / unit=unlimited 表达）。
+	// 无上限时 Remaining 没有意义，展示层应显示「无限」而不是数字。
+	Unlimited bool
+}
+
 // Totals 折算「剩余 / 总额」。
 //
-// 优先使用标准键 remaining/total/used；同时兼容各供应商已有的键名。
-func Totals(response *pluginapi.QuotaFetchResponse) (remaining, total int64) {
+// 键名按族识别（标准键、credit_*、user_quota_* / addon_quota_*）。
+// **新增供应商必须复用其中一族**：这个函数只认白名单，写别的键名会静默
+// 得到 0/0，页面就会一直显示 0 / 0（Trae 曾用 remaining_credit 踩过）。
+func Totals(response *pluginapi.QuotaFetchResponse) QuotaTotals {
 	if response == nil {
-		return 0, 0
+		return QuotaTotals{}
 	}
+	var totals QuotaTotals
 	for _, metric := range response.Summary {
-		switch metric.Key {
-		case "remaining", "credit_remain", "user_quota_remaining", "addon_quota_remaining":
-			if remaining == 0 {
-				remaining = int64(metric.Value)
+		if isRemainingKey(metric.Key) && (strings.EqualFold(metric.Unit, "unlimited") || metric.Value < 0) {
+			totals.Unlimited = true
+			continue
+		}
+		switch {
+		case isRemainingKey(metric.Key):
+			if totals.Remaining == 0 {
+				totals.Remaining = int64(metric.Value)
 			}
-		case "total", "credit_total", "user_quota_total", "addon_quota_total":
-			if total == 0 {
-				total = int64(metric.Value)
+		case isTotalKey(metric.Key):
+			if totals.Total == 0 {
+				totals.Total = int64(metric.Value)
 			}
 		}
 	}
-	if total == 0 {
+	if totals.Total == 0 {
 		var used int64
 		for _, metric := range response.Summary {
-			switch metric.Key {
-			case "used", "credit_used", "user_quota_used", "addon_quota_used":
+			if isUsedKey(metric.Key) {
 				used += int64(metric.Value)
 			}
 		}
 		if used > 0 {
-			total = remaining + used
+			totals.Total = totals.Remaining + used
 		}
 	}
-	return remaining, total
+	return totals
+}
+
+func isRemainingKey(key string) bool {
+	switch key {
+	case "remaining", "credit_remain", "user_quota_remaining", "addon_quota_remaining":
+		return true
+	}
+	return false
+}
+
+func isTotalKey(key string) bool {
+	switch key {
+	case "total", "credit_total", "user_quota_total", "addon_quota_total":
+		return true
+	}
+	return false
+}
+
+func isUsedKey(key string) bool {
+	switch key {
+	case "used", "credit_used", "user_quota_used", "addon_quota_used":
+		return true
+	}
+	return false
 }

@@ -648,6 +648,7 @@ Esc 取消；清空保存即清除别名。每个供应商的每个模型各自�
 | `workbuddy_sanitize_fingerprints` | bool | `true` | 出站请求体指纹脱敏（WorkBuddy） |
 | `workbuddy_passthrough_ip` | bool | `false` | 是否把客户端 IP 透传给上游 |
 | `workbuddy_user_agent` / `workbuddy_client_version` / `workbuddy_cli_version` | string | 空 | 出站标识覆盖（WorkBuddy） |
+| `traecn_ide_version` / `traecn_ide_version_code` | string | 内置 | 出站 IDE 版本覆盖，键名按实例区分（`traecn` / `traeglobal` / `traesolo`）。上游按构建号下发不同模型目录，构建号过低会看不到新模型（Trae） |
 | `workbuddy_device_token` / `workbuddy_device_token_file` | string | 空 | `X-Device-Token` 兜底（WorkBuddy） |
 | `machine_salt` | string | 自动生成 | 设备指纹盐；从旧插件迁移时填原值可保持指纹不变 |
 | `auto_checkin` / `auto_checkin_at` | bool / string | **`true`** / `10:00` | 每日自动任务（默认开启） |
@@ -725,6 +726,17 @@ CPA 按客户端 IP 统计管理鉴权失败次数，**未携带密钥的请求�
 - 手输的密钥同样先探针验证，验证失败后 10 秒内不允许连续重试。
 
 ## 行为变更（分层重构）
+
+- **响应归一化不再逐分片解码整包请求（v0.1.7，issue #9）**：v0.1.6 引入的全局
+  `response.normalize_before` 钩子被宿主对**每一条 SSE 行**调用一次，参数里带着完整
+  客户端请求与完整上游请求（长上下文下各可达数 MB）。此前插件每次都整包
+  `json.Unmarshal`，把这两份 base64 字段全部解码，实测 12 秒 735 次调用、累计
+  5.24 GB 参数，占 CPA 用户态 CPU 采样的 73%。现在改用单次线性扫描只取
+  `Stream` / `FromFormat` / `ToFormat` / `Body`，两个大字段只做字符串跳过：
+  判定「不需要补 `data:` 信封」时连 `Body` 都不解码。跨协议流式转换的行为不变
+  （Claude / Gemini / openai-responses 目标格式仍补一层 `data:` 前缀，
+  issue #5 / #8 的修复保留）。注：宿主侧逐分片 clone 与 base64 序列化这两份请求体
+  的开销仍需上游侧优化，插件无法消除。
 
 - **Qoder 签到不再假性成功，国际版也能领（v0.1.7）**：Qoder 的签到是**领取每日福利
   活动**，活动窗口每日 10:00（UTC+8）开启、次日 10:00 前关闭，需主动领取、错过不补领。

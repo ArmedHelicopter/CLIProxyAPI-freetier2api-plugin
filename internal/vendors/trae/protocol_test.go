@@ -177,7 +177,16 @@ const catalogFixture = `{
       "context_window_tokens": {"dev": 200000},
       "display_config": {"display_name": "DeepSeek-V4-Pro", "model_capability": "reasoning_model"},
       "extra_config": "{}",
-      "model_detail_list": [{"model_name": "deepseek_v4_pro__dev", "max_tokens": 32000}]
+      "model_detail_list": [{"model_name": "DeepSeek-V4-Pro__dev", "max_tokens": 32000}]
+    },
+    {
+      "config_name": "deepseek-v4.1-flash",
+      "config_switch": true,
+      "usage": "chat_completion",
+      "context_window_tokens": {"dev": 200000},
+      "display_config": {"display_name": "DeepSeek-V4.1-Flash", "model_capability": "reasoning_model"},
+      "extra_config": "{}",
+      "model_detail_list": [{"model_name": "deepseek-v4.1-flash__dev", "max_tokens": 32000}]
     },
     {
       "config_name": "custom_model_gpt-5",
@@ -311,7 +320,7 @@ func TestSoloProfileUsesSoloFunctionAndVersions(t *testing.T) {
 	if cfg.Function != "solo_agent" {
 		t.Fatalf("SOLO function = %q, want solo_agent", cfg.Function)
 	}
-	if cfg.IDEVersion != "0.1.52" || cfg.IDEVersionCode != "20260811" {
+	if cfg.IDEVersion != IDEVersionSolo || cfg.IDEVersionCode != IDEVersionCodeSolo {
 		t.Fatalf("SOLO 版本号不对: %q / %q", cfg.IDEVersion, cfg.IDEVersionCode)
 	}
 	if !cfg.supportsCheckin() {
@@ -505,7 +514,7 @@ func TestFetchCatalogFiltersAndResolvesWireIDs(t *testing.T) {
 	for _, model := range models {
 		ids[model.ID] = true
 	}
-	if !ids["glm-5.2"] || !ids["DeepSeek-V4-Pro"] {
+	if !ids["glm-5.2"] || !ids["DeepSeek-V4-Pro"] || !ids["deepseek-v4.1-flash"] {
 		t.Errorf("可选对话模型缺失: %v", ids)
 	}
 	if ids["custom_model_gpt-5"] {
@@ -519,7 +528,7 @@ func TestFetchCatalogFiltersAndResolvesWireIDs(t *testing.T) {
 	if errResolve != nil {
 		t.Fatalf("resolveModelWithCatalog: %v", errResolve)
 	}
-	if resolved.ConfigName != "DeepSeek-V4-Pro" || resolved.WireName != "deepseek_v4_pro__dev" {
+	if resolved.ConfigName != "DeepSeek-V4-Pro" || resolved.WireName != "DeepSeek-V4-Pro__dev" {
 		t.Errorf("解析结果不对: %+v", resolved)
 	}
 
@@ -530,6 +539,66 @@ func TestFetchCatalogFiltersAndResolvesWireIDs(t *testing.T) {
 	}
 	if resolvedLower.ConfigName != "DeepSeek-V4-Pro" {
 		t.Errorf("小写请求应归一到目录精确拼写: %+v", resolvedLower)
+	}
+}
+
+// TestFetchCatalogUsesChatFunction 锁定目录请求的 function 必须与对话侧一致。
+//
+// 上游按 function 维护两套 wire id 命名空间：目录取 solo_work_lite 的
+// deepseek_v4_pro__dev 再发 chat_v3 对话会被判 4023 model is unknown。
+func TestFetchCatalogUsesChatFunction(t *testing.T) {
+	stubHost(t)
+	var gotBody map[string]any
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotHeaders = r.Header.Clone()
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &gotBody)
+		_, _ = w.Write([]byte(catalogFixture))
+	}))
+	defer server.Close()
+	cfg := testConfig(t, server.URL)
+	cfg.Function = "chat_v3"
+
+	catalogMu.Lock()
+	catalogCache = map[string]catalogEntry{}
+	catalogMu.Unlock()
+
+	if _, errModels := FetchModels(context.Background(), testCredential(), cfg); errModels != nil {
+		t.Fatalf("FetchModels: %v", errModels)
+	}
+	if gotBody["function"] != "chat_v3" {
+		t.Errorf("目录请求体 function = %v，应跟随 cfg.Function", gotBody["function"])
+	}
+	for _, key := range []string{"X-App-Function", "X-Ide-Function"} {
+		if got := gotHeaders.Get(key); got != "chat_v3" {
+			t.Errorf("%s = %q，应跟随 cfg.Function", key, got)
+		}
+	}
+}
+
+// TestConfigureOverridesIDEVersion 锁定版本号可被配置覆盖，且按实例 ID 隔离。
+func TestConfigureOverridesIDEVersion(t *testing.T) {
+	cfg := ConfigFor(RegionCN)
+	inst := &adapter{config: cfg}
+
+	inst.Configure(core.Settings{}, map[string]string{
+		"traecn_ide_version":      "9.9.9",
+		"traecn_ide_version_code": "20990101",
+		// SOLO 是另一条产品线，族级/其它实例的键都不能生效。
+		"trae_ide_version":     "1.1.1",
+		"traesolo_ide_version": "2.2.2",
+	})
+	if got := inst.profile(); got.IDEVersion != "9.9.9" || got.IDEVersionCode != "20990101" {
+		t.Fatalf("覆盖未生效: %q / %q", got.IDEVersion, got.IDEVersionCode)
+	}
+	if inst.profile().Function != "chat_v3" || inst.profile().ChatHost != cfg.ChatHost {
+		t.Error("覆盖版本号不应改动其它 profile 字段")
+	}
+
+	inst.Configure(core.Settings{}, map[string]string{})
+	if got := inst.profile(); got.IDEVersion != IDEVersionCN || got.IDEVersionCode != IDEVersionCodeCN {
+		t.Errorf("移除配置后应回落常量: %q / %q", got.IDEVersion, got.IDEVersionCode)
 	}
 }
 
@@ -662,14 +731,14 @@ func TestFetchQuotaSumsCreditPacks(t *testing.T) {
 	for _, metric := range quota.Summary {
 		values[metric.Key] = metric.Value
 	}
-	if values["total_credit"] != 4600 {
-		t.Errorf("总额度 = %v, want 4600（product_type=0 的包不计）", values["total_credit"])
+	if values["credit_total"] != 4600 {
+		t.Errorf("总额度 = %v, want 4600（product_type=0 的包不计）", values["credit_total"])
 	}
-	if values["used_credit"] != 0.4944 {
-		t.Errorf("已用 = %v, want 0.4944", values["used_credit"])
+	if values["credit_used"] != 0.4944 {
+		t.Errorf("已用 = %v, want 0.4944", values["credit_used"])
 	}
-	if values["remaining_credit"] != 4599.5056 {
-		t.Errorf("剩余 = %v, want 4599.5056", values["remaining_credit"])
+	if values["credit_remain"] != 4599.5056 {
+		t.Errorf("剩余 = %v, want 4599.5056", values["credit_remain"])
 	}
 	if quota.Subscription == nil || quota.Subscription.Plan != "Trae 国内版权益" {
 		t.Errorf("订阅信息不对: %+v", quota.Subscription)
@@ -691,7 +760,7 @@ func TestFetchQuotaHandlesUnlimitedPack(t *testing.T) {
 		t.Fatalf("FetchQuota: %v", errQuota)
 	}
 	for _, metric := range quota.Summary {
-		if metric.Key == "remaining_credit" && (metric.Value != -1 || metric.Unit != "unlimited") {
+		if metric.Key == "credit_remain" && (metric.Value != -1 || metric.Unit != "unlimited") {
 			t.Errorf("无限额度剩余应标记 -1/unlimited，得到 %v/%s", metric.Value, metric.Unit)
 		}
 	}
