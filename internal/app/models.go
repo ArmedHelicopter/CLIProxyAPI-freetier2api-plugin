@@ -71,7 +71,12 @@ func (a *App) handleModelForAuth(request []byte) ([]byte, error) {
 	//
 	// 宿主加载每个凭证文件都会走这条 RPC，因此插件启动后不再依赖 static 探测
 	// 的时序：控制台列表不会因为探测还没跑完而缺整家供应商。
-	a.models.CacheStatic(vendor.ID(), models)
+	// 空清单不写缓存：供应商在探测失败时按契约返回空结果（让宿主淘汰坏凭证），
+	// 若照样覆盖，一次瞬时失败就会把整家供应商从控制台抹掉。
+	if !a.models.CacheProbedModels(vendor.ID(), models) {
+		logger.Info("model.for_auth: %s returned no models for %s (host will drop this credential)",
+			vendor.ID(), rpc.AuthID)
+	}
 	return core.OKEnvelope(pluginapi.ModelResponse{
 		Provider: providerKey,
 		Models:   a.models.ApplyAliases(vendor.ID(), a.models.FilterForVendor(vendor.ID(), models)),
@@ -85,24 +90,11 @@ func (a *App) applyModelCatalog(_ pluginConfig) {
 	a.models.LoadCachedState(snapshot.Models)
 }
 
-func (a *App) persistModels() {
-	flat := a.models.CachedState()
-	if len(flat) == 0 {
-		return
-	}
-	now := a.nowRFC3339()
-	a.MutateState(func(state *pluginState) {
-		state.Models = flat
-		state.ModelsFetchedAt = now
-	})
-}
-
 func (a *App) refreshModelsFromUpstream(ctx context.Context) (int, error) {
 	total, errRefresh := a.models.RefreshFromUpstream(ctx)
 	if errRefresh != nil {
 		return 0, core.ToPluginError(errRefresh)
 	}
-	a.persistModels()
 	return total, nil
 }
 

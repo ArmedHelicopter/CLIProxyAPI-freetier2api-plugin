@@ -94,7 +94,7 @@ func (s *Service) handleModelsList(req pluginapi.ManagementRequest) pluginapi.Ma
 
 	payload := map[string]any{"ok": true, "models": models, "count": len(models)}
 	if len(models) == 0 {
-		payload["error"] = "本地暂无模型缓存，正在从上游获取；也可点「从上游刷新」立即拉取。"
+		payload["error"] = "本地暂无模型缓存，正在从上游获取；也可点上方「读取模型清单」从上游拉取。"
 	} else {
 		// 有供应商仍在后台补探测时告知前端，让它稍后再拉一次；
 		// 否则用户会以为缺的那几家就是没有模型。

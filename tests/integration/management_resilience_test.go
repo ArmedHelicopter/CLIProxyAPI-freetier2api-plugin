@@ -17,6 +17,8 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -212,4 +214,273 @@ func managementCallWithCancel(t *testing.T, method, path string) pluginapi.Manag
 		t.Fatalf("decode management response: %v (raw=%s)", errUnmarshal, env.Result)
 	}
 	return resp
+}
+
+// TestForAuthFailureDoesNotWipeModelCache 复现 OpenCode 模型偶发消失的事故。
+//
+// 供应商在探测失败时按契约返回空清单（让宿主淘汰坏凭证）。若这条路径把空
+// 清单写进控制台缓存，一次瞬时 401 就会让整家供应商的模型消失，且要等下一轮
+// 探测成功才回来。期望：宿主拿到的仍是空清单，但控制台缓存保持原样。
+//
+// 用 OpenCode ZEN 而非 WorkBuddy 复现：前者每次 model.for_auth 都真打上游
+// （WorkBuddy 有 1 小时目录缓存，第二次不会失败）。
+func TestForAuthFailureDoesNotWipeModelCache(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+	host.addAccount("1", "opencodezen-oc_test.json", `{"api_key":"sk-test-opencode","label":"zen-test"}`)
+
+	failing := false
+	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
+		if !strings.Contains(url, "/zen/v1/models") {
+			return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
+		}
+		if failing {
+			return fakeUpstreamResponse{Status: http.StatusUnauthorized, Body: `{"error":{"message":"Invalid credential"}}`}
+		}
+		return fakeUpstreamResponse{
+			Status: http.StatusOK,
+			Body:   `{"data":[{"id":"kept-model-free"},{"id":"other-model"}]}`,
+		}
+	})
+
+	// 先成功一次，写入控制台缓存。
+	callMethod(t, pluginabi.MethodModelForAuth, pluginapi.AuthModelRequest{AuthID: "1"})
+	if len(testApp.RegisteredModels("opencodezen")) == 0 {
+		t.Fatal("first for_auth call must populate the console cache")
+	}
+
+	// 再让上游失败：宿主响应仍为空（契约不变），但缓存不能被清空。
+	failing = true
+	raw := callMethod(t, pluginabi.MethodModelForAuth, pluginapi.AuthModelRequest{AuthID: "1"})
+	var resp pluginapi.ModelResponse
+	if errUnmarshal := json.Unmarshal(raw, &resp); errUnmarshal != nil {
+		t.Fatalf("decode model response: %v", errUnmarshal)
+	}
+	if len(resp.Models) != 0 {
+		t.Fatalf("host must still receive an empty list for a failing credential, got %d", len(resp.Models))
+	}
+	models := testApp.RegisteredModels("opencodezen")
+	if len(models) == 0 || models[0].ID != "kept-model-free" {
+		t.Fatalf("console cache must survive a failed probe, got %+v", models)
+	}
+}
+
+// TestRefreshZeroDoesNotWipeCache 验证上游返回空清单时不清空既有缓存。
+func TestRefreshZeroDoesNotWipeCache(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+	host.addAccount("1", "cn-account", sampleCredentialJSON("cn", "cn1"))
+
+	returnEmpty := false
+	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
+		if !strings.Contains(url, "/v3/config") {
+			return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
+		}
+		if returnEmpty {
+			return fakeUpstreamResponse{Status: http.StatusOK, Body: `{"code":0,"data":{"models":[]}}`}
+		}
+		return fakeUpstreamResponse{
+			Status: http.StatusOK,
+			Body:   `{"code":0,"data":{"models":[{"id":"kept-model","name":"Kept"}]}}`,
+		}
+	})
+
+	managementCall(t, "POST", "/models/refresh")
+	if len(testApp.RegisteredModels("workbuddycn")) == 0 {
+		t.Fatal("refresh must populate the cache")
+	}
+
+	returnEmpty = true
+	managementCall(t, "POST", "/models/refresh")
+	if models := testApp.RegisteredModels("workbuddycn"); len(models) == 0 || models[0].ID != "kept-model" {
+		t.Fatalf("an empty upstream list must not wipe the cache, got %+v", models)
+	}
+}
+
+// TestModelCachePersistsToState 验证探测成功后清单落盘，插件重载可回灌。
+func TestModelCachePersistsToState(t *testing.T) {
+	host := installFakeHost(t)
+	cfg := setupTestPlugin(t)
+	host.addAccount("1", "cn-account", sampleCredentialJSON("cn", "cn1"))
+	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
+		if strings.Contains(url, "/v3/config") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Body:   `{"code":0,"data":{"models":[{"id":"persisted-model","name":"Persisted"}]}}`,
+			}
+		}
+		return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
+	})
+
+	callMethod(t, pluginabi.MethodModelForAuth, pluginapi.AuthModelRequest{AuthID: "1"})
+
+	statePath := filepath.Join(cfg.StateDir, "state.json")
+	persisted := waitFor(t, 5*time.Second, func() bool {
+		raw, errRead := os.ReadFile(statePath)
+		return errRead == nil && strings.Contains(string(raw), "persisted-model")
+	})
+	if !persisted {
+		t.Fatalf("model list must be persisted to %s after a successful probe", statePath)
+	}
+}
+
+// TestUnavailableCredentialStillServesConsole 复现「模型偶发消失 + 额度永远查询中」。
+//
+// 事故链：上游限流（WorkBuddy code:6004）或超时后，宿主路由层把凭证标成
+// unavailable（临时冷却，稍后自动恢复）。插件若把它当成「没有凭证」：
+//   - 模型列表整家消失（ActiveVendorSet 不再包含该供应商）；
+//   - 额度批量查询跳过该账号 → 没有结果 → 页面永远停在「查询中…」。
+//
+// 用 OpenCode ZEN 而非 Trae 验证模型侧：它没有 ConsoleModelProvider，
+// 控制台列表直接来自 Catalog 缓存，能干净地反映「这家有没有被跳过」。
+func TestUnavailableCredentialStillServesConsole(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+	host.addAccount("1", "opencodezen-oc_test.json", `{"api_key":"sk-test-opencode","label":"zen-test"}`)
+	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
+		if strings.Contains(url, "/zen/v1/models") {
+			return fakeUpstreamResponse{Status: http.StatusOK, Body: `{"data":[{"id":"kept-model-free"}]}`}
+		}
+		return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
+	})
+	// 宿主因上游限流给它打上临时冷却。
+	host.MarkUnavailable("opencodezen-oc_test.json", true)
+
+	models := managementCall(t, "GET", "/models")
+	var payload struct {
+		Models []struct {
+			VendorID string `json:"vendor_id"`
+		} `json:"models"`
+	}
+	if errUnmarshal := json.Unmarshal(models.Body, &payload); errUnmarshal != nil {
+		t.Fatalf("decode models: %v (%s)", errUnmarshal, models.Body)
+	}
+	var listed bool
+	for _, model := range payload.Models {
+		if model.VendorID == "opencodezen" {
+			listed = true
+		}
+	}
+	if !listed {
+		t.Fatalf("a temporarily unavailable credential must not drop its vendor from the model list: %s", models.Body)
+	}
+}
+
+// TestUnavailableCredentialStillQueried 锁定账号概览的额度列。
+//
+// 与模型列表同一个根因：额度批量查询复用 pool.Load 的凭证过滤，把宿主的
+// 临时冷却当成「没有凭证」后整批跳过，账号行拿不到任何结果，页面于是永远
+// 停在「查询中…」。凭证只是被限流，额度接口本身是能查的。
+func TestUnavailableCredentialStillQueried(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+	addTraeAccount(t, host)
+	host.MarkUnavailable("traecn-test.json", true)
+
+	if resp := managementCall(t, "POST", "/quotas"); resp.StatusCode != http.StatusOK {
+		t.Fatalf("/quotas = %d: %s", resp.StatusCode, resp.Body)
+	}
+	if !waitFor(t, 5*time.Second, func() bool {
+		for _, account := range statusAccounts(t) {
+			if account.Quota != nil && account.Quota.OK {
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatalf("a temporarily unavailable credential must still yield quota, got %+v", statusAccounts(t))
+	}
+}
+
+// TestCooldownWithFailingUpstreamKeepsConsole 覆盖冷却的真正形态。
+//
+// 凭证被标成 unavailable 的原因通常就是上游正在失败（限流、超时）。此时：
+//   - 额度查询会失败，但**必须缓存成 ok=false**，页面显示「-- / --」而不是
+//     永远停在「查询中…」——「查过但失败」与「还没查」是两种状态；
+//   - 模型探测同样失败，但**已缓存的清单必须保留**，不能让整家供应商消失。
+//
+// 两个断言分别用两家供应商：OpenCode ZEN 有模型接口但没有额度接口，用它
+// 验证缓存保留；Trae 有额度接口，用它验证失败结果被缓存（用 OpenCode 测
+// 额度会走「不支持」分支，等于没测到冷却）。
+func TestCooldownWithFailingUpstreamKeepsConsole(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+	host.addAccount("1", "opencodezen-oc_test.json", `{"api_key":"sk-test-opencode","label":"zen-test"}`)
+	host.addAccount("2", "traecn-test.json",
+		`{"vendor":"traecn","region":"cn","access_token":"test-access-token","uid":"2487573687317868"}`)
+
+	healthy := true
+	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
+		if !healthy {
+			return fakeUpstreamResponse{Status: http.StatusTooManyRequests, Body: `{"error":{"message":"rate limited"}}`}
+		}
+		if strings.Contains(url, "/zen/v1/models") {
+			return fakeUpstreamResponse{Status: http.StatusOK, Body: `{"data":[{"id":"kept-model-free"}]}`}
+		}
+		if strings.Contains(url, "pay/ide_user_ent_usage") {
+			return fakeUpstreamResponse{
+				Status: http.StatusOK,
+				Header: map[string][]string{"Content-Type": {"application/json"}},
+				Body:   traeQuotaFixture,
+			}
+		}
+		return fakeUpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404}`}
+	})
+
+	// 先成功一次，把模型清单写进缓存。
+	managementCall(t, "GET", "/models")
+
+	// 上游开始失败，宿主同时打上临时冷却。
+	healthy = false
+	host.MarkUnavailable("opencodezen-oc_test.json", true)
+	host.MarkUnavailable("traecn-test.json", true)
+
+	// 模型：已缓存的清单必须保留。
+	models := managementCall(t, "GET", "/models")
+	if !strings.Contains(string(models.Body), "kept-model-free") {
+		t.Fatalf("cached models must survive a failing probe during cooldown: %s", models.Body)
+	}
+
+	// 额度：失败也必须留下一条「已确定」的结果，而不是继续「查询中」。
+	managementCall(t, "POST", "/quotas")
+	var traeQuota *struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+	}
+	if !waitFor(t, 5*time.Second, func() bool {
+		for _, account := range statusAccounts(t) {
+			if account.VendorID == "traecn" && account.Quota != nil {
+				traeQuota = account.Quota
+				return true
+			}
+		}
+		return false
+	}) {
+		t.Fatal("a failed quota query must still be cached; otherwise the console shows「查询中…」forever")
+	}
+	if traeQuota.OK {
+		t.Fatalf("quota must report failure during cooldown, got %+v", traeQuota)
+	}
+	if traeQuota.Message == "" {
+		t.Fatal("a failed quota must carry the upstream reason so the console can explain it")
+	}
+}
+
+// TestDisabledCredentialSkipsQuota 锁住另一半边界：用户显式禁用仍然生效。
+//
+// /status 会列出禁用账号（页面要能显示并允许重新启用），所以断言落在
+// 「额度没有被查询」上，而不是「账号不在列表里」。
+func TestDisabledCredentialSkipsQuota(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+	addTraeAccount(t, host)
+	host.MarkDisabled("traecn-test.json", true)
+
+	managementCall(t, "POST", "/quotas")
+	time.Sleep(200 * time.Millisecond) // 给后台轮次一个窗口，确认它确实没有查询
+	for _, account := range statusAccounts(t) {
+		if account.Quota != nil {
+			t.Fatalf("a disabled credential must not be queried for quota, got %+v", account.Quota)
+		}
+	}
 }

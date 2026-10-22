@@ -754,7 +754,7 @@ func (r *runtime) hostProbeCredential(region Region) *Credential {
 		return nil
 	}
 	for _, entry := range entries {
-		if entry.Disabled || entry.Unavailable {
+		if !entry.Usable() {
 			continue
 		}
 		stored, okStored := r.env.Host.AuthJSON(ctx, entry.AuthIndex)

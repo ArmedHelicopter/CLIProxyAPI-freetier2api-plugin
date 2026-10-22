@@ -73,7 +73,7 @@ func (p *Pool) Load(ctx context.Context, callbackID string, opts Options) ([]Acc
 	failures := make([]Failure, 0)
 	seen := map[string]bool{}
 	for _, entry := range entries {
-		if !opts.IncludeDisabled && (entry.Disabled || entry.Unavailable) {
+		if !opts.IncludeDisabled && !entry.Usable() {
 			continue
 		}
 		if len(wanted) > 0 && !wanted[entry.ID] && !wanted[entry.Name] && !wanted[entry.AuthIndex] {

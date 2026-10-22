@@ -12,7 +12,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"freetier2api-plugin/internal/admin"
 	"freetier2api-plugin/internal/core"
@@ -138,8 +137,6 @@ func (a *App) ensureMachineSalt(cfg pluginConfig) (string, error) {
 	logger.Info("machine salt generated at %s (do not change: it defines this deployment's device fingerprints)", path)
 	return salt, nil
 }
-
-func (a *App) nowRFC3339() string { return a.now().Format(time.RFC3339) }
 
 // taskConfig 把全局配置投影成任务引擎需要的最小形状。
 //

@@ -189,3 +189,57 @@ func TestMergeSameNameModels(t *testing.T) {
 		t.Fatalf("modalities = %#v", merged[0].SupportedInputModalities)
 	}
 }
+
+// TestCacheProbedModelsKeepsPreviousOnEmpty 锁定「探测失败不清空缓存」。
+//
+// 真实事故：OpenCode ZEN 的 model.for_auth 在探测失败时按契约返回空清单
+// （让宿主淘汰坏凭证），调用方若照样写缓存，一次瞬时 401 就会让整家供应商
+// 从控制台消失。探测型写入必须走 CacheProbedModels。
+func TestCacheProbedModelsKeepsPreviousOnEmpty(t *testing.T) {
+	manager := newTestCatalog(t)
+	manager.CacheProbedModels("workbuddycn", []pluginapi.ModelInfo{{ID: "glm-5.2"}, {ID: "glm-5.3"}})
+
+	if wrote := manager.CacheProbedModels("workbuddycn", nil); wrote {
+		t.Fatal("empty probe result must not be written")
+	}
+	if got := len(manager.Registered("workbuddycn")); got != 2 {
+		t.Fatalf("cached models = %d, want the previous 2 kept", got)
+	}
+
+	// 非空结果照常覆盖。
+	if wrote := manager.CacheProbedModels("workbuddycn", []pluginapi.ModelInfo{{ID: "glm-5.4"}}); !wrote {
+		t.Fatal("non-empty probe result must be written")
+	}
+	models := manager.Registered("workbuddycn")
+	if len(models) != 1 || models[0].ID != "glm-5.4" {
+		t.Fatalf("cache = %+v, want glm-5.4", models)
+	}
+}
+
+// TestCacheProbedModelsPersistsOnlyOnChange 验证清单落在 state.json 里，
+// 且内容未变化时不重复写盘（宿主每个凭证都会调一次 model.for_auth）。
+func TestCacheProbedModelsPersistsOnlyOnChange(t *testing.T) {
+	manager := newTestCatalog(t)
+	manager.CacheProbedModels("workbuddycn", []pluginapi.ModelInfo{{ID: "glm-5.2"}})
+
+	snapshot := manager.store.Snapshot()
+	if len(snapshot.Models) != 1 || snapshot.Models[0].ID != "glm-5.2" {
+		t.Fatalf("state models = %+v, want glm-5.2 persisted", snapshot.Models)
+	}
+
+	// 哨兵时间：内容没变就不该再落盘，它必须原样留着。
+	manager.store.Mutate(func(s *state.State) { s.ModelsFetchedAt = "sentinel" })
+	manager.CacheProbedModels("workbuddycn", []pluginapi.ModelInfo{{ID: "glm-5.2"}})
+	if got := manager.store.Snapshot().ModelsFetchedAt; got != "sentinel" {
+		t.Fatalf("identical list must not be re-persisted (fetched_at = %q)", got)
+	}
+
+	manager.CacheProbedModels("workbuddycn", []pluginapi.ModelInfo{{ID: "glm-5.3"}})
+	updated := manager.store.Snapshot()
+	if len(updated.Models) != 1 || updated.Models[0].ID != "glm-5.3" {
+		t.Fatalf("state models = %+v, want glm-5.3 after a changed probe", updated.Models)
+	}
+	if updated.ModelsFetchedAt == "sentinel" {
+		t.Fatal("a changed list must be persisted")
+	}
+}

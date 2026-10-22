@@ -85,9 +85,6 @@ input.aliasinput:focus { outline: none; border-color: var(--accent); }
 .banner.ok { background: rgba(26,127,55,.1); border: 1px solid var(--ok); color: var(--ok); }
 .banner.warn { background: rgba(154,103,0,.1); border: 1px solid var(--warn); color: var(--warn); }
 .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
-.pendingbar { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px;
-              background: rgba(154,103,0,.1); border: 1px solid var(--warn); color: var(--warn); }
-.pendingbar[hidden] { display: none; }
 progress { width: 160px; height: 8px; }
 .dropdown { position: relative; display: inline-block; }
 .dropdown-menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 20;
@@ -137,9 +134,6 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   </div>
 
   <div id="banner" class="banner"></div>
-  <div id="pendingBar" class="pendingbar" hidden>
-    <span>模型变更待生效，需重启CPA生效。</span>
-  </div>
 
   <section id="view-accounts">
     <div class="card">
@@ -769,7 +763,13 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       var nextTasks = (scheduler.next_tasks || []).map(function (kind) { return labels[kind] || kind; });
       document.getElementById("scheduleInfo").textContent =
         "下次执行：" + (scheduler.next_at || "-") + " · 任务：" + (nextTasks.join("、") || "无");
-      setPendingBar(!!status.restart_pending);
+      // 自愈：上次变更后重载没跑成功（页面被关掉、宿主当时不可用），这里补一次。
+      // 重载成功后插件会清除该标记；每次页面生命周期只补一次，避免宿主不支持
+      // 自动重载时反复写配置。
+      if (status.restart_pending && !modelSyncSelfHealed) {
+        modelSyncSelfHealed = true;
+        syncModelConfig();
+      }
     }).catch(function (err) { banner("err", err.message); throw err; });
   }
 
@@ -1195,7 +1195,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
           if (!data) { restore(); return; }
           saved = next;
           model.alias = next;
-          setPendingBar(true);
+          // 别名的出站翻译已即时生效；这里再同步一次，让 /v1/models 的 ID 跟着变。
+          syncModelConfig();
           restore();
         }).catch(function (err) {
           // 保存失败：回到原值并提示（错误是需要用户知晓的，成功则静默）。
@@ -1238,27 +1239,66 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
   // toggleModels 批量禁用/启用选中的模型。
   //
-  // 落点是**注册层**：被禁用的模型不再注册给宿主，因此宿主重启后
-  // /v1/models 里就没有它们，客户端请求会被宿主直接拒绝。
+  // 落点是**注册层**：被禁用的模型不再注册给宿主，因此 /v1/models 里就会消失，
+  // 客户端请求会被宿主直接拒绝。调用拦截是即时的，注册表由 syncModelConfig
+  // 触发的宿主配置重载来更新。
   function toggleModels(disabled) {
     var ids = selectedModelIDs();
     if (!ids.length) { banner("err", "请先勾选模型"); return; }
     var verb = disabled ? "禁用" : "启用";
     api("POST", "/models/toggle", { models: ids, disabled: disabled }).then(function (data) {
       if (!data) return;
-      banner("warn", "已" + verb + " " + (data.changed || ids.length) + " 个模型。调用已即时拦截；列表更新请点上方「应用变更」或重启宿主。");
-      setPendingBar(true);
+      banner("ok", "已" + verb + " " + (data.changed || ids.length) + " 个模型，正在同步到宿主…");
+      syncModelConfig();
       loadModels(false);
     }).catch(function (err) { banner("err", err.message); });
   }
 
   // ---- 模型变更的生效 ----
   //
-  // 禁用/启用与别名改的是插件状态，宿主只在重启（重建模型注册表）后更新
-  // /v1/models，因此变更后常驻一条提示条。页面无法重启宿主进程，只作提示。
-  function setPendingBar(show) {
-    var bar = document.getElementById("pendingBar");
-    if (bar) bar.hidden = !show;
+  // 禁用/启用与别名改的是插件状态，宿主只在重建模型注册表（plugin.register /
+  // plugin.reconfigure）后更新 /v1/models。宿主没有 reload 端点，但写插件配置会
+  // 触发一次配置重载，重载时宿主回调插件 reconfigure，注册表随之重建。
+  //
+  // 宿主按配置文件 hash 判断是否需要重载，内容不变会直接跳过，所以这里写入
+  // config_reloaded_at（本插件配置的更新时间）来制造内容变化。插件解析器对未知键
+  // 宽容，该键只进配置原文表，不产生任何行为。
+  var MODEL_SYNC_DEBOUNCE_MS = 400;
+  var modelSyncTimer = null;
+  var modelSyncRunning = false;
+  var modelSyncPending = false;
+  // 自愈只尝试一次：restart_pending 长时间为 true 时（宿主不支持自动重载），
+  // 不能让每次 /status 都去写一遍配置。
+  var modelSyncSelfHealed = false;
+
+  // syncModelConfig 请求宿主重载插件配置，使模型注册表与最新状态一致。
+  // 连续操作（批量勾选、接连改别名）由防抖合并；同一时刻只跑一次，运行期间
+  // 又来的变更在结束后补跑一次。
+  function syncModelConfig() {
+    if (modelSyncTimer) { clearTimeout(modelSyncTimer); }
+    modelSyncTimer = setTimeout(runModelSync, MODEL_SYNC_DEBOUNCE_MS);
+  }
+
+  function runModelSync() {
+    modelSyncTimer = null;
+    if (modelSyncRunning) { modelSyncPending = true; return; }
+    modelSyncRunning = true;
+    var configPath = hostPath("/plugins/freetier2api/config");
+    api("GET", configPath).then(function (config) {
+      // GET 返回的可能是空对象（该插件段尚未落过自定义配置），补成对象再合并。
+      var body = (config && typeof config === "object") ? config : {};
+      body.config_reloaded_at = new Date().toISOString();
+      return api("PATCH", configPath, body);
+    }).then(function () {
+      loadModels(false);
+    }).catch(function (err) {
+      // 失败必须让用户知道：调用拦截已生效，但 /v1/models 的增删还没同步。
+      banner("err", "模型列表同步失败：" + err.message
+        + "（可再操作一次重试；宿主版本过老时需手动重启一次）");
+    }).then(function () {
+      modelSyncRunning = false;
+      if (modelSyncPending) { modelSyncPending = false; syncModelConfig(); }
+    });
   }
 
   // formatTokens 把 token 数格式化为可读串。
@@ -1294,15 +1334,31 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       if (allModels.length || !autoRefresh || modelsLoaded) return;
       modelsLoaded = true;
       // 缓存为空：自动从上游拉一次（只做一次，避免失败时反复打上游）。
-      api("POST", "/models/refresh", {}).then(function () {
-        api("GET", "/models").then(function (retry) {
-          if (!retry) return;
-          allModels = (retry && retry.models) || [];
-          renderModels();
-          setText("modelCount", allModels.length ? "（" + allModels.length + "）" : "");
-        }).catch(function () { /* 忽略 */ });
-      }).catch(function () { /* 忽略：失败时保持空提示 */ });
+      refreshModels(true);
     }).catch(function (err) { banner("err", err.message); });
+  }
+
+  // refreshModels 手动「读取模型清单」：真正去上游拉一次再回读列表。
+  //
+  // 之前这个按钮绑的是 loadModels（只重读本地缓存），所以缓存一旦是空的，
+  // 点它永远没反应。失败时把上游错误原样显示出来——401 与超时的处理方式
+  // 完全不同，藏进日志等于让用户自己猜。
+  function refreshModels(quiet) {
+    var btn = document.getElementById("btnLoadModels");
+    if (btn) btn.disabled = true;
+    modelsLoaded = true;        // 已手动刷新，不再触发首屏自动刷新
+    modelsPollLeft = 2;
+    if (!quiet) banner("ok", "正在从上游拉取模型清单…", 0);
+    api("POST", "/models/refresh", {}).then(function (data) {
+      var count = (data && data.models) || 0;
+      if (!quiet) {
+        banner(count ? "ok" : "warn",
+          count ? ("已从上游拉取 " + count + " 个模型") : "上游返回 0 个模型，请查看运行日志", 6000);
+      }
+      return loadModels(false);
+    }).catch(function (err) {
+      if (!quiet) banner("err", "从上游刷新失败：" + err.message, 10000);
+    }).then(function () { if (btn) btn.disabled = false; });
   }
 
   // ---- 任务视图 ----
@@ -1726,7 +1782,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     });
   });
   document.getElementById("btnLoadQuotas").addEventListener("click", function () { loadQuotas(false); });
-  document.getElementById("btnLoadModels").addEventListener("click", loadModels);
+  document.getElementById("btnLoadModels").addEventListener("click", function () { refreshModels(false); });
   document.getElementById("modelFilter").addEventListener("input", renderModels);
   document.getElementById("btnDisableModels").addEventListener("click", function () { toggleModels(true); });
   document.getElementById("btnEnableModels").addEventListener("click", function () { toggleModels(false); });

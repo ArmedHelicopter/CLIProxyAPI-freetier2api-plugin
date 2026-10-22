@@ -182,7 +182,7 @@ func ProbeNativeCredential[T any](env Env, vendorID string, extract NativeExtrac
 		return nil, false
 	}
 	for _, entry := range entries {
-		if entry.Disabled || entry.Unavailable {
+		if !entry.Usable() {
 			continue
 		}
 		raw, okRaw := env.Host.AuthJSON(ctx, entry.AuthIndex)

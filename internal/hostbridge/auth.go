@@ -298,7 +298,7 @@ func ActiveVendorSet(ctx context.Context, callbackID string, registry *core.Regi
 	}
 	active := make(map[string]bool)
 	for _, entry := range entries {
-		if entry.Disabled || entry.Unavailable {
+		if !entry.Usable() {
 			continue
 		}
 		raw, _, okRaw := AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)

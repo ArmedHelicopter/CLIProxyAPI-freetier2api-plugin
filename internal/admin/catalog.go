@@ -300,12 +300,83 @@ func (c *Catalog) ClearRestartPending() {
 }
 
 // CacheStatic 记录某供应商的官方模型清单（控制台回读用）。
-// CacheStatic 记录某供应商的官方模型清单（控制台回读用）。
+//
+// 允许写空清单：调用方用空值表达「显式清空」，`registeredLocked` 也依赖
+// 「空清单 = 未知」的保守语义。**探测回包不要用它**，改用 CacheProbedModels。
 func (c *Catalog) CacheStatic(vendorID string, models []pluginapi.ModelInfo) {
 	copied := append([]pluginapi.ModelInfo(nil), models...)
 	c.mu.Lock()
 	c.cached[vendorID] = copied
 	c.mu.Unlock()
+}
+
+// CacheProbedModels 记录一次探测得到的官方清单并落盘。
+//
+// 探测失败（上游抖动、凭证暂不可用、免费层改名导致过滤后为空）与「模型真的
+// 全部下线」在回包上无法区分，而前者远比后者常见：一次瞬时 401 让整家供应商
+// 从控制台消失，是实际发生过的事故。因此空结果只记日志、不动缓存。
+//
+// 落盘后插件重载（宿主重启/重装）可由 LoadCachedState 回灌，控制台不必再等
+// 一轮上游探测。批量探测（StaticModels / RefreshFromUpstream）改用 cacheProbed，
+// 在整轮结束时统一落盘一次。
+//
+// 返回是否写入了缓存。
+func (c *Catalog) CacheProbedModels(vendorID string, models []pluginapi.ModelInfo) bool {
+	if !c.cacheProbed(vendorID, models) {
+		return false
+	}
+	c.persistProbed()
+	return true
+}
+
+// cacheProbed 只更新内存缓存，由调用方决定何时落盘。
+func (c *Catalog) cacheProbed(vendorID string, models []pluginapi.ModelInfo) bool {
+	if len(models) == 0 {
+		logger.Info("models: %s probe returned 0 model(s); keeping %d cached",
+			vendorID, len(c.Registered(vendorID)))
+		return false
+	}
+	c.CacheStatic(vendorID, models)
+	return true
+}
+
+// persistProbed 把当前清单写入 state.json（内容未变则不写）。
+//
+// 宿主加载 N 个凭证会调 N 次 model.for_auth，无脑落盘会把一次启动放大成十几次
+// state.json 写入。比较在锁外读完快照后完成，只在确实变化时才进 Mutate。
+func (c *Catalog) persistProbed() {
+	if c.store == nil {
+		return
+	}
+	flat := c.CachedState()
+	if len(flat) == 0 || equalCachedModels(c.store.Snapshot().Models, flat) {
+		return
+	}
+	now := time.Now().Format(time.RFC3339)
+	c.store.Mutate(func(s *state.State) {
+		s.Models = flat
+		s.ModelsFetchedAt = now
+	})
+}
+
+// equalCachedModels 比较两份清单是否等价（忽略顺序）。
+func equalCachedModels(a, b []core.CachedModel) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	type key struct{ vendor, id string }
+	index := make(map[key]core.CachedModel, len(a))
+	for _, item := range a {
+		index[key{item.VendorID, item.ID}] = item
+	}
+	for _, item := range b {
+		prev, ok := index[key{item.VendorID, item.ID}]
+		if !ok || prev.Name != item.Name || prev.ContextLength != item.ContextLength ||
+			prev.MaxOutputTokens != item.MaxOutputTokens {
+			return false
+		}
+	}
+	return true
 }
 
 // Registered 返回某供应商最近一次的官方模型清单。
@@ -316,8 +387,8 @@ func (c *Catalog) Registered(vendorID string) []pluginapi.ModelInfo {
 }
 
 const (
-	// modelProbeTTL 是「缓存为空时补探测」的冷却时间：探测失败后 30 秒内
-	// 不再重复打上游，避免页面反复刷新把失败放大成上游压力。
+	// modelProbeTTL 是补探测失败后的冷却时间：这段时间内不再重复打上游，
+	// 避免页面反复刷新把一次失败放大成上游压力。成功不设冷却。
 	modelProbeTTL = 30 * time.Second
 	// modelProbeWait 是列表请求等待补探测的上限：超时先渲染已有缓存，
 	// 探测在后台继续跑完，下一次刷新即可看到。
@@ -328,11 +399,10 @@ const (
 
 // EnsureModels 在缓存为空时为某供应商触发一次补探测（不等待完成）。
 //
-// 为什么需要这一步：控制台清单只读这里的内存缓存，而它原先只在 static
-// 探测与「从上游刷新」时写入。宿主加载凭证走的是 model.for_auth，插件重启
-// 后若 static 探测还没跑完，页面就会整家供应商缺模型——表现为「有时有、
-// 有时没有」。这里在缓存为空时主动补一次，并用 singleflight + 冷却保证
-// 一次页面加载最多发起一次上游请求。
+// 为什么需要这一步：控制台清单只读这里的内存缓存，而它只在探测类路径写入。
+// 宿主加载凭证走的是 model.for_auth，插件重启后若 static 探测还没跑完，页面
+// 就会整家供应商缺模型——表现为「有时有、有时没有」。这里在缓存为空时主动补
+// 一次，并用 singleflight + 冷却保证一次页面加载最多发起一次上游请求。
 //
 // 只启动不等待：调用方在收集完所有供应商后再统一 WaitProbes，避免逐个
 // 串行等待把页面拖慢成 N 倍的上游延迟。
@@ -352,7 +422,6 @@ func (c *Catalog) EnsureModels(vendor core.Vendor) {
 	}
 	pending := make(chan struct{})
 	c.probing[vendorID] = pending
-	c.probeAt[vendorID] = time.Now()
 	go c.probeVendor(vendor, pending)
 }
 
@@ -390,29 +459,36 @@ func (c *Catalog) ProbesRunning() int {
 //
 // 用后台 context 而不是管理请求的 context：页面刷新会取消管理 RPC，
 // 探测不该因此半途而废（同一类问题见额度查询）。
+//
+// 冷却只对失败打点：成功后再来一次补探测应当照常进行，否则一次成功会
+// 把接下来 30 秒的补探测全部挡掉。
 func (c *Catalog) probeVendor(vendor core.Vendor, done chan struct{}) {
 	vendorID := vendor.ID()
-	defer func() {
-		c.probeMu.Lock()
-		if c.probing[vendorID] == done {
-			delete(c.probing, vendorID)
-		}
-		c.probeMu.Unlock()
-		close(done)
-	}()
-
 	ctx, cancel := context.WithTimeout(context.Background(), modelProbeTimeout)
-	defer cancel()
 	models, errModels := vendor.StaticModels(ctx)
+	cancel()
+
+	wrote := false
 	if errModels != nil {
 		logger.Info("models: %s console probe failed: %v", vendorID, errModels)
-		return
+	} else {
+		wrote = c.CacheProbedModels(vendorID, models)
+		if wrote {
+			logger.Info("models: %s console probe cached %d model(s)", vendorID, len(models))
+		}
 	}
-	if len(models) == 0 {
-		return
+
+	c.probeMu.Lock()
+	if c.probing[vendorID] == done {
+		delete(c.probing, vendorID)
 	}
-	c.CacheStatic(vendorID, models)
-	logger.Info("models: %s console probe cached %d model(s)", vendorID, len(models))
+	if wrote {
+		delete(c.probeAt, vendorID)
+	} else {
+		c.probeAt[vendorID] = time.Now()
+	}
+	c.probeMu.Unlock()
+	close(done)
 }
 
 // LoadCachedState 从 state.json 恢复全部供应商的模型缓存，并通知供应商预热。
@@ -649,9 +725,11 @@ func (c *Catalog) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 		}
 		logger.Info("models: %s registered %d model(s)", vendor.ID(), len(models))
 		// 缓存官方 ID 清单供管理页回读（注册路径随后会换成别名）。
-		c.CacheStatic(vendor.ID(), models)
+		c.cacheProbed(vendor.ID(), models)
 		all = append(all, c.ApplyAliases(vendor.ID(), c.FilterForVendor(vendor.ID(), models))...)
 	}
+	// 整轮探测结束统一落盘：逐个供应商写会把一次注册放大成 N 次磁盘写入。
+	c.persistProbed()
 	if len(all) == 0 && firstErr != nil {
 		return nil, firstErr
 	}
@@ -681,9 +759,10 @@ func (c *Catalog) RefreshFromUpstream(ctx context.Context) (int, error) {
 			continue
 		}
 		logger.Info("models: refresh %s got %d model(s)", vendor.ID(), len(models))
-		c.CacheStatic(vendor.ID(), models)
+		c.cacheProbed(vendor.ID(), models)
 		total += len(models)
 	}
+	c.persistProbed()
 	if total == 0 && firstErr != nil {
 		return 0, firstErr
 	}

@@ -372,3 +372,64 @@ func TestConsoleQuotaCellUsesCapability(t *testing.T) {
 		t.Fatal("「查询中…」must be shown only when the vendor supports quota")
 	}
 }
+
+// TestConsoleModelChangesTriggerHostReload 锁定「模型变更自动生效」的接线。
+//
+// 宿主只在 plugin.register / plugin.reconfigure 时重建模型注册表，而插件自己的
+// /models/toggle 与 /models/alias 不会通知宿主。宿主也没有 reload 端点，唯一可用
+// 的是写插件配置触发的隐含重载：PATCH /v0/management/plugins/:id/config。
+//
+// 该重载按配置文件 hash 判断是否需要执行，内容不变会被跳过，所以必须写入一个
+// 会变化的键（config_reloaded_at）。页面不得再显示「重启 CPA 生效」的提示条，
+// 也不得提供手动重载按钮——变更是自动同步的。
+func TestConsoleModelChangesTriggerHostReload(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+
+	for _, literal := range []string{
+		"syncModelConfig",                          // 同步入口
+		"config_reloaded_at",                       // 制造配置内容变化的键
+		`hostPath("/plugins/freetier2api/config")`, // 宿主插件配置路由
+		`api("PATCH", configPath`,                  // 浅合并写配置，触发宿主重载
+	} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("console page missing model-sync wiring (%s)", literal)
+		}
+	}
+
+	// 变更成功后必须同步，而不是留给用户手动操作。
+	for _, hook := range []string{"syncModelConfig();"} {
+		if strings.Count(page, hook) < 2 {
+			t.Fatalf("console must call %s from both model toggle and alias paths", hook)
+		}
+	}
+
+	// 旧的「待生效提示条 / 重启」说法必须彻底消失。
+	for _, stale := range []string{"pendingBar", "setPendingBar", "需重启CPA生效", "应用变更"} {
+		if strings.Contains(page, stale) {
+			t.Fatalf("console must not keep the restart-pending UI anymore (%s)", stale)
+		}
+	}
+}
+
+// TestConsoleLoadModelsButtonRefreshesUpstream 锁定「读取模型清单」按钮的真实行为。
+//
+// 事故：该按钮曾绑定 loadModels（只重读插件内存缓存）。缓存一旦为空（插件刚
+// 重载、探测失败），点它永远没反应，用户也就无从恢复整家供应商的模型列表。
+// 按钮必须 POST /models/refresh 去上游拉一次，失败时把上游错误显示出来——
+// 401 与超时的处理方式完全不同，藏进日志等于让用户自己猜。
+func TestConsoleLoadModelsButtonRefreshesUpstream(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+
+	for _, literal := range []string{
+		`api("POST", "/models/refresh"`, // 真正触发上游拉取
+		`refreshModels(false);`,         // 按钮绑定到刷新入口
+		"从上游刷新失败：",                      // 上游错误原样呈现
+	} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("console page missing model-refresh wiring (%s)", literal)
+		}
+	}
+	if strings.Contains(page, `addEventListener("click", loadModels`) {
+		t.Fatal("the load-models button must not just re-read the local cache")
+	}
+}

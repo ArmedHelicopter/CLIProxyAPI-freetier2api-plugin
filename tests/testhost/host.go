@@ -111,6 +111,29 @@ func (h *Host) AddAccount(authIndex, name, credentialJSON string) {
 	})
 }
 
+// MarkUnavailable 模拟宿主路由层给凭证打上「临时不可用」（上游限流/超时后的
+// 冷却）。它与用户显式禁用不同：凭证仍应参与模型探测与额度查询。
+func (h *Host) MarkUnavailable(name string, unavailable bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for index := range h.authFiles {
+		if h.authFiles[index].Name == name || h.authFiles[index].ID == name {
+			h.authFiles[index].Unavailable = unavailable
+		}
+	}
+}
+
+// MarkDisabled 模拟用户显式禁用某凭证。
+func (h *Host) MarkDisabled(name string, disabled bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for index := range h.authFiles {
+		if h.authFiles[index].Name == name || h.authFiles[index].ID == name {
+			h.authFiles[index].Disabled = disabled
+		}
+	}
+}
+
 // SetUpstream 设置出站请求的应答。
 func (h *Host) SetUpstream(fn func(method, url, body string) UpstreamResponse) {
 	h.mu.Lock()
