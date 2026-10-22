@@ -348,6 +348,7 @@ func (r *runtime) loadCachedModelsFromState(cached []core.CachedModel) {
 			CanDisableThinking: item.CanDisableThink,
 			OnlyReasoning:      item.OnlyReasoning,
 			Description:        item.Description,
+			Credits:            item.Credits,
 		})
 	}
 	for region, models := range byRegion {

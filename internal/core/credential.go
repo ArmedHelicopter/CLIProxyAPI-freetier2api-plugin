@@ -217,6 +217,11 @@ type CachedModel struct {
 	CanDisableThink bool     `json:"can_disable_thinking,omitempty"`
 	OnlyReasoning   bool     `json:"only_reasoning,omitempty"`
 	Description     string   `json:"description,omitempty"`
+	// Credits 是上游的额度/费用倍率文案（如 "x0.05"、"免费"）。
+	//
+	// 只用于控制台展示：宿主契约里没有倍率字段，探测回包也带不出来，
+	// 所以单独随模型缓存落盘，重启后控制台不必等一轮上游探测才有倍率。
+	Credits string `json:"credits,omitempty"`
 }
 
 // 本文件保留凭证解析的属性覆盖规则。

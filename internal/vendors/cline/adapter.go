@@ -12,6 +12,7 @@ package cline
 import (
 	"context"
 	"strings"
+	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -24,6 +25,9 @@ import (
 type adapter struct {
 	*core.NativeAdapter[*Credential]
 	baseURL string
+	// creditsMu 保护 credits：最近一次模型清单里的计费档。
+	creditsMu sync.RWMutex
+	credits   map[string]string
 }
 
 // pendingLogin 是一次进行中的 Cline 登录（会话数据）。
@@ -102,6 +106,15 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 
 // modelsToPluginAPI 把上游模型条目转成宿主契约类型。
 func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
+	credits := make(map[string]string, len(models))
+	for _, model := range models {
+		if label := costLabel(model.Cost); label != "" {
+			credits[model.ID] = label
+		}
+	}
+	v.creditsMu.Lock()
+	v.credits = credits
+	v.creditsMu.Unlock()
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		id := strings.TrimSpace(model.ID)
 		if id == "" {
@@ -146,6 +159,34 @@ func describeModel(model Model) string {
 		description += "（推理）"
 	}
 	return description
+}
+
+// ModelCredits 实现 core.CreditsProvider：返回「官方模型 ID → 计费档」。
+//
+// 控制台的「费用倍率」列直接展示这个文案；免费/订阅是 Cline 能给出的
+// 最精确的成本信息（上游不提供数值倍率）。
+func (v *adapter) ModelCredits() map[string]string {
+	v.creditsMu.RLock()
+	defer v.creditsMu.RUnlock()
+	if len(v.credits) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(v.credits))
+	for id, value := range v.credits {
+		out[id] = value
+	}
+	return out
+}
+
+// costLabel 把计费档转成展示文案；未知档返回空串。
+func costLabel(cost string) string {
+	switch cost {
+	case CostFree:
+		return "免费"
+	case CostPass:
+		return "订阅"
+	}
+	return ""
 }
 
 // ---- 执行 ----

@@ -451,8 +451,20 @@ func (v *adapter) ConsoleModels() []core.ConsoleModel {
 			DefaultEffort:   model.DefaultEffort,
 			SupportsImages:  model.SupportsImages,
 			SupportsTools:   model.SupportsToolCall,
-			Credits:         model.Credits,
+			Credits:         core.FormatRate(model.Credits),
 		})
+	}
+	return out
+}
+
+// ModelCredits 实现 core.CreditsProvider：把上游的积分倍率规范化后交给控制台。
+func (v *adapter) ModelCredits() map[string]string {
+	cached := v.rt.cachedModels()[NormalizeRegion(string(v.region))]
+	out := make(map[string]string, len(cached))
+	for _, model := range cached {
+		if rate := core.FormatRate(model.Credits); rate != "" {
+			out[model.ID] = rate
+		}
 	}
 	return out
 }

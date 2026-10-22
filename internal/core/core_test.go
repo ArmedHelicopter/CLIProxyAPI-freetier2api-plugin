@@ -293,3 +293,26 @@ func TestModelsForFallbackAndRefreshFallback(t *testing.T) {
 		t.Fatalf("RefreshVendor fallback = %v %v %v", updated, refreshed, errRefresh)
 	}
 }
+
+func TestFormatRate(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		{"x0.71 credits", "0.71X"},
+		{"x0.05", "0.05X"},
+		{"0.08", "0.08X"},
+		{"0.08X", "0.08X"},
+		{"0.5x", "0.50X"},
+		{"1", "1.00X"},
+		{"免费", "免费"},
+		{"订阅", "订阅"},
+		{"", ""},
+		{"   ", ""},
+	}
+	for _, tc := range cases {
+		if got := FormatRate(tc.input); got != tc.want {
+			t.Errorf("FormatRate(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+}

@@ -433,3 +433,95 @@ func TestConsoleLoadModelsButtonRefreshesUpstream(t *testing.T) {
 		t.Fatal("the load-models button must not just re-read the local cache")
 	}
 }
+
+// TestConsoleModelTableMergesIDAndCredits 锁定模型表的列重构：
+// 「模型 ID」与「别名」合并为一列，原「别名」位置改为「费用倍率」。
+func TestConsoleModelTableMergesIDAndCredits(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+
+	for _, literal := range []string{
+		"MODEL_COLUMNS",    // 表头与单元格同源的列描述表
+		"modelIDCell",      // 合并列（生效 ID + ✎）
+		"modelCreditsCell", // 费用倍率列
+		"model.credits",    // 读后端下发的 credits
+		`"模型 ID"`,
+		`"费用倍率"`,
+		`"✎"`,              // 铅笔图标（字面量，不引入 SVG/innerHTML）
+		"creditsSortOrder", // 倍率列点击排序
+		"modelCreditValue", // 倍率值解析（无倍率沉底）
+		"th.sortable",      // 表头可排序样式
+		"sort-arrows",      // 双三角排序指示器容器
+		"sort-arrow asc",   // 向上三角
+		"sort-arrow desc",  // 向下三角
+	} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("console page missing model-table marker %q", literal)
+		}
+	}
+
+	// 旧的独立「别名」表头必须消失：它现在是模型 ID 列的一部分。
+	if strings.Contains(page, `"名称", "别名"`) {
+		t.Fatal("alias column must be merged into the model-id column")
+	}
+
+	// 编辑仍走原接口与同步入口（回归保护）。
+	for _, literal := range []string{
+		`api("POST", "/models/alias"`,
+		"syncModelConfig();",
+		"scope_id",
+	} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("alias editing wiring lost: %s", literal)
+		}
+	}
+}
+
+// TestConsoleModelOptionalColumnsHiddenByDefault 锁定「输出上限/推理档位/能力」
+// 可切换且默认显隐符合规范，偏好按浏览器持久化。
+func TestConsoleModelOptionalColumnsHiddenByDefault(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+
+	for _, literal := range []string{
+		`id="btnModelCols"`,
+		`id="modelColsMenu"`,
+		"cols-setter",
+		`"freetier-model-optional-columns"`,
+		"localStorage.getItem(MODEL_COLUMNS_STORE_KEY)",
+		"localStorage.setItem(MODEL_COLUMNS_STORE_KEY",
+		"function readColumnPrefs()",
+		"function visibleColumns()",
+		"function toggleOptionalColumn(",
+		"列展示 ▾",
+	} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("console page missing column-visibility wiring %q", literal)
+		}
+	}
+
+	// 共有三列可切换：输出上限、推理档位、能力——其余列必须恒显。
+	if got := strings.Count(page, "optional: true"); got != 3 {
+		t.Fatalf("optional columns = %d, want 3 (输出上限/推理档位/能力)", got)
+	}
+	for _, key := range []string{"output", "efforts", "caps"} {
+		pattern := regexp.MustCompile(`key: "` + key + `"[\s\S]{0,120}optional: true`)
+		if !pattern.MatchString(page) {
+			t.Fatalf("column %q must be optional", key)
+		}
+	}
+
+	// 输出上限、推理档位默认隐藏，能力默认展示
+	for _, key := range []string{"output", "efforts"} {
+		pattern := regexp.MustCompile(`key: "` + key + `"[\s\S]{0,120}defaultShow: false`)
+		if !pattern.MatchString(page) {
+			t.Fatalf("column %q must have defaultShow: false", key)
+		}
+	}
+	if !regexp.MustCompile(`key: "caps"[\s\S]{0,120}defaultShow: true`).MatchString(page) {
+		t.Fatal(`column "caps" must have defaultShow: true`)
+	}
+
+	// 缺省/损坏/存储不可用时必须回到空对象。
+	if !regexp.MustCompile(`catch \(e\) \{\s*return \{\};`).MatchString(page) {
+		t.Fatal("column preferences must default to an empty object")
+	}
+}

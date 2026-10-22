@@ -26,6 +26,14 @@ func (v *fakeVendor) ExecuteStream(context.Context, *core.Credential, *core.Exec
 	return nil
 }
 
+// ratedVendor 在 fakeVendor 之上补一份计费倍率，用于验证倍率随清单落盘。
+type ratedVendor struct {
+	fakeVendor
+	credits map[string]string
+}
+
+func (v *ratedVendor) ModelCredits() map[string]string { return v.credits }
+
 func newTestCatalog(t *testing.T) *Catalog {
 	t.Helper()
 	store := state.NewStore()
@@ -241,5 +249,70 @@ func TestCacheProbedModelsPersistsOnlyOnChange(t *testing.T) {
 	}
 	if updated.ModelsFetchedAt == "sentinel" {
 		t.Fatal("a changed list must be persisted")
+	}
+}
+
+// TestCreditsFollowProbeAndSurviveRestart 锁定「费用倍率」的两条不变量：
+//
+//  1. 倍率与模型清单是同一次探测的产物，必须一起落盘；
+//  2. 插件重启后（新的 Catalog + LoadCachedState）倍率立刻可用，
+//     不必等一轮上游探测——否则控制台会在启动后显示一排「—」。
+func TestCreditsFollowProbeAndSurviveRestart(t *testing.T) {
+	store := state.NewStore()
+	store.Configure(t.TempDir())
+	if _, errLoad := store.Load(); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	registry := core.NewRegistry()
+	if errRegister := registry.Register(&ratedVendor{
+		fakeVendor: fakeVendor{Meta: core.Meta{VendorID: "qodercn", VendorName: "Qoder CN", VendorRegion: "cn"}},
+		credits:    map[string]string{"glm-5.3": "x0.42"},
+	}); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	manager := NewCatalog(store, registry)
+	manager.CacheProbedModels("qodercn", []pluginapi.ModelInfo{{ID: "glm-5.3"}})
+
+	snapshot := store.Snapshot()
+	if len(snapshot.Models) != 1 || snapshot.Models[0].Credits != "0.42X" {
+		t.Fatalf("state models = %+v, want credits persisted with the model", snapshot.Models)
+	}
+
+	restored := NewCatalog(store, registry)
+	restored.LoadCachedState(snapshot.Models)
+	if got := restored.CreditsFor("qodercn", "glm-5.3"); got != "0.42X" {
+		t.Fatalf("credits after restart = %q, want 0.42X", got)
+	}
+	// 未知模型不能凭空编出倍率。
+	if got := restored.CreditsFor("qodercn", "unknown-model"); got != "" {
+		t.Fatalf("unknown model credits = %q, want empty", got)
+	}
+}
+
+// TestCreditsChangeTriggersPersist 验证倍率变化本身也会落盘。
+//
+// 模型清单不变、只有倍率变了（上游调价）时，persistProbed 若只比较 ID/名称
+// 就会静默丢掉这次更新。
+func TestCreditsChangeTriggersPersist(t *testing.T) {
+	store := state.NewStore()
+	store.Configure(t.TempDir())
+	if _, errLoad := store.Load(); errLoad != nil {
+		t.Fatal(errLoad)
+	}
+	vendor := &ratedVendor{
+		fakeVendor: fakeVendor{Meta: core.Meta{VendorID: "qodercn", VendorName: "Qoder CN", VendorRegion: "cn"}},
+		credits:    map[string]string{"glm-5.3": "x0.42"},
+	}
+	registry := core.NewRegistry()
+	if errRegister := registry.Register(vendor); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	manager := NewCatalog(store, registry)
+	manager.CacheProbedModels("qodercn", []pluginapi.ModelInfo{{ID: "glm-5.3"}})
+
+	vendor.credits = map[string]string{"glm-5.3": "x0.80"}
+	manager.CacheProbedModels("qodercn", []pluginapi.ModelInfo{{ID: "glm-5.3"}})
+	if got := store.Snapshot().Models[0].Credits; got != "0.80X" {
+		t.Fatalf("persisted credits = %q, want 0.80X after repricing", got)
 	}
 }

@@ -183,3 +183,29 @@ func TestModelsToPluginAPIUsesSlug(t *testing.T) {
 		t.Errorf("index after registration = %q; want dmodel", key)
 	}
 }
+
+// TestModelCreditsFromPriceFactor 锁定控制台的「费用倍率」数据源。
+//
+// 倍率只出现在上游 model/list 的 price_factor 上；宿主契约没有这个字段，
+// 因此转换模型时必须顺手记下，否则控制台只能去解析 description 文本。
+func TestModelCreditsFromPriceFactor(t *testing.T) {
+	instance := newInstance(core.Env{}, RegionCN).(*adapter)
+	models := []Model{
+		{Key: "dmodel", DisplayName: "DeepSeek-V4-Pro", PriceFactor: 0.42},
+		{Key: "gmodel", DisplayName: "GLM-5.3"},
+	}
+	instance.modelsToPluginAPI(models)
+
+	credits := instance.ModelCredits()
+	if got := credits["deepseek-v4-pro"]; got != "0.42X" {
+		t.Errorf("deepseek-v4-pro credits = %q; want 0.42X", got)
+	}
+	// price_factor 缺失（0）表示上游没给倍率，不能显示成 x0.00。
+	if _, ok := credits["glm-5.3"]; ok {
+		t.Errorf("model without price_factor must have no credits entry, got %q", credits["glm-5.3"])
+	}
+	// 键必须是对外 slug，而不是上游 key（控制台按注册 ID 匹配）。
+	if _, ok := credits["dmodel"]; ok {
+		t.Error("credits must be keyed by the registered slug, not the upstream key")
+	}
+}

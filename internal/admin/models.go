@@ -106,15 +106,31 @@ func (s *Service) handleModelsList(req pluginapi.ManagementRequest) pluginapi.Ma
 }
 
 func (s *Service) consoleModelsForVendor(manager *Catalog, vendor core.Vendor) []consoleModel {
+	out := consoleModelsFromRegistered(manager, s.registry, vendor)
+	// 供应商能给出更详细的展示信息时优先用它；但返回空快照（冷启动尚未
+	// 探测、无可用凭证）不能把整家供应商从控制台抹掉，因此只在非空时替换。
 	if provider, okProvider := core.As[core.ConsoleModelProvider](vendor); okProvider {
-		return s.consoleModelsFromProvider(vendor, provider.ConsoleModels())
+		if models := provider.ConsoleModels(); len(models) > 0 {
+			out = s.consoleModelsFromProvider(vendor, models)
+		}
 	}
+	// 倍率随模型缓存落盘，重启后从这里回填；provider 已带倍率时不覆盖。
+	for index := range out {
+		if out[index].Credits == "" {
+			out[index].Credits = manager.CreditsFor(vendor.ID(), out[index].ID)
+		}
+	}
+	return out
+}
+
+// consoleModelsFromRegistered 把目录缓存的官方清单转成控制台条目。
+func consoleModelsFromRegistered(manager *Catalog, registry *core.Registry, vendor core.Vendor) []consoleModel {
 	infos := manager.Registered(vendor.ID())
 	out := make([]consoleModel, 0, len(infos))
 	for _, info := range infos {
 		entry := consoleModel{
 			ID:              info.ID,
-			ScopeID:         s.registry.ModelKeyFor(vendor.ID(), info.ID),
+			ScopeID:         registry.ModelKeyFor(vendor.ID(), info.ID),
 			VendorID:        vendor.ID(),
 			VendorName:      vendor.Name(),
 			Realm:           vendor.Region(),

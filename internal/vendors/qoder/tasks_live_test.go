@@ -32,6 +32,13 @@ import (
 //
 // 只打印截断后的非敏感信息（轮次、状态、额度），不打印凭证内容。
 
+// resolveLiveIdentity 按实况探针所在账号派生设备身份。
+//
+// 探针必须与插件走同一条身份来源，否则测的就不是线上行为。
+func resolveLiveIdentity(_ context.Context, _ Region) MachineIdentity {
+	return ResolveIdentity(FingerprintSeed("", os.Getenv("QODER_LIVE_CREDS")), nil)
+}
+
 // configureQoderProbeHost 装上把出站请求真发到上游的宿主。
 func configureQoderProbeHost(t *testing.T) {
 	t.Helper()
@@ -122,7 +129,10 @@ func TestLiveCheckin(t *testing.T) {
 		t.Logf("读取额度基线失败（将只用 reward 回读判定）: %v", errQuota)
 	}
 
-	result, errCheckin := Checkin(context.Background(), cred)
+	identity := resolveLiveIdentity(context.Background(), region)
+	t.Logf("设备身份: native=%v", identity.Native())
+
+	result, errCheckin := Checkin(context.Background(), cred, identity)
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -142,6 +152,6 @@ func TestLiveCheckin(t *testing.T) {
 		t.Logf("状态不是 %s，跳过领取回读", CheckinClaimed)
 		return
 	}
-	granted, amount := readCampaignReward(context.Background(), region, checkinBearer(cred.Token), result.CampaignID)
+	granted, amount := readCampaignReward(context.Background(), region, checkinBearer(cred.Token), identity, result.CampaignID)
 	t.Logf("奖励回读: granted=%v amount=%d", granted, amount)
 }

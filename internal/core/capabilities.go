@@ -11,7 +11,10 @@ package core
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strconv"
+	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 )
@@ -135,6 +138,36 @@ type Configurable interface {
 	Configure(settings Settings, raw map[string]string)
 }
 
+// CreditsProvider 由能给出模型计费倍率的供应商实现。
+//
+// 返回「官方模型 ID → 展示文案」（如 "0.08X"、"免费"）。宿主契约里没有倍率
+// 字段，控制台只能通过这个能力拿到；不实现即视为「未知」，页面显示「—」。
+//
+// 单独成一个窄接口，而不是塞进 ConsoleModelProvider：倍率与「模型清单长什么样」
+// 是两件事，供应商只需给出自己独有的那一维信息，其余明细由 Catalog 推导。
+type CreditsProvider interface {
+	ModelCredits() map[string]string
+}
+
+// FormatRate 把上游各种原始倍率串（如 "x0.71 credits"、"x0.05"、"0.5"）
+// 归一化为统一的始终保留两位小数的 "0.50X" 样式；非数值文案（如 "免费"、"订阅"）原样保留。
+func FormatRate(raw string) string {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return ""
+	}
+	// 去掉多余的 credits / credit 等单位
+	lower := strings.ToLower(s)
+	clean := strings.TrimSpace(strings.TrimSuffix(strings.TrimSuffix(lower, "credits"), "credit"))
+	clean = strings.TrimPrefix(clean, "x")
+	clean = strings.TrimSuffix(clean, "x")
+	clean = strings.TrimSpace(clean)
+	if num, err := strconv.ParseFloat(clean, 64); err == nil && num >= 0 {
+		return fmt.Sprintf("%.2fX", num)
+	}
+	return s
+}
+
 // ConsoleModel 是供应商提供的模型展示明细（控制台模型页用）。
 type ConsoleModel struct {
 	ID              string
@@ -149,6 +182,34 @@ type ConsoleModel struct {
 	Credits         string
 }
 
+// ConsoleModelsFromInfo 把注册清单转成控制台展示条目，倍率按官方模型 ID 补充。
+//
+// 只给倍率表的供应商用它就能完成接入：明细字段全部来自注册清单，不另存
+// 一份模型元数据，也就不会出现两处慢慢对不上。
+func ConsoleModelsFromInfo(models []pluginapi.ModelInfo, credits map[string]string) []ConsoleModel {
+	out := make([]ConsoleModel, 0, len(models))
+	for _, model := range models {
+		entry := ConsoleModel{
+			ID:              model.ID,
+			Name:            FirstNonEmpty(model.DisplayName, model.Name),
+			Description:     model.Description,
+			ContextLength:   model.ContextLength,
+			MaxOutputTokens: model.MaxCompletionTokens,
+			SupportsImages:  ModelSupportsImages(model),
+			SupportsTools:   ModelSupportsTools(model),
+			Credits:         credits[model.ID],
+		}
+		if model.Thinking != nil {
+			entry.Efforts = model.Thinking.Levels
+			if len(model.Thinking.Levels) > 0 {
+				entry.DefaultEffort = model.Thinking.Levels[0]
+			}
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
 // ModelCacheLoader 由需要预热自身模型目录的供应商实现。
 //
 // state.json 中的缓存按 VendorID 区分；Manager 在启动时把对应条目交给
@@ -157,9 +218,10 @@ type ModelCacheLoader interface {
 	LoadModelCache(cached []CachedModel)
 }
 
-// ConsoleModelProvider 由需要补充展示明细（如积分倍率）的供应商实现。
+// ConsoleModelProvider 由需要向控制台补充展示明细的供应商实现。
 //
-// 未实现时控制台从已注册的模型清单回读（缺少 Credits 等扩展信息）。
+// 未实现时控制台直接用 Catalog 缓存的注册清单（模型 ID、上下文、输出上限、
+// 能力等都能从 pluginapi.ModelInfo 推导），只是没有倍率这类宿主契约之外的字段。
 type ConsoleModelProvider interface {
 	ConsoleModels() []ConsoleModel
 }

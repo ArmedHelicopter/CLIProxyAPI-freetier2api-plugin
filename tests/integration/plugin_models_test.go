@@ -475,6 +475,7 @@ func TestModelChangeMarksRestartPending(t *testing.T) {
 func TestDefaultStateDirFallback(t *testing.T) {
 	tempHome := t.TempDir()
 	t.Setenv("HOME", tempHome)
+	t.Setenv("USERPROFILE", tempHome)
 	t.Setenv("FREETIER2API_PLUGIN_HOME", "")
 
 	// 1. 无 ~/.cli-proxy-api → 回退 ~/.freetier2api-plugin

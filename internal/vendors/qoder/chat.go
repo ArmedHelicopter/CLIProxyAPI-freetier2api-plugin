@@ -1093,10 +1093,18 @@ func DeriveMachineType(seed string) string {
 	return deriveID(seed, "machinetype")[:18]
 }
 
-// DeriveMachineToken 派生稳定的 machine token（与 hub derive_machine_token 同构）。
+// DeriveMachineToken 派生稳定的 machine token。
+//
+// 形态对齐官方组件输出：88 字符 base64url（65 字节熵）。SHA-512 只有 64
+// 字节，因此再追加一轮带不同前缀的摘要凑满——仍是确定性的，同一种子不变。
 func DeriveMachineToken(seed string) string {
-	sum := sha512.Sum512([]byte("machinetoken:" + saltedSeed(seed)))
-	return base64.RawURLEncoding.EncodeToString(sum[:])[:43]
+	primary := sha512.Sum512([]byte("machinetoken:" + saltedSeed(seed)))
+	secondary := sha512.Sum512([]byte("machinetoken2:" + saltedSeed(seed)))
+	raw := make([]byte, 66)
+	copy(raw, primary[:])
+	raw[64] = secondary[0]
+	raw[65] = secondary[1]
+	return base64.RawURLEncoding.EncodeToString(raw)[:88]
 }
 
 const Version = "1.0.10"

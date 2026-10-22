@@ -42,14 +42,27 @@ type Catalog struct {
 	settings ModelSettings
 	disabled map[string]bool
 	aliases  map[string]string
-	// cached 是最近一次拿到的**官方 ID** 静态清单（控制台回读用）。
-	cached map[string][]pluginapi.ModelInfo
+	// cached 是各供应商最近一次拿到的**官方 ID** 清单（控制台回读用）。
+	cached map[string]cachedVendor
 
 	// probing 记录正在进行中的按供应商探测（singleflight）。
 	// probeMu 保护它；probeAt 是上次探测时间，用于 TTL 内不重复打上游。
 	probeMu sync.Mutex
 	probing map[string]chan struct{}
 	probeAt map[string]time.Time
+}
+
+// cachedVendor 是一个供应商的控制台回读缓存。
+//
+// 倍率（credits）与模型清单同属一次探测的结果，放在同一个条目里而不是
+// 另开一张表：两者必须同进同退，分开存迟早出现「模型换了一批、倍率还是
+// 上一批」的错配。
+type cachedVendor struct {
+	models []pluginapi.ModelInfo
+	// credits 是官方模型 ID → 额度/费用倍率文案（如 "x0.05"、"免费"）。
+	// 宿主契约 pluginapi.ModelInfo 没有这个字段，只能由供应商的
+	// ConsoleModels 能力单独提供。
+	credits map[string]string
 }
 
 // New 创建 Catalog。
@@ -59,7 +72,7 @@ func NewCatalog(store *state.Store, registry *core.Registry) *Catalog {
 		registry: registry,
 		disabled: map[string]bool{},
 		aliases:  map[string]string{},
-		cached:   map[string][]pluginapi.ModelInfo{},
+		cached:   map[string]cachedVendor{},
 		probing:  map[string]chan struct{}{},
 		probeAt:  map[string]time.Time{},
 	}
@@ -206,7 +219,7 @@ func (c *Catalog) IsDisabled(vendorID, modelID string) bool {
 // 清单为空表示还没拉到（冷启动或探测失败），此时无从判定「模型已消失」，
 // 按「存在」处理——一次网络抖动不能改变鉴权语义。调用方须持有读锁。
 func (c *Catalog) registeredLocked(vendorID, modelID string) bool {
-	models := c.cached[vendorID]
+	models := c.cached[vendorID].models
 	if len(models) == 0 {
 		return true
 	}
@@ -303,14 +316,16 @@ func (c *Catalog) ClearRestartPending() {
 //
 // 允许写空清单：调用方用空值表达「显式清空」，`registeredLocked` 也依赖
 // 「空清单 = 未知」的保守语义。**探测回包不要用它**，改用 CacheProbedModels。
+//
+// 倍率是探测产物，随清单一起清空：新的清单还没配到倍率时，留着上一批的
+// 倍率只会张冠李戴。
 func (c *Catalog) CacheStatic(vendorID string, models []pluginapi.ModelInfo) {
-	copied := append([]pluginapi.ModelInfo(nil), models...)
 	c.mu.Lock()
-	c.cached[vendorID] = copied
+	c.cached[vendorID] = cachedVendor{models: append([]pluginapi.ModelInfo(nil), models...)}
 	c.mu.Unlock()
 }
 
-// CacheProbedModels 记录一次探测得到的官方清单并落盘。
+// CacheProbedModels 记录一次探测得到的官方清单（含倍率）并落盘。
 //
 // 探测失败（上游抖动、凭证暂不可用、免费层改名导致过滤后为空）与「模型真的
 // 全部下线」在回包上无法区分，而前者远比后者常见：一次瞬时 401 让整家供应商
@@ -330,14 +345,53 @@ func (c *Catalog) CacheProbedModels(vendorID string, models []pluginapi.ModelInf
 }
 
 // cacheProbed 只更新内存缓存，由调用方决定何时落盘。
+//
+// 倍率与清单在这里一起写：两者都是同一次探测的产物，共用一个条目就不会
+// 出现「清单是新的、倍率还是上一批」的错配。
 func (c *Catalog) cacheProbed(vendorID string, models []pluginapi.ModelInfo) bool {
 	if len(models) == 0 {
 		logger.Info("models: %s probe returned 0 model(s); keeping %d cached",
 			vendorID, len(c.Registered(vendorID)))
 		return false
 	}
-	c.CacheStatic(vendorID, models)
+	// 先取倍率再进临界区：ModelCredits 由供应商实现，持 Catalog 锁调用它
+	// 等于把两把锁嵌套在一起，属于可避免的死锁风险。
+	credits := c.creditsFromProvider(vendorID)
+	c.mu.Lock()
+	c.cached[vendorID] = cachedVendor{
+		models:  append([]pluginapi.ModelInfo(nil), models...),
+		credits: credits,
+	}
+	c.mu.Unlock()
 	return true
+}
+
+// creditsFromProvider 读取供应商自报的倍率表（官方模型 ID → 文案）。
+//
+// 只有实现了 CreditsProvider 的供应商才有倍率；宿主契约里没有这个字段，
+// 因此不能从 models 里推。空值不写入，避免把「没提供」当成「免费」。
+// 调用方必须在 Catalog 写锁之外调用。
+func (c *Catalog) creditsFromProvider(vendorID string) map[string]string {
+	vendor, okVendor := c.registry.ByID(vendorID)
+	if !okVendor {
+		return nil
+	}
+	provider, okProvider := core.As[core.CreditsProvider](vendor)
+	if !okProvider {
+		return nil
+	}
+	credits := make(map[string]string)
+	for id, value := range provider.ModelCredits() {
+		id = strings.TrimSpace(id)
+		rate := core.FormatRate(value)
+		if id != "" && rate != "" {
+			credits[id] = rate
+		}
+	}
+	if len(credits) == 0 {
+		return nil
+	}
+	return credits
 }
 
 // persistProbed 把当前清单写入 state.json（内容未变则不写）。
@@ -372,7 +426,7 @@ func equalCachedModels(a, b []core.CachedModel) bool {
 	for _, item := range b {
 		prev, ok := index[key{item.VendorID, item.ID}]
 		if !ok || prev.Name != item.Name || prev.ContextLength != item.ContextLength ||
-			prev.MaxOutputTokens != item.MaxOutputTokens {
+			prev.MaxOutputTokens != item.MaxOutputTokens || prev.Credits != item.Credits {
 			return false
 		}
 	}
@@ -383,7 +437,7 @@ func equalCachedModels(a, b []core.CachedModel) bool {
 func (c *Catalog) Registered(vendorID string) []pluginapi.ModelInfo {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return append([]pluginapi.ModelInfo(nil), c.cached[vendorID]...)
+	return append([]pluginapi.ModelInfo(nil), c.cached[vendorID].models...)
 }
 
 const (
@@ -493,31 +547,30 @@ func (c *Catalog) probeVendor(vendor core.Vendor, done chan struct{}) {
 
 // LoadCachedState 从 state.json 恢复全部供应商的模型缓存，并通知供应商预热。
 func (c *Catalog) LoadCachedState(cached []core.CachedModel) {
-	byVendor := map[string][]pluginapi.ModelInfo{}
+	entries := map[string]cachedVendor{}
 	for _, item := range cached {
 		if strings.TrimSpace(item.ID) == "" {
 			continue
 		}
-		vendorID := strings.TrimSpace(item.VendorID)
-		if vendorID == "" {
-			// 旧状态没有 vendor_id：当时只有 WorkBuddy 写模型缓存。
-			switch item.Realm {
-			case "global":
-				vendorID = "workbuddyglobal"
-			default:
-				vendorID = "workbuddycn"
-			}
-		}
-		byVendor[vendorID] = append(byVendor[vendorID], pluginapi.ModelInfo{
+		vendorID := cachedVendorID(item)
+		entry := entries[vendorID]
+		entry.models = append(entry.models, pluginapi.ModelInfo{
 			ID: item.ID, Name: item.Name, DisplayName: item.Name,
 			Description: item.Description, ContextLength: item.ContextLength,
 			InputTokenLimit: item.ContextLength, MaxCompletionTokens: item.MaxOutputTokens,
 			OutputTokenLimit: item.MaxOutputTokens, Thinking: thinkingFromCached(item),
 		})
+		if rate := core.FormatRate(item.Credits); rate != "" {
+			if entry.credits == nil {
+				entry.credits = map[string]string{}
+			}
+			entry.credits[item.ID] = rate
+		}
+		entries[vendorID] = entry
 	}
 	c.mu.Lock()
-	for vendorID, models := range byVendor {
-		c.cached[vendorID] = models
+	for vendorID, entry := range entries {
+		c.cached[vendorID] = entry
 	}
 	c.mu.Unlock()
 
@@ -535,26 +588,47 @@ func (c *Catalog) CachedState() []core.CachedModel {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	out := make([]core.CachedModel, 0, 64)
-	for vendorID, models := range c.cached {
-		for _, model := range models {
-			entry := core.CachedModel{
+	for vendorID, entry := range c.cached {
+		for _, model := range entry.models {
+			cachedModel := core.CachedModel{
 				VendorID: vendorID, ID: model.ID, Name: model.Name,
 				Description: model.Description, ContextLength: model.ContextLength,
 				MaxOutputTokens: model.MaxCompletionTokens,
+				Credits:         entry.credits[model.ID],
 			}
 			if vendor, okVendor := c.registry.ByID(vendorID); okVendor {
-				entry.Realm = vendor.Region()
+				cachedModel.Realm = vendor.Region()
 			}
 			if model.Thinking != nil {
-				entry.Efforts = append([]string(nil), model.Thinking.Levels...)
-				entry.DefaultEffort = model.Thinking.Levels[0]
+				cachedModel.Efforts = append([]string(nil), model.Thinking.Levels...)
+				cachedModel.DefaultEffort = model.Thinking.Levels[0]
 			}
-			entry.SupportsImages = core.ModelSupportsImages(model)
-			entry.SupportsTool = core.ModelSupportsTools(model)
-			out = append(out, entry)
+			cachedModel.SupportsImages = core.ModelSupportsImages(model)
+			cachedModel.SupportsTool = core.ModelSupportsTools(model)
+			out = append(out, cachedModel)
 		}
 	}
 	return out
+}
+
+// CreditsFor 返回某供应商某官方模型的倍率文案；未知时返回空串。
+func (c *Catalog) CreditsFor(vendorID, modelID string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.cached[vendorID].credits[strings.TrimSpace(modelID)]
+}
+
+// cachedVendorID 解析缓存条目的归属供应商。
+//
+// 旧状态没有 vendor_id：当时只有 WorkBuddy 写模型缓存，按 realm 回填。
+func cachedVendorID(item core.CachedModel) string {
+	if vendorID := strings.TrimSpace(item.VendorID); vendorID != "" {
+		return vendorID
+	}
+	if item.Realm == "global" {
+		return "workbuddyglobal"
+	}
+	return "workbuddycn"
 }
 
 func cachedForVendor(cached []core.CachedModel, vendorID string) []core.CachedModel {

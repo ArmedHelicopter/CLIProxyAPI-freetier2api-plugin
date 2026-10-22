@@ -374,7 +374,10 @@ type dailyCheckinStatus struct {
 }
 
 // Checkin 执行一次签到。
-func Checkin(ctx context.Context, cred *Credential) (*CheckinResult, error) {
+//
+// identity 是本次要携带的官方客户端设备身份；国际版缺它时活动列表会被
+// 上游静默过滤，因此这里在查活动**之前**就如实报告「缺少设备身份」。
+func Checkin(ctx context.Context, cred *Credential, identity MachineIdentity) (*CheckinResult, error) {
 	result := &CheckinResult{Status: CheckinError}
 	bearer := checkinBearer(cred.Token)
 	if bearer == "" {
@@ -382,8 +385,8 @@ func Checkin(ctx context.Context, cred *Credential) (*CheckinResult, error) {
 		result.Message = "凭证里没有可用 token"
 		return result, nil
 	}
-	result = campaignsCheckin(ctx, cred.Region, bearer, result)
-	readDailyCheckinStats(ctx, cred.Region, bearer, result)
+	result = campaignsCheckin(ctx, cred.Region, bearer, identity, result)
+	readDailyCheckinStats(ctx, cred.Region, bearer, identity, result)
 	return result, nil
 }
 
@@ -415,8 +418,8 @@ var checkinNow = func() time.Time { return time.Now().In(campaignZone) }
 // 自然日：上游每天 10:00 换一条新活动，9 点那一轮看到的是**上一轮**已领取
 // 的活动，把它当成「今日已领取」就会显示假性成功，而当日窗口随后开启时
 // 已经错过——官方不补领，积分就此永久丢失。
-func campaignsCheckin(ctx context.Context, region Region, bearer string, result *CheckinResult) *CheckinResult {
-	status, body, raw := doCheckinRequest(ctx, region, http.MethodGet, "/sash/api/v1/me/campaigns", bearer, nil)
+func campaignsCheckin(ctx context.Context, region Region, bearer string, identity MachineIdentity, result *CheckinResult) *CheckinResult {
+	status, body, raw := doCheckinRequest(ctx, region, http.MethodGet, "/sash/api/v1/me/campaigns", bearer, identity, nil)
 	if status != http.StatusOK {
 		result.Message = fmt.Sprintf("查询活动失败 HTTP %d: %s", status, core.Truncate(raw, 300))
 		result.NotRecorded = true
@@ -480,7 +483,7 @@ func campaignsCheckin(ctx context.Context, region Region, bearer string, result 
 				result.Message = fmt.Sprintf("上游领取窗口 %02d:00（UTC+8）开启，当前未开启", dailyRoundHour)
 				return result
 			}
-			return claimCampaign(ctx, region, bearer, current, result)
+			return claimCampaign(ctx, region, bearer, identity, current, result)
 		case "CLAIMED":
 			// 已领取，但要确认领的是**哪一轮**：只有今天 10:00 开启的
 			// 那一轮才算「今日已领」。9 点那一轮看到的是昨天 10:00 开启
@@ -539,13 +542,13 @@ func campaignsCheckin(ctx context.Context, region Region, bearer string, result 
 // 「领取请求返回 200」不等于「积分到账」——上游可能因风控拒绝发放却仍返回
 // 成功形态。因此这里在拿到 CLAIMED 后再回查 reward 与额度，两个信号都没
 // 落实就不算成功，避免控制台显示假性成功。
-func claimCampaign(ctx context.Context, region Region, bearer string, target *campaignInfo, result *CheckinResult) *CheckinResult {
+func claimCampaign(ctx context.Context, region Region, bearer string, identity MachineIdentity, target *campaignInfo, result *CheckinResult) *CheckinResult {
 	// 领取前先读一次额度作为基线：领取后要与它比较，判断积分是否真的到账。
 	quotaBefore, errBefore := readAddonQuotaTotal(ctx, region, bearer)
 	hadQuotaBefore := errBefore == nil
 
 	claimPath := fmt.Sprintf("/sash/api/v1/me/campaigns/%s/claim", target.CampaignID)
-	status, body, raw := doCheckinRequest(ctx, region, http.MethodPost, claimPath, bearer, nil)
+	status, body, raw := doCheckinRequest(ctx, region, http.MethodPost, claimPath, bearer, identity, nil)
 	if status != http.StatusOK {
 		result.Status = CheckinError
 		result.NotRecorded = true
@@ -568,7 +571,7 @@ func claimCampaign(ctx context.Context, region Region, bearer string, target *ca
 			result.Message = "今日已领取"
 			return result
 		}
-		return confirmClaim(ctx, region, bearer, target, claim, quotaBefore, hadQuotaBefore, result)
+		return confirmClaim(ctx, region, bearer, identity, target, claim, quotaBefore, hadQuotaBefore, result)
 	case "BLOCKED":
 		// 官方按「人」去重：同一人多账号时只允许领一份。
 		result.Status = CheckinBlocked
@@ -597,12 +600,12 @@ func claimCampaign(ctx context.Context, region Region, bearer string, target *ca
 // 两个信号任一落实即视为到账：reward 回查拿到发放记录，或额度总额高于
 // 领取前的基线。两者都没落实时按「未确认」处理——宁可少报一次成功，
 // 也不要让用户以为已经领到而实际没到账。
-func confirmClaim(ctx context.Context, region Region, bearer string, target *campaignInfo, claim claimResponse, quotaBefore float64, hadQuotaBefore bool, result *CheckinResult) *CheckinResult {
+func confirmClaim(ctx context.Context, region Region, bearer string, identity MachineIdentity, target *campaignInfo, claim claimResponse, quotaBefore float64, hadQuotaBefore bool, result *CheckinResult) *CheckinResult {
 	amount := 0
 	if claim.Benefit != nil {
 		amount = claim.Benefit.Amount
 	}
-	granted, rewardAmount := readCampaignReward(ctx, region, bearer, target.CampaignID)
+	granted, rewardAmount := readCampaignReward(ctx, region, bearer, identity, target.CampaignID)
 	if rewardAmount > 0 {
 		amount = rewardAmount
 	}
@@ -635,9 +638,9 @@ func confirmClaim(ctx context.Context, region Region, bearer string, target *cam
 //
 // 返回 (是否已发放, 发放积分数)。reward 端点对未领取的活动返回 404，
 // 对已领取的返回 CLAIMED + grantedAt。
-func readCampaignReward(ctx context.Context, region Region, bearer, campaignID string) (bool, int) {
+func readCampaignReward(ctx context.Context, region Region, bearer string, identity MachineIdentity, campaignID string) (bool, int) {
 	path := fmt.Sprintf("/sash/api/v1/me/campaigns/%s/reward", campaignID)
-	status, body, _ := doCheckinRequest(ctx, region, http.MethodGet, path, bearer, nil)
+	status, body, _ := doCheckinRequest(ctx, region, http.MethodGet, path, bearer, identity, nil)
 	if status != http.StatusOK {
 		return false, 0
 	}
@@ -761,8 +764,8 @@ func unavailableSuffix(campaign *campaignInfo) string {
 // 上游把该批次标为 DISABLED 时（实测国内版当前就是），返回的计数恒为 0。
 // 那不是「连续 0 天」，而是这条统计线已经停用——此时不展示，避免用户
 // 以为自己从没领过。
-func readDailyCheckinStats(ctx context.Context, region Region, bearer string, result *CheckinResult) {
-	status, body, _ := doCheckinRequest(ctx, region, http.MethodGet, "/sash/api/v1/me/daily-check-in/status", bearer, nil)
+func readDailyCheckinStats(ctx context.Context, region Region, bearer string, identity MachineIdentity, result *CheckinResult) {
+	status, body, _ := doCheckinRequest(ctx, region, http.MethodGet, "/sash/api/v1/me/daily-check-in/status", bearer, identity, nil)
 	if status != http.StatusOK {
 		return
 	}
@@ -809,14 +812,32 @@ func parseCampaigns(raw any) []campaignInfo {
 //
 // cosy-clienttype: 10 是桌面端标识；上游按它放行签到接口，
 // 不需要 cosy 签名（这是签到与对话接口最大的差异）。
-func checkinHeaders(bearer string) map[string]string {
-	return map[string]string{
-		"authorization":   "Bearer " + bearer,
-		"accept":          "application/json",
-		"accept-language": "zh-CN",
-		"user-agent":      "Qoder",
-		"cosy-clienttype": "10",
+//
+// 机器头只在拿到**官方组件给的真身份**时才发（见 identity.go）：国际版
+// 缺了它们，可领取活动会被上游静默过滤；而发派生假身份同样会被过滤，
+// 所以拿不到就一个都不发。
+// checkinHeaders 是桌面端签到所需的请求头（抓包确认）。
+//
+// cosy-clienttype: 10 是桌面端标识；上游按它放行签到接口，
+// 不需要 cosy 签名（这是签到与对话接口最大的差异）。
+//
+// 机器头必须**成对**出现（token + type）：实测缺任一个，国际版可领取活动
+// 会被上游静默过滤。身份由 identity.go 按账号种子派生。
+func checkinHeaders(bearer string, identity MachineIdentity) map[string]string {
+	headers := map[string]string{
+		"authorization":        "Bearer " + bearer,
+		"accept":               "application/json",
+		"accept-language":      "zh-CN",
+		"user-agent":           "Qoder",
+		"cosy-clienttype":      "10",
+		"cosy-version":         identity.Version,
+		"cosy-machineid":       identity.MachineID,
+		"cosy-machinetoken":    identity.Token,
+		"cosy-machinetype":     identity.Type,
+		"cosy-machineos":       identity.MachineOS,
+		"cosy-machinehostname": identity.Hostname,
 	}
+	return headers
 }
 
 // checkinBase 返回该区域签到接口的域名。
@@ -828,7 +849,7 @@ func checkinBase(region Region) string {
 }
 
 // doCheckinRequest 发送签到相关请求，返回 (状态码, 解析后的 JSON, 原始正文)。
-func doCheckinRequest(ctx context.Context, region Region, method, path, bearer string, reqBody any) (int, any, string) {
+func doCheckinRequest(ctx context.Context, region Region, method, path, bearer string, identity MachineIdentity, reqBody any) (int, any, string) {
 	base := checkinBase(region)
 	url := base + path
 	var body io.Reader
@@ -843,7 +864,7 @@ func doCheckinRequest(ctx context.Context, region Region, method, path, bearer s
 	if errRequest != nil {
 		return 0, nil, fmt.Sprintf("build request: %v", errRequest)
 	}
-	for key, value := range checkinHeaders(bearer) {
+	for key, value := range checkinHeaders(bearer, identity) {
 		req.Header.Set(key, value)
 	}
 	if method == http.MethodPost {

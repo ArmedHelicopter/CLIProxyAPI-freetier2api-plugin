@@ -84,6 +84,76 @@ func campaignsBody(campaigns ...string) string {
 		strings.Join(campaigns, ","))
 }
 
+// testIdentity 返回一份插件派生的设备身份。
+//
+// 值本身无所谓：上游只要求 token/type 成对，这里只驱动请求头组装与判定。
+func testIdentity() MachineIdentity {
+	return ResolveIdentity("test-seed", nil)
+}
+
+// TestCheckinGlobalSendsNativeMachineHeaders 覆盖：拿到真身份后，活动查询、
+// 领取与发放回查都要带同一组机器头（上游在三条链路上都按身份过滤）。
+func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
+	now := time.Now().In(campaignZone)
+	startAt, endAt, _, _ := roundWindow(t, now)
+	const campaignID = "camp-global-identity"
+	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
+	upstream.responses["GET https://openapi.qoder.sh/sash/api/v1/me/campaigns"] = testhostResponse{
+		status: http.StatusOK,
+		body:   campaignsBody(claimableCampaign(campaignID, "act-global", startAt, endAt)),
+	}
+	upstream.responses["POST https://openapi.qoder.sh/sash/api/v1/me/campaigns/"+campaignID+"/claim"] = testhostResponse{
+		status: http.StatusOK,
+		body:   `{"grantId":"g1","status":"CLAIMED","replayed":false,"benefit":{"kind":"CREDITS","amount":100}}`,
+	}
+	upstream.responses["GET https://openapi.qoder.sh/sash/api/v1/me/campaigns/"+campaignID+"/reward"] = testhostResponse{
+		status: http.StatusOK,
+		body:   `{"grantId":"g1","status":"CLAIMED","grantedAt":"2026-10-22T04:16:34Z","benefit":{"kind":"CREDITS","amount":100}}`,
+	}
+	upstream.responses["GET https://openapi.qoder.sh/api/v2/quota/usage"] = testhostResponse{
+		status: http.StatusOK,
+		body:   `{"addOnQuota":{"total":2700}}`,
+	}
+	upstream.responses["GET https://openapi.qoder.sh/sash/api/v1/me/daily-check-in/status"] = testhostResponse{
+		status: http.StatusNotFound,
+		body:   `{"errorCode":"NotFound"}`,
+	}
+	installStubHost(t, upstream)
+
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionGlobal}, testIdentity())
+	if errCheckin != nil {
+		t.Fatalf("Checkin 返回错误: %v", errCheckin)
+	}
+	if result.Status != CheckinClaimed {
+		t.Fatalf("状态 = %q, 期望 %q（message=%s）", result.Status, CheckinClaimed, result.Message)
+	}
+
+	identity := testIdentity()
+	want := map[string]string{
+		"Cosy-Machinetoken": identity.Token,
+		"Cosy-Machinetype":  identity.Type,
+		"Cosy-Machineid":    identity.MachineID,
+		"Cosy-Machineos":    identity.MachineOS,
+		"Cosy-Version":      identity.Version,
+	}
+	checked := 0
+	for _, request := range upstream.requests {
+		if !strings.Contains(request.url, "/sash/") {
+			continue
+		}
+		checked++
+		for key, value := range want {
+			if got := request.headers[key]; len(got) == 0 || got[0] != value {
+				t.Errorf("%s %s 的头 %s = %v, 期望 [%s]", request.method, request.url, key, got, value)
+			}
+		}
+	}
+	// 活动查询、领取、reward 回查三条链路都必须带身份。
+	if checked < 3 {
+		t.Errorf("只检查到 %d 个 /sash/ 请求，期望至少 3 个", checked)
+	}
+}
+
 // claimableCampaign 造一条可领取活动。
 func claimableCampaign(id, key string, startAt, endAt int64) string {
 	return fmt.Sprintf(`{"campaignId":%q,"campaignKey":%q,"actionType":"CLAIM_BENEFIT",`+
@@ -140,7 +210,7 @@ func TestCheckinClaimsCurrentRound(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -190,7 +260,7 @@ func TestCheckinBeforeWindowIsNotRecorded(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -222,7 +292,7 @@ func TestCheckinCurrentRoundAlreadyClaimed(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -258,7 +328,7 @@ func TestCheckinBlockedByUpstream(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -303,7 +373,7 @@ func TestCheckinNotConfirmedWithoutGrant(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -334,7 +404,7 @@ func TestCheckinAchievementGate(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -367,7 +437,7 @@ func TestCheckinGlobalRegionUsesGlobalEndpoint(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionGlobal})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionGlobal}, testIdentity())
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -416,7 +486,7 @@ func TestCheckinAtNineAMDoesNotClaimToday(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}
@@ -473,7 +543,7 @@ func TestCheckinAfterOpenClaimsToday(t *testing.T) {
 	}
 	installStubHost(t, upstream)
 
-	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
 	if errCheckin != nil {
 		t.Fatalf("Checkin 返回错误: %v", errCheckin)
 	}

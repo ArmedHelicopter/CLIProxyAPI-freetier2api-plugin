@@ -49,6 +49,44 @@ table { width: 100%; border-collapse: collapse; font-size: 13px; }
    内容总宽超出容器时由外层 #models 横向滚动兜底。 */
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
 th { color: var(--muted); font-weight: 500; }
+th.sortable { cursor: pointer; user-select: none; }
+th.sortable:hover { color: var(--accent); }
+th.sortable .th-sort-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  line-height: 1;
+  vertical-align: middle;
+}
+.sort-arrows {
+  display: inline-flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+  position: relative;
+  top: -1px;
+}
+.sort-arrow {
+  display: block;
+  width: 0;
+  height: 0;
+  border-left: 3px solid transparent;
+  border-right: 3px solid transparent;
+  transition: border-color .15s ease;
+}
+.sort-arrow.asc {
+  border-bottom: 4px solid var(--muted);
+  margin-bottom: 2px;
+}
+.sort-arrow.desc {
+  border-top: 4px solid var(--muted);
+}
+.sort-arrows.order-asc .sort-arrow.asc {
+  border-bottom-color: var(--accent);
+}
+.sort-arrows.order-desc .sort-arrow.desc {
+  border-top-color: var(--accent);
+}
 tr:last-child td { border-bottom: none; }
 .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px;
         border: 1px solid var(--border); }
@@ -73,12 +111,50 @@ textarea { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px
 input.aliasinput { padding: 3px 6px; width: 100%; min-width: 96px; font-size: 13px;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 input.aliasinput:focus { outline: none; border-color: var(--accent); }
-/* 模型表容器：列宽由内容决定，超宽时横向滚动而不是压窄各列。 */
+/* 模型表容器与自适应列宽：超宽时外层横向滚动；
+   固定信息列紧凑收拢，模型ID与名称通过弹性最大宽度自适应，
+   为费用倍率、上下文、能力等业务列留出充裕呼吸感 */
 #models { overflow-x: auto; }
-#models table { width: auto; min-width: 100%; }
-/* 别名的展示态：可点击进入编辑，悬停给出提示。 */
-.aliasview { cursor: pointer; border-bottom: 1px dashed var(--border); padding: 1px 2px; }
-.aliasview:hover { color: var(--accent); border-bottom-color: var(--accent); }
+#models table { width: 100%; min-width: 680px; }
+#models th, #models td { padding: 9px 14px; text-align: left; }
+#models .col-check { width: 1%; text-align: center; padding-left: 10px; padding-right: 6px; }
+#models .col-status,
+#models .col-vendor { width: 1%; white-space: nowrap; }
+#models .modelidname {
+  display: inline-block;
+  max-width: 180px;
+  max-width: clamp(120px, 14vw, 200px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+#models .name-text {
+  display: inline-block;
+  max-width: 140px;
+  max-width: clamp(80px, 10vw, 150px);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+}
+#models .col-credits { min-width: 96px; white-space: nowrap; }
+#models .col-context { min-width: 85px; white-space: nowrap; }
+#models .col-caps { min-width: 105px; white-space: nowrap; }
+#models .col-output { min-width: 85px; white-space: nowrap; }
+#models .col-efforts { min-width: 110px; white-space: nowrap; }
+/* 模型 ID / 别名合并列：文字可点击进入编辑，右侧 ✎ 给出可编辑暗示。 */
+.modelid { display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
+           border-bottom: 1px dashed var(--border); padding: 1px 2px; }
+.modelid:hover { color: var(--accent); border-bottom-color: var(--accent); }
+.modelid:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+.modelidedit { color: var(--muted); font-size: 12px; }
+.modelid:hover .modelidedit { color: var(--accent); }
+/* 列展示：贴按钮行最右侧；菜单靠右展开，避免超出视口。 */
+.cols-setter { margin-left: auto; }
+.dropdown-menu.right { left: auto; right: 0; }
+.dropdown-menu label { display: flex; align-items: center; gap: 8px;
+                       padding: 9px 14px; cursor: pointer; font-size: 13px; }
+.dropdown-menu label:hover { background: var(--bg); }
+.dropdown-menu label.disabled { cursor: not-allowed; opacity: .7; }
 .banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; display: none; transition: opacity .2s ease; }
 .banner.show { display: block; }
 .banner.err { background: rgba(207,34,46,.1); border: 1px solid var(--err); color: var(--err); }
@@ -214,9 +290,14 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         <button class="act" id="btnSelectAllModels">全选</button>
         <button class="act" id="btnSelectNoneModels">清空</button>
         <label>筛选 <input type="text" id="modelFilter" placeholder="如 glm / gpt" style="width:160px"></label>
+        <div class="dropdown cols-setter">
+          <button class="act" id="btnModelCols" aria-haspopup="true" aria-expanded="false"
+                  title="选择要在表格中展示的列">列展示 ▾</button>
+          <div class="dropdown-menu right" id="modelColsMenu" hidden></div>
+        </div>
       </div>
       <div class="hint">
-        点击某行「别名」即可编辑（留空=清除）。<b>不同供应商的模型设成同一别名</b>，宿主会当成一个 ID 自动调度。
+        点击「模型 ID」列的模型名或其右侧 ✎ 即可编辑别名（留空=恢复官方 ID）。<b>不同供应商的模型设成同一别名</b>，宿主会当成一个 ID 自动调度。
       </div>
       <div id="models"></div>
     </div>
@@ -1072,6 +1153,98 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
   var allModels = [];
 
+  // ---- 模型表列定义 ----
+  //
+  // 表头与每行单元格都从这份描述渲染：列顺序与显隐只有一个来源，不会出现
+  // 「表头藏了、单元格还在」的错位。optional 的列默认隐藏，可按浏览器打开。
+  var MODEL_COLUMNS = [
+    { key: "check", header: "", cell: modelCheckCell },
+    { key: "status", header: "状态", cell: modelStatusCell },
+    { key: "vendor", header: "供应商", cell: modelVendorCell },
+    { key: "model", header: "模型 ID", cell: modelIDCell },
+    { key: "name", header: "名称", cell: function (m) {
+      var td = el("td");
+      var span = el("span", m.name || "—", "name-text");
+      if (m.name) span.title = m.name;
+      td.appendChild(span);
+      return td;
+    } },
+    { key: "credits", header: "费用倍率", cell: modelCreditsCell },
+    { key: "context", header: "上下文", cell: function (m) {
+      return el("td", m.context_length ? formatTokens(m.context_length) : "—");
+    } },
+    { key: "output", header: "输出上限", optional: true, defaultShow: false, cell: function (m) {
+      return el("td", m.max_output_tokens ? formatTokens(m.max_output_tokens) : "—");
+    } },
+    { key: "efforts", header: "推理档位", optional: true, defaultShow: false, cell: function (m) {
+      var levels = (m.efforts || []).join(" / ");
+      return el("td", levels || "—", levels ? "" : "muted");
+    } },
+    { key: "caps", header: "能力", optional: true, defaultShow: true, cell: function (m) {
+      var caps = [];
+      if (m.supports_images) caps.push("图片");
+      if (m.supports_tools) caps.push("工具");
+      return el("td", caps.join(" · ") || "—", caps.length ? "" : "muted");
+    } }
+  ];
+
+  // 偏好存为对象映射 { [colKey]: boolean }：
+  // 缺省时按各列的 defaultShow 处理，具备自然扩展性与向后兼容性。
+  var MODEL_COLUMNS_STORE_KEY = "freetier-model-optional-columns";
+  var columnPrefs = readColumnPrefs();
+  var creditsSortOrder = null; // null | "asc" | "desc"
+
+  function readColumnPrefs() {
+    try {
+      var raw = localStorage.getItem(MODEL_COLUMNS_STORE_KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        var legacy = {};
+        parsed.forEach(function (k) { legacy[k] = true; });
+        return legacy;
+      }
+      return (parsed && typeof parsed === "object") ? parsed : {};
+    } catch (e) {
+      return {};   // 隐私模式/脏数据：回到默认显隐，不阻塞渲染
+    }
+  }
+
+  function columnVisible(col) {
+    if (!col.optional) return true;
+    if (Object.prototype.hasOwnProperty.call(columnPrefs, col.key)) {
+      return !!columnPrefs[col.key];
+    }
+    return !!col.defaultShow;
+  }
+
+  function visibleColumns() {
+    return MODEL_COLUMNS.filter(columnVisible);
+  }
+
+  // modelCreditValue 解析倍率数值，无有效倍率（包括空/未配置）返回 null。
+  function modelCreditValue(model) {
+    var raw = String(model.credits || "").trim();
+    if (!raw) return null;
+    if (raw === "免费") return 0;
+    var cleaned = raw.replace(/\bcredits?\b/ig, "").replace(/^[xX]/, "").replace(/[xX]$/, "").trim();
+    var num = parseFloat(cleaned);
+    if (!isNaN(num) && isFinite(num) && num >= 0) {
+      return num;
+    }
+    return null;
+  }
+
+  // toggleOptionalColumn 只改本地偏好并重渲染，不发任何请求。
+  // 写入失败（隐私模式/配额）时仍按内存值生效，本次会话不受影响。
+  function toggleOptionalColumn(key, show) {
+    columnPrefs[key] = !!show;
+    try {
+      localStorage.setItem(MODEL_COLUMNS_STORE_KEY, JSON.stringify(columnPrefs));
+    } catch (e) { /* 忽略：仅本次会话生效 */ }
+    renderModels();
+  }
+
   function renderModels() {
     var host = document.getElementById("models");
     host.textContent = "";
@@ -1083,8 +1256,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       var text = (bareID + " " + String(m.name || "") + " " + String(m.alias || "") + " " + vendor).toLowerCase();
       return text.indexOf(filter) >= 0;
     });
-    // 排序：状态 + 供应商名称 + 模型 ID（启用在上，禁用在下；同状态内按 供应商名称 + 模型 ID 升序）
-    list.sort(function (a, b) {
+
+    // 默认排序方式：状态 + 供应商名称 + 模型 ID（启用在上，禁用在下；同状态内按 供应商名称 + 模型 ID 升序）
+    function compareDefault(a, b) {
       var statusA = a.disabled ? 1 : 0;
       var statusB = b.disabled ? 1 : 0;
       if (statusA !== statusB) return statusA - statusB;
@@ -1101,6 +1275,22 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         return idA < idB ? -1 : 1;
       }
       return 0;
+    }
+
+    list.sort(function (a, b) {
+      if (creditsSortOrder) {
+        var valA = modelCreditValue(a);
+        var valB = modelCreditValue(b);
+        var hasA = valA !== null;
+        var hasB = valB !== null;
+        // 没有倍率的排在最后
+        if (hasA && !hasB) return -1;
+        if (!hasA && hasB) return 1;
+        if (hasA && hasB && valA !== valB) {
+          return creditsSortOrder === "asc" ? valA - valB : valB - valA;
+        }
+      }
+      return compareDefault(a, b);
     });
     setText("modelCount", allModels.length ? "（" + list.length + " / " + allModels.length + "）" : "");
 
@@ -1111,112 +1301,163 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
         : "暂无模型清单，正在从上游获取…", "muted"));
       return;
     }
+    var columns = visibleColumns();
     var table = el("table");
     var head = el("tr");
-    ["", "状态", "供应商", "模型 ID", "名称", "别名", "上下文", "输出上限", "推理档位", "能力"]
-      .forEach(function (name) { head.appendChild(el("th", name)); });
+    columns.forEach(function (col) {
+      var headerText = col.header;
+      var th = el("th", null, "col-" + col.key);
+      if (col.key === "credits") {
+        th.className += " sortable";
+        th.title = "点击按费用倍率排序（从低到高 / 从高到低 / 恢复默认）";
+        var wrap = el("span", null, "th-sort-wrap");
+        wrap.appendChild(el("span", headerText));
+        var arrows = el("span", null, "sort-arrows" + (creditsSortOrder ? " order-" + creditsSortOrder : ""));
+        arrows.appendChild(el("span", null, "sort-arrow asc"));
+        arrows.appendChild(el("span", null, "sort-arrow desc"));
+        wrap.appendChild(arrows);
+        th.appendChild(wrap);
+        th.addEventListener("click", function () {
+          if (!creditsSortOrder) creditsSortOrder = "asc";
+          else if (creditsSortOrder === "asc") creditsSortOrder = "desc";
+          else creditsSortOrder = null;
+          renderModels();
+        });
+      } else {
+        th.textContent = headerText;
+      }
+      head.appendChild(th);
+    });
     table.appendChild(head);
 
     list.forEach(function (model) {
       var row = el("tr");
-      // 勾选列：用于批量禁用/启用。
-      var checkCell = el("td");
-      var checkbox = document.createElement("input");
-      checkbox.type = "checkbox";
-      checkbox.checked = false;
-      checkbox.setAttribute("data-model-id", model.scope_id || model.id);
-      checkCell.appendChild(checkbox);
-      row.appendChild(checkCell);
-
-      // 状态列：紧挨勾选框，便于对照哪些行被禁用。
-      row.appendChild(cellWith(model.disabled ? pill("已禁用", "err") : pill("正常", "ok")));
-
-      // 供应商列
-      var vendor = vendorLabel(model.vendor_id, model.realm);
-      var vendorCell = el("td");
-      // 国内版用 warn 色区分（海外版用默认色），与账号表保持一致的视觉约定。
-      vendorCell.appendChild(pill(vendor, ""));
-      row.appendChild(vendorCell);
-
-      // 模型 ID 列（裸名，不带供应商前缀）
-      var bareID = String(model.id || "");
-      row.appendChild(el("td", bareID, "mono"));
-
-      row.appendChild(el("td", model.name || "—"));
-
-      // 别名列：行内可编辑，失焦/回车即保存（留空=清除，恢复官方 ID）。
-      row.appendChild(aliasCell(model));
-
-      row.appendChild(el("td", model.context_length ? formatTokens(model.context_length) : "—"));
-      row.appendChild(el("td", model.max_output_tokens ? formatTokens(model.max_output_tokens) : "—"));
-
-      var levels = (model.efforts || []).join(" / ");
-      row.appendChild(el("td", levels || "—", levels ? "" : "muted"));
-
-      var caps = [];
-      if (model.supports_images) caps.push("图片");
-      if (model.supports_tools) caps.push("工具");
-      row.appendChild(el("td", caps.join(" · ") || "—", caps.length ? "" : "muted"));
+      columns.forEach(function (col) {
+        var cell = col.cell(model);
+        cell.className = (cell.className ? cell.className + " " : "") + "col-" + col.key;
+        row.appendChild(cell);
+      });
       table.appendChild(row);
     });
     host.appendChild(table);
   }
 
-  // aliasCell 渲染一个「点击即可编辑」的别名单元格。
-  //
-  // 平时显示当前别名（无别名时显示灰色的「无别名」）；点击空白文本即切换成输入框：
-  // 回车/失焦即保存，Esc 撤销。清空输入框保存 = 清除别名（恢复用官方 ID）。
-  // 每个供应商的每个模型各自独立——提交时带上该模型的 scope_id。
-  function aliasCell(model) {
+  // ---- 模型表的单元格 ----
+
+  // 勾选列：用于批量禁用/启用。
+  function modelCheckCell(model) {
     var cell = el("td");
+    var checkbox = document.createElement("input");
+    checkbox.type = "checkbox";
+    checkbox.checked = false;
+    checkbox.setAttribute("data-model-id", model.scope_id || model.id);
+    cell.appendChild(checkbox);
+    return cell;
+  }
+
+  function modelStatusCell(model) {
+    return cellWith(model.disabled ? pill("已禁用", "err") : pill("正常", "ok"));
+  }
+
+  function modelVendorCell(model) {
+    // 国内版用 warn 色区分（海外版用默认色），与账号表保持一致的视觉约定。
+    return cellWith(pill(vendorLabel(model.vendor_id, model.realm), ""));
+  }
+
+  // formatCredits 归一化倍率样式为始终保留两位小数的 "0.50X"；剥除多余的 "credits" 字符，汉字（如 "免费" / "订阅"）保留。
+  function formatCredits(raw) {
+    var str = String(raw || "").trim();
+    if (!str) return "";
+    var cleaned = str.replace(/\bcredits?\b/ig, "").replace(/^[xX]/, "").replace(/[xX]$/, "").trim();
+    var num = parseFloat(cleaned);
+    if (!isNaN(num) && isFinite(num) && /^[0-9]+(\.[0-9]+)?$/.test(cleaned) && num >= 0) {
+      return num.toFixed(2) + "X";
+    }
+    return str;
+  }
+
+  // modelCreditsCell 显示上游给的额度/费用倍率（如 "0.08X"、"免费"）。
+  // 上游没提供时显示「—」：不猜值，避免把「未知」误导成「免费」。
+  function modelCreditsCell(model) {
+    var credits = formatCredits(model.credits);
+    if (!credits) return el("td", "—", "muted");
+    var cell = el("td", credits, "mono");
+    cell.title = "上游计费倍率：" + credits;
+    return cell;
+  }
+
+  // modelIDCell 渲染「模型 ID / 别名」合并列：显示当前生效的对外 ID，
+  // 右侧 ✎ 表示可编辑。未设别名时就是官方 ID，不出现「无别名」这种中间态。
+  //
+  // 点击文字/铅笔，或聚焦后按回车/空格进入编辑：回车/失焦保存，Esc 取消。
+  // 清空保存 = 清除别名，恢复官方 ID。保存后同步一次宿主注册表。
+  function modelIDCell(model) {
+    var cell = el("td");
+    var bareID = String(model.id || "");
     var saved = model.alias || "";
     var key = String(model.scope_id || model.id);
 
-    // 静态展示态：可点击，点击后切换为输入框。
-    var display = el("span", saved || "无别名", "aliasview" + (saved ? " mono" : " muted"));
-    display.addEventListener("click", function () { beginEdit(); });
+    var wrap = el("span", null, "modelid");
+    wrap.setAttribute("role", "button");
+    wrap.setAttribute("tabindex", "0");
+    var nameSpan = el("span", null, "modelidname mono");
+    var pencil = el("span", "✎", "modelidedit");
+    pencil.setAttribute("aria-hidden", "true");
+    wrap.appendChild(nameSpan);
+    wrap.appendChild(pencil);
+    cell.appendChild(wrap);
+    syncName();
+
+    function syncName() {
+      nameSpan.textContent = saved || bareID;
+      wrap.setAttribute("title", saved
+        ? "点击编辑对外模型 ID（留空恢复官方 ID：" + bareID + "）"
+        : "点击编辑对外模型 ID（留空即用官方 ID：" + bareID + "）");
+    }
 
     function beginEdit() {
       var input = document.createElement("input");
       input.type = "text";
       input.className = "aliasinput";
       input.value = saved;
-      input.placeholder = String(model.id || "");
+      // placeholder 用官方 ID：告诉用户「留空就是默认用它」。
+      input.placeholder = bareID;
       var done = false;
 
-      // finish 提交并回到展示态。alias 为空即清除。
-      function finish(commit) {
+      // finish 提交并回到展示态。focusBack 只在键盘结束时置真，
+      // 失焦提交不抢焦点，避免把用户刚点到的元素顶掉。
+      function finish(commit, focusBack) {
         if (done) return;
         done = true;
         var next = commit ? (input.value || "").trim() : saved;
-        if (next === saved) { restore(); return; }
+        if (next === saved) { restore(focusBack); return; }
         input.disabled = true;
         api("POST", "/models/alias", { model: key, alias: next }).then(function (data) {
-          if (!data) { restore(); return; }
+          if (!data) { restore(focusBack); return; }
           saved = next;
           model.alias = next;
           // 别名的出站翻译已即时生效；这里再同步一次，让 /v1/models 的 ID 跟着变。
           syncModelConfig();
-          restore();
+          restore(focusBack);
         }).catch(function (err) {
           // 保存失败：回到原值并提示（错误是需要用户知晓的，成功则静默）。
           banner("err", err.message);
-          restore();
+          restore(focusBack);
         });
       }
 
-      function restore() {
+      function restore(focusBack) {
         cell.textContent = "";
-        display.textContent = saved || "无别名";
-        display.className = "aliasview" + (saved ? " mono" : " muted");
-        cell.appendChild(display);
+        syncName();
+        cell.appendChild(wrap);
+        if (focusBack) wrap.focus();
       }
 
       input.addEventListener("keydown", function (ev) {
-        if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
-        else if (ev.key === "Escape") { ev.preventDefault(); finish(false); }
+        if (ev.key === "Enter") { ev.preventDefault(); finish(true, true); }
+        else if (ev.key === "Escape") { ev.preventDefault(); finish(false, true); }
       });
-      input.addEventListener("blur", function () { finish(true); });
+      input.addEventListener("blur", function () { finish(true, false); });
 
       cell.textContent = "";
       cell.appendChild(input);
@@ -1224,7 +1465,10 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       input.select();
     }
 
-    cell.appendChild(display);
+    wrap.addEventListener("click", beginEdit);
+    wrap.addEventListener("keydown", function (ev) {
+      if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); beginEdit(); }
+    });
     return cell;
   }
 
@@ -1754,7 +1998,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     if (event.target === this) closeClaimModal();
   });
   document.addEventListener("keydown", function (event) {
-    if (event.key === "Escape") closeClaimModal();
+    if (event.key === "Escape") { closeClaimModal(); closeModelColumnsMenu(); }
   });
   document.getElementById("claimVerifyParam").addEventListener("input", function () {
     if (this.value.trim()) {
@@ -1783,6 +2027,59 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   });
   document.getElementById("btnLoadQuotas").addEventListener("click", function () { loadQuotas(false); });
   document.getElementById("btnLoadModels").addEventListener("click", function () { refreshModels(false); });
+
+  // ---- 模型表列展示 ----
+  //
+  // 列出所有有标题的列：必显列常态勾选且置灰（不可取消勾选），
+  // 可选列（输出上限、推理档位默认隐藏，能力默认展示）可按需切换。
+  // 勾选只改本地偏好并重渲染，不发任何请求；菜单内点击不冒泡，方便连续勾选。
+  function buildModelColumnsMenu() {
+    var menu = document.getElementById("modelColsMenu");
+    if (!menu) return;
+    menu.textContent = "";
+    MODEL_COLUMNS.filter(function (col) { return !!col.header; }).forEach(function (col) {
+      var label = el("label");
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      if (col.optional) {
+        box.checked = columnVisible(col);
+        box.addEventListener("change", function () { toggleOptionalColumn(col.key, box.checked); });
+      } else {
+        box.checked = true;
+        box.disabled = true;
+        label.className = "disabled";
+        label.title = "必显列，不可取消勾选";
+      }
+      label.appendChild(box);
+      label.appendChild(el("span", col.header));
+      menu.appendChild(label);
+    });
+    menu.addEventListener("click", function (event) { event.stopPropagation(); });
+  }
+
+  function closeModelColumnsMenu() {
+    var menu = document.getElementById("modelColsMenu");
+    var btn = document.getElementById("btnModelCols");
+    if (menu) menu.hidden = true;
+    if (btn) btn.setAttribute("aria-expanded", "false");
+  }
+
+  function toggleModelColumnsMenu() {
+    var menu = document.getElementById("modelColsMenu");
+    var btn = document.getElementById("btnModelCols");
+    if (!menu) return;
+    menu.hidden = !menu.hidden;
+    if (btn) btn.setAttribute("aria-expanded", menu.hidden ? "false" : "true");
+  }
+
+  buildModelColumnsMenu();
+  document.getElementById("btnModelCols").addEventListener("click", function (event) {
+    event.stopPropagation();
+    toggleModelColumnsMenu();
+  });
+  // 点击页面其它位置收起列设置（与供应商下拉同一套路）。
+  document.addEventListener("click", closeModelColumnsMenu);
+
   document.getElementById("modelFilter").addEventListener("input", renderModels);
   document.getElementById("btnDisableModels").addEventListener("click", function () { toggleModels(true); });
   document.getElementById("btnEnableModels").addEventListener("click", function () { toggleModels(false); });

@@ -18,6 +18,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -44,6 +45,14 @@ type adapter struct {
 	//
 	// 必须挂在实例上：国内版与国际版的同名上游 key 可能对应不同模型。
 	models modelIndex
+	// credits 是「对外模型 ID → 计费倍率文案」，与 models 同源同生命周期。
+	//
+	// 控制台要展示倍率，但宿主契约（pluginapi.ModelInfo）没有这个字段，
+	// 只能由本实例在转换模型时顺手记下，供 ConsoleModels 回读。
+	creditsMu sync.RWMutex
+	credits   map[string]string
+	// settings 是原始配置键（设备身份需要读 qoder_desktop_version）。
+	settings atomic.Value // map[string]string
 }
 
 // Instances 构造 Qoder 的两个区域实例。
@@ -93,7 +102,17 @@ func newInstance(env core.Env, region Region) core.Vendor {
 		}),
 		region: region,
 	}
+	instance.settings.Store(map[string]string{})
 	return instance
+}
+
+// Configure 保存 Qoder 专属配置（设备身份的桌面端版本覆盖）。
+func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
+	snapshot := make(map[string]string, len(raw))
+	for key, value := range raw {
+		snapshot[key] = value
+	}
+	v.settings.Store(snapshot)
 }
 
 // Match 判断一份凭证是否属于本区域。
@@ -235,7 +254,16 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if errNative != nil {
 		return nil, errNative
 	}
-	result, errCheckin := Checkin(ctx, native)
+	// machineid 的推导与其它 Qoder 调用点（额度、登录、jobToken 交换）保持
+	// 同一口径：上游不校验它的内容，但同一账号在不同链路上报不同的
+	// machineid 等于自曝多设备，没有必要。
+	//
+	// 种子按**账号 token** 取，因此同一机器上的多个国际号各自有一套身份。
+	// 这不影响上游的同人去重（服务端按人/设备判，不看我们报的值），也让每个
+	// 账号的请求在形态上与它自己的 cosy 会话一致。
+	seed := FingerprintSeed("", native.Token)
+	identity := ResolveIdentity(seed, v.settingsSnapshot())
+	result, errCheckin := Checkin(ctx, native, identity)
 	if errCheckin != nil {
 		return nil, errCheckin
 	}
@@ -248,6 +276,21 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 		Message:     result.Message,
 		NotRecorded: result.NotRecorded,
 	}, nil
+}
+
+// settingsSnapshot 返回配置键快照。
+func (v *adapter) settingsSnapshot() map[string]string {
+	if snapshot, okSnapshot := v.settings.Load().(map[string]string); okSnapshot {
+		return snapshot
+	}
+	return nil
+}
+
+// ConfigFields 声明 Qoder 专属 YAML 配置。
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{
+		{Name: "qoder_desktop_version", Type: pluginapi.ConfigFieldTypeString, Description: "cosy-version 桌面端版本覆盖。"},
+	}
 }
 
 // ---- 登录与续期 ----
@@ -394,7 +437,8 @@ func (v *adapter) bridgeCacheKey(cred *Credential) string {
 // Qoder 加密网关要求的 model_config.key / x-model-key。
 func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	slugByKey := v.models.replace(models)
-	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
+	credits := make(map[string]string, len(models))
+	registered := core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		key := strings.TrimSpace(model.Key)
 		if key == "" {
 			return core.ModelDescriptor{}, false
@@ -407,6 +451,9 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 		if name == "" {
 			name = key
 		}
+		if rate := rateLabel(model.PriceFactor); rate != "" {
+			credits[id] = rate
+		}
 		return core.ModelDescriptor{
 			ID:                 id,
 			Name:               name,
@@ -417,6 +464,34 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 			CanDisableThinking: !model.IsReasoning,
 		}, true
 	})
+	v.creditsMu.Lock()
+	v.credits = credits
+	v.creditsMu.Unlock()
+	return registered
+}
+
+// ModelCredits 实现 core.CreditsProvider：返回「对外模型 ID → 计费倍率」。
+//
+// 只报倍率这一维信息，模型清单本身由目录层从注册结果推导。
+func (v *adapter) ModelCredits() map[string]string {
+	v.creditsMu.RLock()
+	defer v.creditsMu.RUnlock()
+	if len(v.credits) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(v.credits))
+	for id, value := range v.credits {
+		out[id] = value
+	}
+	return out
+}
+
+// rateLabel 把上游的 price_factor 转成形如 0.08X 的展示文案；<=0 视为未提供。
+func rateLabel(factor float64) string {
+	if factor <= 0 {
+		return ""
+	}
+	return fmt.Sprintf("%.2fX", factor)
 }
 
 // describeModel 拼接模型说明（带价格倍率）。
