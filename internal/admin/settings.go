@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 
@@ -27,8 +26,8 @@ type settingsUpdateRequest struct {
 
 func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body settingsUpdateRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	changed := map[string]any{}
 	s.deps.MutateState(func(current *state.State) {

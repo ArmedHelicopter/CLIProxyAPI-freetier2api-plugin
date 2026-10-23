@@ -3,7 +3,6 @@ package admin
 // 本文件是任务引擎的管理接口适配层：解析请求、调用 tasks.Service、封装响应。
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -33,8 +32,8 @@ func (s *Service) handleTasksAuto(req pluginapi.ManagementRequest) pluginapi.Man
 		AccountID string `json:"account_id"`
 		TaskCode  string `json:"task_code"`
 	}
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()

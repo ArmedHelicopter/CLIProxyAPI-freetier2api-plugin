@@ -8,7 +8,6 @@ package admin
 // 粘回来，插件就地解析完成登录。
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -29,13 +28,8 @@ type loginCallbackRequest struct {
 // 生成，已经刻意去掉了回调链接本身（里面带 refreshToken / 票据密钥）。
 func (s *Service) handleLoginCallbackRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body loginCallbackRequest
-	if len(req.Body) > 0 {
-		if errUnmarshal := json.Unmarshal(req.Body, &body); errUnmarshal != nil {
-			return JSONResponse(http.StatusBadRequest, map[string]any{
-				"ok": false, "status": string(pluginapi.AuthLoginStatusError),
-				"message": "请求体解析失败，请刷新页面后重试",
-			})
-		}
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	// 入参校验（state 非空、URL 非空）统一由 App.SubmitLoginCallback 负责：
 	// 它是唯一调用供应商的地方，校验放在这里就得再抄一份。

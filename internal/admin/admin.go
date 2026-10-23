@@ -270,6 +270,22 @@ func HTMLResponse(status int, body []byte) pluginapi.ManagementResponse {
 	}
 }
 
+// decodeJSONBody 解码管理请求体。空请求体保持兼容并视为未提供参数；非空
+// 请求体只要不是合法 JSON 就统一由各入口返回 400，避免畸形请求继续执行默认逻辑。
+func decodeJSONBody(raw []byte, target any) error {
+	if len(raw) == 0 {
+		return nil
+	}
+	return json.Unmarshal(raw, target)
+}
+
+// BadJSONRequestResponse 构造统一的畸形 JSON 请求响应。
+func BadJSONRequestResponse() pluginapi.ManagementResponse {
+	return JSONResponse(http.StatusBadRequest, map[string]any{
+		"ok": false, "error": "请求体解析失败，请检查 JSON 格式",
+	})
+}
+
 // JSONResponse 构造 JSON 管理响应。
 func JSONResponse(status int, payload any) pluginapi.ManagementResponse {
 	raw, errMarshal := json.Marshal(payload)

@@ -79,8 +79,8 @@ func (s *Service) resolvePlanTarget(ctx context.Context, callbackID, accountID s
 // 仍看到旧列表。
 func (s *Service) handlePlansPreview(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body planPreviewRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
@@ -111,8 +111,8 @@ func (s *Service) handlePlansPreview(req pluginapi.ManagementRequest) pluginapi.
 // handlePlansClaim 提交人机验证令牌并领取套餐。
 func (s *Service) handlePlansClaim(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body planClaimRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()

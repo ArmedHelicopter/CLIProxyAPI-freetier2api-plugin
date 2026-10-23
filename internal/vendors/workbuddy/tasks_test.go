@@ -107,6 +107,50 @@ func TestParseGrowthHeatmapEmpty(t *testing.T) {
 	}
 }
 
+// TestParseClaimResultRejectsMalformedPayloads 领奖响应解析失败必须显式报错，
+// 不能把 malformed JSON/HTML 静默当成 0 奖励成功。
+func TestParseClaimResultRejectsMalformedPayloads(t *testing.T) {
+	for _, raw := range []string{
+		`{`,
+		`<html><body>upstream error</body></html>`,
+		`{"unexpected":true}`,
+		`null`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			credit, energy, errParse := parseClaimResult(json.RawMessage(raw))
+			if errParse == nil {
+				t.Fatalf("parseClaimResult(%q) returned nil error with %d/%d reward", raw, credit, energy)
+			}
+			if credit != 0 || energy != 0 {
+				t.Fatalf("malformed claim result returned reward %d/%d", credit, energy)
+			}
+		})
+	}
+}
+
+func TestParseClaimResult(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		raw          string
+		wantCredit   int64
+		wantEnergy   int64
+		wantNilError bool
+	}{
+		{"reward", `{"credit":12,"energy":3}`, 12, 3, true},
+		{"already claimed", `{"already_claimed":true}`, 0, 0, true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			credit, energy, errParse := parseClaimResult(json.RawMessage(testCase.raw))
+			if (errParse == nil) != testCase.wantNilError {
+				t.Fatalf("error = %v, want nil=%v", errParse, testCase.wantNilError)
+			}
+			if credit != testCase.wantCredit || energy != testCase.wantEnergy {
+				t.Fatalf("reward = %d/%d, want %d/%d", credit, energy, testCase.wantCredit, testCase.wantEnergy)
+			}
+		})
+	}
+}
+
 // TestTaskSpecsForGlobalRegistersDailyBonus 国际版必须注册每日活跃奖励族。
 func TestTaskSpecsForGlobalRegistersDailyBonus(t *testing.T) {
 	specs := TaskSpecsFor(RegionGlobal)
