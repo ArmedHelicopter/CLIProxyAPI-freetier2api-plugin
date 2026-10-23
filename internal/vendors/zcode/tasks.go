@@ -28,7 +28,11 @@ func billingHeaders(cred *Credential) map[string]string {
 		"User-Agent":   UserAgent,
 	}
 	BuildIdentityHeaders(cred.Profile).Apply(headers)
-	headers["Authorization"] = "Bearer " + cred.JWTToken
+	if strings.TrimSpace(cred.JWTToken) != "" {
+		headers["Authorization"] = "Bearer " + cred.JWTToken
+	} else if strings.TrimSpace(cred.APIKey) != "" {
+		headers["x-api-key"] = cred.APIKey
+	}
 	headers["x-request-id"] = NewUUID()
 	return headers
 }
@@ -572,6 +576,23 @@ func fetchOfferedPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, 
 	return plans, codeSuccess, nil
 }
 
+// ProbeActivity 只读探测账号当前活动资格，不执行领取。
+// 它允许 API Key 账号参与 1024 Dev Day 等不限 Coding Plan 的活动探测。
+func (v *adapter) ProbeActivity(ctx context.Context, cred *core.Credential) ([]core.PlanInfo, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return nil, errNative
+	}
+	if native == nil {
+		return nil, core.NewPluginError("zcode_credential_missing", "zcode credential is nil", http.StatusBadRequest)
+	}
+	// 活跃上报是官方客户端资格同步，不能因缺 JWT 阻止活动探测。
+	if reason := v.ensureActivation(ctx, native); reason != "" {
+		return nil, core.NewPluginError("zcode_activity_activation", reason, http.StatusBadGateway)
+	}
+	return fetchActivityPlans(ctx, native)
+}
+
 // PreviewPlans 返回账号当前可领的套餐（已剔除已持有的）。
 //
 // 空切片表示没有可领的，页面据此把按钮置灰成「已领取」。
@@ -584,6 +605,20 @@ func (v *adapter) PreviewPlans(ctx context.Context, cred *core.Credential) ([]co
 }
 
 // previewPlans 是 PreviewPlans 的原生凭证层实现（领取链路内部复用）。
+func fetchActivityPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, error) {
+	if cred == nil {
+		return nil, core.NewPluginError("zcode_credential_missing", "zcode credential is nil", http.StatusBadRequest)
+	}
+	plans, code, errPreview := fetchOfferedPlans(ctx, cred)
+	if errPreview != nil {
+		return nil, errPreview
+	}
+	if code != codeSuccess {
+		return nil, claimFailure(code, nil)
+	}
+	return plans, nil
+}
+
 func (v *adapter) previewPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, error) {
 	if reason := billingBlockReason(cred); reason != "" {
 		return nil, core.NewPluginError("zcode_no_plan_channel", reason, http.StatusBadRequest)

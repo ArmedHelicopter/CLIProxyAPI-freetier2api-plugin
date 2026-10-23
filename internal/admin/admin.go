@@ -111,6 +111,7 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "GET", Path: prefix + "/school/status", Description: "开学季活动状态。"},
 		{Method: "POST", Path: prefix + "/keepalive", Description: "手动执行 token 保活。"},
 		{Method: "POST", Path: prefix + "/plans/preview", Description: "查询账号当前可领套餐与人机验证控件参数。"},
+		{Method: "POST", Path: prefix + "/activities/preview", Description: "只读探测账号当前活动资格，不执行领取。"},
 		{Method: "POST", Path: prefix + "/plans/claim", Description: "提交人机验证令牌并领取套餐。"},
 		{Method: "POST", Path: prefix + "/login/callback", Description: "提交用户粘贴的 localhost 授权回调链接（远程部署下的登录兜底）。"},
 	}
@@ -204,6 +205,8 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/plans/preview"):
 		return core.OKEnvelope(s.handlePlansPreview(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/activities/preview"):
+		return core.OKEnvelope(s.handleActivitiesPreview(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/plans/claim"):
 		return core.OKEnvelope(s.handlePlansClaim(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/callback"):

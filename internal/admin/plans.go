@@ -35,6 +35,30 @@ type planClaimRequest struct {
 	VerifyRegion string `json:"verify_region,omitempty"`
 }
 
+type activityTarget struct {
+	Probe      core.ActivityProbe
+	Credential *core.Credential
+}
+
+func (s *Service) resolveActivityTarget(ctx context.Context, callbackID, accountID string) (activityTarget, string) {
+	identifier := strings.TrimSpace(accountID)
+	if identifier == "" {
+		return activityTarget{}, "缺少 account_id"
+	}
+	loaded, failures := s.pool.Load(ctx, callbackID, authpkg.Options{Targets: []string{identifier}, EnabledRealms: s.deps.Config().EnabledRealms})
+	if len(loaded) == 0 {
+		if len(failures) > 0 {
+			return activityTarget{}, failures[0].Message
+		}
+		return activityTarget{}, "账号不存在或已被删除"
+	}
+	probe, ok := core.As[core.ActivityProbe](loaded[0].Vendor)
+	if !ok {
+		return activityTarget{}, "该供应商不提供活动探测"
+	}
+	return activityTarget{Probe: probe, Credential: loaded[0].Credential}, ""
+}
+
 // planTarget 是一个已定位的领取目标：账号的套餐能力与对应凭证。
 type planTarget struct {
 	Claimer    core.PlanClaimer
@@ -71,6 +95,27 @@ func (s *Service) resolvePlanTarget(ctx context.Context, callbackID, accountID s
 		Credential: account.Credential,
 		AuthID:     core.FirstNonEmpty(account.Entry.ID, account.Entry.Name),
 	}, ""
+}
+
+func (s *Service) handleActivitiesPreview(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	var body planPreviewRequest
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
+	}
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	target, reason := s.resolveActivityTarget(ctx, hostbridge.RequestCallbackID(req), body.AccountID)
+	if reason != "" {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": reason})
+	}
+	plans, errProbe := target.Probe.ProbeActivity(ctx, target.Credential)
+	if errProbe != nil {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": errProbe.Error()})
+	}
+	if plans == nil {
+		plans = []core.PlanInfo{}
+	}
+	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "activities": plans})
 }
 
 // handlePlansPreview 返回账号**实时**可领套餐与人机验证控件参数。

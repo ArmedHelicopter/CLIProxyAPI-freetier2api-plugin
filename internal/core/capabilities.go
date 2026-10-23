@@ -361,6 +361,12 @@ type PlanClaimer interface {
 	ClaimPlan(ctx context.Context, cred *Credential, req ClaimPlanRequest) (ClaimPlanResponse, error)
 }
 
+// ActivityProbe 是只读的活动探测能力，与套餐领取能力分离。
+// 实现可以在探测前执行必要的无副作用资格同步（例如日活事件），但不得领取。
+type ActivityProbe interface {
+	ProbeActivity(ctx context.Context, cred *Credential) ([]PlanInfo, error)
+}
+
 // RuntimeFieldsProvider 由需要声明管理页可改字段的供应商实现。
 type RuntimeFieldsProvider interface {
 	RuntimeFields() []pluginapi.ConfigField
