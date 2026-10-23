@@ -59,6 +59,8 @@ func Totals(response *pluginapi.QuotaFetchResponse) QuotaTotals {
 		return QuotaTotals{}
 	}
 	var totals QuotaTotals
+	remainingFound := false
+	totalFound := false
 	for _, metric := range response.Summary {
 		if isRemainingKey(metric.Key) && (strings.EqualFold(metric.Unit, "unlimited") || metric.Value < 0) {
 			totals.Unlimited = true
@@ -66,16 +68,21 @@ func Totals(response *pluginapi.QuotaFetchResponse) QuotaTotals {
 		}
 		switch {
 		case isRemainingKey(metric.Key):
-			if totals.Remaining == 0 {
+			// Zero is a valid remaining value. Track presence separately so a
+			// later quota family cannot overwrite an exhausted primary bucket.
+			if !remainingFound {
 				totals.Remaining = int64(metric.Value)
+				remainingFound = true
 			}
 		case isTotalKey(metric.Key):
-			if totals.Total == 0 {
+			// A zero total is also meaningful (for example, no entitlement).
+			if !totalFound {
 				totals.Total = int64(metric.Value)
+				totalFound = true
 			}
 		}
 	}
-	if totals.Total == 0 {
+	if !totalFound {
 		var used int64
 		for _, metric := range response.Summary {
 			if isUsedKey(metric.Key) {

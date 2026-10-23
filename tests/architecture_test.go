@@ -223,6 +223,24 @@ func TestInternalPackageAllowlist(t *testing.T) {
 	}
 }
 
+// TestDeclaredPackagesHaveBoundaryRules prevents a package allowlist entry from
+// silently bypassing the dependency boundary checks. app is the composition root
+// and is intentionally unrestricted; vendors is covered by its per-vendor rules.
+func TestDeclaredPackagesHaveBoundaryRules(t *testing.T) {
+	covered := make(map[string]bool, len(layerRules))
+	for _, rule := range layerRules {
+		covered[strings.Split(rule.pkg, "/")[0]] = true
+	}
+	for pkg := range internalPackages {
+		if pkg == "app" || pkg == "vendors" {
+			continue
+		}
+		if !covered[pkg] {
+			t.Errorf("internal/%s is allowlisted but has no layerRules boundary", pkg)
+		}
+	}
+}
+
 func TestLayerBoundaries(t *testing.T) {
 	root := filepath.Join("..", "internal")
 	for _, rule := range layerRules {
