@@ -1019,10 +1019,14 @@ const (
 
 	// ── 计费 / 额度（zcode.z.ai）────────────────────────────────────────────
 
-	// BillingBase 是计费族基准（current/balance/preview/claim）。
+	// BillingBase 是计费族基准（balance/preview/claim）。
+	//
+	// billing/current 已废弃（官方源码 codingPlanProviderAvailability.ts 与
+	// bigmodelUsageQuotaProvider.ts 均标注），持有套餐改由 billing/balance 的
+	// data.plans 判定，见 tasks.go 的 fetchPlanSnapshot。
 	BillingBase = ZCodeOrigin + "/api/v1/zcode-plan"
 
-	PathBillingCurrent = "/billing/current"
+	// PathBillingBalance 同时返回 data.plans（持有套餐）与 data.balances（余量）。
 	PathBillingBalance = "/billing/balance"
 	// PathBillingPreview 列出上游当前投放的套餐（未过滤已持有）。
 	PathBillingPreview = "/billing/preview"
@@ -1030,6 +1034,13 @@ const (
 	PathBillingClaim  = "/billing/claim"
 	PathUsage         = "/usage"
 	PathClientConfigs = "/api/v1/client/configs"
+
+	// PathEventReport 是客户端埋点上报端点。
+	//
+	// **不在 zcode-plan 之下**（拼 BillingBase 会 404），也不带 Authorization。
+	// 上游把它当作活动套餐的投放资格信号：官方桌面端每次启动发 app_launch、
+	// 每天发一次 app_daily_active，缺了这两条 billing/preview 就恒空。
+	PathEventReport = "/api/v1/event/report"
 
 	// ── 客户端指纹 ──────────────────────────────────────────────────────────
 

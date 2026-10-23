@@ -1356,7 +1356,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   }
 
   function modelStatusCell(model) {
-    return cellWith(model.disabled ? pill("已禁用", "err") : pill("正常", "ok"));
+    return cellWith(model.disabled ? pill("禁用", "err") : pill("正常", "ok"));
   }
 
   function modelVendorCell(model) {

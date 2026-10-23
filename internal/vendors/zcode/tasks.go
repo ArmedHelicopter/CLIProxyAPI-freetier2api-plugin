@@ -153,8 +153,8 @@ func classifyBillingOutcome(code int, body map[string]any) string {
 	return base
 }
 
-// FetchQuota 查询 ZCode 账号的套餐与余量。
-func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchResponse, error) {
+// fetchQuota 查询 ZCode 账号的套餐与余量。
+func (v *adapter) fetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchResponse, error) {
 	if cred == nil {
 		return nil, transientErr("zcode credential is nil")
 	}
@@ -179,44 +179,49 @@ func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchRes
 
 	// 一次快照同时供给三处：订阅名、各模型余量、套餐领取状态。
 	// 多出的那一次 preview 请求换来的是「按钮是否置灰」不必另开轮询端点。
-	snapshot := fetchPlanSnapshot(ctx, cred)
+	snapshot := v.fetchPlanSnapshot(ctx, cred)
 	applySubscription(snapshot, response)
 	response.Claim = claimStatusOf(snapshot)
-
-	metrics, errBalance := fetchBalances(ctx, cred)
-	if errBalance != nil {
-		return nil, errBalance
+	response.Summary = append(response.Summary, snapshot.metrics...)
+	if snapshot.errBalance != nil {
+		return nil, snapshot.errBalance
 	}
-	response.Summary = append(response.Summary, metrics...)
 	return response, nil
 }
 
 // applySubscription 用已持有的套餐补充订阅名（失败时保留默认值）。
 //
-// 数据来自套餐快照里已经拿到的 billing/current，不额外发请求。
+// 数据来自套餐快照里已经拿到的 billing/balance，不额外发请求。
 func applySubscription(snapshot planSnapshot, response *pluginapi.QuotaFetchResponse) {
-	for _, plan := range snapshot.offered {
-		if snapshot.held[plan.PlanID] && plan.Name != "" {
-			response.Subscription.Plan = plan.Name
-			response.Subscription.TierName = plan.PlanID
-			return
+	for _, plan := range snapshot.plans {
+		status := strings.ToLower(strings.TrimSpace(core.RawStringField(plan, "status")))
+		if status != "" && status != "active" {
+			continue
 		}
+		name := core.RawStringField(plan, "name")
+		if name == "" {
+			continue
+		}
+		response.Subscription.Plan = name
+		response.Subscription.TierName = core.FirstNonEmpty(
+			normalizePlanID(core.FirstNonEmpty(
+				core.RawStringField(plan, "plan_id"),
+				core.RawStringField(plan, "planId"),
+			)),
+			"zcode",
+		)
+		return
 	}
 }
 
-// fetchBalances 读取各模型余量并转成指标。
-func fetchBalances(ctx context.Context, cred *Credential) ([]pluginapi.QuotaMetric, error) {
-	code, body, errRequest := billingRequest(ctx, cred, "GET", PathBillingBalance, nil)
-	if errRequest != nil {
-		return nil, errRequest
-	}
-	if code != codeSuccess {
-		return nil, Classify(0, classifyBillingOutcome(code, body))
-	}
-
+// balanceMetrics 把 billing/balance 的额度桶转成指标。
+//
+// balance 同时给出持有套餐（data.plans）与余量（data.balances），一次请求供两者，
+// 这也是取代废弃 billing/current 的原因。
+func balanceMetrics(body map[string]any) []pluginapi.QuotaMetric {
 	balances, _ := dataMap(body)["balances"].([]any)
 	if len(balances) == 0 {
-		return nil, nil
+		return nil
 	}
 
 	metrics := make([]pluginapi.QuotaMetric, 0, len(balances))
@@ -236,7 +241,7 @@ func fetchBalances(ctx context.Context, cred *Credential) ([]pluginapi.QuotaMetr
 			Unit:  "tokens",
 		})
 	}
-	return metrics, nil
+	return metrics
 }
 
 // sanitizeMetricKey 把模型名转成稳定的指标键。
@@ -412,16 +417,24 @@ func parseCaptchaConfig(body []byte) core.CaptchaConfig {
 
 // planSnapshot 是一次「账号套餐视图」：上游投放了什么、账号已经持有什么。
 //
-// 两者都取自 billing 族：持有情况在 billing/current，投放情况在
-// billing/preview。一次快照就是两个请求，没有多余开销——它同时供额度查询、
-// 按钮状态与领取前的校验复用。
+// 全部取自 billing 族：投放情况在 billing/preview，持有情况与余量在
+// billing/balance（billing/current 已废弃，balance 的 data.plans 才是权威）。
+// 一次快照就是两个请求，供额度查询、按钮状态与领取前的校验复用。
 type planSnapshot struct {
 	// offered 是上游当前投放的套餐（按优先级降序）。
 	offered []core.PlanInfo
 	// held 是账号已持有且仍生效的套餐 ID 集合。
 	held map[string]bool
-	// errPreview 是 preview 请求的失败原因（current 失败时 held 为空）。
+	// plans 是 balance 返回的原始套餐条目（订阅名与状态展示用）。
+	plans []map[string]any
+	// metrics 是 balance 换算出的各模型余量。
+	metrics []pluginapi.QuotaMetric
+	// errPreview 是 preview 请求的失败原因（balance 失败时 held 为空）。
 	errPreview error
+	// errBalance 是 balance 请求的失败原因；非空时额度结果不完整。
+	errBalance error
+	// errActivation 是活跃上报的失败原因，用于解释「为什么一个活动都看不到」。
+	errActivation string
 }
 
 // claimable 返回尚未领取的投放套餐。
@@ -437,14 +450,29 @@ func (s planSnapshot) claimable() []core.PlanInfo {
 
 // fetchPlanSnapshot 拉取套餐视图。
 //
-// current 失败不算整体失败：此时把持有集合当作空（结果偏保守——已领的套餐
-// 会被再列成可领，用户点下去拿到上游 1003，语义依然正确）。preview 失败会
-// 记进 errPreview，由调用方决定是降级还是报错。
-func fetchPlanSnapshot(ctx context.Context, cred *Credential) planSnapshot {
+// 顺序有语义：活跃上报必须**先于** preview——上游按「当日活跃」决定投不投活动，
+// 反过来做会让新的一天永远拿不到活动（见 activation.go）。
+//
+// balance 失败不算整体失败：此时把持有集合当作空（结果偏保守——已领的套餐
+// 会被再列成可领，用户点下去拿到上游 1003，语义依然正确），但额度与订阅名
+// 会缺失，调用方据 errBalance 决定是否上报失败。preview 失败记进 errPreview。
+func (v *adapter) fetchPlanSnapshot(ctx context.Context, cred *Credential) planSnapshot {
 	snapshot := planSnapshot{held: map[string]bool{}}
-	if code, body, err := billingRequest(ctx, cred, http.MethodGet, PathBillingCurrent, nil); err == nil && code == codeSuccess {
-		snapshot.held = heldPlanIDs(body)
+	snapshot.errActivation = v.ensureActivation(ctx, cred)
+
+	code, body, errBalance := billingRequest(ctx, cred, http.MethodGet,
+		PathBillingBalance+"?app_version="+url.QueryEscape(ClientAppVersion), nil)
+	switch {
+	case errBalance != nil:
+		snapshot.errBalance = errBalance
+	case code != codeSuccess:
+		snapshot.errBalance = Classify(0, classifyBillingOutcome(code, body))
+	default:
+		snapshot.plans = planRows(body)
+		snapshot.held = heldPlanIDs(snapshot.plans, serverSeconds(body))
+		snapshot.metrics = balanceMetrics(body)
 	}
+
 	offered, code, errOffered := fetchOfferedPlans(ctx, cred)
 	if errOffered != nil {
 		snapshot.errPreview = errOffered
@@ -458,19 +486,40 @@ func fetchPlanSnapshot(ctx context.Context, cred *Credential) planSnapshot {
 	return snapshot
 }
 
-// heldPlanIDs 从 billing/current 响应里取账号已持有且生效的套餐 ID。
+// planRows 取 balance 响应里的 data.plans。
+func planRows(body map[string]any) []map[string]any {
+	raw, _ := dataMap(body)["plans"].([]any)
+	rows := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if entry, okEntry := item.(map[string]any); okEntry {
+			rows = append(rows, entry)
+		}
+	}
+	return rows
+}
+
+// serverSeconds 取响应体里的服务端时间（秒）；缺失时返回 0。
+//
+// 用服务端时间而不是本机时钟：过期判定要跟上游口径一致，本机时钟漂移会让
+// 刚结束的活动继续显示成「已持有」。
+func serverSeconds(body map[string]any) int64 {
+	return int64(floatField(dataMap(body), "server_time"))
+}
+
+// heldPlanIDs 从 balance 的 data.plans 里取账号已持有且生效的套餐 ID。
 //
 // status 非 active（已过期 / 已停用）的不算持有，否则活动下线后按钮会永远灰着。
-func heldPlanIDs(body map[string]any) map[string]bool {
+// status 缺失时按 active 处理（上游历史形态），但仍受 ends_at 约束。
+func heldPlanIDs(plans []map[string]any, serverTime int64) map[string]bool {
 	held := map[string]bool{}
-	raw, _ := dataMap(body)["plans"].([]any)
-	for _, item := range raw {
-		entry, okEntry := item.(map[string]any)
-		if !okEntry {
-			continue
-		}
+	for _, entry := range plans {
 		status := strings.ToLower(strings.TrimSpace(core.RawStringField(entry, "status")))
 		if status != "" && status != "active" {
+			continue
+		}
+		// 官方客户端同样把「active 但已过 ends_at」归一成 expired
+		// （zaiStartPlanBilling.ts 的 normalizeStartPlanExpiry）。
+		if endsAt := floatField(entry, "ends_at"); endsAt > 0 && serverTime > 0 && endsAt <= float64(serverTime) {
 			continue
 		}
 		planID := normalizePlanID(core.FirstNonEmpty(
@@ -526,29 +575,41 @@ func fetchOfferedPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, 
 // PreviewPlans 返回账号当前可领的套餐（已剔除已持有的）。
 //
 // 空切片表示没有可领的，页面据此把按钮置灰成「已领取」。
-func PreviewPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, error) {
+func (v *adapter) PreviewPlans(ctx context.Context, cred *core.Credential) ([]core.PlanInfo, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return nil, errNative
+	}
+	return v.previewPlans(ctx, native)
+}
+
+// previewPlans 是 PreviewPlans 的原生凭证层实现（领取链路内部复用）。
+func (v *adapter) previewPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, error) {
 	if reason := billingBlockReason(cred); reason != "" {
 		return nil, core.NewPluginError("zcode_no_plan_channel", reason, http.StatusBadRequest)
 	}
-	snapshot := fetchPlanSnapshot(ctx, cred)
+	snapshot := v.fetchPlanSnapshot(ctx, cred)
 	if snapshot.errPreview != nil {
 		return nil, snapshot.errPreview
 	}
-	claimable := snapshot.claimable()
-	if len(claimable) == 0 {
-		return nil, nil
-	}
-	return claimable, nil
+	return snapshot.claimable(), nil
 }
 
 // claimStatusOf 把套餐视图折成额度响应里的领取状态。
+//
+// **「空列表」与「没查到」必须分开**：preview 成功且确实没有投放时才是「已领取」；
+// 活跃上报或 preview 失败时说成「已领取」是在骗页面，用户会以为没活动可领而错过。
 func claimStatusOf(snapshot planSnapshot) *pluginapi.ClaimStatus {
 	status := &pluginapi.ClaimStatus{
 		Available: len(snapshot.offered),
 		Claimable: len(snapshot.claimable()),
 	}
-	if snapshot.errPreview != nil {
+	switch {
+	case snapshot.errPreview != nil:
 		status.Error = snapshot.errPreview.Error()
+	case len(snapshot.offered) == 0 && snapshot.errActivation != "":
+		// 活动投放以当日活跃为资格：没报上活跃，空列表不说明「已领完」。
+		status.Error = snapshot.errActivation
 	}
 	return status
 }
@@ -665,7 +726,7 @@ func (v *adapter) claimPlan(ctx context.Context, cred *Credential, req core.Clai
 			"zcode_captcha_required", "请先在页面上完成人机验证", http.StatusBadRequest)
 	}
 
-	plan, errPick := pickClaimPlan(ctx, cred, req.PlanID)
+	plan, errPick := v.pickClaimPlan(ctx, cred, req.PlanID)
 	if errPick != nil {
 		return core.ClaimPlanResponse{}, errPick
 	}
@@ -706,8 +767,8 @@ func (v *adapter) claimPlan(ctx context.Context, cred *Credential, req core.Clai
 //
 // 指定 plan_id 时校验它当前确实可领（预览里存在且未持有）；没指定就取
 // 优先级最高的可领项。两者都拿不到候选时报错，避免把无效plan_id 打给上游。
-func pickClaimPlan(ctx context.Context, cred *Credential, planID string) (*core.PlanInfo, error) {
-	available, errPreview := PreviewPlans(ctx, cred)
+func (v *adapter) pickClaimPlan(ctx context.Context, cred *Credential, planID string) (*core.PlanInfo, error) {
+	available, errPreview := v.previewPlans(ctx, cred)
 	if errPreview != nil {
 		return nil, errPreview
 	}
@@ -775,15 +836,6 @@ var claimTimezone = time.FixedZone("Asia/Shanghai", 8*3600)
 // CaptchaConfig 实现 core.CaptchaProvider。
 func (v *adapter) CaptchaConfig(ctx context.Context) (core.CaptchaConfig, error) {
 	return FetchCaptchaConfig(ctx)
-}
-
-// PreviewPlans 实现 core.PlanPreviewProvider。
-func (v *adapter) PreviewPlans(ctx context.Context, cred *core.Credential) ([]core.PlanInfo, error) {
-	native, errNative := v.Native(cred)
-	if errNative != nil {
-		return nil, errNative
-	}
-	return PreviewPlans(ctx, native)
 }
 
 // ClaimPlan 实现 core.PlanClaimProvider。

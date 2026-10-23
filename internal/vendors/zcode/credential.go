@@ -269,11 +269,13 @@ func decodeJWTPayload(segment string) map[string]any {
 	return claims
 }
 
-// 计费族（billing/*、usage、event/report）的公共请求层。
+// 计费族（billing/*、usage）的公共请求层。
 //
 // 这些端点都在 zcode.z.ai 的 zcode-plan 之下，共用同一套身份头，且都**必须**
 // 带 X-Device-Mid——缺失时上游返回 code=3001。鉴权用 Coding Plan JWT
 // （API Key 通道没有套餐概念，不参与计费族）。
+//
+// event/report 不在此列：它不在 zcode-plan 之下、也不需要鉴权，见 activation.go。
 //
 // 参考 zcode2api/app/quota.py 的 _auth_headers 与 app/claim.py 的 _billing_request。
 
@@ -284,14 +286,14 @@ const (
 	billingMaxBody = 4 << 20
 )
 
-// 额度查询：billing/current（套餐）+ billing/balance（余量）。
+// 额度查询：billing/balance（持有套餐 + 余量）。
 //
 // 只对 Coding Plan（JWT）账号有意义——API Key 是用户自带的按量付费 Key，
 // 没有套餐窗口。参考 zcode2api/app/quota.py。
 
 // 每账号客户端设备档案（一号一台设备）与上游身份头构造。
 //
-// 为什么需要它：billing 族（current/balance/preview/claim）**必需** X-Device-Mid，
+// 为什么需要它：billing 族（balance/preview/claim）**必需** X-Device-Mid，
 // 缺失时上游返回 code=3001；同时上游按设备聚类做风控，多个账号共用同一套
 // 平台/内核/分辨率会聚成「一台机器开了 N 个账号」的关联信号。
 //
