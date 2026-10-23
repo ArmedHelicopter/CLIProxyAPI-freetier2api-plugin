@@ -1,6 +1,7 @@
 package zcode
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -119,11 +120,11 @@ func TestLocalDateFollowsProfileTimezone(t *testing.T) {
 func TestEnsureActivationExplainsMissingUserID(t *testing.T) {
 	// 无 user_id 时不上报，但必须给出原因：否则用户只会看到永远空的活动列表。
 	v := Instances(core.Env{})[0].(*adapter)
-	reason := v.ensureActivation(t.Context(), &Credential{JWTToken: "not-a-jwt"})
+	reason := v.ensureActivation(context.Background(), &Credential{JWTToken: "not-a-jwt"})
 	if reason == "" {
 		t.Fatal("缺少 user_id 时必须返回原因")
 	}
-	if reason := v.ensureActivation(t.Context(), nil); reason != "" {
+	if reason := v.ensureActivation(context.Background(), nil); reason != "" {
 		t.Fatalf("nil 凭证应静默, got %q", reason)
 	}
 }
