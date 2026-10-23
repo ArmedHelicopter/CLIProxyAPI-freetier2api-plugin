@@ -773,17 +773,20 @@ func PathSigFrom(rawURL string) (string, error) {
 	return p, nil
 }
 
-const qoderMaxResponseBytes int64 = 1 << 20
+// shortResponseMaxBytes 是 Qoder 短响应（模型目录、额度、签到、换取 jobToken、
+// userinfo、登录轮询）的读取上限。这些接口正常响应都在几十 KB 内，超限说明
+// 上游返回了异常内容（HTML 错误页、代理注入），必须拒绝而不是无界读进内存。
+const shortResponseMaxBytes int64 = 1 << 20
 
 // readQoderResponseBody 读取 Qoder 短响应，并拒绝超过上限的正文。
 // 读取 limit+1 字节用于区分「恰好达到上限」和「被截断」，避免静默解析半截 JSON。
 func readQoderResponseBody(body io.Reader) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(body, qoderMaxResponseBytes+1))
+	data, err := io.ReadAll(io.LimitReader(body, shortResponseMaxBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if int64(len(data)) > qoderMaxResponseBytes {
-		return nil, fmt.Errorf("qoder response body exceeds %d bytes", qoderMaxResponseBytes)
+	if int64(len(data)) > shortResponseMaxBytes {
+		return nil, fmt.Errorf("qoder response body exceeds %d bytes", shortResponseMaxBytes)
 	}
 	return data, nil
 }

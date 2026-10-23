@@ -25,8 +25,8 @@ type settingsUpdateRequest struct {
 }
 
 func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body settingsUpdateRequest
-	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+	body, errDecode := decodeRequest[settingsUpdateRequest](req.Body)
+	if errDecode != nil {
 		return BadJSONRequestResponse()
 	}
 	changed := map[string]any{}

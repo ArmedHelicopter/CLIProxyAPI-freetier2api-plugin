@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"regexp"
 	"sort"
@@ -133,7 +132,10 @@ func FetchUserInfoWithToken(ctx context.Context, token string, region Region) (m
 	}
 	defer resp.Body.Close()
 	var result map[string]interface{}
-	raw, _ := io.ReadAll(resp.Body)
+	raw, errRead := readQoderResponseBody(resp.Body)
+	if errRead != nil {
+		return nil, fmt.Errorf("read qoder userinfo: %w", errRead)
+	}
 	if err := json.Unmarshal(raw, &result); err != nil {
 		return nil, err
 	}

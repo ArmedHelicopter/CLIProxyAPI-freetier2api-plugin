@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -32,8 +31,6 @@ const (
 	loginFlowTTL = 10 * time.Minute
 	// loginHTTPTimeout 是登录相关请求的上限。
 	loginHTTPTimeout = 30 * time.Second
-	// loginMaxResponseBytes 是登录响应的读取上限。
-	loginMaxResponseBytes = 1 << 20
 	// loginPollInterval 是同一会话两次访问上游 poll 端点之间的最小间隔。
 	//
 	// 控制台页的轮询频率远高于上游建议（上游客户端是 1 秒一次），
@@ -153,7 +150,10 @@ func pollDeviceToken(ctx context.Context, entry *pendingLogin) (token, refreshTo
 		return "", "", false, errDo
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, loginMaxResponseBytes))
+	body, errRead := readQoderResponseBody(resp.Body)
+	if errRead != nil {
+		return "", "", false, fmt.Errorf("读取上游 poll 响应失败：%w", errRead)
+	}
 
 	switch resp.StatusCode {
 	case http.StatusNotFound:

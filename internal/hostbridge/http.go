@@ -271,7 +271,11 @@ func (b *streamBody) Read(p []byte) (int, error) {
 // errTooManyEmptyReads 表示宿主持续返回空分片，流已被主动终止。
 var errTooManyEmptyReads = errors.New("host http stream returned too many empty chunks")
 
-// readChunk 向宿主索要一个分片。空分片时退避，并限制连续空分片次数，避免空转。
+// readChunk 向宿主索要一个分片。
+//
+// 空分片不是结束信号：宿主桥接在缓冲区暂时为空时会返回 payload=nil。处理方式
+// 是退避重试，并给单次调用里的连续空分片设上限——桥接异常时不能永久空转。
+// 每次 Read 都是一次新的 readChunk，计数器与退避自然从头开始。
 func (b *streamBody) readChunk() ([]byte, error) {
 	if strings.TrimSpace(b.streamID) == "" {
 		return nil, errors.New("host http stream id is missing")
@@ -306,14 +310,10 @@ func (b *streamBody) readChunk() ([]byte, error) {
 			return nil, errTooManyEmptyReads
 		}
 		// 空分片：指数退避让出 CPU，直到有数据、结束或 context 取消。
-		timer := time.NewTimer(backoff)
 		select {
 		case <-b.ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
 			return nil, b.ctx.Err()
-		case <-timer.C:
+		case <-time.After(backoff):
 		}
 		if backoff < emptyReadBackoffMax {
 			backoff *= 2

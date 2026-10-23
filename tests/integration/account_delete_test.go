@@ -9,9 +9,8 @@ package tests
 // 保护直接以 filepath.IsAbs 拒绝，Windows 桌面版点「删除」只会得到
 // 「拒绝删除非绝对路径」，账号永远删不掉。
 //
-// 修复与宿主管理接口 DELETE /v0/management/auth-files 的解析规则保持一致：
-// 非绝对路径先按宿主工作目录（插件与宿主同进程）解析成绝对路径，再走
-// .json / 符号链接 / 目录 三道安全检查。
+// 路径归一化现在统一在 hostbridge 边界完成（hostbridge.ResolveAuthPath），
+// 这里用「工作目录 / oauth 平级」的真实布局复现宿主的相对 auth-dir。
 
 import (
 	"encoding/json"
@@ -19,67 +18,10 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-
-	"freetier2api-plugin/cpasdk/pluginabi"
-	"freetier2api-plugin/cpasdk/pluginapi"
 )
 
 // traeCredentialJSON 是一份可被 Trae 供应商解析的凭证（删除前要校验归属）。
 const traeCredentialJSON = `{"vendor":"traecn","region":"cn","access_token":"test-access-token","uid":"2487573687317868"}`
-
-// managementCallWithBody 调一次带 JSON body 的插件管理接口。
-func managementCallWithBody(t *testing.T, method, path string, body any) pluginapi.ManagementResponse {
-	t.Helper()
-	request := pluginapi.ManagementRequest{
-		Method:  method,
-		Path:    "/v0/management/plugins/freetier2api" + path,
-		Headers: http.Header{"X-Host-Callback-Id": []string{testCallbackID}},
-	}
-	if body != nil {
-		request.Body = mustMarshal(body)
-	}
-	raw, errHandle := testApp.HandleMethod(pluginabi.MethodManagementHandle, mustMarshal(request))
-	if errHandle != nil {
-		t.Fatalf("%s %s: %v", method, path, errHandle)
-	}
-	return decodeManagementResponse(t, raw)
-}
-
-// decodeManagementResponse 解开 management.handle 的信封，取出响应体。
-func decodeManagementResponse(t *testing.T, raw []byte) pluginapi.ManagementResponse {
-	t.Helper()
-	var env abiEnvelope
-	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
-		t.Fatalf("decode envelope: %v (raw=%s)", errUnmarshal, raw)
-	}
-	var response pluginapi.ManagementResponse
-	if errUnmarshal := json.Unmarshal(env.Result, &response); errUnmarshal != nil {
-		t.Fatalf("decode management response: %v (raw=%s)", errUnmarshal, env.Result)
-	}
-	return response
-}
-
-// newRelativeAuthFile 在测试工作目录里落一份凭证文件，返回（相对文件名, 绝对路径）。
-//
-// 刻意放在工作目录而不是 t.TempDir()：后者在 Windows 上通常位于另一块盘，
-// filepath.Rel 跨盘无法构造出宿主实际返回的 `..\oauth\<name>.json` 形态。
-func newRelativeAuthFile(t *testing.T, pattern, content string) (string, string) {
-	t.Helper()
-	file, errTemp := os.CreateTemp(".", pattern)
-	if errTemp != nil {
-		t.Fatalf("create temp auth file: %v", errTemp)
-	}
-	absolute := file.Name()
-	t.Cleanup(func() { _ = os.Remove(absolute) })
-	if _, errWrite := file.WriteString(content); errWrite != nil {
-		_ = file.Close()
-		t.Fatalf("write temp auth file: %v", errWrite)
-	}
-	if errClose := file.Close(); errClose != nil {
-		t.Fatalf("close temp auth file: %v", errClose)
-	}
-	return filepath.Base(absolute), absolute
-}
 
 // accountDeleteResult 是 POST /accounts/delete 的响应形状。
 type accountDeleteResult struct {
@@ -92,14 +34,86 @@ type accountDeleteResult struct {
 	} `json:"results"`
 }
 
+// relativeAuthFile 复现宿主的相对 auth-dir 布局：
+//
+//	<root>/core    ← 进程工作目录（宿主 cpa-core 的位置）
+//	<root>/oauth   ← auth-dir（配置为 ../oauth）
+//
+// 返回宿主实际会给出的相对路径（`../oauth/<name>`）与绝对路径。
+func relativeAuthFile(t *testing.T, name, content string) (relative, absolute string) {
+	t.Helper()
+	root := t.TempDir()
+	work := filepath.Join(root, "core")
+	oauth := filepath.Join(root, "oauth")
+	for _, dir := range []string{work, oauth} {
+		if errMkdir := os.MkdirAll(dir, 0o755); errMkdir != nil {
+			t.Fatalf("mkdir %s: %v", dir, errMkdir)
+		}
+	}
+	absolute = filepath.Join(oauth, name)
+	if errWrite := os.WriteFile(absolute, []byte(content), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+	chdirForTest(t, work)
+	return filepath.Join("..", "oauth", name), absolute
+}
+
+// chdirForTest 切换工作目录并在用例结束还原：路径归一化依赖进程工作目录。
+func chdirForTest(t *testing.T, dir string) {
+	t.Helper()
+	previous, errGetwd := os.Getwd()
+	if errGetwd != nil {
+		t.Fatalf("getwd: %v", errGetwd)
+	}
+	if errChdir := os.Chdir(dir); errChdir != nil {
+		t.Fatalf("chdir %s: %v", dir, errChdir)
+	}
+	t.Cleanup(func() { _ = os.Chdir(previous) })
+}
+
+// TestAccountDeleteWithAbsoluteHostPath 覆盖标准 CLIProxyAPI 部署：auth-dir 默认
+// `~/.cli-proxy-api` 展开后是绝对路径，删除必须照常工作（#14 之前这条本来就是通的，
+// 但归一化改动不能破坏它）。
+func TestAccountDeleteWithAbsoluteHostPath(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+
+	name := "delete-absolute-1.json"
+	dir := t.TempDir()
+	absolute := filepath.Join(dir, name)
+	if errWrite := os.WriteFile(absolute, []byte(traeCredentialJSON), 0o600); errWrite != nil {
+		t.Fatalf("write auth file: %v", errWrite)
+	}
+	host.addAccount("1", name, traeCredentialJSON)
+	host.SetAuthFilePath("1", absolute)
+
+	response := managementCallWithBody(t, "POST", "/accounts/delete", map[string]any{
+		"account_ids": []string{name},
+	})
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("/accounts/delete = %d: %s", response.StatusCode, response.Body)
+	}
+	var payload accountDeleteResult
+	if errUnmarshal := json.Unmarshal(response.Body, &payload); errUnmarshal != nil {
+		t.Fatalf("decode delete response: %v (%s)", errUnmarshal, response.Body)
+	}
+	if !payload.OK || payload.Deleted != 1 || len(payload.Results) != 1 || !payload.Results[0].OK {
+		t.Fatalf("绝对路径删除失败: %s", response.Body)
+	}
+	if _, errStat := os.Stat(absolute); !os.IsNotExist(errStat) {
+		t.Fatalf("凭证文件应已删除，实际 stat 结果: %v", errStat)
+	}
+}
+
 // TestAccountDeleteResolvesHostRelativePath 复现事故：宿主返回相对路径时删除必须成功。
 func TestAccountDeleteResolvesHostRelativePath(t *testing.T) {
 	host := installFakeHost(t)
 	setupTestPlugin(t)
 
-	name, absolute := newRelativeAuthFile(t, "delete-relative-*.json", traeCredentialJSON)
+	name := "delete-relative-1.json"
+	relative, absolute := relativeAuthFile(t, name, traeCredentialJSON)
 	host.addAccount("1", name, traeCredentialJSON)
-	host.SetAuthFilePath("1", name) // 宿主原样返回相对路径
+	host.SetAuthFilePath("1", relative)
 
 	response := managementCallWithBody(t, "POST", "/accounts/delete", map[string]any{
 		"account_ids": []string{name},
@@ -125,9 +139,10 @@ func TestAccountDeleteKeepsRelativePathGuards(t *testing.T) {
 	host := installFakeHost(t)
 	setupTestPlugin(t)
 
-	name, absolute := newRelativeAuthFile(t, "delete-guard-*.txt", traeCredentialJSON)
+	name := "delete-guard-1.txt"
+	relative, absolute := relativeAuthFile(t, name, traeCredentialJSON)
 	host.addAccount("1", name, traeCredentialJSON)
-	host.SetAuthFilePath("1", name)
+	host.SetAuthFilePath("1", relative)
 
 	response := managementCallWithBody(t, "POST", "/accounts/delete", map[string]any{
 		"account_ids": []string{name},
@@ -144,5 +159,34 @@ func TestAccountDeleteKeepsRelativePathGuards(t *testing.T) {
 	}
 	if _, errStat := os.Stat(absolute); errStat != nil {
 		t.Fatalf("被拒绝删除的文件不应消失: %v", errStat)
+	}
+}
+
+// TestAccountDeleteReportsMissingFile 锁定「文件不存在 ≠ 已删除」。
+// 宿主路径若因工作目录基准不同而指向别处，静默成功会让页面显示「已删除」
+// 而账号其实还在。
+func TestAccountDeleteReportsMissingFile(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+
+	root := t.TempDir()
+	work := filepath.Join(root, "core")
+	if errMkdir := os.MkdirAll(work, 0o755); errMkdir != nil {
+		t.Fatalf("mkdir: %v", errMkdir)
+	}
+	chdirForTest(t, work)
+	name := "delete-missing-1.json"
+	host.addAccount("1", name, traeCredentialJSON)
+	host.SetAuthFilePath("1", filepath.Join("..", "oauth", name))
+
+	response := managementCallWithBody(t, "POST", "/accounts/delete", map[string]any{
+		"account_ids": []string{name},
+	})
+	var payload accountDeleteResult
+	if errUnmarshal := json.Unmarshal(response.Body, &payload); errUnmarshal != nil {
+		t.Fatalf("decode delete response: %v (%s)", errUnmarshal, response.Body)
+	}
+	if payload.Deleted != 0 || len(payload.Results) != 1 || payload.Results[0].OK {
+		t.Fatalf("文件不存在时不应报告删除成功: %s", response.Body)
 	}
 }

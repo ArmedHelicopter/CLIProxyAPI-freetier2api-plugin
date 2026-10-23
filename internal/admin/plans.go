@@ -78,8 +78,8 @@ func (s *Service) resolvePlanTarget(ctx context.Context, callbackID, accountID s
 // 不读任何缓存：这是用户点开弹窗那一刻的真实状态，复用缓存会让刚领完的用户
 // 仍看到旧列表。
 func (s *Service) handlePlansPreview(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body planPreviewRequest
-	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+	body, errDecode := decodeRequest[planPreviewRequest](req.Body)
+	if errDecode != nil {
 		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
@@ -110,8 +110,8 @@ func (s *Service) handlePlansPreview(req pluginapi.ManagementRequest) pluginapi.
 
 // handlePlansClaim 提交人机验证令牌并领取套餐。
 func (s *Service) handlePlansClaim(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body planClaimRequest
-	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+	body, errDecode := decodeRequest[planClaimRequest](req.Body)
+	if errDecode != nil {
 		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)

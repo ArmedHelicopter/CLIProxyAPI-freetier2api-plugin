@@ -64,8 +64,8 @@ type quotaBatchOutcome struct {
 }
 
 func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountBatchRequest
-	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+	body, errDecode := decodeRequest[accountBatchRequest](req.Body)
+	if errDecode != nil {
 		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)

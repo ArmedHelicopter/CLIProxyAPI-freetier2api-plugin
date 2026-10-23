@@ -16,34 +16,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
-
-	"freetier2api-plugin/cpasdk/pluginabi"
-	"freetier2api-plugin/cpasdk/pluginapi"
 )
 
-// managementCall 调一次插件管理接口并返回响应体。
-func managementCall(t *testing.T, method, path string) pluginapi.ManagementResponse {
-	t.Helper()
-	raw, errHandle := testApp.HandleMethod(pluginabi.MethodManagementHandle, mustMarshal(pluginapi.ManagementRequest{
-		Method: method,
-		Path:   "/v0/management/plugins/freetier2api" + path,
-		Headers: http.Header{
-			"X-Host-Callback-Id": []string{testCallbackID},
-		},
-	}))
-	if errHandle != nil {
-		t.Fatalf("%s %s: %v", method, path, errHandle)
-	}
-	var env abiEnvelope
-	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
-		t.Fatalf("decode envelope: %v", errUnmarshal)
-	}
-	var resp pluginapi.ManagementResponse
-	if errUnmarshal := json.Unmarshal(env.Result, &resp); errUnmarshal != nil {
-		t.Fatalf("decode management response: %v (raw=%s)", errUnmarshal, env.Result)
-	}
-	return resp
-}
+// managementCall 与 managementCallWithBody 见 testutil_test.go。
 
 // statusAccounts 拉一次 /status 并取出账号列表。
 func statusAccounts(t *testing.T) []struct {

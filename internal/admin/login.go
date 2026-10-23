@@ -27,9 +27,14 @@ type loginCallbackRequest struct {
 // 页面：页面要的是一句能直接显示的原因，而不是状态码——错误文案由供应商侧
 // 生成，已经刻意去掉了回调链接本身（里面带 refreshToken / 票据密钥）。
 func (s *Service) handleLoginCallbackRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body loginCallbackRequest
-	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
-		return BadJSONRequestResponse()
+	body, errDecode := decodeRequest[loginCallbackRequest](req.Body)
+	if errDecode != nil {
+		// 页面按 AuthLoginStatus 契约读 status / message，这里不能套用通用的
+		// {ok, error} 形状，否则「请刷新页面后重试」这句提示会丢失。
+		return JSONResponse(http.StatusBadRequest, map[string]any{
+			"ok": false, "status": string(pluginapi.AuthLoginStatusError),
+			"message": "请求体解析失败，请刷新页面后重试",
+		})
 	}
 	// 入参校验（state 非空、URL 非空）统一由 App.SubmitLoginCallback 负责：
 	// 它是唯一调用供应商的地方，校验放在这里就得再抄一份。

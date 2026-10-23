@@ -4,17 +4,25 @@ package tasks
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"time"
 
 	"freetier2api-plugin/internal/core"
 )
 
-type taskRunRequest struct {
+// QueueRequest 是「启动任务队列」的请求参数。
+//
+// 解析放在管理接口层（tasks 不得依赖 admin）：本包只接收已解析的参数，
+// 不再自己解 JSON——那会让畸形请求静默退化成默认队列。
+type QueueRequest struct {
 	Concurrency int  `json:"concurrency"`
 	Growth      bool `json:"growth"`
 	School      bool `json:"school"`
+}
+
+// DefaultQueueRequest 是请求体缺省时的队列参数（旧控制台的默认行为）。
+func DefaultQueueRequest() QueueRequest {
+	return QueueRequest{Concurrency: 1, Growth: true, School: true}
 }
 
 // Scan 扫描全部账号的待办任务。
@@ -30,12 +38,8 @@ func (s *Service) Scan(ctx context.Context, callbackID string) map[string]any {
 // QueueSnapshot 返回任务队列快照。
 func (s *Service) QueueSnapshot() map[string]any { return s.taskQueueSnapshot() }
 
-// StartQueue 解析请求并启动任务队列。
-func (s *Service) StartQueue(body []byte, callbackID string) (map[string]any, int) {
-	request := taskRunRequest{Concurrency: 1, Growth: true, School: true}
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &request)
-	}
+// StartQueue 按已解析的参数启动任务队列。
+func (s *Service) StartQueue(request QueueRequest, callbackID string) (map[string]any, int) {
 	concurrency := request.Concurrency
 	if concurrency < 1 {
 		concurrency = 1

@@ -11,7 +11,7 @@ import (
 func TestReadQoderResponseBodyLimit(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
-		_, _ = io.WriteString(w, strings.Repeat("x", int(qoderMaxResponseBytes)+1))
+		_, _ = io.WriteString(w, strings.Repeat("x", int(shortResponseMaxBytes)+1))
 	}))
 	defer server.Close()
 

@@ -100,7 +100,7 @@ func httpGetBearerJSON(ctx context.Context, endpoint, token string) (map[string]
 		return nil, NewError("qoder_upstream_transient", errDo.Error(), http.StatusBadGateway)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := readQoderResponseBody(resp.Body)
 	if errRead != nil {
 		return nil, NewError("qoder_upstream_error", errRead.Error(), http.StatusBadGateway)
 	}
@@ -889,7 +889,10 @@ func doCheckinRequest(ctx context.Context, region Region, method, path, bearer s
 		return 0, nil, fmt.Sprintf("do request: %v", errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, errRead := readQoderResponseBody(resp.Body)
+	if errRead != nil {
+		return resp.StatusCode, nil, "read response: " + errRead.Error()
+	}
 	var parsed any
 	if len(data) > 0 {
 		_ = json.Unmarshal(data, &parsed)

@@ -64,6 +64,39 @@ func TestTotalsRecognizesEveryVendorKeyFamily(t *testing.T) {
 			want: QuotaTotals{Remaining: 0, Total: 100},
 		},
 		{
+			// Qoder Free 计划：套餐额度是合法的 {used:0,total:0,remaining:0}，
+			// 真正有数的是拓展包。按出现顺序取会把账号永久锁死在 0/0。
+			name: "首个族为 0/0 时让位给有容量的族（Qoder Free + 拓展包）",
+			summary: []pluginapi.QuotaMetric{
+				{Key: "user_quota_remaining", Value: 0},
+				{Key: "user_quota_total", Value: 0},
+				{Key: "user_quota_used", Value: 0},
+				{Key: "addon_quota_remaining", Value: 50},
+				{Key: "addon_quota_total", Value: 200},
+				{Key: "addon_quota_used", Value: 150},
+			},
+			want: QuotaTotals{Remaining: 50, Total: 200},
+		},
+		{
+			name: "所有族都是 0/0 时保留第一个族（额度已用尽 / 未开通）",
+			summary: []pluginapi.QuotaMetric{
+				{Key: "user_quota_remaining", Value: 0},
+				{Key: "user_quota_total", Value: 0},
+				{Key: "addon_quota_remaining", Value: 0},
+				{Key: "addon_quota_total", Value: 0},
+			},
+			want: QuotaTotals{Remaining: 0, Total: 0},
+		},
+		{
+			name: "只给了 total=0 时不从 used 反推（presence 决定，非数值）",
+			summary: []pluginapi.QuotaMetric{
+				{Key: "credit_remain", Value: 0},
+				{Key: "credit_total", Value: 0},
+				{Key: "credit_used", Value: 20},
+			},
+			want: QuotaTotals{Remaining: 0, Total: 0},
+		},
+		{
 			name: "无限额度（Trae 用 -1 / unlimited 表达）",
 			summary: []pluginapi.QuotaMetric{
 				{Key: "credit_remain", Value: -1, Unit: "unlimited"},

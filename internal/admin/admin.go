@@ -270,16 +270,31 @@ func HTMLResponse(status int, body []byte) pluginapi.ManagementResponse {
 	}
 }
 
-// decodeJSONBody 解码管理请求体。空请求体保持兼容并视为未提供参数；非空
-// 请求体只要不是合法 JSON 就统一由各入口返回 400，避免畸形请求继续执行默认逻辑。
-func decodeJSONBody(raw []byte, target any) error {
+// decodeRequest 解码管理请求体。空请求体保持兼容并视为未提供参数（返回零值）；
+// 非空请求体只要不是合法 JSON 就返回错误，由调用方统一回 400，
+// 避免畸形请求继续按默认值执行。
+func decodeRequest[T any](raw []byte) (T, error) {
+	var body T
+	return decodeRequestInto(raw, body)
+}
+
+// decodeRequestInto 与 decodeRequest 相同，但以一个非零默认值起步：
+// 只出现在请求体里的字段才覆盖默认值，缺省字段保留 base。
+func decodeRequestInto[T any](raw []byte, base T) (T, error) {
 	if len(raw) == 0 {
-		return nil
+		return base, nil
 	}
-	return json.Unmarshal(raw, target)
+	if errUnmarshal := json.Unmarshal(raw, &base); errUnmarshal != nil {
+		var zero T
+		return zero, errUnmarshal
+	}
+	return base, nil
 }
 
 // BadJSONRequestResponse 构造统一的畸形 JSON 请求响应。
+//
+// login/callback 是唯一例外：页面按 AuthLoginStatus 契约读 status / message，
+// 那边自己构造同样形状的 400，不套用这里。
 func BadJSONRequestResponse() pluginapi.ManagementResponse {
 	return JSONResponse(http.StatusBadRequest, map[string]any{
 		"ok": false, "error": "请求体解析失败，请检查 JSON 格式",

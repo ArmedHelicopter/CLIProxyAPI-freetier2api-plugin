@@ -12,10 +12,13 @@ package tests
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginabi"
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/app"
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/vendors/workbuddy"
@@ -203,4 +206,32 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return condition()
+}
+
+// managementCall 调一次插件管理接口并返回响应体（body 可为 nil）。
+func managementCall(t *testing.T, method, path string) pluginapi.ManagementResponse {
+	t.Helper()
+	return managementCallWithBody(t, method, path, nil)
+}
+
+// managementCallWithBody 调一次带 JSON body 的插件管理接口。
+func managementCallWithBody(t *testing.T, method, path string, body any) pluginapi.ManagementResponse {
+	t.Helper()
+	request := pluginapi.ManagementRequest{
+		Method:  method,
+		Path:    "/v0/management/plugins/freetier2api" + path,
+		Headers: http.Header{"X-Host-Callback-Id": []string{testCallbackID}},
+	}
+	if body != nil {
+		request.Body = mustMarshal(body)
+	}
+	raw, errHandle := testApp.HandleMethod(pluginabi.MethodManagementHandle, mustMarshal(request))
+	if errHandle != nil {
+		t.Fatalf("%s %s: %v", method, path, errHandle)
+	}
+	var response pluginapi.ManagementResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelopeResultForTest(t, raw), &response); errUnmarshal != nil {
+		t.Fatalf("decode management response: %v", errUnmarshal)
+	}
+	return response
 }

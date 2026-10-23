@@ -245,36 +245,35 @@ func (c *Client) ClaimRewardMP(ctx context.Context, cred *Credential, code strin
 }
 
 // parseClaimResult 解析领奖响应。
+//
+// 领奖是有副作用的请求。响应无法解析时不能把它当作「已领取」处理，否则
+// HTML 错误页、截断 JSON 等异常会被静默报告成成功且奖励为 0。用指针字段
+// 一次解码即可同时得到值与「字段是否存在」，无需先解成 map 再解一次 struct。
+//
+// 必须至少出现一个领奖契约字段（already_claimed / credit / energy）：
+// 空对象、null、完全陌生的 JSON 对象都不是成功响应。
 func parseClaimResult(data json.RawMessage) (credit, energy int64, err error) {
-	// 领奖是有副作用的请求。响应无法解析时不能把它当作「已领取」处理，
-	// 否则 HTML 错误页、截断 JSON 等异常会被静默报告成成功且奖励为 0。
-	var fields map[string]json.RawMessage
-	if errUnmarshal := json.Unmarshal(data, &fields); errUnmarshal != nil {
-		return 0, 0, fmt.Errorf("decode claim result: %w", errUnmarshal)
-	}
-	if fields == nil {
-		return 0, 0, fmt.Errorf("decode claim result: expected JSON object")
-	}
 	var payload struct {
-		AlreadyClaimed bool  `json:"already_claimed"`
-		Credit         int64 `json:"credit"`
-		Energy         int64 `json:"energy"`
+		AlreadyClaimed *bool  `json:"already_claimed"`
+		Credit         *int64 `json:"credit"`
+		Energy         *int64 `json:"energy"`
 	}
 	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
 		return 0, 0, fmt.Errorf("decode claim result: %w", errUnmarshal)
 	}
-	// 至少要有一个领奖契约字段。空对象或完全陌生的 JSON 对象不是成功响应。
-	if _, hasClaimed := fields["already_claimed"]; !hasClaimed {
-		if _, hasCredit := fields["credit"]; !hasCredit {
-			if _, hasEnergy := fields["energy"]; !hasEnergy {
-				return 0, 0, fmt.Errorf("decode claim result: missing reward fields")
-			}
-		}
+	if payload.AlreadyClaimed == nil && payload.Credit == nil && payload.Energy == nil {
+		return 0, 0, fmt.Errorf("decode claim result: missing reward fields")
 	}
-	if payload.AlreadyClaimed {
+	if payload.AlreadyClaimed != nil && *payload.AlreadyClaimed {
 		return 0, 0, nil
 	}
-	return payload.Credit, payload.Energy, nil
+	if payload.Credit != nil {
+		credit = *payload.Credit
+	}
+	if payload.Energy != nil {
+		energy = *payload.Energy
+	}
+	return credit, energy, nil
 }
 
 // IsMPTaskCode 报告任务码是否属于小程序口径。
@@ -1471,7 +1470,10 @@ func runGrowthTask(ctx context.Context, client *Client, credential *Credential, 
 			return "任务已完成且已领奖", 0, 0, nil
 		}
 		if task.Done() {
-			credit, energy := claimGrowthReward(ctx, client, credential, code)
+			credit, energy, errClaim := claimGrowthReward(ctx, client, credential, code)
+			if errClaim != nil {
+				return "", 0, 0, fmt.Errorf("任务已达标，但领奖失败：%w", errClaim)
+			}
 			msg := "任务已达标（跳过重复执行）"
 			if credit > 0 || energy > 0 {
 				msg = fmt.Sprintf("任务已达标，已领奖 +%d 积分 +%d 能量", credit, energy)
@@ -1484,7 +1486,10 @@ func runGrowthTask(ctx context.Context, client *Client, credential *Credential, 
 		return "", 0, 0, errRun
 	}
 	if waitGrowthClaimable(ctx, client, credential, code) {
-		credit, energy := claimGrowthReward(ctx, client, credential, code)
+		credit, energy, errClaim := claimGrowthReward(ctx, client, credential, code)
+		if errClaim != nil {
+			return "", 0, 0, fmt.Errorf("%s；但领奖失败：%w", message, errClaim)
+		}
 		if credit > 0 || energy > 0 {
 			message += fmt.Sprintf("（领奖 +%d 积分 +%d 能量）", credit, energy)
 		}
@@ -1536,21 +1541,26 @@ func findGrowthTask(ctx context.Context, client *Client, credential *Credential,
 	return nil, nil
 }
 
-func claimGrowthReward(ctx context.Context, client *Client, credential *Credential, code string) (int64, int64) {
+// claimGrowthReward 领奖并把错误交给调用方。
+//
+// 早期这里吞掉错误返回 (0, 0)：领奖响应解析失败（HTML 错误页、上游改结构）
+// 会被 runGrowthTask 当成「任务已达标但没奖励」，用户看到的是一句成功文案。
+// 领奖有副作用，失败必须让页面看见。
+func claimGrowthReward(ctx context.Context, client *Client, credential *Credential, code string) (int64, int64, error) {
 	if IsMPTaskCode(code) {
 		credit, energy, errClaim := client.ClaimRewardMP(ctx, credential, code)
 		if errClaim != nil {
 			logger.Debug("claim mp reward for %s failed: %v", code, errClaim)
-			return 0, 0
+			return 0, 0, errClaim
 		}
-		return credit, energy
+		return credit, energy, nil
 	}
 	credit, energy, errClaim := client.ClaimReward(ctx, credential, code)
 	if errClaim != nil {
 		logger.Debug("claim reward for %s failed: %v", code, errClaim)
-		return 0, 0
+		return 0, 0, errClaim
 	}
-	return credit, energy
+	return credit, energy, nil
 }
 
 func acceptPendingTasks(ctx context.Context, client *Client, credential *Credential) int {
