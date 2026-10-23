@@ -190,8 +190,8 @@ type accountBatchRequest struct {
 
 func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body accountBatchRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	if len(body.AccountIDs) == 0 {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "account_ids 不能为空"})
@@ -311,8 +311,8 @@ type accountAddRequest struct {
 
 func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body accountAddRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	vendorID := strings.TrimSpace(body.Vendor)
 	apiKey := strings.TrimSpace(body.APIKey)
@@ -370,8 +370,8 @@ func maskedAPIKey(key string) string {
 
 func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	var body accountBatchRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	if errDecode := decodeJSONBody(req.Body, &body); errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()

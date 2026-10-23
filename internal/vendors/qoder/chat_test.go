@@ -1,8 +1,52 @@
 package qoder
 
 import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 )
+
+func TestReadQoderResponseBodyLimit(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, strings.Repeat("x", int(qoderMaxResponseBytes)+1))
+	}))
+	defer server.Close()
+
+	resp, err := server.Client().Get(server.URL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if _, err = readQoderResponseBody(resp.Body); err == nil {
+		t.Fatal("expected oversized response to be rejected")
+	} else if !strings.Contains(err.Error(), "exceeds") {
+		t.Fatalf("unexpected oversized response error: %v", err)
+	}
+}
+
+func TestReadQoderResponseBodyAllowsNormalResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{"ok":true}`)
+	}))
+	defer server.Close()
+
+	resp, err := server.Client().Get(server.URL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := readQoderResponseBody(resp.Body)
+	if err != nil {
+		t.Fatalf("normal response rejected: %v", err)
+	}
+	if string(body) != `{"ok":true}` {
+		t.Fatalf("body = %q", body)
+	}
+}
 
 func TestMergeToolCallDeltas(t *testing.T) {
 	delta1 := []interface{}{

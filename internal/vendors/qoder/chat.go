@@ -773,6 +773,21 @@ func PathSigFrom(rawURL string) (string, error) {
 	return p, nil
 }
 
+const qoderMaxResponseBytes int64 = 1 << 20
+
+// readQoderResponseBody 读取 Qoder 短响应，并拒绝超过上限的正文。
+// 读取 limit+1 字节用于区分「恰好达到上限」和「被截断」，避免静默解析半截 JSON。
+func readQoderResponseBody(body io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(body, qoderMaxResponseBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > qoderMaxResponseBytes {
+		return nil, fmt.Errorf("qoder response body exceeds %d bytes", qoderMaxResponseBytes)
+	}
+	return data, nil
+}
+
 // callGet 用 cosy 签名发送 GET 请求，body 部分参与签名时为空字符串。
 // 用于 /algo/api/v2/model/list 之类的纯查询接口。
 func (c *BearerClient) callGet(ctx context.Context, fullURL string) (map[string]interface{}, error) {
@@ -796,7 +811,10 @@ func (c *BearerClient) callGet(ctx context.Context, fullURL string) (map[string]
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, errRead := readQoderResponseBody(resp.Body)
+	if errRead != nil {
+		return nil, fmt.Errorf("read qoder response: %w", errRead)
+	}
 	if resp.StatusCode != 200 {
 		return nil, NewUpstreamError(resp.StatusCode, string(data))
 	}
@@ -867,8 +885,11 @@ func (c *BearerClient) openStreamLines(ctx context.Context, fullURL string, json
 			return WrapTransportError(err)
 		}
 		if resp.StatusCode != 200 {
-			body, _ := io.ReadAll(resp.Body)
+			body, errRead := readQoderResponseBody(resp.Body)
 			resp.Body.Close()
+			if errRead != nil {
+				return fmt.Errorf("read qoder stream response: %w", errRead)
+			}
 			detail := string(body)
 			if signal, queued := ParseQueueSignal(detail); queued && queueWaits < maxQueueWaits && ctx.Err() == nil {
 				wait := queueWaitFor(signal)
@@ -1003,7 +1024,10 @@ func ExchangeJobToken(ctx context.Context, token, machineId, machineToken, machi
 		return nil, err
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(resp.Body)
+	data, errRead := readQoderResponseBody(resp.Body)
+	if errRead != nil {
+		return nil, fmt.Errorf("read qoder job token response: %w", errRead)
+	}
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("HTTP %d at jobToken body=%s", resp.StatusCode, string(data))
 	}

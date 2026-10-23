@@ -27,8 +27,12 @@ import (
 	"freetier2api-plugin/cpasdk/pluginabi"
 )
 
-// emptyReadBackoff 是宿主返回空分片时的让出间隔，避免桥接异常时读取循环空转。
-const emptyReadBackoff = time.Millisecond
+// 空分片保护：宿主短暂没有数据时退避；宿主持续异常时及时终止，避免永久空转。
+const (
+	emptyReadBackoff         = time.Millisecond
+	emptyReadBackoffMax      = 16 * time.Millisecond
+	maxConsecutiveEmptyReads = 32
+)
 
 // Client 返回经宿主 host.http.do 出站的客户端。
 func Client(ctx context.Context, timeout time.Duration) *http.Client {
@@ -264,11 +268,16 @@ func (b *streamBody) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-// readChunk 向宿主索要一个分片。空分片时短暂让出，避免空转。
+// errTooManyEmptyReads 表示宿主持续返回空分片，流已被主动终止。
+var errTooManyEmptyReads = errors.New("host http stream returned too many empty chunks")
+
+// readChunk 向宿主索要一个分片。空分片时退避，并限制连续空分片次数，避免空转。
 func (b *streamBody) readChunk() ([]byte, error) {
 	if strings.TrimSpace(b.streamID) == "" {
 		return nil, errors.New("host http stream id is missing")
 	}
+	emptyReads := 0
+	backoff := emptyReadBackoff
 	for {
 		select {
 		case <-b.ctx.Done():
@@ -292,11 +301,25 @@ func (b *streamBody) readChunk() ([]byte, error) {
 		if len(chunk.Payload) > 0 {
 			return chunk.Payload, nil
 		}
-		// 空分片：让出 CPU 后重试，直到有数据、结束或 context 取消。
+		emptyReads++
+		if emptyReads >= maxConsecutiveEmptyReads {
+			return nil, errTooManyEmptyReads
+		}
+		// 空分片：指数退避让出 CPU，直到有数据、结束或 context 取消。
+		timer := time.NewTimer(backoff)
 		select {
 		case <-b.ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return nil, b.ctx.Err()
-		case <-time.After(emptyReadBackoff):
+		case <-timer.C:
+		}
+		if backoff < emptyReadBackoffMax {
+			backoff *= 2
+			if backoff > emptyReadBackoffMax {
+				backoff = emptyReadBackoffMax
+			}
 		}
 	}
 }

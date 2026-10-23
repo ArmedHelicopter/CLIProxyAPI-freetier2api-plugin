@@ -246,14 +246,30 @@ func (c *Client) ClaimRewardMP(ctx context.Context, cred *Credential, code strin
 
 // parseClaimResult 解析领奖响应。
 func parseClaimResult(data json.RawMessage) (credit, energy int64, err error) {
+	// 领奖是有副作用的请求。响应无法解析时不能把它当作「已领取」处理，
+	// 否则 HTML 错误页、截断 JSON 等异常会被静默报告成成功且奖励为 0。
+	var fields map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(data, &fields); errUnmarshal != nil {
+		return 0, 0, fmt.Errorf("decode claim result: %w", errUnmarshal)
+	}
+	if fields == nil {
+		return 0, 0, fmt.Errorf("decode claim result: expected JSON object")
+	}
 	var payload struct {
 		AlreadyClaimed bool  `json:"already_claimed"`
 		Credit         int64 `json:"credit"`
 		Energy         int64 `json:"energy"`
 	}
 	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-		// 结构不认识但请求成功：副作用已发生，按无新增处理。
-		return 0, 0, nil
+		return 0, 0, fmt.Errorf("decode claim result: %w", errUnmarshal)
+	}
+	// 至少要有一个领奖契约字段。空对象或完全陌生的 JSON 对象不是成功响应。
+	if _, hasClaimed := fields["already_claimed"]; !hasClaimed {
+		if _, hasCredit := fields["credit"]; !hasCredit {
+			if _, hasEnergy := fields["energy"]; !hasEnergy {
+				return 0, 0, fmt.Errorf("decode claim result: missing reward fields")
+			}
+		}
 	}
 	if payload.AlreadyClaimed {
 		return 0, 0, nil
