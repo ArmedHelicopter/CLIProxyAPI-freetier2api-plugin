@@ -240,10 +240,7 @@ func (s *Service) deleteAuthFile(ctx context.Context, callbackID string, entry c
 	if _, okParse := s.registry.ParseCredential(raw, hostbridge.AccountIdentity(entry), nil); !okParse {
 		return fmt.Errorf("该凭证不属于本插件，拒绝删除")
 	}
-	targetPath := strings.TrimSpace(filePath)
-	if targetPath == "" {
-		targetPath = strings.TrimSpace(entry.Path)
-	}
+	targetPath := resolveAuthFilePath(core.FirstNonEmpty(filePath, entry.Path))
 	if targetPath == "" {
 		return fmt.Errorf("该账号没有对应的凭证文件（运行时凭证），无法删除")
 	}
@@ -258,6 +255,29 @@ func (s *Service) deleteAuthFile(ctx context.Context, callbackID string, entry c
 	}
 	logger.Info("deleted auth file %s (vendor=%s)", filepath.Base(targetPath), entry.Name)
 	return nil
+}
+
+// resolveAuthFilePath 把宿主给出的凭证路径归一化成绝对路径。
+//
+// 宿主不一定给绝对路径：EasyCLIProxyAPI 把内核的 oauth.auth-dir 配成相对路径
+// （默认 ../oauth，相对内核工作目录），CLIProxyAPI 扫盘时按 auth-dir 原样
+// WalkDir 并把相对路径写进 auth 属性，host.auth.get / host.auth.list 又原样
+// 返回。于是删除保护收到的是 `..\oauth\<name>.json` 这种相对路径，一律判成
+// 「非绝对路径」——用户点「删除」什么都删不掉，账号永远留在页面上。
+//
+// 插件与宿主运行在同一个进程里、工作目录一致，所以用 filepath.Abs 解析出来的
+// 就是宿主实际读写的那个文件。这也是宿主管理接口 DELETE /v0/management/auth-files
+// 自己的做法：先取 auth 的 path 属性，非绝对时再 filepath.Abs。归一化只做路径
+// 换算，.json / 符号链接 / 目录 三道安全检查仍由 ensureAuthFilePathSafe 负责。
+func resolveAuthFilePath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	if abs, errAbs := filepath.Abs(trimmed); errAbs == nil {
+		return abs
+	}
+	return trimmed
 }
 
 func ensureAuthFilePathSafe(path string) error {

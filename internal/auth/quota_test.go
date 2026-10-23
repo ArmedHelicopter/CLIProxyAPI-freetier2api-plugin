@@ -54,6 +54,16 @@ func TestTotalsRecognizesEveryVendorKeyFamily(t *testing.T) {
 			want: QuotaTotals{Remaining: 80, Total: 100},
 		},
 		{
+			name: "合法零额度不被后续额度族覆盖",
+			summary: []pluginapi.QuotaMetric{
+				{Key: "user_quota_remaining", Value: 0},
+				{Key: "addon_quota_remaining", Value: 50},
+				{Key: "user_quota_total", Value: 100},
+				{Key: "addon_quota_total", Value: 200},
+			},
+			want: QuotaTotals{Remaining: 0, Total: 100},
+		},
+		{
 			name: "无限额度（Trae 用 -1 / unlimited 表达）",
 			summary: []pluginapi.QuotaMetric{
 				{Key: "credit_remain", Value: -1, Unit: "unlimited"},
