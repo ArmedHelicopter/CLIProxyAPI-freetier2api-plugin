@@ -146,10 +146,22 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 		}
 		if q := s.getCachedQuota(uid, summary.AuthID, summary.AuthIndex, entry.Name, summary.Label); q != nil {
 			summary.Quota = q
+			// A successful quota read proves the credential is usable even when
+			// the host retained a stale runtime error from an earlier request.
+			// Do not mutate host auth state; only avoid displaying a contradictory
+			// error in this plugin's account overview.
+			summary.Status = displayedAccountStatus(summary.Status, q.OK)
 		}
 		out = append(out, summary)
 	}
 	return out
+}
+
+func displayedAccountStatus(status string, quotaOK bool) string {
+	if strings.EqualFold(strings.TrimSpace(status), "error") && quotaOK {
+		return "active"
+	}
+	return status
 }
 
 // supportsQuota 报告该供应商是否提供额度查询。
