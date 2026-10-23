@@ -95,6 +95,12 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	// 已有一轮在跑时不重复打上游：等它结束，再回读缓存。
 	jobs := make([]quotaJob, 0, len(loaded))
 	for _, account := range loaded {
+		// Unsupported vendors (for example OpenCode ZEN) must not enter a quota
+		// query round or its result window. They remain visible in the account
+		// table, where supports_quota=false renders "-- / --".
+		if !supportsQuota(account.Vendor) {
+			continue
+		}
 		jobs = append(jobs, quotaJob{entry: account.Entry, vendor: account.Vendor, credential: account.Credential})
 	}
 	done, owner := s.acquireQuotaRun()
