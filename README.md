@@ -89,7 +89,7 @@ plugins:
 | 供应商 | 必填字段 | 建议 / 可选字段 |
 | --- | --- | --- |
 | WorkBuddy 国内版 / 国际版 | `auth.accessToken` | `auth.refreshToken`（自动续期必需）、`auth.expiresAt`、`auth.domain`、`auth.realm`、`account.uid`（指纹种子）、`device_token`；顶层扁平写法同样支持 |
-| Qoder 国内版 / 国际版 | `device_token`（`dt-` 前缀；`pt-` PAT 亦可） | `refresh_token`（`drt-` 前缀）、`region`（`cn` / `global`）、`secret`（qoder2api 导出格式） |
+| Qoder 国内版 / 国际版 | `device_token`（`dt-` 前缀；`pt-` PAT 亦可） | `refresh_token`（`drt-` 前缀）、`region`（`cn` / `global`）、`secret`（qoder2api 导出格式）、`machine_token` / `machine_type` / `machine_code`（国际版签到所需的官方设备身份） |
 | OpenCode ZEN | `api_key`（`apikey` / `zen_key` 亦兼容） | `label`（缺失时自动脱敏显示） |
 | Cline | `refreshToken`（WorkOS 设备授权产物） | `accessToken`、`email` |
 | ZCode | 对话要 `api_key`（智谱格式 `xxx.yyy`）；查额度要 `jwt_token` | `profile`（每账号独立设备档案）、`email`、`user_id`、`label`；`auth_mode: oauth` |
@@ -408,6 +408,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 | `workbuddy_device_token` / `workbuddy_device_token_file` | string | 空 | `X-Device-Token` 兜底（WorkBuddy） |
 | `machine_salt` | string | 自动生成 | 设备指纹盐；填原值可保持指纹不变 |
 | `qoder_desktop_version` | string | `0.4.8` | `cosy-version` 桌面端版本覆盖（Qoder） |
+| `qoder_machine_token` / `qoder_machine_type` / `qoder_machine_code` | string | 空 | 官方组件签发的设备身份，用于解锁 Qoder **国际版**每日领取活动；token 与 type 必须成对填写，也可写在单个凭证文件里（见「已知限制」） |
 | `auto_checkin` / `auto_checkin_at` | bool / string | **`true`** / `10:00` | 每日自动任务（默认开启） |
 | `auto_tasks` | bool | **`true`** | 每日自动跑任务闭环（连登兑换、抽奖、旅行、夜猫子等） |
 | `opencodezen_base_url` | string | 空 | 覆盖 OpenCode ZEN 上游基地址（默认 `https://opencode.ai/zen`） |
@@ -451,12 +452,17 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 - **同名模型跨供应商合并**：宿主按 `EqualFold` 合并后选号，可能落到另一家；需要精确指定时用 `vendor:model`。
 - **WorkBuddy 国际版签到**是每日活跃信标，次日发放积分；成长任务仍只在国内版提供。
 - **Qoder 签到**是领取每日福利活动，窗口每日 10:00（UTC+8）开启、错过不补领。
-  国际版的活动列表按**设备身份**过滤：`cosy-machinetoken` 与 `cosy-machinetype`
-  必须**成对**出现在请求头里；缺任一个，「每日领取 100 Credits」这类可领取活动
-  会被整条过滤（HTTP 仍返回 200，只剩详情类活动，看起来就像账号没有资格）。
-  插件按账号种子稳定派生这两个值（与对话链路的 cosy 会话同一套算法），
-  **不需要安装或读取 Qoder 客户端**。身份是机器级的，同一台机器上的多个国际号
-  只能领一份（上游按设备去重，不是插件限制）。
+  **国内版直接可领**，不需要任何机器身份。
+  **国际版的活动按设备定向下发**：上游对请求头的 `cosy-machinetoken` 与
+  `cosy-machinetype` 做**精确校验**（实测改一个字符、截断一位、把 A 设备的
+  token 配上 B 设备的 type 都会让可领取活动消失），这对值由官方桌面端的
+  UMID 组件签发、无法伪造——包括容器里跑出来的组件（`vmInfo.isVm=true`）
+  也拿不到活动。因此国际版需要用户从**自己登录过官方桌面的那台机器**上取一次身份：
+  运行 `runtime-info`（Windows 为客户端 `resources/umid/runtime-info.exe`），
+  把输出里的 `machineToken` / `machineType` 填进凭证文件或插件配置
+  `qoder_machine_token` / `qoder_machine_type`。没填时插件**不发送任何机器头**
+  （填假值比不填更糟：国内版会因此看不到活动），并在结果里说明原因。
+  身份是机器级的，同一台机器上的多个国际号只能领一份（上游按设备去重）。
 - **Qoder 任务中心为空**：上游没有可自动推进的日常任务接口，签到即覆盖全部可自动化收益。
 - **ZCode 套餐领取**依赖浏览器内的人机验证，跨出口部署可能因 IP 校验失败。
 - **ZCode 没有签到**：其「签到」实质就是领取活动套餐。

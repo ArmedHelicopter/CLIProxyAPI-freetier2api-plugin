@@ -84,11 +84,16 @@ func campaignsBody(campaigns ...string) string {
 		strings.Join(campaigns, ","))
 }
 
-// testIdentity 返回一份插件派生的设备身份。
+// testIdentity 返回一份「用户提供的」设备身份。
 //
-// 值本身无所谓：上游只要求 token/type 成对，这里只驱动请求头组装与判定。
+// 值本身无所谓：这里只驱动请求头组装与判定。上游对真值做精确校验，但那
+// 属于服务端行为，单测只验证「有身份就发、没身份就不发」的契约。
 func testIdentity() MachineIdentity {
-	return ResolveIdentity("test-seed", nil)
+	return ResolveIdentity(nil, map[string]string{
+		"qoder_machine_token": "token-from-official-component",
+		"qoder_machine_type":  "type-from-official-component",
+		"qoder_machine_code":  "code-from-official-component",
+	})
 }
 
 // TestCheckinGlobalSendsNativeMachineHeaders 覆盖：拿到真身份后，活动查询、
@@ -132,10 +137,12 @@ func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
 	want := map[string]string{
 		"Cosy-Machinetoken": identity.Token,
 		"Cosy-Machinetype":  identity.Type,
-		"Cosy-Machineid":    identity.MachineID,
-		"Cosy-Machineos":    identity.MachineOS,
+		"Cosy-Machinecode":  identity.Code,
 		"Cosy-Version":      identity.Version,
 	}
+	// 派生机器头（machineid / machineos / hostname）一律不发：上游只认官方
+	// 组件签发的精确值，别的机器头既解锁不了活动，还会让请求形态偏离官方客户端。
+	forbidden := []string{"Cosy-Machineid", "Cosy-Machineos", "Cosy-Machinehostname"}
 	checked := 0
 	for _, request := range upstream.requests {
 		if !strings.Contains(request.url, "/sash/") {
@@ -145,6 +152,11 @@ func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
 		for key, value := range want {
 			if got := request.headers[key]; len(got) == 0 || got[0] != value {
 				t.Errorf("%s %s 的头 %s = %v, 期望 [%s]", request.method, request.url, key, got, value)
+			}
+		}
+		for _, key := range forbidden {
+			if got := request.headers[key]; len(got) != 0 {
+				t.Errorf("%s %s 不应发送 %s = %v", request.method, request.url, key, got)
 			}
 		}
 	}

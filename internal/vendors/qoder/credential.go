@@ -65,6 +65,15 @@ type Credential struct {
 	Label string
 	// Email 是账号邮箱（登录流程会填）。
 	Email string
+
+	// MachineToken / MachineType / MachineCode 是官方组件签发的设备身份。
+	//
+	// 上游对活动列表按设备身份做**精确校验**（见 identity.go），插件无法
+	// 伪造，只能由用户从自己登录过官方桌面的那台机器上取来填进凭证文件。
+	// 为空表示未提供，签到时不发机器头。
+	MachineToken string
+	MachineType  string
+	MachineCode  string
 }
 
 // ParseCredential 解析 Qoder 凭证 JSON。
@@ -113,7 +122,20 @@ func ParseCredential(raw []byte, fallbackRegion Region) (*Credential, error) {
 	if email, okEmail := payload["email"].(string); okEmail {
 		cred.Email = strings.TrimSpace(email)
 	}
+	cred.MachineToken = firstStringIn(payload, "machine_token", "machineToken")
+	cred.MachineType = firstStringIn(payload, "machine_type", "machineType")
+	cred.MachineCode = firstStringIn(payload, "machine_code", "machineCode")
 	return cred, nil
+}
+
+// firstStringIn 返回给定键里第一个非空字符串值。
+func firstStringIn(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, okValue := payload[key].(string); okValue && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // firstTokenIn 返回一层 JSON 里第一个非空的 token 字段。

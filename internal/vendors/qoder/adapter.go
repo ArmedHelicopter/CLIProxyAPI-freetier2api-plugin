@@ -254,15 +254,10 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if errNative != nil {
 		return nil, errNative
 	}
-	// machineid 的推导与其它 Qoder 调用点（额度、登录、jobToken 交换）保持
-	// 同一口径：上游不校验它的内容，但同一账号在不同链路上报不同的
-	// machineid 等于自曝多设备，没有必要。
-	//
-	// 种子按**账号 token** 取，因此同一机器上的多个国际号各自有一套身份。
-	// 这不影响上游的同人去重（服务端按人/设备判，不看我们报的值），也让每个
-	// 账号的请求在形态上与它自己的 cosy 会话一致。
-	seed := FingerprintSeed("", native.Token)
-	identity := ResolveIdentity(seed, v.settingsSnapshot())
+	// 设备身份只取自「用户提供的真身份」（凭证字段或全局配置）。插件不会
+	// 自行派生：上游对机器头做精确校验，派生值会让可领取活动被整条过滤，
+	// 详见 identity.go。没有真身份时签到时一个机器头都不发。
+	identity := ResolveIdentity(native, v.settingsSnapshot())
 	result, errCheckin := Checkin(ctx, native, identity)
 	if errCheckin != nil {
 		return nil, errCheckin
@@ -290,6 +285,9 @@ func (v *adapter) settingsSnapshot() map[string]string {
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
 		{Name: "qoder_desktop_version", Type: pluginapi.ConfigFieldTypeString, Description: "cosy-version 桌面端版本覆盖。"},
+		{Name: "qoder_machine_token", Type: pluginapi.ConfigFieldTypeString, Description: "官方组件签发的 machineToken，用于解锁国际版每日领取活动。"},
+		{Name: "qoder_machine_type", Type: pluginapi.ConfigFieldTypeString, Description: "与 qoder_machine_token 配对的 machineType，必须成对填写。"},
+		{Name: "qoder_machine_code", Type: pluginapi.ConfigFieldTypeString, Description: "可选的 machineCode（不填不影响活动可见性）。"},
 	}
 }
 
