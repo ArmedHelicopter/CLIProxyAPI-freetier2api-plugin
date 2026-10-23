@@ -25,11 +25,13 @@ type adapter struct {
 	baseURL string
 	// claims 是本实例的领取节流器；不共享，多 App 并存时互不影响。
 	claims *claimGate
+	// activations 是本实例的活跃上报去重表（每账号每日一次）。
+	activations *activationState
 }
 
 // Instances 构造 ZCode 实例。
 func Instances(env core.Env) []core.Vendor {
-	return []core.Vendor{&adapter{claims: newClaimGate(), NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+	return []core.Vendor{&adapter{claims: newClaimGate(), activations: newActivationState(), NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
 		Meta: core.Meta{VendorID: VendorID, VendorName: VendorName, VendorRegion: "global"},
 		Env:  env,
 		Extract: func(c *core.Credential) (*Credential, bool) {
@@ -146,7 +148,7 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 	if errNative != nil {
 		return nil, errNative
 	}
-	return FetchQuota(ctx, native)
+	return v.fetchQuota(ctx, native)
 }
 
 // ---- 登录与续期 ----

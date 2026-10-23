@@ -87,19 +87,40 @@ func TestParsePlanGrantsFallsBackToGrantsField(t *testing.T) {
 }
 
 func TestHeldPlanIDsExcludesInactivePlans(t *testing.T) {
-	body := map[string]any{"data": map[string]any{"plans": []any{
+	plans := planRows(map[string]any{"data": map[string]any{"plans": []any{
 		map[string]any{"plan_id": "active-plan", "status": "active"},
 		map[string]any{"plan_id": "expired-plan", "status": "expired"},
 		map[string]any{"plan_id": "implicit-active"},
 		map[string]any{"status": "active"}, // 无 ID：跳过
-	}}}
-	held := heldPlanIDs(body)
+	}}})
+	held := heldPlanIDs(plans, 0)
 	if !held["active-plan"] || !held["implicit-active"] {
 		t.Fatalf("生效套餐应计入持有: %+v", held)
 	}
 	// 过期套餐必须排除：否则活动下线后按钮会永远灰着。
 	if held["expired-plan"] {
 		t.Fatalf("过期套餐不应计入持有: %+v", held)
+	}
+}
+
+func TestHeldPlanIDsTreatsPastEndsAtAsExpired(t *testing.T) {
+	// 上游可能把已结束的活动仍标成 active（官方客户端按服务端时间归一成 expired）。
+	// 不归一的话活动下线后按钮会一直灰在「已领取」。
+	plans := planRows(map[string]any{"data": map[string]any{"plans": []any{
+		map[string]any{"plan_id": "ended", "status": "active", "ends_at": float64(1000)},
+		map[string]any{"plan_id": "running", "status": "active", "ends_at": float64(3000)},
+		map[string]any{"plan_id": "no-end", "status": "active"},
+	}}})
+	held := heldPlanIDs(plans, 2000)
+	if held["ended"] {
+		t.Fatalf("ends_at 已过的 active 套餐不应计入持有: %+v", held)
+	}
+	if !held["running"] || !held["no-end"] {
+		t.Fatalf("未到期/无到期时间的套餐应计入持有: %+v", held)
+	}
+	// 服务端时间缺失（0）时不做过期推断，保持保守。
+	if !heldPlanIDs(plans, 0)["ended"] {
+		t.Fatal("缺少服务端时间时不应按本机时钟推断过期")
 	}
 }
 
@@ -142,6 +163,24 @@ func TestClaimStatusCountsAndErrors(t *testing.T) {
 	})
 	if failed.Error == "" || failed.Claimable != 0 {
 		t.Fatalf("preview 失败应带 error: %+v", failed)
+	}
+
+	// 活跃上报失败且活动列表为空：不能说成「已领取」——空列表本来就不代表领完。
+	activationFailed := claimStatusOf(planSnapshot{
+		held:          map[string]bool{},
+		errActivation: "激活上报 HTTP 500",
+	})
+	if activationFailed.Error == "" {
+		t.Fatalf("活跃上报失败时空列表必须带 error: %+v", activationFailed)
+	}
+	// 反过来：有投放时活跃上报的失败不影响按钮可用性，就不该打扰用户。
+	withPlans := claimStatusOf(planSnapshot{
+		offered:       []core.PlanInfo{{PlanID: "a"}},
+		held:          map[string]bool{},
+		errActivation: "激活上报 HTTP 500",
+	})
+	if withPlans.Error != "" || withPlans.Claimable != 1 {
+		t.Fatalf("有可领套餐时不应带 error: %+v", withPlans)
 	}
 }
 
