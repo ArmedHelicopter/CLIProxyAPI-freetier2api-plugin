@@ -40,6 +40,9 @@ type Host struct {
 	authFiles []core.HostAuth
 	// authJSON 是 auth_index → 凭证 JSON。
 	authJSON map[string]string
+	// authPaths 是 auth_index → 宿主返回的凭证文件路径（host.auth.get 的 path）。
+	// 真实宿主的 path 不保证绝对：以相对 auth-dir 启动的宿主会返回相对路径。
+	authPaths map[string]string
 	// upstream 是出站请求的应答函数（按 method + url 匹配）。
 	upstream func(method, url, body string) UpstreamResponse
 	// upstreamCalls 记录出站请求次数（供 singleflight 类断言）。
@@ -57,8 +60,9 @@ type Host struct {
 // New 构造一个 Fake Host。
 func New() *Host {
 	return &Host{
-		authJSON: map[string]string{},
-		streams:  map[string]*Stream{},
+		authJSON:  map[string]string{},
+		authPaths: map[string]string{},
+		streams:   map[string]*Stream{},
 		upstream: func(string, string, string) UpstreamResponse {
 			return UpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404,"msg":"not stubbed"}`}
 		},
@@ -109,6 +113,17 @@ func (h *Host) AddAccount(authIndex, name, credentialJSON string) {
 	h.authFiles = append(h.authFiles, core.HostAuth{
 		ID: name, AuthIndex: authIndex, Name: name, Provider: core.ProviderKey, Label: name,
 	})
+}
+
+// SetAuthFilePath 让 host.auth.get 返回凭证的物理文件路径。
+//
+// 真实宿主的 path 不保证绝对：以相对 auth-dir 启动的宿主（EasyCLIProxyAPI
+// 默认就是 ../oauth）会把 WalkDir 得到的相对路径原样返回。这里也原样透传，
+// 供删除等依赖路径的功能复现该形态。
+func (h *Host) SetAuthFilePath(authIndex, path string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.authPaths[authIndex] = path
 }
 
 // MarkUnavailable 模拟宿主路由层给凭证打上「临时不可用」（上游限流/超时后的
@@ -252,13 +267,19 @@ func (h *Host) handleAuthGet(payload any) (json.RawMessage, error) {
 
 	h.mu.Lock()
 	raw, okRaw := h.authJSON[req.AuthIndex]
+	path := h.authPaths[req.AuthIndex]
 	h.mu.Unlock()
 	if !okRaw {
 		return json.RawMessage(`{"auth_index":"` + req.AuthIndex + `","json":null}`), nil
 	}
 	// 真实宿主的 HostAuthGetResponse.JSON 是 json.RawMessage：原样内联，
 	// 不能走 []byte 序列化（那会变成 base64，插件侧解不出来）。
-	return json.RawMessage(`{"auth_index":"` + req.AuthIndex + `","json":` + raw + `}`), nil
+	response := struct {
+		AuthIndex string          `json:"auth_index"`
+		Path      string          `json:"path,omitempty"`
+		JSON      json.RawMessage `json:"json"`
+	}{AuthIndex: req.AuthIndex, Path: path, JSON: json.RawMessage(raw)}
+	return marshalJSON(response)
 }
 
 func (h *Host) handleStreamEmit(payload any) (json.RawMessage, error) {
