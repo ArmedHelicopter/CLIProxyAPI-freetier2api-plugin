@@ -593,6 +593,8 @@ func (v *adapter) ProbeActivity(ctx context.Context, cred *core.Credential) ([]c
 	return queryMarketingTouch(ctx, native)
 }
 
+var _ core.ActivityProbe = (*adapter)(nil)
+
 // PreviewPlans 返回账号当前可领的套餐（已剔除已持有的）。
 //
 // 空切片表示没有可领的，页面据此把按钮置灰成「已领取」。

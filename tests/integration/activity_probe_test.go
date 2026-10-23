@@ -21,7 +21,7 @@ func TestZCodeActivityPreviewIsReadOnlyAndSupportsAPIKey(t *testing.T) {
 			return testhost.UpstreamResponse{Status: 200, Body: `{"code":0}`}
 		}
 		if method == http.MethodGet && rawURL == "https://zcode.z.ai/api/v1/marketing/touch?seq=0" {
-			return testhost.UpstreamResponse{Status: 200, Body: `{"code":0,"data":{"deliveries":[{"campaign_id":"c1","banner":{"background":{"args":{"zcode_plan":{"plan_id":"dev-day-1024","name":"ZCode 1024 Dev Day","priority":9}}}}}]}}`}
+			return testhost.UpstreamResponse{Status: 200, Body: `{"code":0,"data":{"deliveries":[{"campaign_id":"c1","banner":{"background":{"args":{"zcode_plan":{"plan_id":"dev-day-1024","name":"ZCode 1024 Dev Day","priority":9,"starts_at":1792756800,"ends_at":1792976400,"entitlements":[{"show_name":"GLM-5.3-Flash","grant_units":300000000,"period":"one_time"}]}}}}}]}}`}
 		}
 		if rawURL == "https://zcode.z.ai/api/v1/zcode-plan/billing/claim" {
 			claimCalls++
