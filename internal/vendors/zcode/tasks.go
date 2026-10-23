@@ -590,7 +590,7 @@ func (v *adapter) ProbeActivity(ctx context.Context, cred *core.Credential) ([]c
 	if reason := v.ensureActivation(ctx, native); reason != "" {
 		return nil, core.NewPluginError("zcode_activity_activation", reason, http.StatusBadGateway)
 	}
-	return fetchActivityPlans(ctx, native)
+	return queryMarketingTouch(ctx, native)
 }
 
 // PreviewPlans 返回账号当前可领的套餐（已剔除已持有的）。
