@@ -15,7 +15,7 @@
 ## 功能特性
 
 - 复用宿主 Anthropic `/v1/messages`、OpenAI `/v1/chat/completions` 与 OpenAI `/v1/responses` 接口，无需额外部署独立网关
-- 支持 8 大体系共 13 个国内外免费额度供应商实例，凭证严格按供应商隔离（单供应商上限 10 个账号）
+- 支持 8 大体系共 13 个国内外免费额度供应商实例（另有 AutoClaw 国内/国际与小浣熊 3 个骨架实例，待上游资料回填后启用），凭证严格按供应商隔离（单供应商上限 10 个账号）
 - 模型清单动态探测、自定义模型别名与跨供应商同名模型自动负载均衡/故障转移
 - 内嵌单页 Web 控制台：支持 OAuth 设备授权 / 本地回调粘贴 / API Key 添加账号、额度可视化、模型启停与运行日志
 - 支持每日自动签到、每日自动任务与 Token 自动续期保活
@@ -27,8 +27,11 @@
 | --- | --- | --- | --- | --- |
 | `workbuddycn` | WorkBuddy 国内版 | `cn` | OAuth 设备授权 | `workbuddycn-*.json` |
 | `workbuddyglobal` | WorkBuddy 国际版 | `global` | OAuth 设备授权 | `workbuddyglobal-*.json` |
+| `autoclawcn` | AutoClaw 国内版 | `cn` | API Key | `autoclawcn-*.json` |
+| `autoclawglobal` | AutoClaw 国际版 | `global` | API Key | `autoclawglobal-*.json` |
 | `qodercn` | Qoder 国内版 | `cn` | OAuth 设备授权 | `qodercn-*.json` |
 | `qoderglobal` | Qoder 国际版 | `global` | OAuth 设备授权 | `qoderglobal-*.json` |
+| `raccoon` | 小浣熊 | — | API Key | `raccoon-*.json` |
 | `opencodezen` | OpenCode ZEN | `global` | API Key | `opencodezen-*.json` |
 | `cline` | Cline | `global` | WorkOS 设备授权 | `cline-*.json` |
 | `zcode` | ZCode | `global` | OAuth CLI 授权 | `zcode-*.json` |
@@ -38,6 +41,8 @@
 | `codearts` | CodeArts | `cn` | OAuth 授权 | `codearts-*.json` |
 | `minimaxcodecn` | MiniMax Code 国内版 | `cn` | OAuth 设备授权 | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code 国际版 | `global` | OAuth 设备授权 | `minimaxcodeglobal-*.json` |
+
+> **骨架供应商提示**：`autoclawcn` / `autoclawglobal`（AutoClaw 国内版/国际版）与 `raccoon`（小浣熊）当前为骨架实现：凭证管理与转发链路已就绪，但上游域名未经实测确认，默认端点为空。使用前请在配置中设置 `autoclawcn_base_url` / `autoclawglobal_base_url` / `raccoon_base_url`，详见 [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md)。
 
 ## 快速开始
 

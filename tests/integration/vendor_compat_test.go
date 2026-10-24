@@ -11,7 +11,7 @@ import (
 	"freetier2api-plugin/internal/core"
 )
 
-// TestVendorRegistryCompatibility 锁定 13 个供应商实例的对外身份与顺序。
+// TestVendorRegistryCompatibility 锁定 16 个供应商实例的对外身份与顺序。
 func TestVendorRegistryCompatibility(t *testing.T) {
 	installFakeHost(t)
 	setupTestPlugin(t)
@@ -20,6 +20,8 @@ func TestVendorRegistryCompatibility(t *testing.T) {
 		name   string
 		region string
 	}{
+		{"autoclawcn", "AutoClaw 国内版", "cn"},
+		{"autoclawglobal", "AutoClaw 国际版", "global"},
 		{"cline", "Cline", ""},
 		{"codearts", "CodeArts", "cn"},
 		{"minimaxcodecn", "MiniMax Code 国内版", "cn"},
@@ -27,6 +29,7 @@ func TestVendorRegistryCompatibility(t *testing.T) {
 		{"opencodezen", "OpenCode ZEN", ""},
 		{"qodercn", "Qoder 国内版", "cn"},
 		{"qoderglobal", "Qoder 国际版", "global"},
+		{"raccoon", "小浣熊", ""},
 		{"traecn", "Trae 国内版", "cn"},
 		{"traeglobal", "Trae 国际版", "global"},
 		{"traesolo", "TRAE SOLO", "cn"},
@@ -70,6 +73,8 @@ func TestVendorCapabilities(t *testing.T) {
 		authMode  string
 	}
 	cases := map[string]want{
+		"autoclawcn":        {refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
+		"autoclawglobal":    {refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
 		"cline":             {login: true, refresh: true, merge: true, configure: true, authMode: "oauth"},
 		"codearts":          {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true},
 		"minimaxcodecn":     {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},
@@ -77,6 +82,7 @@ func TestVendorCapabilities(t *testing.T) {
 		"opencodezen":       {refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
 		"qodercn":           {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
 		"qoderglobal":       {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
+		"raccoon":           {refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
 		"traecn":            {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},
 		"traeglobal":        {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},
 		"traesolo":          {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},

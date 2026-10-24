@@ -15,7 +15,7 @@ If this project helps you, a Star would mean a lot.
 ## Features
 
 - Native integration with CLIProxyAPI's Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`, and OpenAI `/v1/responses` endpoints without running a separate gateway service
-- Supports 13 free-tier provider instances across 8 vendor families with strict per-vendor credential isolation (capped at 10 accounts per provider)
+- Supports 13 free-tier provider instances across 8 vendor families (plus 3 skeleton instances: AutoClaw CN/Global and Raccoon, pending upstream details) with strict per-vendor credential isolation (capped at 10 accounts per provider)
 - Dynamic model catalog discovery, custom model aliases, and cross-provider load balancing / failover
 - Built-in single-page Web console for OAuth device login, localhost callback paste, API Key import, quota tracking, model toggling, and live logs
 - Automated daily check-in, automated daily tasks, and token keepalive refresh
@@ -27,8 +27,11 @@ If this project helps you, a Star would mean a lot.
 | --- | --- | --- | --- | --- |
 | `workbuddycn` | WorkBuddy CN | `cn` | OAuth Device Flow | `workbuddycn-*.json` |
 | `workbuddyglobal` | WorkBuddy Global | `global` | OAuth Device Flow | `workbuddyglobal-*.json` |
+| `autoclawcn` | AutoClaw CN | `cn` | API Key | `autoclawcn-*.json` |
+| `autoclawglobal` | AutoClaw Global | `global` | API Key | `autoclawglobal-*.json` |
 | `qodercn` | Qoder CN | `cn` | OAuth Device Flow | `qodercn-*.json` |
 | `qoderglobal` | Qoder Global | `global` | OAuth Device Flow | `qoderglobal-*.json` |
+| `raccoon` | Raccoon (XiaoHuanXiong) | — | API Key | `raccoon-*.json` |
 | `opencodezen` | OpenCode ZEN | `global` | API Key | `opencodezen-*.json` |
 | `cline` | Cline | `global` | WorkOS Device Flow | `cline-*.json` |
 | `zcode` | ZCode | `global` | OAuth CLI Flow | `zcode-*.json` |
@@ -38,6 +41,8 @@ If this project helps you, a Star would mean a lot.
 | `codearts` | CodeArts | `cn` | OAuth Flow | `codearts-*.json` |
 | `minimaxcodecn` | MiniMax Code CN | `cn` | OAuth Device Flow | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code Global | `global` | OAuth Device Flow | `minimaxcodeglobal-*.json` |
+
+> **Skeleton vendors**: `autoclawcn` / `autoclawglobal` (AutoClaw CN/Global) and `raccoon` are currently skeleton implementations: credential handling and the forwarding pipeline are ready, but the upstream domains are unverified, so the default endpoints are empty. Set `autoclawcn_base_url` / `autoclawglobal_base_url` / `raccoon_base_url` before use; see [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md).
 
 ## Quick Start
 

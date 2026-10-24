@@ -98,6 +98,12 @@ func TestAuthParseVendorOwnershipDiscrimination(t *testing.T) {
 		{"minimaxcodecn filename", "minimaxcodecn-user1.json", "", `{"token":"at_123"}`, true},
 		{"minimaxcodeglobal filename", "minimaxcodeglobal-user1.json", "", `{"token":"at_123","region":"global"}`, true},
 
+		// 新增骨架供应商：AutoClaw 国内版/国际版、小浣熊（API key 型）。
+		{"autoclawcn filename", "autoclawcn-user1.json", "", `{"api_key":"sk-abc"}`, true},
+		{"autoclawglobal filename", "autoclawglobal-user1.json", "", `{"api_key":"sk-abc","region":"global"}`, true},
+		{"autoclaw vendor field", "acc.json", "", `{"vendor":"autoclawcn","autoclaw_key":"sk-abc"}`, true},
+		{"raccoon filename", "raccoon-user1.json", "", `{"raccoon_key":"rk-abc"}`, true},
+		{"raccoon pinyin filename", "xiaohuanxiong-u1.json", "", `{"raccoon_key":"rk-abc","label":"u1"}`, true},
 		// 跨供应商误吞防护：通用结构必须落在**正确**的供应商头上。
 		{"qoder pt token is qoder", "acc.json", "", `{"access_token":"pt-abc"}`, true},
 		{"cline camel is cline", "acc.json", "", `{"accessToken":"at","refreshToken":"rt"}`, true},
