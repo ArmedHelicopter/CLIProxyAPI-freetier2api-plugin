@@ -1,8 +1,11 @@
 package zcode
 
 import (
+	"net/http"
 	"strings"
 	"testing"
+
+	"freetier2api-plugin/internal/core"
 )
 
 func TestClassifyOrderingCaptchaBeforeAuth(t *testing.T) {
@@ -33,5 +36,14 @@ func TestClassifyBusinessCodeWithoutStatus(t *testing.T) {
 	errQuota := Classify(0, `{"code":1005,"msg":"daily quota exhausted"}`)
 	if errQuota.HTTPStatus() != 402 {
 		t.Fatalf("额度耗尽应映射为 402，得到 %d", errQuota.HTTPStatus())
+	}
+}
+
+// TestClassify500WrappedPlanConcurrencyLimit 验证上游把 Start Plan 并发超限
+// 包成 500 时按文案归 SoftRate，而不是落进 5xx 上游故障分支计入熔断。
+func TestClassify500WrappedPlanConcurrencyLimit(t *testing.T) {
+	body := `{"message":"model concurrency limit exceeded","type":"server_error","code":"internal_server_error"}`
+	if failure := Classify(http.StatusInternalServerError, body); failure.Kind != core.FailureKindSoftRate {
+		t.Fatalf("kind = %v, want SoftRate", failure.Kind)
 	}
 }

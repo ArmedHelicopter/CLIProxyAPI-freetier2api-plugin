@@ -229,3 +229,28 @@ func TestMergeStorageJSONPreservesUserKeys(t *testing.T) {
 		t.Fatalf("用户字段丢失: %v", out)
 	}
 }
+
+// TestAccountKeyPrioritizesIdentity 验证闸门键优先用 user_id，回退 email，
+// 两者都缺时用出站凭证指纹，避免互不相关的账号共用同一把闸门。
+func TestAccountKeyPrioritizesIdentity(t *testing.T) {
+	cases := []struct {
+		cred Credential
+		want string
+	}{
+		{Credential{UserID: "u1", Email: "a@b.c", APIKey: "k1"}, "uid:u1"},
+		{Credential{Email: "a@b.c", APIKey: "k1"}, "email:a@b.c"},
+	}
+	for _, tc := range cases {
+		if got := tc.cred.AccountKey(); got != tc.want {
+			t.Fatalf("AccountKey() = %q, want %q", got, tc.want)
+		}
+	}
+	first := (&Credential{APIKey: "k1"}).AccountKey()
+	second := (&Credential{APIKey: "k2"}).AccountKey()
+	if first == "" || first == second {
+		t.Fatalf("token fingerprint must be non-empty and distinct: %q vs %q", first, second)
+	}
+	if (&Credential{}).AccountKey() != "" {
+		t.Fatal("credential without any identity must yield empty key")
+	}
+}

@@ -2,6 +2,8 @@ package zcode
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -46,6 +48,27 @@ func (c *Credential) OutboundToken() string {
 		return c.APIKey
 	}
 	return strings.TrimSpace(c.JWTToken)
+}
+
+// AccountKey 返回按账号串行化时使用的稳定标识：user_id 优先，回退 email，
+// 再回退出站凭证指纹（手工导入的凭证可能两者都缺）；完全无凭证字段的异常
+// 对象返回空串，由调用方按空键兜底。
+func (c *Credential) AccountKey() string {
+	if c == nil {
+		return ""
+	}
+	if key := strings.TrimSpace(c.UserID); key != "" {
+		return "uid:" + key
+	}
+	if key := strings.TrimSpace(c.Email); key != "" {
+		return "email:" + key
+	}
+	token := c.OutboundToken()
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return "token:" + hex.EncodeToString(sum[:8])
 }
 
 // ParseCredential 解析凭证 JSON。

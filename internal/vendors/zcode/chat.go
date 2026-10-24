@@ -6,6 +6,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -36,12 +37,6 @@ type ChatRequest struct {
 
 // Chat 执行一次非流式对话，返回 OpenAI 格式的完整响应。
 func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) {
-	release, errGate := acquireGateForCredential(ctx, req.Credential)
-	if errGate != nil {
-		return nil, errGate
-	}
-	defer release()
-
 	httpReq, model, errBuild := buildHTTPRequest(ctx, baseURL, req)
 	if errBuild != nil {
 		return nil, errBuild
@@ -69,13 +64,6 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 
 // ChatStream 执行一次流式对话，逐条投递 OpenAI chunk。
 func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk func([]byte) error) error {
-	// 闸门覆盖整个流的生命周期：流未读完前，同账号的其他请求都在排队。
-	release, errGate := acquireGateForCredential(ctx, req.Credential)
-	if errGate != nil {
-		return errGate
-	}
-	defer release()
-
 	httpReq, model, errBuild := buildHTTPRequest(ctx, baseURL, req)
 	if errBuild != nil {
 		return errBuild
@@ -113,6 +101,90 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk fu
 		return errStart
 	}
 	return parseAnthropicSSE(resp.Body, converter, onChunk)
+}
+
+// ---- Start Plan 出站闸门 ----
+
+// planQueueWaitTimeout 是排队等待同账号在途对话出清的上限。覆盖常见流式
+// 回答长度；超过后按 SoftRate 交还宿主换路，不把请求挂死。
+const planQueueWaitTimeout = 90 * time.Second
+
+// errPlanQueueTimeout 表示排队超过上限，未取得出站资格。
+var errPlanQueueTimeout = errors.New("zcode start plan queue timeout")
+
+// chatGate 按账号串行化 Start Plan 通道的对话出站。
+//
+// 为什么需要它：Start Plan 是单用户交互套餐，上游以 3008/3009/3010 明确
+// 声明了并发上限，高频并发还会触发 3012「unusual activity」；官方客户端天然
+// 串行（一个用户在打字）。本插件把宿主转发来的并发 agent 请求直灌上游，
+// 等价于把几十个会话塞进一个交互套餐——上游按设计拒绝。同一账号同一时刻
+// 只放行一个在途对话，排队者等前一个出清后再出站，与官方客户端行为一致。
+//
+// 这不是绕过风控：上游以业务错误码声明了并发上限，客户端遵守自己收到的
+// 限制并排队是标准做法；排队等不到时按 SoftRate 交还宿主换路。
+//
+// 状态属于 vendor 实例（与 claimGate 同一约定）：多 App 并存时各自独立。
+type chatGate struct {
+	mu    sync.Mutex
+	slots map[string]chan struct{}
+}
+
+// newChatGate 构造实例级闸门。
+func newChatGate() *chatGate {
+	return &chatGate{slots: map[string]chan struct{}{}}
+}
+
+// acquire 取得该账号的出站资格并返回交还函数：无在途对话立即返回；否则
+// 有界排队，请求 context 取消（宿主断开客户端）时提前退出、不占队列。
+func (g *chatGate) acquire(ctx context.Context, accountKey string) (func(), error) {
+	slot := g.slot(accountKey)
+	timer := time.NewTimer(planQueueWaitTimeout)
+	defer timer.Stop()
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, errPlanQueueTimeout
+	}
+}
+
+// slot 返回账号对应的闸门。账号数受 core.MaxAccountsPerVendor 约束，无需回收。
+func (g *chatGate) slot(accountKey string) chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	slot, ok := g.slots[accountKey]
+	if !ok {
+		slot = make(chan struct{}, 1)
+		g.slots[accountKey] = slot
+	}
+	return slot
+}
+
+// holdStartPlanSlot 为一次对话取得 Start Plan 出站资格，返回值在成功时必为
+// 可调用函数，便于 defer。纯 API Key 通道不受该并发上限约束，直接放行。
+func (v *adapter) holdStartPlanSlot(ctx context.Context, cred *Credential) (func(), error) {
+	if cred == nil || !cred.UsesPlanChannel() {
+		return func() {}, nil
+	}
+	release, errAcquire := v.gate.acquire(ctx, cred.AccountKey())
+	if errAcquire == nil {
+		return release, nil
+	}
+	if errors.Is(errAcquire, errPlanQueueTimeout) {
+		return nil, &core.Failure{
+			Kind:   core.FailureKindSoftRate,
+			Status: 0,
+			Msg:    "zcode Start Plan 通道并发排队超时（同账号在途对话未出清），已交还宿主换路",
+		}
+	}
+	// 宿主已断开：不重试，也不计入上游故障。
+	return nil, &core.Failure{
+		Kind:   core.FailureKindClient,
+		Status: 0,
+		Msg:    "zcode chat cancelled while queued: " + errAcquire.Error(),
+	}
 }
 
 // emitCollapsedCompletion 把一次非流式响应折成 OpenAI chunk 序列。

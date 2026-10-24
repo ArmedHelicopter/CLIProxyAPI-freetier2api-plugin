@@ -1,9 +1,13 @@
 package zcode
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // 对话转换测试：请求侧（tools / tool_calls / tool role / 多模态）与
@@ -459,5 +463,91 @@ func TestApplyCacheControl(t *testing.T) {
 	first := messages[0].(map[string]any)
 	if _, isString := first["content"].(string); !isString {
 		t.Fatalf("非末条消息不应被改写: %v", first["content"])
+	}
+}
+
+// ---- Start Plan 出站闸门 ----
+
+// TestChatGateSerializesPerAccount 验证同账号闸门串行：持有者未释放时后来者
+// 排队，释放后可再次获取；不同账号互不阻塞。
+func TestChatGateSerializesPerAccount(t *testing.T) {
+	gate := newChatGate()
+
+	release, errAcquire := gate.acquire(context.Background(), "uid:user-a")
+	if errAcquire != nil {
+		t.Fatalf("first acquire: %v", errAcquire)
+	}
+
+	ctxQuick, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, errSecond := gate.acquire(ctxQuick, "uid:user-a"); errSecond == nil {
+		t.Fatal("second acquire must block while the slot is held")
+	}
+
+	release()
+	releaseAgain, errThird := gate.acquire(context.Background(), "uid:user-a")
+	if errThird != nil {
+		t.Fatalf("acquire after release: %v", errThird)
+	}
+	releaseAgain()
+
+	releaseOther, errOther := gate.acquire(context.Background(), "uid:user-b")
+	if errOther != nil {
+		t.Fatalf("other account must not be blocked: %v", errOther)
+	}
+	releaseOther()
+}
+
+// TestChatGateRespectsCancelledContext 验证宿主取消请求时排队者立即退出。
+func TestChatGateRespectsCancelledContext(t *testing.T) {
+	gate := newChatGate()
+	release, errAcquire := gate.acquire(context.Background(), "uid:cancel")
+	if errAcquire != nil {
+		t.Fatalf("first acquire: %v", errAcquire)
+	}
+	defer release()
+
+	ctxCancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, errSecond := gate.acquire(ctxCancelled, "uid:cancel"); errSecond == nil {
+		t.Fatal("cancelled context must not acquire a held slot")
+	}
+}
+
+// TestHoldStartPlanSlotSkipsAPIKeyChannel 验证纯 API Key 通道不进闸门：该通道
+// 没有 3008/3009/3010 并发上限，不能被同账号的在途对话挡在队列里。
+func TestHoldStartPlanSlotSkipsAPIKeyChannel(t *testing.T) {
+	v := &adapter{gate: newChatGate()}
+	cred := &Credential{APIKey: "k.s"} // 无 JWT，走网关通道
+
+	release, errHold := v.holdStartPlanSlot(context.Background(), cred)
+	if errHold != nil {
+		t.Fatalf("api-key channel must not queue: %v", errHold)
+	}
+	release()
+
+	if _, errNil := v.holdStartPlanSlot(context.Background(), nil); errNil != nil {
+		t.Fatalf("nil credential must fall through: %v", errNil)
+	}
+}
+
+// TestHoldStartPlanSlotCancelWhileQueuedIsClientFault 验证排队中宿主断开时按
+// 客户端取消处理（不重试、不计上游故障），而不是当成上游 5xx。
+func TestHoldStartPlanSlotCancelWhileQueuedIsClientFault(t *testing.T) {
+	v := &adapter{gate: newChatGate()}
+	native := &Credential{JWTToken: "jwt", UserID: "u-queued"}
+
+	held, errHeld := v.gate.acquire(context.Background(), native.AccountKey())
+	if errHeld != nil {
+		t.Fatalf("hold slot: %v", errHeld)
+	}
+	defer held()
+
+	ctxCancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, errHold := v.holdStartPlanSlot(ctxCancelled, native)
+	failure, ok := errHold.(*core.Failure)
+	if !ok || failure.Kind != core.FailureKindClient {
+		t.Fatalf("cancel while queued = %v, want client failure", errHold)
 	}
 }

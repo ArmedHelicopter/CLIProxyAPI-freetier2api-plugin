@@ -26,11 +26,13 @@ type adapter struct {
 	claims *claimGate
 	// activations 是本实例的活跃上报去重表（每账号每日一次）。
 	activations *activationState
+	// gate 是本实例的 Start Plan 出站闸门；不共享，多 App 并存时互不影响。
+	gate *chatGate
 }
 
 // Instances 构造 ZCode 实例。
 func Instances(env core.Env) []core.Vendor {
-	return []core.Vendor{&adapter{claims: newClaimGate(), activations: newActivationState(), NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+	return []core.Vendor{&adapter{claims: newClaimGate(), activations: newActivationState(), gate: newChatGate(), NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
 		Meta: core.Meta{VendorID: VendorID, VendorName: VendorName, VendorRegion: "global"},
 		Env:  env,
 		Extract: func(c *core.Credential) (*Credential, bool) {
@@ -110,6 +112,12 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	if errNative != nil {
 		return nil, errNative
 	}
+	release, errGate := v.holdStartPlanSlot(ctx, native)
+	if errGate != nil {
+		return nil, errGate
+	}
+	defer release()
+
 	payload, errChat := Chat(ctx, v.baseURL, ChatRequest{
 		Credential: native,
 		Body:       req.Payload,
@@ -130,6 +138,12 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errNative != nil {
 		return errNative
 	}
+	release, errGate := v.holdStartPlanSlot(ctx, native)
+	if errGate != nil {
+		return errGate
+	}
+	defer release()
+
 	return ChatStream(ctx, v.baseURL, ChatRequest{
 		Credential: native,
 		Body:       req.Payload,
