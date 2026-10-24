@@ -602,7 +602,7 @@ func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 // RuntimeFields 声明管理页可改字段。
 func (v *adapter) RuntimeFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{Name: "workbuddy_prompt_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"passthrough", "custom", "append"}, Description: "系统提示词处理模式（页面覆盖 YAML）。"},
+		{Name: "workbuddy_prompt_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"passthrough", "custom", "append"}, Description: "系统提示词处理模式（页面覆盖 YAML）：passthrough=透传 / custom=替换 / append=追加。"},
 	}
 }
 
@@ -783,3 +783,26 @@ func (r *runtime) hostProbeCredential(region Region) *Credential {
 	}
 	return nil
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor                = (*adapter)(nil)
+	_ core.CheckinProvider       = (*adapter)(nil)
+	_ core.Configurable          = (*adapter)(nil)
+	_ core.ConfigFieldsProvider  = (*adapter)(nil)
+	_ core.ConsoleModelProvider  = (*adapter)(nil)
+	_ core.CreditsProvider       = (*adapter)(nil)
+	_ core.LoginProvider         = (*adapter)(nil)
+	_ core.ModelCacheLoader      = (*adapter)(nil)
+	_ core.ModelsProvider        = (*adapter)(nil)
+	_ core.QuotaProvider         = (*adapter)(nil)
+	_ core.Refresher             = (*adapter)(nil)
+	_ core.RuntimeFieldsProvider = (*adapter)(nil)
+	_ core.StorageMerger         = (*adapter)(nil)
+	_ core.TaskCatalogProvider   = (*adapter)(nil)
+	_ core.TaskInspector         = (*adapter)(nil)
+	_ core.TaskPreparer          = (*adapter)(nil)
+	_ core.TaskRunner            = (*adapter)(nil)
+	_ core.TaskStatusProvider    = (*adapter)(nil)
+	_ core.ScheduledRunner       = (*adapter)(nil)
+)

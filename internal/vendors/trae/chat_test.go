@@ -502,10 +502,6 @@ func TestFetchCatalogFiltersAndResolvesWireIDs(t *testing.T) {
 	cred := testCredential()
 
 	// 清掉可能存在的缓存，保证本用例独立。
-	catalogMu.Lock()
-	catalogCache = map[string]catalogEntry{}
-	catalogMu.Unlock()
-
 	models, errModels := FetchModels(context.Background(), cred, cfg)
 	if errModels != nil {
 		t.Fatalf("FetchModels: %v", errModels)
@@ -524,18 +520,18 @@ func TestFetchCatalogFiltersAndResolvesWireIDs(t *testing.T) {
 		t.Error("config_switch=false 的模型不应出现在清单")
 	}
 
-	resolved, errResolve := resolveModelWithCatalog(context.Background(), "DeepSeek-V4-Pro", cfg, cred)
+	resolved, errResolve := (&catalogCache{}).resolve(context.Background(), "DeepSeek-V4-Pro", cfg, cred)
 	if errResolve != nil {
-		t.Fatalf("resolveModelWithCatalog: %v", errResolve)
+		t.Fatalf("catalog.resolve: %v", errResolve)
 	}
 	if resolved.ConfigName != "DeepSeek-V4-Pro" || resolved.WireName != "DeepSeek-V4-Pro__dev" {
 		t.Errorf("解析结果不对: %+v", resolved)
 	}
 
 	// 大小写不敏感匹配，返回目录里的精确拼写。
-	resolvedLower, errLower := resolveModelWithCatalog(context.Background(), "deepseek-v4-pro", cfg, cred)
+	resolvedLower, errLower := (&catalogCache{}).resolve(context.Background(), "deepseek-v4-pro", cfg, cred)
 	if errLower != nil {
-		t.Fatalf("resolveModelWithCatalog(lower): %v", errLower)
+		t.Fatalf("catalog.resolve(lower): %v", errLower)
 	}
 	if resolvedLower.ConfigName != "DeepSeek-V4-Pro" {
 		t.Errorf("小写请求应归一到目录精确拼写: %+v", resolvedLower)
@@ -560,10 +556,7 @@ func TestFetchCatalogUsesChatFunction(t *testing.T) {
 	cfg := testConfig(t, server.URL)
 	cfg.Function = "chat_v3"
 
-	catalogMu.Lock()
-	catalogCache = map[string]catalogEntry{}
-	catalogMu.Unlock()
-
+	// nil 缓存：本次调用直接打上游，不受其它用例留下的条目影响。
 	if _, errModels := FetchModels(context.Background(), testCredential(), cfg); errModels != nil {
 		t.Fatalf("FetchModels: %v", errModels)
 	}

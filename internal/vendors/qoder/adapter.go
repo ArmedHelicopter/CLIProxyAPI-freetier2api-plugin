@@ -531,3 +531,17 @@ func (r *payloadRecorder) WriteHeader(statusCode int) { r.status = statusCode }
 func (r *payloadRecorder) Payload() []byte { return r.body }
 
 func (v *adapter) SupportsCheckin() bool { return true }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.CheckinProvider      = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+	_ core.LoginSessionOwner    = (*adapter)(nil)
+	_ core.ModelsProvider       = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+	_ core.StorageMerger        = (*adapter)(nil)
+)

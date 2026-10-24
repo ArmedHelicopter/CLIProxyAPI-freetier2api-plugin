@@ -170,3 +170,16 @@ func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 		{Name: "zcode_claim_min_interval", Type: pluginapi.ConfigFieldTypeString, Description: "两次套餐领取之间的最小间隔（Go 时长，如 15s；0 表示不节流）。"},
 	}
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.AuthModeReporter     = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+	_ core.Refresher            = (*adapter)(nil)
+	_ core.ActivityProbe        = (*adapter)(nil)
+	_ core.PlanClaimer          = (*adapter)(nil)
+)

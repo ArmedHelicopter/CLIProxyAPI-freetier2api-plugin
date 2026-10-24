@@ -44,7 +44,6 @@ type Deps interface {
 	State() state.State
 	MutateState(func(*state.State))
 	Model() *Catalog
-	WorkbuddyPromptMode() string
 	RefreshModels(ctx context.Context) (int, error)
 	// SubmitLoginCallback 处理用户粘贴回来的 localhost 授权回调链接。
 	SubmitLoginCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error)
@@ -268,8 +267,12 @@ func normalizeRequestPath(path string) string {
 func HTMLResponse(status int, body []byte) pluginapi.ManagementResponse {
 	return pluginapi.ManagementResponse{
 		StatusCode: status,
-		Headers:    http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-		Body:       body,
+		Headers: http.Header{
+			"Content-Type": []string{"text/html; charset=utf-8"},
+			// 页面与后端字段名一起演进：不允许浏览器拿旧页面去提交已改名的键。
+			"Cache-Control": []string{"no-store"},
+		},
+		Body: body,
 	}
 }
 

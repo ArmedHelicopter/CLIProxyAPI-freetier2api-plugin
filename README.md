@@ -237,8 +237,8 @@ internal/vendors/<name>            协议层 + 适配层同包，文件名是**�
   现在 8 个包都是**单包**，`tests/architecture_test.go` 的 `layerRules` 里
   qoder 只剩一条单包条目。
 
-供应商的可变状态（base URL、运行时配置、提示词、档位表、设备令牌缓存、
-登录会话、领取节流窗口、登录回调监听）一律放在 adapter/runtime/SessionStore
+供应商的可变状态（base URL、运行时配置、提示词、档位表、上游目录缓存、
+设备令牌缓存、登录会话、领取节流窗口、登录回调监听）一律放在 adapter/runtime/SessionStore
 实例里，不声明可变包级变量；只读的内嵌 JSON、静态端点表与正则等可作为
 包级常量/只读数据。这样同一进程内多个 App 实例互不影响。
 
@@ -432,7 +432,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 | POST | `/models/alias` | 设置/清除某个模型的别名（body `{"model":"<vendor>:<官方ID>","alias":"对外ID"}`，`alias` 留空清除） |
 | POST | `/models/refresh` | 从上游拉取模型清单并缓存 |
 | GET | `/logs?since=&limit=` | 读插件日志（环形缓冲，增量拉取） |
-| POST | `/settings` | 改插件运行期设置 |
+| POST | `/settings` | 改插件运行期设置；`vendor_settings` 里的键必须是某供应商 `RuntimeFields()` 声明过的字段，枚举/布尔值就地校验，空串表示撤销运行期覆盖、回到 YAML 配置 |
 | POST | `/tasks/scan` | 全账号任务扫描 |
 | POST | `/tasks/run` | 执行待办队列（账号内串行、账号间并发 1-4） |
 | GET | `/tasks/queue` | 队列进度 |

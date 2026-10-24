@@ -42,7 +42,6 @@ func TestDecodeValidation(t *testing.T) {
 		"enabled_realms: mars\n",
 		"log_level: verbose\n",
 		"auto_checkin_at: 25:00\n",
-		"prompt_mode: overwrite\n",
 	} {
 		if _, err := DecodePluginConfig([]byte(raw), DefaultPluginConfig()); err == nil {
 			t.Fatalf("expected error for %q", raw)

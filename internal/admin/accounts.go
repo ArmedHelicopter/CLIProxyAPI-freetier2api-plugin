@@ -36,20 +36,19 @@ func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string
 		modelCounts[model.Realm]++
 	}
 	return map[string]any{
-		"ok":                    true,
-		"plugin":                s.deps.Identity().ID,
-		"version":               s.deps.Identity().Version,
-		"enabled_realms":        cfg.EnabledRealms,
-		"workbuddy_prompt_mode": s.deps.WorkbuddyPromptMode(),
-		"log_level":             logger.CurrentLevel(),
-		"state_dir":             cfg.StateDir,
-		"accounts":              accounts,
-		"account_count":         len(accounts),
-		"model_counts":          modelCounts,
-		"models_fetched_at":     current.ModelsFetchedAt,
-		"restart_pending":       current.RestartPending,
-		"settings":              s.tasks.EffectiveSettings(),
-		"scheduler":             s.tasks.Status(),
+		"ok":                true,
+		"plugin":            s.deps.Identity().ID,
+		"version":           s.deps.Identity().Version,
+		"enabled_realms":    cfg.EnabledRealms,
+		"log_level":         logger.CurrentLevel(),
+		"state_dir":         cfg.StateDir,
+		"accounts":          accounts,
+		"account_count":     len(accounts),
+		"model_counts":      modelCounts,
+		"models_fetched_at": current.ModelsFetchedAt,
+		"restart_pending":   current.RestartPending,
+		"settings":          s.tasks.EffectiveSettings(),
+		"scheduler":         s.tasks.Status(),
 	}
 }
 

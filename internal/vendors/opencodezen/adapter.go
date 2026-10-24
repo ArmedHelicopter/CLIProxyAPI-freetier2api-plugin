@@ -27,6 +27,8 @@ import (
 type adapter struct {
 	*core.NativeAdapter[*Credential]
 	baseURL string
+	// modelsDev 是 models.dev 目录缓存，随实例隔离。
+	modelsDev modelsDevCache
 }
 
 // Instances 构造 ZEN 实例（只有一个，没有区域之分）。
@@ -84,7 +86,7 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 		return nil, errModels
 	}
 	// 上游只给 ID；上下文/输出/档位等元数据由 models.dev 目录按 ID 合并。
-	enrichWithModelsDev(ctx, models)
+	v.modelsDev.enrich(ctx, models)
 	return v.modelsToPluginAPI(models), nil
 }
 
@@ -108,7 +110,7 @@ func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]p
 		logger.Info("opencodezen: model probe failed: %v", errModels)
 		return nil, nil
 	}
-	enrichWithModelsDev(ctx, models)
+	v.modelsDev.enrich(ctx, models)
 	return v.modelsToPluginAPI(models), nil
 }
 
@@ -211,3 +213,12 @@ func (v *adapter) probeAPIKey() string {
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{{Name: "opencodezen_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"}}
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.AuthModeReporter     = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.ModelsProvider       = (*adapter)(nil)
+)

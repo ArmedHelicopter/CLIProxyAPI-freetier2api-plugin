@@ -200,3 +200,13 @@ func (v *adapter) LocalCallbackHint() string { return LocalCallbackURL }
 func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
 	return SubmitCallback(ctx, v.Env.Logins, state, rawURL)
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor            = (*adapter)(nil)
+	_ core.CallbackSubmitter = (*adapter)(nil)
+	_ core.CheckinProvider   = (*adapter)(nil)
+	_ core.LoginProvider     = (*adapter)(nil)
+	_ core.ModelsProvider    = (*adapter)(nil)
+	_ core.QuotaProvider     = (*adapter)(nil)
+)

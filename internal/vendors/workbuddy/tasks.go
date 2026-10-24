@@ -1228,7 +1228,7 @@ func TaskSpecsFor(region Region) []core.TaskSpec {
 				Kind:         TaskKindDailyBonus,
 				Label:        "每日活跃奖励",
 				Description:  "国际版每日签到：活跃信标点亮成长热力图，Bonus Pack 次日凌晨发放",
-				DefaultHours: GlobalDailyBonusHours,
+				DefaultHours: globalDailyBonusHours,
 				Manual:       true,
 				Route:        "/dailybonus",
 			},
@@ -1947,10 +1947,10 @@ func tailOf(text string, n int) string {
 //     单次失败交给下一个排程点兜底；
 //   - 每天多个排程点：已点亮的点只花一次热力图读，几乎零成本。
 
-// GlobalDailyBonusHours 是国际版每日活跃奖励的默认排程点（本地时间）。
+// globalDailyBonusHours 是国际版每日活跃奖励的默认排程点（本地时间）。
 // 4 个点足够兜住「宿主刚启动网络未就绪」这类瞬时失败；运行幂等，
 // 多跑只多一次热力图读。
-var GlobalDailyBonusHours = []int{8, 12, 16, 20}
+var globalDailyBonusHours = []int{8, 12, 16, 20}
 
 // growthHeatmapCell 是成长热力图上的一格。
 type growthHeatmapCell struct {

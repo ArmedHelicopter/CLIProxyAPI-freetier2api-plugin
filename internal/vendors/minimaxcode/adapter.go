@@ -191,3 +191,13 @@ func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 		{Name: "minimaxcode_global_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "国际版上游基地址覆盖。"},
 	}
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.CheckinProvider      = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+)

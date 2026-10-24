@@ -162,8 +162,7 @@ func (d adminDeps) State() state.State         { return d.app.SnapshotState() }
 func (d adminDeps) MutateState(fn func(*state.State)) {
 	d.app.MutateState(fn)
 }
-func (d adminDeps) Model() *admin.Catalog       { return d.app.models }
-func (d adminDeps) WorkbuddyPromptMode() string { return d.app.promptModeFor() }
+func (d adminDeps) Model() *admin.Catalog { return d.app.models }
 
 func (d adminDeps) RefreshModels(ctx context.Context) (int, error) {
 	return d.app.refreshModelsFromUpstream(ctx)

@@ -57,11 +57,6 @@ const (
 	// RealmCN / RealmGlobal 是受支持的域。
 	RealmCN     = "cn"
 	RealmGlobal = "global"
-
-	// PromptModeCustom / PromptModeAppend / PromptModePassThrough 是合法模式。
-	PromptModeCustom      = "custom"
-	PromptModeAppend      = "append"
-	PromptModePassThrough = "passthrough"
 )
 
 // listValuedConfigKeys 是「允许用 YAML 列表写法」的配置键。
@@ -153,14 +148,6 @@ func applyConfigLine(cfg *PluginConfig, key, value string) error {
 		}
 	case "log_to_file":
 		cfg.LogToFile = ParseBool(value, cfg.LogToFile)
-	case "prompt_mode":
-		// 提示词体系属于供应商标属，但枚举值在全局层校验：
-		// 写错时明确报错，而不是让供应商静默回落 passthrough。
-		switch strings.ToLower(strings.TrimSpace(value)) {
-		case "", PromptModeCustom, PromptModeAppend, PromptModePassThrough:
-		default:
-			return fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", value)
-		}
 	case "auto_checkin":
 		cfg.AutoCheckin = ParseBool(value, cfg.AutoCheckin)
 	case "auto_checkin_at":
@@ -218,13 +205,22 @@ func ParseRealms(raw string) ([]string, error) {
 
 // ParseBool 解析布尔值，无法解析时保留 fallback。
 func ParseBool(raw string, fallback bool) bool {
+	value, ok := parseStrictBool(raw)
+	if !ok {
+		return fallback
+	}
+	return value
+}
+
+// parseStrictBool 解析布尔值，无法解析时返回 ok=false（配置校验用）。
+func parseStrictBool(raw string) (value bool, ok bool) {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
 	case "true", "yes", "on", "1":
-		return true
+		return true, true
 	case "false", "no", "off", "0":
-		return false
+		return false, true
 	}
-	return fallback
+	return false, false
 }
 
 // ParseClock 解析 HH:MM 格式的本地时间。

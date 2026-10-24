@@ -399,15 +399,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       <div class="row" style="margin-top:8px">
         <label><input type="checkbox" id="setAutoTasks"> 自动每日任务</label>
       </div>
-      <div class="row" style="margin-top:8px">
-        <label>提示词防御模式
-          <select id="setPromptMode" style="margin-left:8px;padding:3px 6px">
-            <option value="passthrough">透传（保持客户端原始提示词）</option>
-            <option value="custom">替换（剥离特征提示词，注入纯净提示词）</option>
-            <option value="append">追加（文末追加安全指引）</option>
-          </select>
-        </label>
-      </div>
+      <div class="row" id="vendorSettings" style="margin-top:8px"></div>
       <details class="fold" id="scheduleFold">
         <summary>任务排程</summary>
         <div id="taskSchedule"></div>
@@ -889,8 +881,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     });
     host.appendChild(table);
 
-    var summary = el("div", "共 " + accounts.length + " 个账号 · 插件版本 " + (status.version || "-")
-      + " · 提示词 " + (status.workbuddy_prompt_mode || "-"), "hint");
+    var summary = el("div", "共 " + accounts.length + " 个账号 · 插件版本 " + (status.version || "-"), "hint");
     host.appendChild(summary);
   }
 
@@ -908,15 +899,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       document.getElementById("setAutoCheckin").checked = !!settings.auto_checkin;
       document.getElementById("setCheckinAt").value = settings.auto_checkin_at || "10:00";
       document.getElementById("setAutoTasks").checked = !!settings.auto_tasks;
-      var promptSel = document.getElementById("setPromptMode");
-      if (promptSel) {
-        // 键名必须与后端一致：/status 返回 workbuddy_prompt_mode，
-        // 运行期覆盖值在 settings.vendor_settings.workbuddy_prompt_mode。
-        // 两处都取不到才回落 passthrough（后端的默认值）。
-        promptSel.value = status.workbuddy_prompt_mode
-          || (settings.vendor_settings || {}).workbuddy_prompt_mode
-          || "passthrough";
-      }
+      renderVendorSettings(settings);
       renderTaskSchedules(settings);
       var scheduler = status.scheduler || {};
       var labels = {};
@@ -932,6 +915,52 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         syncModelConfig();
       }
     }).catch(function (err) { banner("err", err.message); throw err; });
+  }
+
+  // renderVendorSettings 按供应商自己声明的运行期字段渲染控件。
+  //
+  // 字段来自 /status 的 settings.fields（core.RuntimeFieldsProvider），页面不认
+  // 任何供应商专属键：新增一家供应商只要实现能力，不用改这里。
+  function renderVendorSettings(settings) {
+    var host = document.getElementById("vendorSettings");
+    if (!host) return;
+    host.innerHTML = "";
+    var fields = settings.fields || [];
+    var values = settings.vendor_settings || {};
+    host.style.display = fields.length ? "" : "none";
+    fields.forEach(function (field) {
+      var label = el("label", field.description || field.name);
+      var control;
+      if (field.type === "boolean") {
+        control = vendorSelect([["", "跟随配置"], ["true", "开启"], ["false", "关闭"]]);
+      } else if (field.type === "enum" || (field.enum_values || []).length) {
+        control = vendorSelect([["", "跟随配置"]].concat((field.enum_values || []).map(function (value) {
+          return [value, value];
+        })));
+      } else {
+        control = el("input");
+        control.type = "text";
+      }
+      // 空值表示不覆盖：提交空串时后端删除该键，重新由 YAML 配置决定。
+      control.value = values[field.name] || "";
+      control.dataset.fieldName = field.name;
+      label.appendChild(control);
+      host.appendChild(label);
+      host.appendChild(document.createTextNode(" "));
+    });
+  }
+
+  // vendorSelect 构造下拉控件；options 是 [value, label] 对。
+  function vendorSelect(options) {
+    var control = el("select");
+    control.style.marginLeft = "8px";
+    control.style.padding = "3px 6px";
+    options.forEach(function (pair) {
+      var option = el("option", pair[1]);
+      option.value = pair[0];
+      control.appendChild(option);
+    });
+    return control;
   }
 
   function renderTaskSchedules(settings) {
@@ -2259,12 +2288,15 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     }).catch(function (err) { banner("err", err.message); });
   });
   document.getElementById("btnSaveSettings").addEventListener("click", function () {
-    var promptSel = document.getElementById("setPromptMode");
+    var vendorSettings = {};
+    document.querySelectorAll("#vendorSettings [data-field-name]").forEach(function (control) {
+      vendorSettings[control.dataset.fieldName] = control.value;
+    });
     var payload = {
       auto_checkin: document.getElementById("setAutoCheckin").checked,
       auto_checkin_at: document.getElementById("setCheckinAt").value,
       auto_tasks: document.getElementById("setAutoTasks").checked,
-      workbuddy_prompt_mode: promptSel ? promptSel.value : "passthrough",
+      vendor_settings: vendorSettings,
       task_schedules: {}
     };
     document.querySelectorAll("#taskSchedule input[data-task-kind]").forEach(function (input) {

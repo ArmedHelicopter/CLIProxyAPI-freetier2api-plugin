@@ -32,8 +32,7 @@ func (s stubDeps) State() state.State   { return s.store.Snapshot() }
 func (s stubDeps) MutateState(fn func(*state.State)) {
 	s.store.Mutate(fn)
 }
-func (s stubDeps) Model() *Catalog             { return s.manager }
-func (s stubDeps) WorkbuddyPromptMode() string { return "passthrough" }
+func (s stubDeps) Model() *Catalog { return s.manager }
 func (s stubDeps) ResolveCredential(context.Context, string, []byte, string, map[string]string) (*core.Credential, core.Vendor, error) {
 	return nil, nil, context.Canceled
 }
@@ -177,13 +176,9 @@ func TestSettingsPayloadKeysMatchConsole(t *testing.T) {
 	}
 
 	// 反向：页面读取的 /status 键必须在后端载荷里真实存在。
-	for _, key := range []string{"workbuddy_prompt_mode", "version", "settings"} {
+	for _, key := range []string{"version", "settings", "vendor_settings", "fields"} {
 		if !strings.Contains(page, key) {
 			t.Errorf("页面读取的 /status 键 %q 未出现在页面上", key)
 		}
-	}
-	// 旧键名不得复活：后端已不再返回 prompt_mode。
-	if strings.Contains(page, "status.prompt_mode") {
-		t.Error("页面仍在读 status.prompt_mode，但后端返回的是 workbuddy_prompt_mode")
 	}
 }
