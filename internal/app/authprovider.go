@@ -435,7 +435,12 @@ func (a *App) StartLogin(ctx context.Context, vendorID string, metadata map[stri
 		return nil, core.NewPluginError("vendor_disabled",
 			fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
 	}
-	return a.startVendorLogin(ctx, vendor, metadata)
+	response, errStart := a.startVendorLogin(ctx, vendor, metadata)
+	if errStart != nil {
+		return nil, errStart
+	}
+	logger.Info("started login via console (vendor=%s)", vendor.ID())
+	return response, nil
 }
 
 // LoginCaptchaConfig 取登录前的人机验证控件参数。
