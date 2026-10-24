@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/admin"
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
@@ -139,13 +138,12 @@ func (a *App) Model() *admin.Catalog { return a.models }
 // taskDeps 实现 tasks.Deps。
 type taskDeps struct{ app *App }
 
-func (d taskDeps) Registry() *core.Registry               { return d.app.registry }
-func (d taskDeps) Pool() *auth.Pool                       { return d.app.pool }
-func (d taskDeps) Config() tasks.Config                   { return taskConfig(d.app.Config()) }
-func (d taskDeps) State() state.State                     { return d.app.SnapshotState() }
-func (d taskDeps) MutateState(fn func(*state.State))      { d.app.MutateState(fn) }
-func (d taskDeps) Now() time.Time                         { return d.app.now() }
-func (d taskDeps) RuntimeFields() []pluginapi.ConfigField { return d.app.runtimeFields() }
+func (d taskDeps) Registry() *core.Registry          { return d.app.registry }
+func (d taskDeps) Pool() *auth.Pool                  { return d.app.pool }
+func (d taskDeps) Config() tasks.Config              { return taskConfig(d.app.Config()) }
+func (d taskDeps) State() state.State                { return d.app.SnapshotState() }
+func (d taskDeps) MutateState(fn func(*state.State)) { d.app.MutateState(fn) }
+func (d taskDeps) Now() time.Time                    { return d.app.now() }
 
 // SaveRefreshedCredential 复用组合根里的凭证写回实现（merge → host.auth.save → 落盘）。
 func (d taskDeps) SaveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor,

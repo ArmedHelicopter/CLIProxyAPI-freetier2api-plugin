@@ -227,6 +227,9 @@ internal/vendors/<name>            协议层 + 适配层同包，文件名是**�
   `Instances(env core.Env) []core.Vendor`。
 - 错误分类统一返回 `*core.Failure`（不再有 `type Error = core.Failure` 这类别名），
   兜底模型清单统一叫 `bundledModels()` / `bundledModelsFor(cfg)`。
+- 页面可改的运行期设置由各 adapter 的 `RuntimeFields()` 自己声明（键名、类型、
+  枚举值、说明），管理端只做汇总、校验与按供应商分组渲染，不认任何具体键；
+  字段语义与提示词过滤规则留在供应商包内。
 - 内嵌资源一律放 `assets/`，`go:embed` 写相对路径。
 
 刻意的差异（都不是漏改）：

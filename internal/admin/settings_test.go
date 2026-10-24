@@ -2,7 +2,9 @@ package admin
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -28,18 +30,52 @@ func (*fakeRuntimeVendor) ExecuteStream(context.Context, *core.Credential, *core
 }
 func (*fakeRuntimeVendor) RuntimeFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{Name: "fake_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"a", "b"}},
-		{Name: "fake_flag", Type: pluginapi.ConfigFieldTypeBoolean},
-		{Name: "fake_text", Type: pluginapi.ConfigFieldTypeString},
+		{Name: "fake_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"a", "b"}, Description: "假模式"},
+		{Name: "fake_flag", Type: pluginapi.ConfigFieldTypeBoolean, Description: "假开关"},
+		{Name: "fake_text", Type: pluginapi.ConfigFieldTypeString, Description: "假文本"},
+	}
+}
+
+// newFakeService 注册两个实例（模拟 workbuddycn / workbuddyglobal 这类多实例供应商）。
+func newFakeService(t *testing.T) *Service {
+	t.Helper()
+	deps := newStubDeps(t)
+	for _, id := range []string{"fakecn", "fakeglobal"} {
+		meta := core.Meta{VendorID: id, VendorName: "Fake " + id}
+		if err := deps.registry.Register(&fakeRuntimeVendor{Meta: meta}); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+	return newServiceWithDeps(t, deps)
+}
+
+func TestSettingsViewExposesVendorFields(t *testing.T) {
+	raw, err := json.Marshal(newFakeService(t).settingsView()["fields"])
+	if err != nil {
+		t.Fatalf("marshal fields: %v", err)
+	}
+	// 页面契约是 snake_case：大写 ABI 字段直接输出会让脚本读到 undefined。
+	for _, key := range []string{`"name":"fake_mode"`, `"type":"enum"`, `"enum_values":["a","b"]`, `"vendor":"Fake fakecn"`} {
+		if !strings.Contains(string(raw), key) {
+			t.Errorf("fields 载荷缺少 %s: %s", key, raw)
+		}
+	}
+	if strings.Contains(string(raw), `"EnumValues"`) {
+		t.Errorf("fields 载荷泄漏了 ABI 字段名: %s", raw)
+	}
+
+	var views []vendorFieldView
+	if err := json.Unmarshal(raw, &views); err != nil {
+		t.Fatalf("unmarshal fields: %v", err)
+	}
+	// 两个实例声明同一批键，按键名去重后应只剩 3 个。
+	if len(views) != 3 || views[0].Name != "fake_mode" || views[0].Vendor != "Fake fakecn" {
+		t.Fatalf("fields 未按供应商去重: %#v", views)
 	}
 }
 
 func TestNormalizeVendorSettings(t *testing.T) {
-	registry := core.NewRegistry()
-	if err := registry.Register(&fakeRuntimeVendor{Meta: core.Meta{VendorID: "fake"}}); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	service := &Service{registry: registry}
+	service := newFakeService(t)
 
 	got, err := service.normalizeVendorSettings(map[string]string{
 		"fake_mode": " a ", "fake_flag": " YES ", "fake_text": " x ",

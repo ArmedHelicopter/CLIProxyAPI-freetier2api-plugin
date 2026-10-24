@@ -47,7 +47,7 @@ func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string
 		"model_counts":      modelCounts,
 		"models_fetched_at": current.ModelsFetchedAt,
 		"restart_pending":   current.RestartPending,
-		"settings":          s.tasks.EffectiveSettings(),
+		"settings":          s.settingsView(),
 		"scheduler":         s.tasks.Status(),
 	}
 }

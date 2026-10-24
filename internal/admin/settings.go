@@ -112,14 +112,8 @@ func (s *Service) normalizeVendorSettings(input map[string]string) (map[string]s
 		return nil, nil
 	}
 	fields := map[string]pluginapi.ConfigField{}
-	for _, vendor := range s.registry.Vendors() {
-		provider, okProvider := core.As[core.RuntimeFieldsProvider](vendor)
-		if !okProvider {
-			continue
-		}
-		for _, field := range provider.RuntimeFields() {
-			fields[field.Name] = field
-		}
+	for _, item := range s.runtimeFields() {
+		fields[item.Field.Name] = item.Field
 	}
 	out := make(map[string]string, len(input))
 	for key, value := range input {
@@ -151,6 +145,68 @@ func (s *Service) normalizeVendorSettings(input map[string]string) (map[string]s
 		out[key] = value
 	}
 	return out, nil
+}
+
+// vendorField 是「某个供应商自己声明的运行期字段」。
+//
+// 字段声明归供应商所有（core.RuntimeFieldsProvider）：过滤规则、取值集合都写在
+// 各自 adapter 里，管理端只负责汇总、校验与按页面契约输出，不认任何供应商专属键。
+type vendorField struct {
+	Vendor string
+	Field  pluginapi.ConfigField
+}
+
+// runtimeFields 汇总各供应商声明的运行期字段。
+//
+// 同名键只保留一次：一家供应商的多个实例（workbuddycn / workbuddyglobal）会声明
+// 同一批键，而键本身是插件级配置，重复渲染只会让页面出现两个互不相干的控件。
+func (s *Service) runtimeFields() []vendorField {
+	seen := map[string]bool{}
+	var out []vendorField
+	for _, vendor := range s.registry.Vendors() {
+		provider, okProvider := core.As[core.RuntimeFieldsProvider](vendor)
+		if !okProvider {
+			continue
+		}
+		for _, field := range provider.RuntimeFields() {
+			if field.Name == "" || seen[field.Name] {
+				continue
+			}
+			seen[field.Name] = true
+			out = append(out, vendorField{Vendor: vendor.Name(), Field: field})
+		}
+	}
+	return out
+}
+
+// vendorFieldView 是控制台读取的运行期字段形状（snake_case，与页面脚本一致）。
+//
+// pluginapi.ConfigField 是宿主 ABI 的结构（字段名大写、不带 tag），直接塞进
+// /status 会让页面读到 undefined；页面契约在这里显式定义。
+type vendorFieldView struct {
+	Name        string   `json:"name"`
+	Type        string   `json:"type"`
+	EnumValues  []string `json:"enum_values,omitempty"`
+	Description string   `json:"description"`
+	Vendor      string   `json:"vendor"`
+}
+
+// settingsView 是 /status 的 settings 载荷：任务引擎的可读设置 + 供应商字段。
+func (s *Service) settingsView() map[string]any {
+	settings := s.tasks.EffectiveSettings()
+	fields := s.runtimeFields()
+	views := make([]vendorFieldView, 0, len(fields))
+	for _, item := range fields {
+		views = append(views, vendorFieldView{
+			Name:        item.Field.Name,
+			Type:        string(item.Field.Type),
+			EnumValues:  item.Field.EnumValues,
+			Description: item.Field.Description,
+			Vendor:      item.Vendor,
+		})
+	}
+	settings["fields"] = views
+	return settings
 }
 
 // handleScheduledRun 手动触发一个定时任务。

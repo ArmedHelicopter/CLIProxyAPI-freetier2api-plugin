@@ -238,14 +238,3 @@ func isChatFormat(format string) bool {
 	}
 	return false
 }
-
-// runtimeFields 汇总供应商声明的页面可改字段。
-func (a *App) runtimeFields() []pluginapi.ConfigField {
-	fields := []pluginapi.ConfigField{}
-	for _, vendor := range a.registry.Vendors() {
-		if provider, ok := core.As[core.RuntimeFieldsProvider](vendor); ok {
-			fields = append(fields, provider.RuntimeFields()...)
-		}
-	}
-	return fields
-}

@@ -160,7 +160,6 @@ func (s *Service) effectiveSettings() map[string]any {
 		"schedule":        s.effectiveSchedule(),
 		"task_specs":      s.catalog.Specs(),
 		"vendor_settings": s.deps.State().VendorSettings,
-		"fields":          s.deps.RuntimeFields(),
 	}
 }
 
