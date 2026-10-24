@@ -2094,7 +2094,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     trigger.style.pointerEvents = "none";
     holder.appendChild(trigger);
 
-    var flow = { generation: generation, instance: null, element: element, button: trigger, timer: 0 };
+    var flow = { generation: generation, instance: null, element: element, button: trigger, timer: 0, verified: false };
     loginCaptchaFlow = flow;
 
     // region/prefix 必须在脚本加载前设好，否则 SDK 会打默认站点一直转圈。
@@ -2136,6 +2136,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
               var value = captchaParamText(param);
               if (!value) return { captchaResult: false, bizResult: false };
               return Promise.resolve(onVerify(value)).then(function (ok) {
+                if (ok) flow.verified = true;
                 return { captchaResult: !!ok, bizResult: !!ok };
               }).catch(function () {
                 return { captchaResult: false, bizResult: false };
@@ -2160,6 +2161,13 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     }).then(function () {
       if (generation !== loginCaptchaGeneration) return;
       trigger.click();
+      // SDK 面板右上角的关闭不回调，没人拖动时这里就是唯一能复原界面的地方。
+      setTimeout(function () {
+        if (generation !== loginCaptchaGeneration || flow.verified) return;
+        document.getElementById("loginStatus").textContent = "验证码等待超时，请重新点击登录再试一次";
+        resetLoginCaptcha();
+        setLoginVariantBusy(false);
+      }, 120000);
     });
   }
 
