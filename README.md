@@ -440,6 +440,9 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 | POST | `/tasks/auto_all` | 全部账号依次一键完成（控制台页的批量按钮用它） |
 | GET | `/school/status` | 开学季活动状态 |
 | POST | `/travel` `/activity` `/keepalive` `/blackcat` `/school/run` | 手动触发定时任务 |
+| POST | `/plans/preview` | 查账号当前可领套餐与人机验证控件参数（body `{"account_id":"..."}`） |
+| POST | `/plans/claim` | 提交人机验证令牌领取套餐（body 含 `account_id` / `plan_id` / `verify_param`） |
+| POST | `/activities/preview` | 只读探测账号当前活动投放，不领取；返回 `{ok,activities,warning?}`，`warning` 说明活跃上报失败等导致结果不完整的原因 |
 | POST | `/login/callback` | 提交用户粘贴的 localhost 授权回调链接（body 含 state 与 url 两个字段，详见 core.CallbackSubmitter） |
 | GET | `/v0/resource/plugins/freetier2api/console` | 内嵌控制台页 |
 
@@ -469,6 +472,8 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 - **ZCode 活动套餐以「当日活跃」为投放资格**：官方桌面端每次启动与每日首次活跃都会
   向 `api/v1/event/report` 上报埋点。插件在查询额度/领取前会补报（每账号每日一次），
   否则上游 `billing/preview` 恒空，页面会误显示「已领取」。
+  `activities/preview` 返回的是营销通道的**上游当前投放**（复用套餐字段，不代表可领），
+  且对纯 API Key 凭证同样可用；缺少 `user_id` 时无法补报活跃，此时结果带 `warning`。
 - **Qoder 没有配额重置接口**：额度按计费周期自动恢复。
 - **WorkBuddy 的 `Expert_Philanthropy` 任务不可自动化**：需要真实捐款回执。
 - **宿主「OAuth 模型禁用」弹窗列不出本插件的模型**：宿主只认内置 provider 白名单，请用本插件控制台页的「模型」区块。
