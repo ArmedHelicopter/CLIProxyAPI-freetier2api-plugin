@@ -36,6 +36,12 @@ type ChatRequest struct {
 
 // Chat 执行一次非流式对话，返回 OpenAI 格式的完整响应。
 func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) {
+	release, errGate := acquireGateForCredential(ctx, req.Credential)
+	if errGate != nil {
+		return nil, errGate
+	}
+	defer release()
+
 	httpReq, model, errBuild := buildHTTPRequest(ctx, baseURL, req)
 	if errBuild != nil {
 		return nil, errBuild
@@ -63,6 +69,13 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 
 // ChatStream 执行一次流式对话，逐条投递 OpenAI chunk。
 func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk func([]byte) error) error {
+	// 闸门覆盖整个流的生命周期：流未读完前，同账号的其他请求都在排队。
+	release, errGate := acquireGateForCredential(ctx, req.Credential)
+	if errGate != nil {
+		return errGate
+	}
+	defer release()
+
 	httpReq, model, errBuild := buildHTTPRequest(ctx, baseURL, req)
 	if errBuild != nil {
 		return errBuild
