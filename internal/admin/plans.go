@@ -35,28 +35,26 @@ type planClaimRequest struct {
 	VerifyRegion string `json:"verify_region,omitempty"`
 }
 
-type activityTarget struct {
-	Probe      core.ActivityProbe
-	Credential *core.Credential
-}
-
-func (s *Service) resolveActivityTarget(ctx context.Context, callbackID, accountID string) (activityTarget, string) {
+// resolveAccount 按管理页传来的账号标识载入一个账号。
+//
+// 标识可以是 auth id 或 auth index。失败原因以字符串返回（面向页面提示），
+// 空串表示成功。所有「按账号找能力」的端点共用这段定位逻辑。
+func (s *Service) resolveAccount(ctx context.Context, callbackID, accountID string) (authpkg.Account, string) {
 	identifier := strings.TrimSpace(accountID)
 	if identifier == "" {
-		return activityTarget{}, "缺少 account_id"
+		return authpkg.Account{}, "缺少 account_id"
 	}
-	loaded, failures := s.pool.Load(ctx, callbackID, authpkg.Options{Targets: []string{identifier}, EnabledRealms: s.deps.Config().EnabledRealms})
+	loaded, failures := s.pool.Load(ctx, callbackID, authpkg.Options{
+		Targets:       []string{identifier},
+		EnabledRealms: s.deps.Config().EnabledRealms,
+	})
 	if len(loaded) == 0 {
 		if len(failures) > 0 {
-			return activityTarget{}, failures[0].Message
+			return authpkg.Account{}, failures[0].Message
 		}
-		return activityTarget{}, "账号不存在或已被删除"
+		return authpkg.Account{}, "账号不存在或已被删除"
 	}
-	probe, ok := core.As[core.ActivityProbe](loaded[0].Vendor)
-	if !ok {
-		return activityTarget{}, "该供应商不提供活动探测"
-	}
-	return activityTarget{Probe: probe, Credential: loaded[0].Credential}, ""
+	return loaded[0], ""
 }
 
 // planTarget 是一个已定位的领取目标：账号的套餐能力与对应凭证。
@@ -71,21 +69,10 @@ type planTarget struct {
 // 预览与领取共用这段定位逻辑：两者都是「按账号 ID 找凭证 → 断言能力」，
 // 只有随后的动作不同。失败原因以字符串返回（面向页面提示），空串表示成功。
 func (s *Service) resolvePlanTarget(ctx context.Context, callbackID, accountID string) (planTarget, string) {
-	identifier := strings.TrimSpace(accountID)
-	if identifier == "" {
-		return planTarget{}, "缺少 account_id"
+	account, reason := s.resolveAccount(ctx, callbackID, accountID)
+	if reason != "" {
+		return planTarget{}, reason
 	}
-	loaded, failures := s.pool.Load(ctx, callbackID, authpkg.Options{
-		Targets:       []string{identifier},
-		EnabledRealms: s.deps.Config().EnabledRealms,
-	})
-	if len(loaded) == 0 {
-		if len(failures) > 0 {
-			return planTarget{}, failures[0].Message
-		}
-		return planTarget{}, "账号不存在或已被删除"
-	}
-	account := loaded[0]
 	claimer, okClaimer := core.As[core.PlanClaimer](account.Vendor)
 	if !okClaimer {
 		return planTarget{}, "该供应商不提供套餐领取"
@@ -104,18 +91,27 @@ func (s *Service) handleActivitiesPreview(req pluginapi.ManagementRequest) plugi
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
-	target, reason := s.resolveActivityTarget(ctx, hostbridge.RequestCallbackID(req), body.AccountID)
+	account, reason := s.resolveAccount(ctx, hostbridge.RequestCallbackID(req), body.AccountID)
 	if reason != "" {
 		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": reason})
 	}
-	plans, errProbe := target.Probe.ProbeActivity(ctx, target.Credential)
+	probe, okProbe := core.As[core.ActivityProbe](account.Vendor)
+	if !okProbe {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": "该供应商不提供活动探测"})
+	}
+	result, errProbe := probe.ProbeActivity(ctx, account.Credential)
 	if errProbe != nil {
 		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": errProbe.Error()})
 	}
-	if plans == nil {
-		plans = []core.PlanInfo{}
+	activities := result.Activities
+	if activities == nil {
+		activities = []core.PlanInfo{}
 	}
-	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "activities": plans})
+	payload := map[string]any{"ok": true, "activities": activities}
+	if result.Warning != "" {
+		payload["warning"] = result.Warning
+	}
+	return JSONResponse(http.StatusOK, payload)
 }
 
 // handlePlansPreview 返回账号**实时**可领套餐与人机验证控件参数。
