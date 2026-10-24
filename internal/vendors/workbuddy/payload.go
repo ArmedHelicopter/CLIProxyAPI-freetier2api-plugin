@@ -110,6 +110,10 @@ func PrepareBody(body []byte, opts PrepareOptions) []byte {
 	// 10) 档位归一。
 	normalizeReasoningEffort(payload, opts.SupportedEfforts[model])
 
+	// 10.5) reasoning_summary：正版在开思考（thinking enabled 或带档位）
+	// 且调用方未指定时注入 "auto"，补齐协议形态。
+	injectReasoningSummary(payload)
+
 	// 11) reasoning_content 回填。
 	backfillReasoningContent(payload)
 
@@ -509,6 +513,21 @@ func nearestEffort(supported []string, requestedRank int) string {
 		return lowest
 	}
 	return supported[0]
+}
+
+// injectReasoningSummary 在开思考且调用方未指定摘要档位时注入 "auto"。
+//
+// 与正版 injectReasoningSummaryIfNeeded 对齐：thinking.type=enabled、
+// reasoning_effort 或 reasoning.effort 存在即视为开思考；
+// body 已带 reasoning_summary（含显式关闭）时不覆盖。
+func injectReasoningSummary(payload map[string]any) {
+	if _, okSummary := payload["reasoning_summary"]; okSummary {
+		return
+	}
+	if !reasoningGateOpen(payload) {
+		return
+	}
+	payload["reasoning_summary"] = "auto"
 }
 
 // backfillReasoningContent 为 assistant 消息补齐 reasoning 字段。
