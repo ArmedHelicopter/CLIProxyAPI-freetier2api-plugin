@@ -120,7 +120,7 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 
 	for _, job := range jobs {
 		identity := job.identity()
-		if cached := s.getCachedQuota(identity.UID, identity.AuthID, identity.AuthIndex, identity.Name, identity.Label); cached != nil {
+		if cached := s.getCachedQuota(identity.VendorID, identity.UID, identity.AuthID); cached != nil {
 			results = append(results, *cached)
 			continue
 		}
@@ -171,7 +171,7 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 		// 而「上游没有额度接口」这类结论早已确定，不存在还会变。
 		defer func() {
 			result := outcome.result
-			s.cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
+			s.cacheQuotaResult(result)
 		}()
 		quota, errQuota := s.queryQuota(ctx, current)
 		if errQuota != nil {

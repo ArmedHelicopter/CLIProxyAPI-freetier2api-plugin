@@ -74,28 +74,45 @@ type accountSummary struct {
 	SupportsClaim bool               `json:"supports_claim"`
 }
 
-func (s *Service) getCachedQuota(keys ...string) *quotaResult {
-	s.quotaMu.RLock()
-	defer s.quotaMu.RUnlock()
-	for _, key := range keys {
-		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			if q, ok := s.quotaCache[trimmed]; ok {
-				copyQ := q
-				return &copyQ
-			}
-		}
+// quotaCacheKey 返回额度缓存的唯一键：供应商 + 账号身份（FileID 优先，AuthID 兜底）。
+//
+// 键必须同时包含供应商与账号身份。额度结果曾按 Name / Label / AuthIndex 多键落库，
+// 这些字段跨供应商并不唯一（两个账号同昵称、或同一个 auth_index 都很常见），于是 A
+// 账号的额度会被 B 账号读到——OpenCode ZEN 显示 WorkBuddy 的「剩余 / 总额」正是
+// 这条路径。
+func quotaCacheKey(vendorID, fileID, authID string) string {
+	vendorID = strings.TrimSpace(vendorID)
+	accountID := core.FirstNonEmpty(fileID, authID)
+	if vendorID == "" || accountID == "" {
+		return ""
 	}
-	return nil
+	return vendorID + "\x00" + accountID
 }
 
-func (s *Service) cacheQuotaResult(q quotaResult, keys ...string) {
+// getCachedQuota 读取账号额度缓存；身份不完整时视为未命中。
+func (s *Service) getCachedQuota(vendorID, fileID, authID string) *quotaResult {
+	key := quotaCacheKey(vendorID, fileID, authID)
+	if key == "" {
+		return nil
+	}
+	s.quotaMu.RLock()
+	defer s.quotaMu.RUnlock()
+	q, ok := s.quotaCache[key]
+	if !ok {
+		return nil
+	}
+	return &q
+}
+
+// cacheQuotaResult 写入账号额度缓存；身份不完整时不写。
+func (s *Service) cacheQuotaResult(q quotaResult) {
+	key := quotaCacheKey(q.VendorID, q.UID, q.AuthID)
+	if key == "" {
+		return
+	}
 	s.quotaMu.Lock()
 	defer s.quotaMu.Unlock()
-	for _, key := range keys {
-		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			s.quotaCache[trimmed] = q
-		}
-	}
+	s.quotaCache[key] = q
 }
 
 func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
@@ -143,13 +160,17 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 			claim := record
 			summary.Claim = &claim
 		}
-		if q := s.getCachedQuota(uid, summary.AuthID, summary.AuthIndex, entry.Name, summary.Label); q != nil {
-			summary.Quota = q
-			// A successful quota read proves the credential is usable even when
-			// the host retained a stale runtime error from an earlier request.
-			// Do not mutate host auth state; only avoid displaying a contradictory
-			// error in this plugin's account overview.
-			summary.Status = displayedAccountStatus(summary.Status, q.OK)
+		// 只有支持额度查询的供应商才读取额度缓存。不支持额度的账号（OpenCode
+		// ZEN、Cline 等）不该显示任何「剩余 / 总额」，即便缓存里存在同名字段。
+		if supportsQuota(vendor) {
+			if q := s.getCachedQuota(vendor.ID(), uid, summary.AuthID); q != nil {
+				summary.Quota = q
+				// A successful quota read proves the credential is usable even when
+				// the host retained a stale runtime error from an earlier request.
+				// Do not mutate host auth state; only avoid displaying a contradictory
+				// error in this plugin's account overview.
+				summary.Status = displayedAccountStatus(summary.Status, q.OK)
+			}
 		}
 		out = append(out, summary)
 	}
