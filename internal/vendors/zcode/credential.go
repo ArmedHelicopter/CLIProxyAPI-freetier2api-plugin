@@ -499,6 +499,22 @@ func (h *IdentityHeaders) Apply(target map[string]string) {
 	}
 }
 
+// upstreamAuthHeaders 是上游通用的身份与鉴权头。
+//
+// JWT 优先（Coding Plan 通道），没有 JWT 时回退 API Key：两条链路的网关都认
+// 这两种凭证，只是 billing 族仅对 JWT 有意义。请求级追踪头每请求重新生成。
+func upstreamAuthHeaders(cred *Credential) map[string]string {
+	headers := map[string]string{}
+	BuildIdentityHeaders(cred.Profile).Apply(headers)
+	if strings.TrimSpace(cred.JWTToken) != "" {
+		headers["Authorization"] = "Bearer " + cred.JWTToken
+	} else if strings.TrimSpace(cred.APIKey) != "" {
+		headers["x-api-key"] = cred.APIKey
+	}
+	headers["x-request-id"] = NewUUID()
+	return headers
+}
+
 // BuildIdentityHeaders 构造完整身份头（对齐官方桌面端 companion 头集合）。
 //
 // 有账号时取该账号的设备档案；profile 为零值时回退全局伪装常量。

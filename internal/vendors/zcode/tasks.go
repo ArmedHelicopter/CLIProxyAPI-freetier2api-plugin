@@ -23,17 +23,8 @@ import (
 // 平台/语言/时区/设备 ID 全部取账号档案：上游按设备聚类做风控，
 // 全局伪装值会让所有账号聚成同一台机器。
 func billingHeaders(cred *Credential) map[string]string {
-	headers := map[string]string{
-		"Content-Type": "application/json",
-		"User-Agent":   UserAgent,
-	}
-	BuildIdentityHeaders(cred.Profile).Apply(headers)
-	if strings.TrimSpace(cred.JWTToken) != "" {
-		headers["Authorization"] = "Bearer " + cred.JWTToken
-	} else if strings.TrimSpace(cred.APIKey) != "" {
-		headers["x-api-key"] = cred.APIKey
-	}
-	headers["x-request-id"] = NewUUID()
+	headers := upstreamAuthHeaders(cred)
+	headers["Content-Type"] = "application/json"
 	return headers
 }
 
@@ -492,9 +483,14 @@ func (v *adapter) fetchPlanSnapshot(ctx context.Context, cred *Credential) planS
 
 // planRows 取 balance 响应里的 data.plans。
 func planRows(body map[string]any) []map[string]any {
-	raw, _ := dataMap(body)["plans"].([]any)
-	rows := make([]map[string]any, 0, len(raw))
-	for _, item := range raw {
+	return objectRows(dataMap(body)["plans"])
+}
+
+// objectRows 把 JSON 数组里的对象挑出来，忽略其他形态的条目。
+func objectRows(value any) []map[string]any {
+	items, _ := value.([]any)
+	rows := make([]map[string]any, 0, len(items))
+	for _, item := range items {
 		if entry, okEntry := item.(map[string]any); okEntry {
 			rows = append(rows, entry)
 		}
@@ -550,47 +546,54 @@ func fetchOfferedPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, 
 		return nil, code, nil
 	}
 
-	raw, _ := dataMap(body)["plans"].([]any)
-	plans := make([]core.PlanInfo, 0, len(raw))
+	return normalizePlans(planRows(body)), codeSuccess, nil
+}
+
+// normalizePlans 把原始套餐条目归一化成 PlanInfo 列表。
+//
+// 丢弃没有 plan_id 的条目、按 plan_id 去重，再按优先级降序 / plan_id 升序排列：
+// 同优先级也要有稳定顺序，否则页面展示会随上游返回顺序抖动。billing/preview 与
+// marketing/touch 两条链路共用这段约定。
+func normalizePlans(rows []map[string]any) []core.PlanInfo {
+	plans := make([]core.PlanInfo, 0, len(rows))
 	seen := map[string]bool{}
-	for _, item := range raw {
-		entry, okEntry := item.(map[string]any)
-		if !okEntry {
-			continue
-		}
-		plan := parsePlan(entry)
+	for _, row := range rows {
+		plan := parsePlan(row)
 		if plan == nil || seen[plan.PlanID] {
 			continue
 		}
 		seen[plan.PlanID] = true
 		plans = append(plans, *plan)
 	}
-	// 优先级降序；同优先级按 plan_id 排序保证顺序稳定（否则同批活动的展示
-	// 顺序会随上游返回顺序抖动）。
 	sort.SliceStable(plans, func(i, j int) bool {
 		if plans[i].Priority != plans[j].Priority {
 			return plans[i].Priority > plans[j].Priority
 		}
 		return plans[i].PlanID < plans[j].PlanID
 	})
-	return plans, codeSuccess, nil
+	return plans
 }
 
-// ProbeActivity 只读探测账号当前活动资格，不执行领取。
-// 它允许 API Key 账号参与 1024 Dev Day 等不限 Coding Plan 的活动探测。
-func (v *adapter) ProbeActivity(ctx context.Context, cred *core.Credential) ([]core.PlanInfo, error) {
+// ProbeActivity 只读探测账号当前可见的活动投放，不执行领取。
+//
+// 探测允许 API Key 账号参与（如 1024 Dev Day 这类不限 Coding Plan 的活动），
+// 因此不走 billingBlockReason（那条通道只服务 JWT）。活跃上报失败只降级成
+// Warning：缺 user_id 的 API Key 凭证报不上活跃，但营销通道可能仍有投放，
+// 直接失败会让端点对它完全不可用。
+func (v *adapter) ProbeActivity(ctx context.Context, cred *core.Credential) (core.ActivityProbeResult, error) {
 	native, errNative := v.Native(cred)
 	if errNative != nil {
-		return nil, errNative
+		return core.ActivityProbeResult{}, errNative
 	}
 	if native == nil {
-		return nil, core.NewPluginError("zcode_credential_missing", "zcode credential is nil", http.StatusBadRequest)
+		return core.ActivityProbeResult{}, core.NewPluginError("zcode_credential_missing", "zcode credential is nil", http.StatusBadRequest)
 	}
-	// 活跃上报是官方客户端资格同步，不能因缺 JWT 阻止活动探测。
-	if reason := v.ensureActivation(ctx, native); reason != "" {
-		return nil, core.NewPluginError("zcode_activity_activation", reason, http.StatusBadGateway)
+	warning := v.ensureActivation(ctx, native)
+	activities, errQuery := queryMarketingTouch(ctx, native)
+	if errQuery != nil {
+		return core.ActivityProbeResult{}, errQuery
 	}
-	return queryMarketingTouch(ctx, native)
+	return core.ActivityProbeResult{Activities: activities, Warning: warning}, nil
 }
 
 var _ core.ActivityProbe = (*adapter)(nil)

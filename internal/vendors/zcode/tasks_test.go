@@ -16,16 +16,12 @@ import (
 //   - 集合运算：已投放 ∩ 已持有 = 按钮置灰的依据；
 //   - 业务码翻译：页面上的文案直接来自这里。
 
-func TestBillingHeadersUseAPIKeyForActivityEligibleCredential(t *testing.T) {
+func TestBillingHeadersFallBackToAPIKey(t *testing.T) {
 	cred := &Credential{APIKey: "sk-test", Profile: DeviceProfile{Platform: "win32", Arch: "x64"}}
 	headers := billingHeaders(cred)
 	if headers["x-api-key"] != "sk-test" || headers["Authorization"] != "" {
 		t.Fatalf("API key headers = %#v", headers)
 	}
-}
-
-func TestAdapterSupportsIndependentActivityProbe(t *testing.T) {
-	var _ core.ActivityProbe = (*adapter)(nil)
 }
 
 func TestNormalizePlanIDIsCaseAndSpaceInsensitive(t *testing.T) {

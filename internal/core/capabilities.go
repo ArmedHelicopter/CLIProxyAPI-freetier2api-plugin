@@ -361,10 +361,22 @@ type PlanClaimer interface {
 	ClaimPlan(ctx context.Context, cred *Credential, req ClaimPlanRequest) (ClaimPlanResponse, error)
 }
 
+// ActivityProbeResult 是一次只读活动探测的结果。
+//
+// Activities 复用 PlanInfo：上游投放的活动与套餐同构（同一个 plan_id、同一份
+// 授予明细），另立一套字段只会多一次逐字段搬运。它**不代表可领**——是否已持有、
+// 是否在领取窗口内由供应商判断，这里如实返回上游当前投放。
+// Warning 说明本次结果可能不完整的原因（例如活跃上报失败），空串表示链路完整；
+// 有 Activities 时 Warning 也可能非空。
+type ActivityProbeResult struct {
+	Activities []PlanInfo `json:"activities"`
+	Warning    string     `json:"warning,omitempty"`
+}
+
 // ActivityProbe 是只读的活动探测能力，与套餐领取能力分离。
 // 实现可以在探测前执行必要的无副作用资格同步（例如日活事件），但不得领取。
 type ActivityProbe interface {
-	ProbeActivity(ctx context.Context, cred *Credential) ([]PlanInfo, error)
+	ProbeActivity(ctx context.Context, cred *Credential) (ActivityProbeResult, error)
 }
 
 // RuntimeFieldsProvider 由需要声明管理页可改字段的供应商实现。

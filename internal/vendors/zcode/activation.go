@@ -163,7 +163,7 @@ func (v *adapter) ensureActivation(ctx context.Context, cred *Credential) string
 	if userID == "" {
 		// 无用户身份无法上报（官方事件体以 user_id 归属）；如实说明而不是静默跳过，
 		// 否则用户会继续看到一个永远空的活动列表。
-		return "凭证缺少 user_id，无法上报活跃事件（可能是旧凭证，请重新登录）"
+		return "凭证缺少 user_id，无法上报活跃事件（活动投放可能不完整；可重新登录或补充 user_id）"
 	}
 
 	today := localDate(cred.Profile, time.Now())
