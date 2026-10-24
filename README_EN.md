@@ -42,7 +42,7 @@ If this project helps you, a Star would mean a lot.
 | `minimaxcodecn` | MiniMax Code CN | `cn` | OAuth Device Flow | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code Global | `global` | OAuth Device Flow | `minimaxcodeglobal-*.json` |
 
-> **New vendors**: `autoclawcn` / `autoclawglobal` (AutoClaw CN/Global) and `raccoon` (SenseTime Raccoon). AutoClaw credentials are `accessToken`/`refreshToken` JSON (paste manually; no console login entry); Raccoon supports web authorize login from the console (official authorize page + callback link paste). See [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md) for protocol details and configuration keys.
+> **New vendors**: `autoclawcn` / `autoclawglobal` (AutoClaw CN/Global) and `raccoon` (SenseTime Raccoon). AutoClaw CN supports console SMS-code login and Global supports Google OAuth web login (or paste `accessToken`/`refreshToken` JSON); Raccoon supports web authorize login from the console (official authorize page + callback link paste). See [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md) for protocol details and configuration keys.
 
 ## Quick Start
 

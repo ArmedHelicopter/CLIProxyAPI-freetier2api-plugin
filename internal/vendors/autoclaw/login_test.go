@@ -1,0 +1,125 @@
+package autoclaw
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"freetier2api-plugin/internal/core"
+)
+
+func TestNormalizePhone(t *testing.T) {
+	cases := map[string]string{
+		"13812345678":    "13812345678",
+		" 138-1234-5678": "13812345678",
+		"+8613812345678": "13812345678",
+		"8613812345678":  "13812345678",
+	}
+	for raw, want := range cases {
+		got, err := normalizePhone(raw)
+		if err != nil || got != want {
+			t.Fatalf("normalizePhone(%q) = %q, %v; want %q", raw, got, err, want)
+		}
+	}
+	for _, bad := range []string{"12345", "23812345678", "1381234567a", ""} {
+		if _, err := normalizePhone(bad); err == nil {
+			t.Fatalf("normalizePhone(%q) should fail", bad)
+		}
+	}
+}
+
+func TestNormalizeSMSCode(t *testing.T) {
+	if got, err := normalizeSMSCode(" 123456 "); err != nil || got != 123456 {
+		t.Fatalf("normalizeSMSCode = %d, %v", got, err)
+	}
+	// 前导零无所谓：服务端只看数值。
+	if got, err := normalizeSMSCode("000000"); err != nil || got != 0 {
+		t.Fatalf("normalizeSMSCode(000000) = %d, %v", got, err)
+	}
+	if _, err := normalizeSMSCode("12345"); err == nil {
+		t.Fatal("5-digit code should fail")
+	}
+	if _, err := normalizeSMSCode("12345a"); err == nil {
+		t.Fatal("non-digit code should fail")
+	}
+}
+
+func TestDescribeSMSLoginError(t *testing.T) {
+	// 400001 是参数错误而不是「验证码不正确」——混为一谈会把排查方向带偏。
+	if got := describeSMSLoginError(400001, "请求数据有问题"); !strings.Contains(got, "参数") {
+		t.Fatalf("400001 message = %q", got)
+	}
+	if got := describeSMSLoginError(630202, ""); !strings.Contains(got, "验证码不正确") {
+		t.Fatalf("630202 message = %q", got)
+	}
+}
+
+func TestMaskPhone(t *testing.T) {
+	if got := MaskPhone("13812345678"); got != "138****5678" {
+		t.Fatalf("MaskPhone = %q", got)
+	}
+	if got := MaskPhone("123"); got != "123" {
+		t.Fatalf("MaskPhone(short) = %q", got)
+	}
+}
+
+func TestSMSLoginProviderCapability(t *testing.T) {
+	instances := Instances(core.Env{})
+	if _, cnOK := core.As[core.SMSLoginProvider](instances[0]); !cnOK {
+		t.Fatal("cn instance should implement SMSLoginProvider")
+	}
+	gl, glOK := core.As[core.SMSLoginProvider](instances[1])
+	if !glOK {
+		t.Fatal("global instance should implement SMSLoginProvider (interface satisfied, entry rejects)")
+	}
+	// 国际版在入口处拒绝（手机验证码已被官方移除）。
+	if _, err := gl.SendLoginCode(testContext(), "13812345678"); err == nil {
+		t.Fatal("intl SendLoginCode should be rejected")
+	} else if _, okLogin := core.As[core.LoginProvider](instances[1]); !okLogin {
+		t.Fatal("global should implement LoginProvider")
+	}
+}
+
+func TestParseOAuthCallback(t *testing.T) {
+	vendor, code, state, ok := ParseOAuthCallback("http://localhost:46952/auth/callback-google?code=ac1&state=up1")
+	if !ok || vendor != oauthVendorGoogle || code != "ac1" || state != "up1" {
+		t.Fatalf("google callback = %v/%v/%v/%v", vendor, code, state, ok)
+	}
+	vendor, code, _, ok = ParseOAuthCallback("http://localhost:18432/auth/callback-zai?code=ac2")
+	if !ok || vendor != oauthVendorZai || code != "ac2" {
+		t.Fatalf("zai callback = %v/%v/%v", vendor, code, ok)
+	}
+	if _, _, _, ok := ParseOAuthCallback("http://evil.com/auth/callback-google?code=x"); ok {
+		t.Fatal("foreign host should be rejected")
+	}
+	if _, _, _, ok := ParseOAuthCallback("http://localhost:46952/other?code=x"); ok {
+		t.Fatal("wrong path should be rejected")
+	}
+}
+
+func TestOAuthNavigateURI(t *testing.T) {
+	if got := OAuthNavigateURI(oauthVendorGoogle, 0); got != "http://localhost:46952/auth/callback-google" {
+		t.Fatalf("OAuthNavigateURI = %q", got)
+	}
+	if got := OAuthNavigateURI(oauthVendorZai, 18432); got != "http://localhost:18432/auth/callback-zai" {
+		t.Fatalf("OAuthNavigateURI zai = %q", got)
+	}
+}
+
+func TestLoginStartRegionGuards(t *testing.T) {
+	instances := Instances(core.Env{})
+	cn, gl := instances[0], instances[1]
+	// 国内版没有 OAuth（上游开关 enabled:false）。
+	if provider, okLogin := core.As[core.LoginProvider](cn); !okLogin {
+		t.Fatal("cn should implement LoginProvider")
+	} else if _, err := provider.LoginStart(testContext(), nil); err == nil {
+		t.Fatal("cn LoginStart should be rejected (no OAuth)")
+	}
+	// 国际版 OAuth 接口存在（URL 获取会打上游，冒烟交给集成测试）。
+	if _, okLogin := core.As[core.LoginProvider](gl); !okLogin {
+		t.Fatal("global should implement LoginProvider")
+	}
+}
+
+// testContext 返回测试用背景 context。
+func testContext() context.Context { return context.Background() }

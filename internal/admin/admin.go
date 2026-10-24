@@ -45,6 +45,10 @@ type Deps interface {
 	MutateState(func(*state.State))
 	Model() *Catalog
 	RefreshModels(ctx context.Context) (int, error)
+	// SendLoginSMS 发送短信验证码（vendorID 定位实现 SMSLoginProvider 的实例）。
+	SendLoginSMS(ctx context.Context, vendorID, phone string) (sessionKey string, err error)
+	// VerifyLoginSMS 用短信验证码完成登录并返回落盘凭证。
+	VerifyLoginSMS(ctx context.Context, vendorID, sessionKey, phone, code string) (fileName, label, storageJSON string, err error)
 	// SubmitLoginCallback 处理用户粘贴回来的 localhost 授权回调链接。
 	SubmitLoginCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error)
 	Reconfigure() error
@@ -113,6 +117,8 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "POST", Path: prefix + "/activities/preview", Description: "只读探测账号当前活动资格，不执行领取。"},
 		{Method: "POST", Path: prefix + "/plans/claim", Description: "提交人机验证令牌并领取套餐。"},
 		{Method: "POST", Path: prefix + "/login/callback", Description: "提交用户粘贴的 localhost 授权回调链接（远程部署下的登录兜底）。"},
+		{Method: "POST", Path: prefix + "/login/sms/send", Description: "发送短信验证码（支持手机验证码登录的供应商）。"},
+		{Method: "POST", Path: prefix + "/login/sms/verify", Description: "用短信验证码完成登录并保存账号。"},
 	}
 	for _, spec := range s.tasks.Catalog().ManualSpecs() {
 		if spec.Route == "" {
@@ -210,6 +216,10 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 		return core.OKEnvelope(s.handlePlansClaim(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/callback"):
 		return core.OKEnvelope(s.handleLoginCallbackRequest(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/sms/send"):
+		return core.OKEnvelope(s.handleLoginSMSSend(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/sms/verify"):
+		return core.OKEnvelope(s.handleLoginSMSVerify(rpc))
 	}
 	if method == http.MethodPost {
 		if suffix, okSuffix := managementSuffix(rpc.Path, id.ID); okSuffix {

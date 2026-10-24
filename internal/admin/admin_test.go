@@ -39,6 +39,14 @@ func (s stubDeps) RefreshModels(context.Context) (int, error) { return 0, nil }
 func (s stubDeps) Reconfigure() error                         { return nil }
 
 // callbackResult / callbackErr 让用例能驱动「粘贴回调链接」的返回分支。
+func (s stubDeps) SendLoginSMS(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (s stubDeps) VerifyLoginSMS(context.Context, string, string, string, string) (string, string, string, error) {
+	return "", "", "", nil
+}
+
 func (s stubDeps) SubmitLoginCallback(context.Context, string, string) (*core.CallbackSubmitResult, error) {
 	if s.callbackErr != nil {
 		return nil, s.callbackErr

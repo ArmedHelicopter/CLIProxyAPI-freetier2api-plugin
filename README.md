@@ -42,7 +42,7 @@
 | `minimaxcodecn` | MiniMax Code 国内版 | `cn` | OAuth 设备授权 | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code 国际版 | `global` | OAuth 设备授权 | `minimaxcodeglobal-*.json` |
 
-> **新供应商**：`autoclawcn` / `autoclawglobal`（AutoClaw 国内版/国际版）与 `raccoon`（小浣熊）。AutoClaw 凭证为 `accessToken`/`refreshToken` JSON（无控制台登录入口，手工粘贴添加）；小浣熊支持控制台网页授权登录（官方授权页 + 回调链接粘贴）。协议细节与配置项见 [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md)。
+> **新供应商**：`autoclawcn` / `autoclawglobal`（AutoClaw 国内版/国际版）与 `raccoon`（小浣熊）。AutoClaw 国内版支持控制台手机验证码登录、国际版支持 Google OAuth 网页登录（也可粘贴 `accessToken`/`refreshToken` JSON）；小浣熊支持控制台网页授权登录（官方授权页 + 回调链接粘贴）。协议细节与配置项见 [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md)。
 
 ## 快速开始
 

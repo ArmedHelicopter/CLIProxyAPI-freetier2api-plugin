@@ -14,6 +14,8 @@ type vendorDescriptor struct {
 	SupportsCheckin bool   `json:"supports_checkin"`
 	AuthMode        string `json:"auth_mode"`
 	SupportsLogin   bool   `json:"supports_login"`
+	// SMSLogin 报告该供应商支持「手机号 + 短信验证码」两步登录表单。
+	SMSLogin bool `json:"sms_login"`
 	// PasteCallback 报告该供应商的登录是否需要（也支持）「粘贴 localhost 回调链接」兜底。
 	PasteCallback bool `json:"paste_callback"`
 	// CallbackHint 是页面要展示的本机回调地址（仅 PasteCallback 为真时有值）。
@@ -34,6 +36,9 @@ func (s *Service) buildVendorsPayload() map[string]any {
 			SupportsCheckin: core.SupportsCheckin(vendor),
 			AuthMode:        vendorAuthMode(vendor),
 			SupportsLogin:   vendorSupportsLogin(vendor),
+		}
+		if _, okSMS := core.As[core.SMSLoginProvider](vendor); okSMS {
+			descriptor.SMSLogin = true
 		}
 		if submitter, okSubmit := core.As[core.CallbackSubmitter](vendor); okSubmit {
 			descriptor.PasteCallback = true

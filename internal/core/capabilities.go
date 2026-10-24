@@ -97,6 +97,19 @@ type CallbackSubmitter interface {
 	SubmitCallback(ctx context.Context, state, rawURL string) (*CallbackSubmitResult, error)
 }
 
+// SMSLoginProvider 由支持「手机号 + 短信验证码」登录的供应商实现。
+//
+// 两步交互与 LoginProvider 的「发起/轮询」模型不同：验证码要用户从手机上
+// 读出来回填，控制台据此渲染专用的两步表单（发码 → 输码登录）。
+// 实现它即表示控制台「添加账号」入口显示手机号表单。
+type SMSLoginProvider interface {
+	// SendLoginCode 发送短信验证码，返回本次登录会话的关联键
+	// （后续 VerifyLoginCode 必须带回它；AutoClaw 是 deviceId）。
+	SendLoginCode(ctx context.Context, phone string) (sessionKey string, err error)
+	// VerifyLoginCode 用验证码完成登录，返回落盘凭证 JSON 与展示标签。
+	VerifyLoginCode(ctx context.Context, sessionKey, phone, code string) (storageJSON []byte, label string, err error)
+}
+
 // Refresher 由需要校验/续期凭证的供应商实现。
 //
 // 未实现时调用方视为「已校验且无需写盘」（refreshed=false）。

@@ -299,6 +299,21 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         <button class="act primary" id="btnAutoAll">一键做任务</button>
       </div>
 
+      <div class="card" id="smsBox" hidden>
+        <h2 id="smsTitle">手机验证码登录</h2>
+        <div class="row" style="margin-bottom:8px">
+          <input type="tel" id="inputSmsPhone" placeholder="手机号（11 位）" style="flex:2;min-width:240px">
+          <button class="act" id="btnSmsSend">发送验证码</button>
+        </div>
+        <div class="row" style="margin-bottom:8px">
+          <input type="text" id="inputSmsCode" placeholder="6 位短信验证码" style="flex:1;min-width:160px" maxlength="6">
+          <input type="text" id="inputSmsLabel" placeholder="备注名称（可选）" style="flex:1;min-width:140px">
+          <button class="act primary" id="btnSmsVerify">登录并添加</button>
+          <button class="act" id="btnSmsCancel">取消</button>
+        </div>
+        <div class="hint" id="smsStatus">输入手机号获取验证码。</div>
+      </div>
+
       <div class="card" id="loginBox" hidden>
         <h2>完成授权</h2>
         <div class="row">
@@ -1886,7 +1901,27 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     }
   }
 
+  var currentSmsVendor = null;
+  var smsSessionKey = "";
+
+  function startSmsLogin(vendor) {
+    stopLoginPolling();
+    currentSmsVendor = vendor;
+    smsSessionKey = "";
+    var box = document.getElementById("smsBox");
+    var login = document.getElementById("loginBox");
+    if (login) login.hidden = true;
+    box.hidden = false;
+    document.getElementById("smsTitle").textContent = "添加 " + vendor.name + " 账号（手机验证码登录）";
+    document.getElementById("inputSmsPhone").value = "";
+    document.getElementById("inputSmsCode").value = "";
+    document.getElementById("inputSmsLabel").value = "";
+    document.getElementById("smsStatus").textContent = "输入手机号获取验证码。";
+    document.getElementById("inputSmsPhone").focus();
+  }
+
   function startLogin(vendor) {
+    if (vendor && vendor.sms_login) { startSmsLogin(vendor); return; }
     stopLoginPolling();
     currentLoginState = "";
     var box = document.getElementById("loginBox");
@@ -2040,6 +2075,61 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   }
 
   document.getElementById("btnSubmitCallback").addEventListener("click", submitLoginCallback);
+
+  // ---- 手机验证码登录（sms_login 供应商）----
+  document.getElementById("btnSmsSend").addEventListener("click", function () {
+    var status = document.getElementById("smsStatus");
+    var phone = document.getElementById("inputSmsPhone").value.trim();
+    var btn = document.getElementById("btnSmsSend");
+    if (!currentSmsVendor) { status.textContent = "请先重新打开添加面板。"; return; }
+    if (!phone) { status.textContent = "请先填写手机号。"; return; }
+    btn.disabled = true; btn.textContent = "发送中…";
+    status.textContent = "正在发送验证码…";
+    api("POST", "/login/sms/send", { vendor_id: currentSmsVendor.id, phone: phone }).then(function (data) {
+      btn.disabled = false; btn.textContent = "发送验证码";
+      if (data && data.ok) {
+        smsSessionKey = (data.session_key || "");
+        status.textContent = data.message || "验证码已发送。";
+        document.getElementById("inputSmsCode").focus();
+      } else {
+        status.textContent = (data && data.message) || "发送失败，请稍后重试。";
+      }
+    }).catch(function (err) {
+      btn.disabled = false; btn.textContent = "发送验证码";
+      status.textContent = "发送失败：" + err.message;
+    });
+  });
+
+  document.getElementById("btnSmsVerify").addEventListener("click", function () {
+    var status = document.getElementById("smsStatus");
+    var phone = document.getElementById("inputSmsPhone").value.trim();
+    var code = document.getElementById("inputSmsCode").value.trim();
+    var label = document.getElementById("inputSmsLabel").value.trim();
+    var btn = document.getElementById("btnSmsVerify");
+    if (!currentSmsVendor) { status.textContent = "请先重新打开添加面板。"; return; }
+    if (!phone || !code) { status.textContent = "请填写手机号与短信验证码。"; return; }
+    btn.disabled = true; btn.textContent = "登录中…";
+    status.textContent = "正在验证并添加账号…";
+    api("POST", "/login/sms/verify", { vendor_id: currentSmsVendor.id, session_key: smsSessionKey, phone: phone, code: code, label: label }).then(function (data) {
+      btn.disabled = false; btn.textContent = "登录并添加";
+      if (data && data.ok) {
+        document.getElementById("smsBox").hidden = true;
+        currentSmsVendor = null;
+        banner("ok", (data.message || "账号添加成功") + "：" + (data.auth_id || ""));
+        loadQuotas(true);
+      } else {
+        status.textContent = (data && data.message) || "登录失败，请检查验证码后重试。";
+      }
+    }).catch(function (err) {
+      btn.disabled = false; btn.textContent = "登录并添加";
+      status.textContent = "登录失败：" + err.message;
+    });
+  });
+
+  document.getElementById("btnSmsCancel").addEventListener("click", function () {
+    document.getElementById("smsBox").hidden = true;
+    currentSmsVendor = null;
+  });
 
   document.getElementById("btnCancelApiKey").addEventListener("click", function () {
     document.getElementById("apiKeyBox").hidden = true;

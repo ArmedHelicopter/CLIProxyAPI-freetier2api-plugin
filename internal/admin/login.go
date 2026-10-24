@@ -9,6 +9,7 @@ package admin
 
 import (
 	"net/http"
+	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/hostbridge"
@@ -80,4 +81,66 @@ func (s *Service) handleLoginCallbackRequest(req pluginapi.ManagementRequest) pl
 		logger.Info("login callback handled (state=%s status=%s)", body.State, status)
 	}
 	return JSONResponse(http.StatusOK, payload)
+}
+
+// ---- 手机验证码登录（SMSLoginProvider）----
+//
+// 交互契约与 login/callback 一致：页面按 {ok, status, message} 读结果，
+// 业务失败返回 200 而不是状态码——错误文案由供应商侧生成，页面直接显示。
+
+type loginSMSSendRequest struct {
+	VendorID string `json:"vendor_id"`
+	Phone    string `json:"phone"`
+}
+
+type loginSMSVerifyRequest struct {
+	VendorID   string `json:"vendor_id"`
+	SessionKey string `json:"session_key"`
+	Phone      string `json:"phone"`
+	Code       string `json:"code"`
+	Label      string `json:"label"`
+}
+
+// handleLoginSMSSend 处理「发送验证码」。
+func (s *Service) handleLoginSMSSend(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	body, errDecode := decodeRequest[loginSMSSendRequest](req.Body)
+	if errDecode != nil {
+		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "message": "请求体解析失败，请刷新页面后重试"})
+	}
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	sessionKey, errSend := s.deps.SendLoginSMS(ctx, strings.TrimSpace(body.VendorID), strings.TrimSpace(body.Phone))
+	if errSend != nil {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": errSend.Error()})
+	}
+	return JSONResponse(http.StatusOK, map[string]any{
+		"ok": true, "session_key": sessionKey,
+		"message": "验证码已发送，请查看手机短信",
+	})
+}
+
+// handleLoginSMSVerify 处理「验证码登录」：换票 + 落盘 + 重载。
+func (s *Service) handleLoginSMSVerify(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	body, errDecode := decodeRequest[loginSMSVerifyRequest](req.Body)
+	if errDecode != nil {
+		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "message": "请求体解析失败，请刷新页面后重试"})
+	}
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	fileName, label, storageJSON, errVerify := s.deps.VerifyLoginSMS(ctx,
+		strings.TrimSpace(body.VendorID), strings.TrimSpace(body.SessionKey),
+		strings.TrimSpace(body.Phone), strings.TrimSpace(body.Code))
+	if errVerify != nil {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": errVerify.Error()})
+	}
+	if body.Label != "" {
+		label = body.Label
+	}
+	if errSave := saveAuthFile(hostbridge.RequestCallbackID(req), fileName, []byte(storageJSON)); errSave != nil {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": "登录成功，但保存凭证失败：" + errSave.Error()})
+	}
+	return JSONResponse(http.StatusOK, map[string]any{
+		"ok": true, "auth_id": fileName, "label": label,
+		"message": "登录成功，账号已添加",
+	})
 }

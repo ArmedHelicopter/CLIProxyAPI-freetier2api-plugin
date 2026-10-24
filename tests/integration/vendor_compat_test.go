@@ -73,8 +73,8 @@ func TestVendorCapabilities(t *testing.T) {
 		authMode  string
 	}
 	cases := map[string]want{
-		"autoclawcn":        {refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
-		"autoclawglobal":    {refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
+		"autoclawcn":        {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true, authMode: "oauth"},
+		"autoclawglobal":    {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true, authMode: "oauth"},
 		"cline":             {login: true, refresh: true, merge: true, configure: true, authMode: "oauth"},
 		"codearts":          {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true},
 		"minimaxcodecn":     {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},

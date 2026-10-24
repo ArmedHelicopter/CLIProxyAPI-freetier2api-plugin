@@ -536,6 +536,46 @@ func (a *App) vendorForLoginSession(sessionID string) (core.Vendor, error) {
 	return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
 }
 
+// SendLoginSMS 发送短信验证码（vendorID 定位实现 SMSLoginProvider 的实例）。
+func (a *App) SendLoginSMS(ctx context.Context, vendorID, phone string) (string, error) {
+	vendor, okVendor := a.registry.ByID(vendorID)
+	if !okVendor {
+		return "", core.NewPluginError("vendor_not_found", "vendor not found: "+vendorID, http.StatusNotFound)
+	}
+	sender, okSMS := core.As[core.SMSLoginProvider](vendor)
+	if !okSMS {
+		return "", core.NewPluginError("sms_unsupported", vendor.Name()+" 不支持手机验证码登录", http.StatusBadRequest)
+	}
+	callbackID := hostbridge.CallbackID(ctx)
+	if errLimit := a.pool.CheckVendorLimit(ctx, callbackID, vendor, ""); errLimit != nil {
+		return "", errLimit
+	}
+	sessionKey, errSend := sender.SendLoginCode(ctx, phone)
+	if errSend != nil {
+		return "", core.ToPluginError(errSend)
+	}
+	return sessionKey, nil
+}
+
+// VerifyLoginSMS 用短信验证码完成登录并返回落盘凭证 JSON。
+func (a *App) VerifyLoginSMS(ctx context.Context, vendorID, sessionKey, phone, code string) (string, string, string, error) {
+	vendor, okVendor := a.registry.ByID(vendorID)
+	if !okVendor {
+		return "", "", "", core.NewPluginError("vendor_not_found", "vendor not found: "+vendorID, http.StatusNotFound)
+	}
+	sender, okSMS := core.As[core.SMSLoginProvider](vendor)
+	if !okSMS {
+		return "", "", "", core.NewPluginError("sms_unsupported", vendor.Name()+" 不支持手机验证码登录", http.StatusBadRequest)
+	}
+	storageJSON, label, errVerify := sender.VerifyLoginCode(ctx, sessionKey, phone, code)
+	if errVerify != nil {
+		return "", "", "", core.ToPluginError(errVerify)
+	}
+	// 文件名按 vendor 前缀 + label 兜底（与 auth.login.poll 的 FileNameFor 同口径）。
+	fileName := core.FileNameFor(vendor.ID(), core.FirstNonEmpty(label, "account"))
+	return fileName, label, string(storageJSON), nil
+}
+
 // SubmitLoginCallback 处理控制台粘贴回来的 localhost 回调链接。
 //
 // 只有实现 core.CallbackSubmitter 的供应商支持（Trae 家族与 CodeArts）：上游
