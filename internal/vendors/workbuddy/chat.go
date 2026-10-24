@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -586,8 +587,6 @@ type ChatMeta struct {
 	ConversationRequestID string
 	// MessageID 是单条消息标识（每条独立）。
 	MessageID string
-	// TraceID 是入站透传的链路 ID（为空时回落 ConversationRequestID）。
-	TraceID string
 }
 
 // applyCommonHeaders 写入所有 API 共享的头。
@@ -717,10 +716,15 @@ func applyAttributionHeaders(req *http.Request, c *Client) {
 	req.Header.Set("X-Product", "SaaS")
 }
 
-// endpointHost 从基址 URL 提取主机名（去 scheme 与结尾斜杠）。
+// endpointHost 从基址 URL 提取主机名（含端口），供 X-Domain 使用。
+// 基址是包内常量且恒带 scheme；解析失败只会出现在误改常量时，返回空串
+// 让问题显式暴露，而不是静默回退到错误的域。
 func endpointHost(base string) string {
-	base = strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(base), "https://"), "http://")
-	return strings.TrimSuffix(base, "/")
+	parsed, errParse := url.Parse(strings.TrimSpace(base))
+	if errParse != nil {
+		return ""
+	}
+	return parsed.Host
 }
 
 // applyConversationHeaders 写入会话头族。
@@ -1449,16 +1453,14 @@ func ensureUsageTotal(usage map[string]any) map[string]any {
 	return out
 }
 
-// ChatMetaFromBody 从请求体与请求头派生会话头族。
+// ChatMetaFromBody 从请求体派生会话头族。
 //
 // conversationRequestID 按正版语义**每轮生成一次**的 UUIDv7（同一次调用的
-// 重试循环共用，靠调用方在轮转循环之外构造一次来保证），不再从内容派生：
-// 内容派生值不是合法 v7 形态，且同一轮跨会话重放会复用同一 ID。
-func ChatMetaFromBody(body []byte, headers http.Header) ChatMeta {
-	conversationKey := ConversationKey(body)
-
+// 重试循环共用，靠调用方在轮转循环之外构造一次来保证）：内容派生值不是
+// 合法 v7 形态，且同一轮跨会话重放会复用同一 ID。
+func ChatMetaFromBody(body []byte) ChatMeta {
 	return ChatMeta{
-		ConversationID:        conversationKey,
+		ConversationID:        ConversationKey(body),
 		ConversationRequestID: NewUUIDv7Hex(),
 	}
 }

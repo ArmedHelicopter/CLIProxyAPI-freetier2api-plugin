@@ -1065,55 +1065,6 @@ func contentSignature(content any) string {
 	return ""
 }
 
-// TurnKey 返回当前轮次的键（最后一条 user 消息）。
-//
-// 序号入键是刻意的：连续两次内容相同的「继续」必须被识别为不同轮次，
-// 否则第二轮会复用第一轮的请求 ID，后台聚合会把它们合并成一次。
-func TurnKey(body []byte) string {
-	payload := decodeBodyMap(body)
-	if payload == nil {
-		return ""
-	}
-	messages, okMessages := payload["messages"].([]any)
-	if !okMessages {
-		return ""
-	}
-	for index := len(messages) - 1; index >= 0; index-- {
-		message, okMessage := messages[index].(map[string]any)
-		if !okMessage {
-			continue
-		}
-		role, _ := message["role"].(string)
-		if !strings.EqualFold(strings.TrimSpace(role), "user") {
-			continue
-		}
-		signature := contentSignature(message["content"])
-		if signature == "" {
-			continue
-		}
-		return fmt.Sprintf("u%d:%s", index, signature)
-	}
-	return ""
-}
-
-// RequestIDForKey 从会话键派生一个稳定的请求 ID。
-func RequestIDForKey(key string) string {
-	if strings.TrimSpace(key) == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte("req|" + key))
-	return hex.EncodeToString(sum[:16])
-}
-
-// TurnRequestID 从轮次键派生一个稳定的请求 ID。
-func TurnRequestID(key string) string {
-	if strings.TrimSpace(key) == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte("turn|" + key))
-	return hex.EncodeToString(sum[:16])
-}
-
 // RealmDisplayName 返回域的展示名。
 func RealmDisplayName(region Region) string {
 	if region.IsGlobal() {

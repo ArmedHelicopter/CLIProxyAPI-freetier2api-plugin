@@ -44,7 +44,7 @@ func TestChatHeadersMatchGenuineClient(t *testing.T) {
 	if errReq != nil {
 		t.Fatal(errReq)
 	}
-	meta := ChatMetaFromBody([]byte(`{"model":"kimi-k3.1-pro","messages":[{"role":"user","content":"hi"}]}`), nil)
+	meta := ChatMetaFromBody([]byte(`{"model":"kimi-k3.1-pro","messages":[{"role":"user","content":"hi"}]}`))
 	c.applyChatHeaders(req, cred, meta, "")
 
 	// 归属与版本。
@@ -121,7 +121,7 @@ func TestChatHeadersMatchGenuineClient(t *testing.T) {
 	if errSecond != nil {
 		t.Fatal(errSecond)
 	}
-	c.applyChatHeaders(second, cred, ChatMetaFromBody([]byte(`{"model":"kimi-k3.1-pro"}`), nil), "")
+	c.applyChatHeaders(second, cred, ChatMetaFromBody([]byte(`{"model":"kimi-k3.1-pro"}`)), "")
 	if second.Header.Get("X-Trace-ID") == traceID {
 		t.Fatal("trace id must be regenerated per request")
 	}
