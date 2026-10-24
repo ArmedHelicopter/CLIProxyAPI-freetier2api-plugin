@@ -16,6 +16,14 @@ import (
 //   - 集合运算：已投放 ∩ 已持有 = 按钮置灰的依据；
 //   - 业务码翻译：页面上的文案直接来自这里。
 
+func TestBillingHeadersFallBackToAPIKey(t *testing.T) {
+	cred := &Credential{APIKey: "sk-test", Profile: DeviceProfile{Platform: "win32", Arch: "x64"}}
+	headers := billingHeaders(cred)
+	if headers["x-api-key"] != "sk-test" || headers["Authorization"] != "" {
+		t.Fatalf("API key headers = %#v", headers)
+	}
+}
+
 func TestNormalizePlanIDIsCaseAndSpaceInsensitive(t *testing.T) {
 	// 上游的 plan_id 大小写不统一（「ZCode-V3-Start-Plan」与「zcode-v3-start-plan」
 	// 指同一个套餐）。不归一化会让已领套餐被再次列成可领。
