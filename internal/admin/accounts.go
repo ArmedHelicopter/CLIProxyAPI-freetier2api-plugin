@@ -118,7 +118,7 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 			Realm:           credential.RegionValue(),
 			Status:          entry.Status,
 			Disabled:        entry.Disabled,
-			SupportsCheckin: core.SupportsCheckin(vendor),
+			SupportsCheckin: core.SupportsCheckinFor(vendor, credential),
 			SupportsQuota:   supportsQuota(vendor),
 			SupportsClaim:   supportsClaim(vendor),
 		}
@@ -334,6 +334,12 @@ func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginap
 	results := s.runForAccounts(ctx, hostbridge.RequestCallbackID(req), body.AccountIDs,
 		func(vendor core.Vendor, _ *core.Credential) bool { return core.SupportsCheckin(vendor) },
 		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (accountActionOutcome, error) {
+			// 供应商级能力为真时仍要按账号复核：企业账号天生没有签到活动，
+			// 如实报「跳过 + 原因」，而不是让上游 400 变成一条失败记录。
+			if !core.SupportsCheckinFor(vendor, credential) {
+				reason := core.FirstNonEmpty(core.CheckinUnsupportedReason(vendor, credential), "本账号不支持签到")
+				return accountActionOutcome{Message: reason, Skipped: true}, nil
+			}
 			checkin, okCheckin := core.As[core.CheckinProvider](vendor)
 			if !okCheckin {
 				return accountActionOutcome{}, fmt.Errorf("本供应商不提供签到")

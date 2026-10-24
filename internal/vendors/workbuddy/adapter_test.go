@@ -128,3 +128,28 @@ func TestBuildCacheKeyIsolatesAccounts(t *testing.T) {
 		t.Fatal("cache key must be deterministic")
 	}
 }
+
+// TestCheckinUnsupportedReasonEnterprise 企业账号没有签到活动。
+//
+// 企业账号打 daily-checkin 恒得到 400 code 10001；如果仍按「支持签到」处理，
+// 自动任务每天会给它记一条失败日志。判据是凭证里的企业租户 id。
+func TestCheckinUnsupportedReasonEnterprise(t *testing.T) {
+	personal := testTaskCredential("uid-personal")
+	if reason := checkinUnsupportedReason(personal); reason != "" {
+		t.Fatalf("个人账号应支持签到，得到 reason=%q", reason)
+	}
+
+	enterprise := testTaskCredential("uid-enterprise")
+	enterprise.EnterpriseID = "fysxmvfpz6dc"
+	reason := checkinUnsupportedReason(enterprise)
+	if !strings.Contains(reason, "企业账号") {
+		t.Fatalf("企业账号的不可签到原因必须可读，得到 %q", reason)
+	}
+
+	// 国际版走每日活跃奖励，与国内版签到端点无关。
+	global := testGlobalCredential("uid-global-enterprise")
+	global.EnterpriseID = "ent-global"
+	if reason := checkinUnsupportedReason(global); reason != "" {
+		t.Fatalf("国际版活跃奖励不受国内企业判定影响，得到 reason=%q", reason)
+	}
+}

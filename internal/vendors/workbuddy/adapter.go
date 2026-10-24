@@ -274,6 +274,11 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if errNative != nil {
 		return nil, errNative
 	}
+	if reason := checkinUnsupportedReason(native); reason != "" {
+		// 企业账号的签到端点恒返回 400 code 10001（「企业账号不支持该操作」）。
+		// 这不是故障，也不该记成「今日已签到」：如实跳过并给出原因。
+		return &core.CheckinResult{NotRecorded: true, Message: reason}, nil
+	}
 	client := v.client(ctx)
 	if v.region.IsGlobal() {
 		result, errBonus := client.GlobalDailyBonus(ctx, native)
@@ -420,6 +425,36 @@ func (v *adapter) client(ctx context.Context) *Client {
 // CN 走 daily-checkin 端点；global 走每日活跃奖励（见 tasks.go），
 // 两个域都有每日收入路径，因此恒为 true。
 func (v *adapter) SupportsCheckin() bool { return true }
+
+// SupportsCheckinFor 实现 core.CheckinCapability：按账号判定签到是否可用。
+func (v *adapter) SupportsCheckinFor(cred *core.Credential) bool {
+	return v.CheckinUnsupportedReason(cred) == ""
+}
+
+// CheckinUnsupportedReason 实现 core.CheckinCapability：返回不可签到的可读原因。
+func (v *adapter) CheckinUnsupportedReason(cred *core.Credential) string {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return ""
+	}
+	return checkinUnsupportedReason(native)
+}
+
+// checkinUnsupportedReason 判定该凭证是否没有签到活动。
+//
+// 企业账号请求 daily-checkin 恒得到 400 code 10001「企业账号不支持该操作」；
+// 企业额度按月度周期自动回满，本来就没有签到这条收入路径。
+// 只看国内版：国际版的每日活跃奖励是另一套链路（信标 + 次日发放），
+// 与国内版签到端点无关。
+func checkinUnsupportedReason(cred *Credential) string {
+	if cred == nil || cred.Realm().IsGlobal() {
+		return ""
+	}
+	if strings.TrimSpace(cred.EnterpriseIDValue()) != "" {
+		return "企业账号不支持签到：企业额度按月度周期自动回满"
+	}
+	return ""
+}
 
 // LoadModelCache 实现 core.ModelCacheLoader：只加载本实例的缓存。
 func (v *adapter) LoadModelCache(cached []core.CachedModel) {

@@ -139,12 +139,28 @@ func registerRequest(t *testing.T, cfg app.Config) []byte {
 
 // sampleCredentialJSON 构造一份凭证 JSON（嵌套形态）。
 func sampleCredentialJSON(realm, uid string) string {
+	return credentialJSON(realm, uid, "ent-1")
+}
+
+// personalCredentialJSON 构造一份不带企业租户的普通账号凭证。
+//
+// 企业账号与个人账号的关键差别就在 enterpriseId 上：企业账号没有签到活动、
+// 额度走企业用量接口，所以「个人账号」用例必须显式不带这个字段。
+func personalCredentialJSON(realm, uid string) string {
+	return credentialJSON(realm, uid, "")
+}
+
+func credentialJSON(realm, uid, enterpriseID string) string {
 	region := workbuddy.NormalizeRegion(realm)
+	enterprise := ""
+	if enterpriseID != "" {
+		enterprise = fmt.Sprintf(`"enterpriseId": %q, `, enterpriseID)
+	}
 	return fmt.Sprintf(`{
   "auth": {"accessToken": "at-%s", "refreshToken": "rt-%s", "expiresAt": %d, "domain": "%s", "realm": "%s"},
-  "account": {"uid": "%s", "enterpriseId": "ent-1", "nickname": "账号%s"},
+  "account": {%s"uid": "%s", "nickname": "账号%s"},
   "device_token": "dt-%s"
-}`, uid, uid, time.Now().Add(24*time.Hour).Unix(), workbuddy.DefaultDomainFor(region), region, uid, uid, uid)
+}`, uid, uid, time.Now().Add(24*time.Hour).Unix(), workbuddy.DefaultDomainFor(region), region, enterprise, uid, uid, uid)
 }
 
 // 小工具。
