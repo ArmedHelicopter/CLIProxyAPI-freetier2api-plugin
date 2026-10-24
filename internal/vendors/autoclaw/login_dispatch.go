@@ -80,11 +80,20 @@ func (oauth *oauthLoginAdapter) LoginStart(ctx context.Context, meta map[string]
 <p style="color:#888">凭证保存后插件会自动续期（refresh_token）。</p>
 </body></html>`
 	dataURL := "data:text/html;charset=utf-8," + url.PathEscape(html)
+	// 宿主要求 login.start 返回非空 state（用于轮询路由与会话归属）；
+	// 会话同时登记进会话表，SubmitCallback 的换票兜底通道依赖它。
+	state := core.RandomHex(16)
+	sessionID := oauth.ID() + "_guide_" + state
+	if oauth.Env.Logins != nil {
+		oauth.Env.Logins.Register(oauth.ID(), sessionID, autoclawOAuthTTL, autoclawOAuthPollInterval,
+			&autoclawPendingLogin{Region: oauth.region, Vendor: oauthVendorGoogle,
+				DeviceID: newDeviceID(), NavigateURI: OAuthNavigateURI(oauthVendorGoogle, 46952)})
+	}
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
 		URL:       dataURL,
-		State:     "",
-		ExpiresAt: time.Now().Add(time.Minute),
+		State:     sessionID,
+		ExpiresAt: time.Now().Add(autoclawOAuthTTL),
 		Metadata: map[string]any{
 			core.VendorKey: oauth.ID(),
 			"region":       string(oauth.region),
