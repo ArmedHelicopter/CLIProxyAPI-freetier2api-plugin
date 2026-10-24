@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 )
 
@@ -285,5 +287,59 @@ func TestOAuthLoginCapabilitiesAndVariants(t *testing.T) {
 	}
 	if list[1].CallbackHint != "http://localhost:46952/auth/callback-google" {
 		t.Fatalf("google hint = %q", list[1].CallbackHint)
+	}
+}
+
+// TestSubmitCallbackExchangesCodeWithSessionNavigateURI 锁定「粘贴回调 → 换码」
+// 这条链：第②跳与第③跳必须用同一个 navigate_uri / device_id，否则 Zai 会以
+// 回调地址不匹配或状态失效拒掉。
+func TestSubmitCallbackExchangesCodeWithSessionNavigateURI(t *testing.T) {
+	useLoopbackHost(t)
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != OAuthLoginPathZai {
+			t.Errorf("path = %q, want %q", r.URL.Path, OAuthLoginPathZai)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_, _ = w.Write([]byte(`{"code":0,"msg":"SUCCESS","data":{"access_token":"access-1",` +
+			`"refresh_token":"refresh-1","user_id":42,"user_name":"tester"}}`))
+	}))
+	defer server.Close()
+
+	instances := Instances(envWithLogins())
+	oauth := instances[1].(*oauthLoginAdapter)
+	oauth.baseURL = server.URL
+	sessionID := oauth.ID() + "_oauth_test"
+	navigateURI := "http://localhost:53699/auth/callback-zai"
+	oauth.Env.Logins.Register(oauth.ID(), sessionID, time.Hour, 0, &autoclawPendingLogin{
+		Region: RegionGlobal, Vendor: oauthVendorZai, DeviceID: "device-1", NavigateURI: navigateURI,
+	})
+
+	result, errSubmit := oauth.SubmitCallback(testContext(), sessionID,
+		"http://localhost:53699/auth/callback-zai?code=code-1&state=upstream-state")
+	if errSubmit != nil {
+		t.Fatalf("SubmitCallback: %v", errSubmit)
+	}
+	if result.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("status = %q, message = %q", result.Status, result.Message)
+	}
+	if result.Auth.FileName != "autoclawglobal-42.json" {
+		t.Fatalf("file name = %q", result.Auth.FileName)
+	}
+	if gotBody["code"] != "code-1" || gotBody["state"] != "upstream-state" {
+		t.Fatalf("body = %#v", gotBody)
+	}
+	if gotBody["navigate_uri"] != navigateURI || gotBody["device_id"] != "device-1" {
+		t.Fatalf("navigate/device mismatch: %#v", gotBody)
+	}
+	var storage map[string]any
+	if errUnmarshal := json.Unmarshal(result.Auth.StorageJSON, &storage); errUnmarshal != nil {
+		t.Fatalf("decode storage: %v", errUnmarshal)
+	}
+	if storage["accessToken"] != "access-1" || storage["refreshToken"] != "refresh-1" {
+		t.Fatalf("storage = %#v", storage)
+	}
+	if _, pollState := oauth.Env.Logins.Poll(sessionID); pollState != core.PollMissing {
+		t.Fatalf("session should be consumed after success, state = %v", pollState)
 	}
 }
