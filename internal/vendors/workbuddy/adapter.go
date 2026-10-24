@@ -10,7 +10,6 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -206,7 +205,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 		Body:       req.Payload,
 		Model:      req.Model,
 		ClientIP:   req.ClientIP,
-		Meta:       ChatMetaFromBody(req.Payload, http.Header(req.Headers)),
+		Meta:       ChatMetaFromBody(req.Payload),
 	})
 	if errChat != nil {
 		return nil, errChat
@@ -229,7 +228,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		Body:       req.Payload,
 		Model:      req.Model,
 		ClientIP:   req.ClientIP,
-		Meta:       ChatMetaFromBody(req.Payload, http.Header(req.Headers)),
+		Meta:       ChatMetaFromBody(req.Payload),
 	})
 	if errStream != nil {
 		return errStream

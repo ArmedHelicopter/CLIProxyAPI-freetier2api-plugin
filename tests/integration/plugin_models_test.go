@@ -26,7 +26,8 @@ func TestModelsForAuthIsolatesRealms(t *testing.T) {
 	host.addAccount("1", "cn-account", sampleCredentialJSON("cn", "cn1"))
 	host.addAccount("2", "global-account", sampleCredentialJSON("global", "g1"))
 	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
-		if (strings.Contains(url, "codebuddy.cn") || strings.Contains(url, "copilot.tencent.com")) && strings.Contains(url, "/v3/config") {
+		// CN /v3/config 随 ChatBase 迁到 www.workbuddy.cn（旧两域保留在条件里做回退兼容）。
+		if (strings.Contains(url, "workbuddy.cn") || strings.Contains(url, "codebuddy.cn") || strings.Contains(url, "copilot.tencent.com")) && strings.Contains(url, "/v3/config") {
 			return fakeUpstreamResponse{
 				Status: http.StatusOK,
 				Body:   `{"code":0,"data":{"models":[{"id":"glm-5.2","name":"GLM-5.2"},{"id":"cn-exclusive","name":"CN Exclusive"}]}}`,

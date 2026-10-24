@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -453,7 +454,10 @@ type Endpoints struct {
 
 var (
 	endpointsCN = Endpoints{
-		ChatBase:       "https://copilot.tencent.com",
+		// ChatBase 与官方 5.8.x 的 product.json endpoint 对齐：模型请求
+		// 自 2026-10 起全部走 www.workbuddy.cn（copilot.tencent.com 只是
+		// 桌面网关的兜底常量）。计费/成长域保持不变（两域目前都在线）。
+		ChatBase:       "https://www.workbuddy.cn",
 		BillingBase:    "https://www.codebuddy.cn",
 		WebBase:        "https://www.workbuddy.cn",
 		Origin:         "https://www.codebuddy.cn",
@@ -536,13 +540,16 @@ const (
 )
 
 // 出站标识内置值。都允许被配置覆盖。
+//
+// 版本号与正版 5.8.3 对齐（UA 三段式取自 daemon.log 头 dump：
+// WorkBuddy/5.8.3 WorkBuddy/5.8.3 CLI/2.161.0）。
 const (
-	defaultClientVersion = "5.5.4"
-	defaultCLIVersion    = "2.137.1"
+	defaultClientVersion = "5.8.3"
+	defaultCLIVersion    = "2.161.0"
 	defaultClientName    = "WorkBuddy"
 	// DesktopClientVersion 是桌面指纹族使用的版本（与 CLI 族刻意不同）。
 	// 导出供 tasks 子包构造桌面指纹事件使用。
-	DesktopClientVersion = "5.5.6"
+	DesktopClientVersion = "5.8.3"
 	// codeBuddyIDEUA / codeBuddyCLIUA 是模型目录探测专用 UA。
 	//
 	// /v3/config 对 UA 敏感：过旧会拿到精简目录或 400 code=12403。
@@ -580,8 +587,6 @@ type ChatMeta struct {
 	ConversationRequestID string
 	// MessageID 是单条消息标识（每条独立）。
 	MessageID string
-	// TraceID 是入站透传的链路 ID（为空时回落 ConversationRequestID）。
-	TraceID string
 }
 
 // applyCommonHeaders 写入所有 API 共享的头。
@@ -646,31 +651,35 @@ func (c *Client) applyChatHeaders(req *http.Request, cred *Credential, meta Chat
 	applyCommonHeaders(req, c, cred)
 	applyAuthHeaders(req, cred)
 
+	// 正版对话请求（CLI 直发路径）不带 Origin/Referer/Accept-Language，
+	// 也不带设备指纹三头（X-Device-Token 仅用于签到与 auth/state）。
+	for _, key := range []string{
+		"Origin", "Referer", "Accept-Language",
+		"X-Device-Token", "X-Machine-ID", "X-Session-ID",
+	} {
+		req.Header.Del(key)
+	}
+
 	req.Header.Set("Accept", "application/json, text/event-stream")
 
 	// 企业与域信息：CN 与 global 的形态不同，写错会被拒。
+	// X-Domain 与正版一致取当前对话域主机名（个人账号也恒发）。
 	if cred.Realm().IsGlobal() {
 		req.Header.Set("X-No-Enterprise-Id", "1")
-		req.Header.Set("X-Domain", strings.TrimSuffix(GetEndpoints(RegionGlobal).ChatBase, "/"))
+		req.Header.Set("X-Domain", endpointHost(GetEndpoints(RegionGlobal).ChatBase))
 	} else {
 		if enterpriseID := cred.EnterpriseIDValue(); enterpriseID != "" {
 			req.Header.Set("X-Enterprise-Id", enterpriseID)
+			req.Header.Set("X-Tenant-Id", enterpriseID)
 		} else {
 			req.Header.Set("X-No-Enterprise-Id", "1")
 		}
-		if domain := cred.DomainValue(); domain != "" {
-			req.Header.Set("X-Domain", domain)
-		} else {
-			req.Header.Set("X-No-Department-Info", "1")
-		}
+		req.Header.Set("X-Domain", endpointHost(GetEndpoints(cred.Realm()).ChatBase))
 	}
 
 	applyAttributionHeaders(req, c)
 	applyConversationHeaders(req, meta)
 
-	if token := c.DeviceToken(cred); token != "" {
-		req.Header.Set("X-Device-Token", token)
-	}
 	if c.opts.PassthroughIP && strings.TrimSpace(clientIP) != "" {
 		req.Header.Set("X-Forwarded-For", clientIP)
 		req.Header.Set("X-Real-IP", clientIP)
@@ -680,7 +689,8 @@ func (c *Client) applyChatHeaders(req *http.Request, cred *Credential, meta Chat
 
 // applyAttributionHeaders 写入客户端归属头。
 //
-// 默认四个头一起给，把请求标识成 WorkBuddy 客户端。
+// 正版恒定发送：X-Product=SaaS（deploymentType）、X-IDE-Type/X-IDE-Name=WorkBuddy、
+// X-IDE-Version=应用版本、X-Agent-Intent=craft、X-Agent-Type=main、X-Private-Data=false。
 // client_name 显式配成 "SaaS" 时还原旧行为（只发 X-Product），保留这个开关
 // 是为了在归属头引起风控变化时能快速回退。
 func applyAttributionHeaders(req *http.Request, c *Client) {
@@ -696,23 +706,44 @@ func applyAttributionHeaders(req *http.Request, c *Client) {
 		req.Header.Set("X-Product", "SaaS")
 		return
 	}
+	req.Header.Set("X-Agent-Intent", "craft")
 	req.Header.Set("X-Agent-Purpose", "conversation")
+	req.Header.Set("X-Agent-Type", "main")
 	req.Header.Set("X-IDE-Name", name)
 	req.Header.Set("X-IDE-Type", name)
 	req.Header.Set("X-IDE-Version", clientVersion)
-	req.Header.Set("X-Product", name)
+	req.Header.Set("X-Private-Data", "false")
+	req.Header.Set("X-Product", "SaaS")
+}
+
+// endpointHost 从基址 URL 提取主机名（含端口），供 X-Domain 使用。
+// 基址是包内常量且恒带 scheme；解析失败只会出现在误改常量时，返回空串
+// 让问题显式暴露，而不是静默回退到错误的域。
+func endpointHost(base string) string {
+	parsed, errParse := url.Parse(strings.TrimSpace(base))
+	if errParse != nil {
+		return ""
+	}
+	return parsed.Host
 }
 
 // applyConversationHeaders 写入会话头族。
 //
+// 正版形态（CLI 直发路径）：
+//   - X-Conversation-Request-ID：每轮稳定（UUIDv7-32hex）；
+//   - X-Conversation-Message-ID / X-Request-ID：每步新生（UUIDv7-32hex，两者同值）；
+//   - X-Root-Request-ID / X-Parent-Conversation-ID：仅子会话才有，主对话不发；
+//   - trace 族每请求随机：traceId 32hex、spanId 16hex、parentSpanId 16hex，
+//     traceparent/b3/X-B3-*/X-Trace-ID 同源。
+//
 // 这一族头看似冗余（多个头取同一个值），但上游后台按它们做请求聚合与链路追踪，
 // 缺任意一个都会让会话在后台被拆散。
 func applyConversationHeaders(req *http.Request, meta ChatMeta) {
-	conversationRequestID := strings.TrimSpace(meta.ConversationRequestID)
 	messageID := strings.TrimSpace(meta.MessageID)
 	if messageID == "" {
-		messageID = newHexID()
+		messageID = NewUUIDv7Hex()
 	}
+	conversationRequestID := strings.TrimSpace(meta.ConversationRequestID)
 	if conversationRequestID == "" {
 		conversationRequestID = messageID
 	}
@@ -722,47 +753,18 @@ func applyConversationHeaders(req *http.Request, meta ChatMeta) {
 	req.Header.Set("X-Conversation-Request-ID", conversationRequestID)
 	req.Header.Set("X-Conversation-Message-ID", messageID)
 	req.Header.Set("X-Request-ID", messageID)
-	req.Header.Set("X-Root-Request-ID", conversationRequestID)
 
-	traceID := strings.TrimSpace(meta.TraceID)
-	if !validTraceID(traceID) {
-		traceID = conversationRequestID
-	}
-	req.Header.Set("X-Trace-ID", traceID)
-
-	b3TraceID := conversationRequestID
-	if !validTraceID(b3TraceID) {
-		b3TraceID = messageID
-	}
-	req.Header.Set("X-B3-TraceId", b3TraceID)
-	req.Header.Set("X-B3-SpanId", spanFromMessageID(messageID))
+	// trace 族：全随机且互相同源（正版由 otel 注入，不复用会话 ID）。
+	traceID := core.RandomHex(16)
+	spanID := core.RandomHex(8)
+	parentSpanID := core.RandomHex(8)
+	req.Header.Set("traceparent", "00-"+traceID+"-"+spanID+"-01")
+	req.Header.Set("b3", traceID+"-"+spanID+"-1-"+parentSpanID)
+	req.Header.Set("X-B3-TraceId", traceID)
+	req.Header.Set("X-B3-SpanId", spanID)
+	req.Header.Set("X-B3-ParentSpanId", parentSpanID)
 	req.Header.Set("X-B3-Sampled", "1")
-}
-
-// spanFromMessageID 从消息 ID 截出 16 位作为 B3 span id。
-func spanFromMessageID(messageID string) string {
-	if len(messageID) >= 16 {
-		return messageID[:16]
-	}
-	return messageID
-}
-
-// validTraceID 校验 trace id：必须是 16 或 32 位 hex（大小写均可）。
-//
-// 上游对非法 trace id 会直接拒绝，因此入站透传的值必须先校验再使用。
-func validTraceID(value string) bool {
-	if len(value) != 16 && len(value) != 32 {
-		return false
-	}
-	for _, char := range value {
-		isDigit := char >= '0' && char <= '9'
-		isLower := char >= 'a' && char <= 'f'
-		isUpper := char >= 'A' && char <= 'F'
-		if !isDigit && !isLower && !isUpper {
-			return false
-		}
-	}
-	return true
+	req.Header.Set("X-Trace-ID", traceID)
 }
 
 // applyBillingHeaders 写入计费域与成长域请求的头。
@@ -1451,32 +1453,14 @@ func ensureUsageTotal(usage map[string]any) map[string]any {
 	return out
 }
 
-// ChatMetaFromBody 从请求体与请求头派生会话头族。
-func ChatMetaFromBody(body []byte, headers http.Header) ChatMeta {
-	conversationKey := ConversationKey(body)
-	turnKey := TurnKey(body)
-
-	// 入站透传的链路 ID 优先（调用方可能已经建好了链路）。
-	traceID := ""
-	if headers != nil {
-		traceID = strings.TrimSpace(headers.Get("X-Trace-ID"))
-	}
-
-	conversationRequestID := ""
-	switch {
-	case conversationKey != "" && turnKey != "":
-		conversationRequestID = TurnRequestID(conversationKey + ":" + turnKey)
-	case turnKey != "":
-		conversationRequestID = TurnRequestID(turnKey)
-	case conversationKey != "":
-		conversationRequestID = RequestIDForKey(conversationKey)
-	default:
-		conversationRequestID = TurnRequestID("")
-	}
-
+// ChatMetaFromBody 从请求体派生会话头族。
+//
+// conversationRequestID 按正版语义**每轮生成一次**的 UUIDv7（同一次调用的
+// 重试循环共用，靠调用方在轮转循环之外构造一次来保证）：内容派生值不是
+// 合法 v7 形态，且同一轮跨会话重放会复用同一 ID。
+func ChatMetaFromBody(body []byte) ChatMeta {
 	return ChatMeta{
-		ConversationID:        conversationKey,
-		ConversationRequestID: conversationRequestID,
-		TraceID:               traceID,
+		ConversationID:        ConversationKey(body),
+		ConversationRequestID: NewUUIDv7Hex(),
 	}
 }
