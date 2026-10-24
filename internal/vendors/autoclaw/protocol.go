@@ -71,4 +71,3 @@ func ApplyModelsHeaders(req *http.Request, apiKey string) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 }
-

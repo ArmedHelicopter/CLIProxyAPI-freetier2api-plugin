@@ -184,4 +184,3 @@ func MaskedKey(key string) string {
 	}
 	return trimmed[:4] + strings.Repeat("*", len(trimmed)-8) + trimmed[len(trimmed)-4:]
 }
-

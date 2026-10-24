@@ -6,4 +6,3 @@ import "encoding/json"
 func jsonUnmarshalHelper(raw string, target *map[string]any) error {
 	return json.Unmarshal([]byte(raw), target)
 }
-

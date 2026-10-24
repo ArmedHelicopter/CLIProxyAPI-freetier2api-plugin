@@ -181,4 +181,3 @@ func TestClassifyStatuses(t *testing.T) {
 func jsonUnmarshalForTest(raw string, target *map[string]any) error {
 	return jsonUnmarshalHelper(raw, target)
 }
-

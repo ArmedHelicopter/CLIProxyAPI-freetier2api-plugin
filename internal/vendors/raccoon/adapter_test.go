@@ -95,4 +95,3 @@ func TestClassifyStatuses(t *testing.T) {
 		t.Fatalf("429 kind = %q", f.Kind)
 	}
 }
-

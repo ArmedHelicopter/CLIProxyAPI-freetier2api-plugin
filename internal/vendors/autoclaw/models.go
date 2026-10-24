@@ -142,4 +142,3 @@ func firstBool(values ...*bool) bool {
 	}
 	return false
 }
-

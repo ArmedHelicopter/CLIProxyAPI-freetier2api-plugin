@@ -24,4 +24,3 @@ func Classify(status int, body string) *core.Failure {
 		Kind:   kind,
 	}
 }
-

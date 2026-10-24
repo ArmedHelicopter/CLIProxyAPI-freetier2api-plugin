@@ -235,4 +235,3 @@ var (
 	_ core.ConfigFieldsProvider = (*adapter)(nil)
 	_ core.ModelsProvider       = (*adapter)(nil)
 )
-
