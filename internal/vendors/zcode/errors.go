@@ -85,8 +85,11 @@ func Classify(status int, body string) *core.Failure {
 			Msg:    core.FirstNonEmpty(msg, "额度已用完"),
 		}
 
-	// 5) 限流 / 并发上限（3008/3009/3010）
-	case status == http.StatusTooManyRequests || payload.Code == codeConcurrent3008 || payload.Code == codeConcurrent3009 || payload.Code == codeConcurrent3010:
+	// 5) 限流 / 并发上限（3008/3009/3010）。上游偶发把并发超限包成 500 +
+	//    OpenAI 形态错误（"model concurrency limit exceeded"），按文案兜住，
+	//    避免落进 5xx 分支被当成上游故障计入熔断。
+	case status == http.StatusTooManyRequests || payload.Code == codeConcurrent3008 || payload.Code == codeConcurrent3009 || payload.Code == codeConcurrent3010 ||
+		strings.Contains(lower, "concurrency limit"):
 		return &core.Failure{
 			Kind:   core.FailureKindSoftRate,
 			Status: pickStatus(status, http.StatusTooManyRequests),
