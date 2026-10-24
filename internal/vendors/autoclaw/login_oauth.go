@@ -14,18 +14,20 @@ package autoclaw
 //	   POST {intl}/userapi/overseasv1/{zai|google}-oauth-login
 //	     {source_id, device_id, code, state, navigate_uri} → token 对。
 //
-// 卡点与取舍：
+// 卡点与解法（2026-10 修正）：
 //   - 第 ② 步强制要求阿里云风控验证码（浏览器端 JS SDK，缺它得误导性的
-//     631002）。插件控制台可以在页面上跑官方 SDK（Agent2API 就是把官方
-//     SDK 原样搬到自己的窗口里跑的），但控制台的登录框契约是「打开 URL +
-//     轮询/粘贴回调」，没有渲染验证码组件的位置。
+//     631002）。插件控制台**本身就是我们自己的页面**，可以直接加载
+//     o.alicdn.com 的官方 SDK（与 ZCode「领套餐」同一套控件），把
+//     captchaVerifyParam 交给 LoginStart，再由这里原样转交上游。
 //   - Google 的回调白名单是 RFC 8252 loopback 宽松匹配（端口任意），浏览器
-//     登录完成后会停在 http://localhost:<任意>/auth/callback-google?code=…，
-//     用户把地址栏整条链接粘回来即可换码（第 ③ 步不需要验证码，实测）。
-//   - Zai 的白名单只认官方客户端那四个登记端口（18432/19654/19723/53699），
-//     且第 ② 步的验证码这关插件侧过不去 —— Zai 暂不支持，入口处明确说明。
+//     登录完成后会停在 http://localhost:46952/auth/callback-google?code=…；
+//     插件跑在远程主机/Docker 时这个地址到不了服务端，用户把地址栏整条链接
+//     粘回来即可换码（第 ③ 步不需要验证码，实测）。
+//   - Zai 的白名单只认官方客户端那四个登记端口
+//     （18432/19654/19723/53699）。这里固定用 53699：官方客户端启动时会先占
+//     第一个空闲端口（通常是 18432），挑末尾那个能避开「回调被桌面端吃掉」。
 //
-// 因此本实现：Google = 完整链路（无需验证码组件）；Zai = 入口拒绝并说明。
+// 因此本实现：Zai / Google 都走完整链路（人机验证 → 授权地址 → 粘贴回调 → 换码）。
 
 import (
 	"context"
@@ -132,6 +134,36 @@ func postSigned(ctx context.Context, baseURL, path string, body any, what string
 	return json.RawMessage(raw), nil
 }
 
+// OAuthCaptchaConfig 取风控验证配置（控制台据此初始化阿里云 SDK）。
+//
+// 返回 enabled=false 不是错误：上游国际化构建会关掉这条登录方式，入口应当
+// 如实告诉用户「这家没有网页登录」，而不是把所有人都引到一次必然失败的滑块。
+func OAuthCaptchaConfig(ctx context.Context, baseURL string) (core.CaptchaConfig, error) {
+	raw, errPost := postSigned(ctx, baseURL, OAuthCaptchaConfigPath, struct{}{}, "获取风控验证配置")
+	if errPost != nil {
+		return core.CaptchaConfig{}, core.ToPluginError(errPost)
+	}
+	code, msg, _ := smsEnvelope(raw)
+	if code != 0 {
+		return core.CaptchaConfig{}, core.NewPluginError("login_failed", describeOAuthError(code, msg), http.StatusBadGateway)
+	}
+	var data struct {
+		Enabled bool   `json:"enabled"`
+		Region  string `json:"region"`
+		Prefix  string `json:"prefix"`
+		SceneID string `json:"scene_id"`
+	}
+	if errUnmarshal := json.Unmarshal(smsData(raw), &data); errUnmarshal != nil {
+		return core.CaptchaConfig{}, &core.Failure{Msg: "parse oauth captcha config: " + errUnmarshal.Error(), Kind: core.FailureKindServer}
+	}
+	return core.CaptchaConfig{
+		Enabled: data.Enabled,
+		SceneID: strings.TrimSpace(data.SceneID),
+		Region:  strings.TrimSpace(data.Region),
+		Prefix:  strings.TrimSpace(data.Prefix),
+	}, nil
+}
+
 // OAuthRequestURL 取 OAuth 授权地址并返回官方登录页 URL。
 //
 // captchaVerifyParam 是控制台页面跑完阿里云 SDK 得到的不透明字符串，网关
@@ -139,13 +171,17 @@ func postSigned(ctx context.Context, baseURL, path string, body any, what string
 // google-oauth-url 的风控要求与 Zai 相同，但 Google 的回调白名单宽松，
 // 部分部署实测可跳过；失败时按 631002 文案回退到「填写凭证」。
 func OAuthRequestURL(ctx context.Context, baseURL string, vendor oauthVendor, navigateURI, captchaVerifyParam, deviceID string) (string, error) {
-	body := map[string]any{
-		"source_id":    protocolName,
-		"device_id":    deviceID,
-		"navigate_uri": navigateURI,
+	captcha := strings.TrimSpace(captchaVerifyParam)
+	if captcha == "" {
+		// 本地就挡掉：不带它打上游必然得到那条误导性的 631002，
+		// 不如在这里说清「验证码这一步没完成」。
+		return "", core.NewPluginError("captcha_required", "缺少风控验证参数，请先完成人机验证", http.StatusBadRequest)
 	}
-	if strings.TrimSpace(captchaVerifyParam) != "" {
-		body["ali_captcha_verify_param"] = strings.TrimSpace(captchaVerifyParam)
+	body := map[string]any{
+		"source_id":                protocolName,
+		"device_id":                deviceID,
+		"navigate_uri":             navigateURI,
+		"ali_captcha_verify_param": captcha,
 	}
 	raw, errPost := postSigned(ctx, baseURL, vendor.urlPath(), body, "获取 "+vendor.label()+" 授权地址")
 	if errPost != nil {
@@ -220,16 +256,62 @@ func OAuthExchangeCode(ctx context.Context, baseURL string, vendor oauthVendor, 
 	return cred, nil
 }
 
+// 回调端口：Zai 只能用官方客户端登记过的那四个端口（见文件头），
+// Google 走 RFC 8252 loopback 匹配，端口任意。
+const (
+	oauthCallbackPortZai    = 53699
+	oauthCallbackPortGoogle = 46952
+)
+
 // OAuthNavigateURI 拼这次登录的回调地址（同时是交给上游的 navigate_uri）。
 //
-// host 必须是 localhost（Zai 白名单逐字校验 host）；Google 是 RFC 8252
-// loopback 宽松匹配，端口任意——这里用 46952（未占用的高位端口），
-// 浏览器登录完成后停在「打不开」的页面上，用户把地址栏整条链接粘回来。
+// host 必须是 localhost（Zai 白名单逐字校验 host）；port<=0 时按变体取默认
+// 端口。插件不监听这个端口：远程/Docker 部署下浏览器停在「打不开」的页面上，
+// 用户把地址栏整条链接粘回来即可。
 func OAuthNavigateURI(vendor oauthVendor, port int) string {
 	if port <= 0 {
-		port = 46952
+		if vendor == oauthVendorZai {
+			port = oauthCallbackPortZai
+		} else {
+			port = oauthCallbackPortGoogle
+		}
 	}
 	return fmt.Sprintf("http://localhost:%d%s%s", port, oauthCallbackPrefix, vendor)
+}
+
+// OAuthVariants 返回控制台要渲染的两个登录入口（顺序与官方客户端一致：Zai 在前）。
+func OAuthVariants() []core.LoginVariant {
+	return []core.LoginVariant{
+		{ID: string(oauthVendorZai), Label: "Zai", CallbackHint: OAuthNavigateURI(oauthVendorZai, 0)},
+		{ID: string(oauthVendorGoogle), Label: "Google", CallbackHint: OAuthNavigateURI(oauthVendorGoogle, 0)},
+	}
+}
+
+// oauthVariantFromMetadata 解析控制台传来的变体标识。
+//
+// 缺省按 Google：宿主旧路径（直接点「添加认证」）不会带这个字段，而 Google
+// 是唯一在任意端口都能完成回调的变体。
+func oauthVariantFromMetadata(meta map[string]any) (oauthVendor, error) {
+	raw := strings.ToLower(metadataString(meta, "oauth_variant"))
+	switch raw {
+	case "", string(oauthVendorGoogle):
+		return oauthVendorGoogle, nil
+	case string(oauthVendorZai):
+		return oauthVendorZai, nil
+	}
+	return "", core.NewPluginError("invalid_request", "未知的登录方式："+raw, http.StatusBadRequest)
+}
+
+// metadataString 取 metadata 里的字符串值（缺失或非字符串返回空串）。
+func metadataString(meta map[string]any, key string) string {
+	if meta == nil {
+		return ""
+	}
+	value, okValue := meta[key].(string)
+	if !okValue {
+		return ""
+	}
+	return strings.TrimSpace(value)
 }
 
 // ParseOAuthCallback 从回调链接里提取 code / state / 变体。
@@ -245,9 +327,15 @@ func ParseOAuthCallback(raw string) (vendor oauthVendor, code, state string, ok 
 	if errParse != nil {
 		return "", "", "", false
 	}
-	if parsed.Hostname() != "localhost" || !strings.HasPrefix(parsed.Path, oauthCallbackPrefix) {
-		// navigate_uri 的 host 必须是 localhost（Zai 白名单逐字校验 host；
-		// 别的 host 即便 path 相同也是伪造回调）。
+	switch strings.ToLower(parsed.Hostname()) {
+	case "localhost", "127.0.0.1", "::1":
+	default:
+		// navigate_uri 的 host 必须是回环地址（Zai 白名单逐字校验 localhost；
+		// 别的 host 即便 path 相同也是伪造回调）。用户从地址栏复制时，
+		// 部分浏览器/代理会把 localhost 规范化成 127.0.0.1 或 [::1]，一并接受。
+		return "", "", "", false
+	}
+	if !strings.HasPrefix(parsed.Path, oauthCallbackPrefix) {
 		return "", "", "", false
 	}
 	switch strings.TrimPrefix(parsed.Path, oauthCallbackPrefix) {

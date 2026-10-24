@@ -20,6 +20,10 @@ type vendorDescriptor struct {
 	PasteCallback bool `json:"paste_callback"`
 	// CallbackHint 是页面要展示的本机回调地址（仅 PasteCallback 为真时有值）。
 	CallbackHint string `json:"callback_hint,omitempty"`
+	// LoginCaptcha 报告登录前是否需要页面内的人机验证控件。
+	LoginCaptcha bool `json:"login_captcha"`
+	// LoginVariants 是同一供应商可选的登录变体（如 AutoClaw 的 Zai / Google）。
+	LoginVariants []core.LoginVariant `json:"login_variants,omitempty"`
 }
 
 func (s *Service) buildVendorsPayload() map[string]any {
@@ -43,6 +47,12 @@ func (s *Service) buildVendorsPayload() map[string]any {
 		if submitter, okSubmit := core.As[core.CallbackSubmitter](vendor); okSubmit {
 			descriptor.PasteCallback = true
 			descriptor.CallbackHint = strings.TrimSpace(submitter.LocalCallbackHint())
+		}
+		if _, okCaptcha := core.As[core.LoginCaptchaProvider](vendor); okCaptcha {
+			descriptor.LoginCaptcha = true
+		}
+		if variants, okVariants := core.As[core.LoginVariantProvider](vendor); okVariants {
+			descriptor.LoginVariants = variants.LoginVariants()
 		}
 		vendors = append(vendors, descriptor)
 	}

@@ -4,7 +4,8 @@
 // 只实现自己真实具备的能力，控制台据此渲染不同的添加表单）：
 //   - smsLoginAdapter（国内版）：core.SMSLoginProvider（手机号 + 验证码）；
 //   - oauthLoginAdapter（国际版）：core.LoginProvider + core.CallbackSubmitter
-//     （Google OAuth 网页登录 + 回调链接粘贴）。
+//     + core.LoginVariantProvider + core.LoginCaptchaProvider
+//     （Zai / Google OAuth 网页登录：页面内人机验证 + 回调链接粘贴）。
 // 共享的 adapter 自身不实现任何登录接口——把 SMS 方法挂在共享类型上会让
 // 国际版在控制台也出现手机号表单（虽然运行时会被拒绝，但 UI 撒谎了）。
 
@@ -14,6 +15,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
@@ -57,14 +59,66 @@ type autoclawPendingLogin struct {
 	NavigateURI string
 }
 
-// LoginStart 返回明确指引（国际版 OAuth 授权链接由上游接口下发且强制要求
-// 阿里云风控验证码——浏览器端 SDK 生成，插件控制台没有该组件的位置，
-// 实测不带参数得到 631002）。控制台在进入添加面板时已直接切换到凭证粘贴
-// 框（startVendorAdd 按 vendor.id 分派），本方法只在绕过面板直调时兜底。
+// LoginStart 用控制台完成人机验证后拿到的令牌换 OAuth 授权地址。
+//
+// 调用链（与 Agent2API providers/autoclaw/oauth.rs 同口径）：
+//
+//	控制台加载阿里云 SDK → 用户拖滑块 → POST {oauth-url}
+//	  {source_id, device_id, navigate_uri, ali_captcha_verify_param}
+//	→ data.oauth_url（就是用户要打开的那个登录页）
+//
+// 第 ② 步的验证码是**浏览器端**生成的，因此这里不接受空令牌：少了它上游
+// 只会回一条误导性的 631002（「当前版本已停止服务」），不如在入口处说清楚。
+// 会话登记进公共会话表，SubmitCallback 靠 state 找回这次的 device_id /
+// navigate_uri / 变体去换码。
 func (oauth *oauthLoginAdapter) LoginStart(ctx context.Context, meta map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	return nil, core.NewPluginError("login_unsupported",
-		"AutoClaw 国际版请在添加面板粘贴 accessToken/refreshToken 凭证 JSON（OAuth 授权链接需上游风控验证码，控制台无法完成）",
-		http.StatusBadRequest)
+	variant, errVariant := oauthVariantFromMetadata(meta)
+	if errVariant != nil {
+		return nil, errVariant
+	}
+	captcha := metadataString(meta, "ali_captcha_verify_param")
+	if captcha == "" {
+		return nil, core.NewPluginError("captcha_required",
+			"请先在控制台完成人机验证（阿里云滑块），再获取授权链接", http.StatusBadRequest)
+	}
+	if oauth.Env.Logins == nil {
+		return nil, core.NewPluginError("login_unavailable",
+			"登录会话表不可用，无法发起登录", http.StatusInternalServerError)
+	}
+	deviceID := newDeviceID()
+	navigateURI := OAuthNavigateURI(variant, 0)
+	authURL, errURL := OAuthRequestURL(ctx, oauth.resolveBaseURL(), variant, navigateURI, captcha, deviceID)
+	if errURL != nil {
+		return nil, core.ToPluginError(errURL)
+	}
+	state := oauth.ID() + "_oauth_" + core.RandomHex(16)
+	oauth.Env.Logins.Register(oauth.ID(), state, autoclawOAuthTTL, autoclawOAuthPollInterval,
+		&autoclawPendingLogin{
+			Region:      oauth.region,
+			Vendor:      variant,
+			DeviceID:    deviceID,
+			NavigateURI: navigateURI,
+		})
+	return &pluginapi.AuthLoginStartResponse{
+		Provider:  core.ProviderKey,
+		URL:       authURL,
+		State:     state,
+		ExpiresAt: time.Now().Add(autoclawOAuthTTL),
+		Metadata: map[string]any{
+			core.VendorKey:  oauth.ID(),
+			"region":        string(oauth.region),
+			"oauth_variant": string(variant),
+			"callback_hint": navigateURI,
+		},
+	}, nil
+}
+
+// LoginVariants 把 Zai / Google 两个入口交给控制台（页面不硬编码供应商细节）。
+func (oauth *oauthLoginAdapter) LoginVariants() []core.LoginVariant { return OAuthVariants() }
+
+// LoginCaptchaConfig 返回阿里云控件的初始化参数（scene_id / region / prefix）。
+func (oauth *oauthLoginAdapter) LoginCaptchaConfig(ctx context.Context) (core.CaptchaConfig, error) {
+	return OAuthCaptchaConfig(ctx, oauth.resolveBaseURL())
 }
 
 // LoginPoll 轮询一次国际版 OAuth 登录状态（等待用户粘贴回调链接）。
@@ -76,17 +130,25 @@ func (oauth *oauthLoginAdapter) LoginPoll(ctx context.Context, state string) (*p
 			Message: "登录会话不存在或已过期，请重新发起登录",
 		}, nil
 	}
-	_ = entry
+	label := oauthVendorGoogle.label()
+	hint := OAuthNavigateURI(oauthVendorGoogle, 0)
+	if pending, okPending := entry.Data.(*autoclawPendingLogin); okPending {
+		label = pending.Vendor.label()
+		hint = pending.NavigateURI
+	}
 	return &pluginapi.AuthLoginPollResponse{
 		Status: pluginapi.AuthLoginStatusPending,
-		Message: "等待用户在授权页完成 Google 登录…登录完成后浏览器会停在 localhost 回调页，" +
-			"请把地址栏里的整条链接复制回控制台提交",
+		Message: "等待用户在授权页完成 " + label + " 登录…登录完成后浏览器会停在 " + hint +
+			"，请把地址栏里的整条链接复制回控制台提交",
 	}, nil
 }
 
-// LocalCallbackHint 返回控制台要展示的本机回调地址（Google 宽松匹配任意端口）。
+// LocalCallbackHint 返回控制台要展示的本机回调地址。
+//
+// 两个变体的端口不同（见 OAuthNavigateURI），页面拿 LoginVariants 里的
+// CallbackHint 逐变体展示；这里给 Google 的地址作为兜底。
 func (oauth *oauthLoginAdapter) LocalCallbackHint() string {
-	return "http://localhost:46952/auth/callback-google"
+	return OAuthNavigateURI(oauthVendorGoogle, 0)
 }
 
 // SubmitCallback 解析用户粘贴的回调链接并完成国际版 OAuth 换票。

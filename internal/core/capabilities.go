@@ -350,6 +350,34 @@ type ConfigFieldsProvider interface {
 // 一起被调用（预览页要 SDK 参数才能渲染控件，领取要用预览结果选套餐）。
 // 拆成三个小接口只会让调用点多写两次类型断言。
 
+// LoginVariant 是「同一供应商有多个 OAuth 身份源」时控制台要渲染的一个入口。
+//
+// ID 会放进 LoginStart 的 metadata["oauth_variant"]，由供应商自己解释
+// （AutoClaw 是 zai / google）；CallbackHint 是该变体在浏览器里会停住的
+// localhost 回调地址，页面据此提示用户把哪条链接粘回来。
+type LoginVariant struct {
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	CallbackHint string `json:"callback_hint,omitempty"`
+}
+
+// LoginVariantProvider 由「登录有多个变体」的供应商实现。
+//
+// 实现即表示控制台要把这些变体渲染成按钮；不实现则仍按单一登录入口处理。
+type LoginVariantProvider interface {
+	LoginVariants() []LoginVariant
+}
+
+// LoginCaptchaProvider 由「登录前必须在浏览器里过一道人机验证」的供应商实现。
+//
+// 登录与套餐领取的差别：套餐领取拿到令牌就去领取；登录拿到令牌只是换授权地址的
+// 前置条件，后续还有「浏览器登录 → 回调链接粘贴 → 换码」。因此单独成一个能力，
+// 而不是复用 PlanClaimer（那会让供应商被迫实现不相干的 PreviewPlans/ClaimPlan）。
+type LoginCaptchaProvider interface {
+	// LoginCaptchaConfig 返回控件初始化参数（当前是阿里云场景 ID/region/prefix）。
+	LoginCaptchaConfig(ctx context.Context) (CaptchaConfig, error)
+}
+
 // CaptchaConfig 是人机验证 SDK 的初始化参数。
 //
 // 前端据此渲染控件，拿到令牌后原样回传 VerifyParam；Region 为空表示上游

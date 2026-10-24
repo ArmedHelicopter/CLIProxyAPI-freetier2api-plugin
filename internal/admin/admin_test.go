@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/state"
@@ -21,6 +22,11 @@ type stubDeps struct {
 
 	callbackResult *core.CallbackSubmitResult
 	callbackErr    error
+
+	loginStart    *pluginapi.AuthLoginStartResponse
+	loginStartErr error
+	captcha       core.CaptchaConfig
+	captchaErr    error
 }
 
 func (s stubDeps) Identity() Identity {
@@ -52,6 +58,21 @@ func (s stubDeps) SubmitLoginCallback(context.Context, string, string) (*core.Ca
 		return nil, s.callbackErr
 	}
 	return s.callbackResult, nil
+}
+
+// loginStart / loginCaptcha 让用例能驱动页面内登录的两个新入口。
+func (s stubDeps) StartLogin(context.Context, string, map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	if s.loginStartErr != nil {
+		return nil, s.loginStartErr
+	}
+	return s.loginStart, nil
+}
+
+func (s stubDeps) LoginCaptchaConfig(context.Context, string) (core.CaptchaConfig, error) {
+	if s.captchaErr != nil {
+		return core.CaptchaConfig{}, s.captchaErr
+	}
+	return s.captcha, nil
 }
 
 func newStubDeps(t *testing.T) stubDeps {

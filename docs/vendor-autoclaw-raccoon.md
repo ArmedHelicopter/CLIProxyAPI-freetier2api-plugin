@@ -17,7 +17,7 @@
 | 供应商 ID | `autoclawcn` / `autoclawglobal` |
 | 展示名 | AutoClaw 国内版 / AutoClaw 国际版 |
 | 上游基址 | cn: `https://autoglm-acceleration-api.zhipuai.cn`；global: `https://autoglm-api.autoglm.ai` |
-| 认证方式 | **国内版：手机号 + 短信验证码登录**（控制台表单）；**国际版：Google OAuth 网页登录**；另支持粘贴 `accessToken`/`refreshToken` JSON |
+| 认证方式 | **国内版：手机号 + 短信验证码登录**（控制台表单）；**国际版：Zai / Google OAuth 网页登录**（控制台页面内完成阿里云人机验证 + 回调链接粘贴）；另支持粘贴 `accessToken`/`refreshToken` JSON |
 | 凭证文件名前缀 | `autoclawcn-*.json` / `autoclawglobal-*.json` |
 | 配置键 | `autoclawcn_base_url` / `autoclawglobal_base_url` |
 
@@ -38,7 +38,13 @@
   `total_balance`；
 - **签到**：`POST .../autoclaw-task-complete` body `{"task_id":"daily_signin"}`，
   服务端幂等（`already_completed=true` 表示今日已签）；
-- **登录**：国内版 `POST /userapi/v1/agent-send-code` + `agent-login/`（验证码必须是 JSON 数字，字符串会得到与验证码错误无关的 400001；两次调用用同一 device_id）；国际版 Google OAuth（`oauth-url` → 浏览器登录 → 回调链接粘贴 → `oauth-login` 换码，第③跳不需要风控验证码）；Zai 因回调白名单只认官方客户端四个端口且第②步强制风控验证码，暂不支持；
+- **登录**：国内版 `POST /userapi/v1/agent-send-code` + `agent-login/`（验证码必须是 JSON 数字，字符串会得到与验证码错误无关的 400001；两次调用用同一 device_id）；国际版 Zai / Google OAuth：
+  1. `POST /userapi/overseasv1/oauth-captcha-config` 取阿里云场景参数（`enabled=false` 表示该构建没有网页登录）；
+  2. 控制台加载官方 `AliyunCaptcha.js`，用户拖滑块拿到 `captchaVerifyParam`；
+  3. `POST .../{zai|google}-oauth-url`（带 `ali_captcha_verify_param`）换授权链接；
+  4. 浏览器登录后停在 `http://localhost:<端口>/auth/callback-{zai|google}?code=…`，把整条链接粘回控制台；
+  5. `POST .../{zai|google}-oauth-login` 换 token（这一跳不需要风控验证码）。
+  Zai 的回调白名单只认官方客户端登记的 `18432/19654/19723/53699`，插件固定用 `53699`（避开桌面端默认先占的 18432）；Google 走 RFC 8252 loopback 宽松匹配（默认 46952）。第 ② 步缺验证码时上游回误导性的 `631002`，因此插件在本地就挡下并提示先完成人机验证；
 - **错误分类**：业务码 `410000` = 会话失效；余额/额度文案 → hard_credit；
   429 → soft_rate。
 
