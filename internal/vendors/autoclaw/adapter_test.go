@@ -108,8 +108,8 @@ func TestLooksLikeCredentialStrict(t *testing.T) {
 
 func TestMatchRoutesRegionsByVendorField(t *testing.T) {
 	instances := Instances(core.Env{})
-	cn := instances[0].(*adapter)
-	gl := instances[1].(*adapter)
+	cn := instances[0].(*smsLoginAdapter).adapter
+	gl := instances[1].(*oauthLoginAdapter).adapter
 
 	cnPayload := map[string]any{core.VendorKey: "autoclawcn"}
 	glPayload := map[string]any{core.VendorKey: "autoclawglobal"}
@@ -129,8 +129,8 @@ func TestMatchRoutesRegionsByVendorField(t *testing.T) {
 
 func TestConfigureBaseURLPerInstance(t *testing.T) {
 	instances := Instances(core.Env{})
-	cn := instances[0].(*adapter)
-	gl := instances[1].(*adapter)
+	cn := instances[0].(*smsLoginAdapter).adapter
+	gl := instances[1].(*oauthLoginAdapter).adapter
 	cn.Configure(core.Settings{}, map[string]string{"autoclawcn_base_url": "http://cn.test"})
 	if cn.resolveBaseURL() != "http://cn.test" {
 		t.Fatalf("cn resolveBaseURL = %q", cn.resolveBaseURL())

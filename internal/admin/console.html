@@ -1890,6 +1890,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
 
     // API Key 型供应商：直接在页面展示输入框添加
     if (loginBox) loginBox.hidden = true;
+    var smsBox = document.getElementById("smsBox");
+    if (smsBox) smsBox.hidden = true;
     currentApiKeyVendor = vendor;
     if (apiKeyBox) {
       apiKeyBox.hidden = false;
@@ -1910,7 +1912,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     smsSessionKey = "";
     var box = document.getElementById("smsBox");
     var login = document.getElementById("loginBox");
+    var apiKey = document.getElementById("apiKeyBox");
     if (login) login.hidden = true;
+    if (apiKey) apiKey.hidden = true;
     box.hidden = false;
     document.getElementById("smsTitle").textContent = "添加 " + vendor.name + " 账号（手机验证码登录）";
     document.getElementById("inputSmsPhone").value = "";
@@ -1922,6 +1926,12 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
 
   function startLogin(vendor) {
     if (vendor && vendor.sms_login) { startSmsLogin(vendor); return; }
+    // 三个添加入口（授权链接 / 短信验证码 / API Key）互斥：打开任一个前先收起另外两个。
+    var smsBox = document.getElementById("smsBox");
+    if (smsBox) { smsBox.hidden = true; }
+    var apiKey = document.getElementById("apiKeyBox");
+    if (apiKey) { apiKey.hidden = true; }
+    currentSmsVendor = null;
     stopLoginPolling();
     currentLoginState = "";
     var box = document.getElementById("loginBox");

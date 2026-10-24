@@ -65,18 +65,18 @@ func TestMaskPhone(t *testing.T) {
 
 func TestSMSLoginProviderCapability(t *testing.T) {
 	instances := Instances(core.Env{})
+	// 登录能力随实例类型分派：cn → smsLoginAdapter，global → oauthLoginAdapter。
 	if _, cnOK := core.As[core.SMSLoginProvider](instances[0]); !cnOK {
 		t.Fatal("cn instance should implement SMSLoginProvider")
 	}
-	gl, glOK := core.As[core.SMSLoginProvider](instances[1])
-	if !glOK {
-		t.Fatal("global instance should implement SMSLoginProvider (interface satisfied, entry rejects)")
+	if _, glSMS := core.As[core.SMSLoginProvider](instances[1]); glSMS {
+		t.Fatal("global instance must NOT implement SMSLoginProvider (it has OAuth instead)")
 	}
-	// 国际版在入口处拒绝（手机验证码已被官方移除）。
-	if _, err := gl.SendLoginCode(testContext(), "13812345678"); err == nil {
-		t.Fatal("intl SendLoginCode should be rejected")
-	} else if _, okLogin := core.As[core.LoginProvider](instances[1]); !okLogin {
-		t.Fatal("global should implement LoginProvider")
+	if _, glLogin := core.As[core.LoginProvider](instances[1]); !glLogin {
+		t.Fatal("global instance should implement LoginProvider")
+	}
+	if _, cnLogin := core.As[core.LoginProvider](instances[0]); cnLogin {
+		t.Fatal("cn instance must NOT implement LoginProvider (it has SMS login instead)")
 	}
 }
 
@@ -109,13 +109,14 @@ func TestOAuthNavigateURI(t *testing.T) {
 func TestLoginStartRegionGuards(t *testing.T) {
 	instances := Instances(core.Env{})
 	cn, gl := instances[0], instances[1]
-	// 国内版没有 OAuth（上游开关 enabled:false）。
-	if provider, okLogin := core.As[core.LoginProvider](cn); !okLogin {
-		t.Fatal("cn should implement LoginProvider")
-	} else if _, err := provider.LoginStart(testContext(), nil); err == nil {
-		t.Fatal("cn LoginStart should be rejected (no OAuth)")
+	// 登录能力随实例类型分派：cn 只有短信登录（SMSLoginProvider），
+	// global 只有 OAuth（LoginProvider + CallbackSubmitter）。
+	if _, okSMS := core.As[core.SMSLoginProvider](cn); !okSMS {
+		t.Fatal("cn should implement SMSLoginProvider")
 	}
-	// 国际版 OAuth 接口存在（URL 获取会打上游，冒烟交给集成测试）。
+	if _, okLogin := core.As[core.LoginProvider](cn); okLogin {
+		t.Fatal("cn must NOT implement LoginProvider")
+	}
 	if _, okLogin := core.As[core.LoginProvider](gl); !okLogin {
 		t.Fatal("global should implement LoginProvider")
 	}
