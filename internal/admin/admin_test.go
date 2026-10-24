@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/state"
@@ -137,20 +136,16 @@ func (s stubTaskDeps) Config() tasks.Config {
 
 func (s stubTaskDeps) SaveRefreshedCredential(context.Context, string, core.Vendor, core.HostAuth, []byte, *core.Credential, string) {
 }
-func (s stubTaskDeps) State() state.State                     { return s.deps.State() }
-func (s stubTaskDeps) MutateState(fn func(*state.State))      { s.deps.MutateState(fn) }
-func (s stubTaskDeps) Now() time.Time                         { return time.Now() }
-func (s stubTaskDeps) RuntimeFields() []pluginapi.ConfigField { return nil }
+func (s stubTaskDeps) State() state.State                { return s.deps.State() }
+func (s stubTaskDeps) MutateState(fn func(*state.State)) { s.deps.MutateState(fn) }
+func (s stubTaskDeps) Now() time.Time                    { return time.Now() }
 
 // TestSettingsPayloadKeysMatchConsole 锁死「后端字段名 ↔ 页面字段名」的一致性。
 //
-// 真实事故：后端把 prompt_mode 改名为 workbuddy_prompt_mode（GET /status 的
-// 响应键与 POST /settings 的请求键都改了），页面没跟着改，于是——
-//   - 摘要行显示「提示词 -」；
-//   - 下拉框永远回落 passthrough，看不出真实配置；
-//   - 点「保存设置」发的是 prompt_mode，后端直接忽略，改动**根本存不进去**。
+// 真实事故：`/settings` 的字段名与页面提交的键曾经漂移过（后端改名、页面没跟），
+// 结果页面上的改动**根本存不进去**且没有任何报错。
 //
-// 编译期已经保证 Go 侧一致，但 HTML 是字符串，编译器看不见。这里用测试把
+// 编译期已经保证 Go 侧一致，但 HTML 是字符串，编译器看不见。这里把
 // settingsUpdateRequest 的每个 json tag 钉到页面上，防止再次漂移。
 func TestSettingsPayloadKeysMatchConsole(t *testing.T) {
 	page := Page("/plugins/freetier2api")
@@ -176,7 +171,7 @@ func TestSettingsPayloadKeysMatchConsole(t *testing.T) {
 	}
 
 	// 反向：页面读取的 /status 键必须在后端载荷里真实存在。
-	for _, key := range []string{"version", "settings", "vendor_settings", "fields"} {
+	for _, key := range []string{"version", "settings", "prompt_mode"} {
 		if !strings.Contains(page, key) {
 			t.Errorf("页面读取的 /status 键 %q 未出现在页面上", key)
 		}

@@ -159,7 +159,6 @@ func (s *Service) effectiveSettings() map[string]any {
 		"auto_tasks":      s.effectiveAutoTasks(),
 		"schedule":        s.effectiveSchedule(),
 		"task_specs":      s.catalog.Specs(),
-		"vendor_settings": s.deps.State().VendorSettings,
 	}
 }
 

@@ -34,6 +34,9 @@ type PluginConfig struct {
 	// AutoTasks 开启成长任务的每日自动闭环。
 	AutoTasks bool
 
+	// PromptMode 是提示词过滤模式（全局）：passthrough / custom / append。
+	PromptMode string
+
 	// Raw 是配置的原始键值表（key → 原文），供供应商解析专属键。
 	Raw map[string]string
 }
@@ -57,7 +60,26 @@ const (
 	// RealmCN / RealmGlobal 是受支持的域。
 	RealmCN     = "cn"
 	RealmGlobal = "global"
+
+	// PromptModeKey / PromptFileKey 是提示词过滤的全局配置键。
+	//
+	// 提示词过滤是插件级能力：模式与提示词文件全局一份，谁实现过滤谁读这两个
+	// 键（当前是 WorkBuddy），页面不按供应商分别配置。
+	PromptModeKey = "prompt_mode"
+	PromptFileKey = "prompt_file"
+
+	// PromptModePassThrough / PromptModeCustom / PromptModeAppend 是合法模式。
+	PromptModePassThrough = "passthrough"
+	PromptModeCustom      = "custom"
+	PromptModeAppend      = "append"
 )
+
+// deprecatedConfigKeys 是改名后的旧配置键：解析时直接归一化到当前键，
+// 避免老配置被静默忽略（提示词过滤被悄悄关掉比报错更糟）。
+var deprecatedConfigKeys = map[string]string{
+	"workbuddy_prompt_mode": PromptModeKey,
+	"workbuddy_prompt_file": PromptFileKey,
+}
 
 // listValuedConfigKeys 是「允许用 YAML 列表写法」的配置键。
 var listValuedConfigKeys = map[string]bool{
@@ -75,6 +97,7 @@ func DefaultPluginConfig() PluginConfig {
 		AutoCheckin:   true,
 		AutoCheckinAt: DefaultCheckinAt,
 		AutoTasks:     true,
+		PromptMode:    PromptModePassThrough,
 	}
 }
 
@@ -111,6 +134,9 @@ func DecodePluginConfig(raw []byte, base PluginConfig) (PluginConfig, error) {
 		key, value, ok := splitConfigLine(line)
 		if !ok {
 			continue
+		}
+		if current, okAlias := deprecatedConfigKeys[key]; okAlias {
+			key = current
 		}
 		if errLine := applyConfigLine(&cfg, key, value); errLine != nil {
 			return cfg, fmt.Errorf("config line %d: %w", lineNo+1, errLine)
@@ -156,6 +182,14 @@ func applyConfigLine(cfg *PluginConfig, key, value string) error {
 		}
 	case "auto_tasks":
 		cfg.AutoTasks = ParseBool(value, cfg.AutoTasks)
+	case PromptModeKey:
+		mode, errMode := ParsePromptMode(value)
+		if errMode != nil {
+			return errMode
+		}
+		if mode != "" {
+			cfg.PromptMode = mode
+		}
 	}
 	return nil
 }
@@ -167,6 +201,11 @@ func ValidatePluginConfig(cfg PluginConfig) error {
 	}
 	if _, _, errClock := ParseClock(cfg.AutoCheckinAt); errClock != nil {
 		return fmt.Errorf("auto_checkin_at: %w", errClock)
+	}
+	switch cfg.PromptMode {
+	case PromptModePassThrough, PromptModeCustom, PromptModeAppend:
+	default:
+		return fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", cfg.PromptMode)
 	}
 	switch cfg.LogLevel {
 	case "debug", "info", "error":
@@ -201,6 +240,24 @@ func ParseRealms(raw string) ([]string, error) {
 		return nil, fmt.Errorf("enabled_realms is empty (want a subset of cn,global)")
 	}
 	return out, nil
+}
+
+// ParsePromptMode 解析提示词过滤模式；空串表示未提供（由调用方沿用当前值）。
+func ParsePromptMode(raw string) (string, error) {
+	mode := strings.ToLower(strings.TrimSpace(raw))
+	switch mode {
+	case "", PromptModePassThrough, PromptModeCustom, PromptModeAppend:
+		return mode, nil
+	}
+	return "", fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", raw)
+}
+
+// EffectivePromptMode 返回当前生效的提示词过滤模式：页面覆盖 > YAML > 内置默认。
+func EffectivePromptMode(cfg PluginConfig, page string) string {
+	if mode := strings.ToLower(strings.TrimSpace(page)); mode != "" {
+		return mode
+	}
+	return cfg.PromptMode
 }
 
 // ParseBool 解析布尔值，无法解析时保留 fallback。

@@ -399,7 +399,15 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       <div class="row" style="margin-top:8px">
         <label><input type="checkbox" id="setAutoTasks"> 自动每日任务</label>
       </div>
-      <div class="row" id="vendorSettings" style="margin-top:8px"></div>
+      <div class="row" style="margin-top:8px">
+        <label>提示词防御模式
+          <select id="setPromptMode" style="margin-left:8px;padding:3px 6px">
+            <option value="passthrough">透传（保持客户端原始提示词）</option>
+            <option value="custom">替换（剥离特征提示词，注入纯净提示词）</option>
+            <option value="append">追加（文末追加安全指引）</option>
+          </select>
+        </label>
+      </div>
       <details class="fold" id="scheduleFold">
         <summary>任务排程</summary>
         <div id="taskSchedule"></div>
@@ -881,7 +889,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     });
     host.appendChild(table);
 
-    var summary = el("div", "共 " + accounts.length + " 个账号 · 插件版本 " + (status.version || "-"), "hint");
+    var summary = el("div", "共 " + accounts.length + " 个账号 · 插件版本 " + (status.version || "-")
+      + " · 提示词 " + ((status.settings || {}).prompt_mode || "-"), "hint");
     host.appendChild(summary);
   }
 
@@ -899,7 +908,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       document.getElementById("setAutoCheckin").checked = !!settings.auto_checkin;
       document.getElementById("setCheckinAt").value = settings.auto_checkin_at || "10:00";
       document.getElementById("setAutoTasks").checked = !!settings.auto_tasks;
-      renderVendorSettings(settings);
+      var promptSel = document.getElementById("setPromptMode");
+      if (promptSel) promptSel.value = settings.prompt_mode || "passthrough";
       renderTaskSchedules(settings);
       var scheduler = status.scheduler || {};
       var labels = {};
@@ -915,72 +925,6 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         syncModelConfig();
       }
     }).catch(function (err) { banner("err", err.message); throw err; });
-  }
-
-  // renderVendorSettings 按供应商自己声明的运行期字段渲染控件。
-  //
-  // 字段来自 /status 的 settings.fields（core.RuntimeFieldsProvider），按供应商
-  // 分组：新增一家供应商只要在自己 adapter 里声明字段，页面自动出现对应控件，
-  // 这里不认识任何具体键。
-  function renderVendorSettings(settings) {
-    var host = document.getElementById("vendorSettings");
-    if (!host) return;
-    host.innerHTML = "";
-    var fields = settings.fields || [];
-    var values = settings.vendor_settings || {};
-    host.style.display = fields.length ? "" : "none";
-    var order = [];
-    var groups = {};
-    fields.forEach(function (field) {
-      var vendor = field.vendor || "";
-      if (!groups[vendor]) {
-        groups[vendor] = [];
-        order.push(vendor);
-      }
-      groups[vendor].push(field);
-    });
-    order.forEach(function (vendor) {
-      if (vendor) {
-        host.appendChild(el("div", vendor, "hint"));
-      }
-      groups[vendor].forEach(function (field) {
-        host.appendChild(vendorFieldControl(field, values[field.name] || ""));
-        host.appendChild(document.createTextNode(" "));
-      });
-    });
-  }
-
-  // vendorFieldControl 渲染单个供应商字段；空值表示不覆盖（回落 YAML）。
-  function vendorFieldControl(field, current) {
-    var label = el("label", field.description || field.name);
-    var control;
-    if (field.type === "boolean") {
-      control = vendorSelect([["", "跟随配置"], ["true", "开启"], ["false", "关闭"]]);
-    } else if (field.type === "enum" || (field.enum_values || []).length) {
-      control = vendorSelect([["", "跟随配置"]].concat((field.enum_values || []).map(function (value) {
-        return [value, value];
-      })));
-    } else {
-      control = el("input");
-      control.type = "text";
-    }
-    control.value = current;
-    control.dataset.fieldName = field.name;
-    label.appendChild(control);
-    return label;
-  }
-
-  // vendorSelect 构造下拉控件；options 是 [value, label] 对。
-  function vendorSelect(options) {
-    var control = el("select");
-    control.style.marginLeft = "8px";
-    control.style.padding = "3px 6px";
-    options.forEach(function (pair) {
-      var option = el("option", pair[1]);
-      option.value = pair[0];
-      control.appendChild(option);
-    });
-    return control;
   }
 
   function renderTaskSchedules(settings) {
@@ -2308,15 +2252,12 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     }).catch(function (err) { banner("err", err.message); });
   });
   document.getElementById("btnSaveSettings").addEventListener("click", function () {
-    var vendorSettings = {};
-    document.querySelectorAll("#vendorSettings [data-field-name]").forEach(function (control) {
-      vendorSettings[control.dataset.fieldName] = control.value;
-    });
+    var promptSel = document.getElementById("setPromptMode");
     var payload = {
       auto_checkin: document.getElementById("setAutoCheckin").checked,
       auto_checkin_at: document.getElementById("setCheckinAt").value,
       auto_tasks: document.getElementById("setAutoTasks").checked,
-      vendor_settings: vendorSettings,
+      prompt_mode: promptSel ? promptSel.value : "passthrough",
       task_schedules: {}
     };
     document.querySelectorAll("#taskSchedule input[data-task-kind]").forEach(function (input) {

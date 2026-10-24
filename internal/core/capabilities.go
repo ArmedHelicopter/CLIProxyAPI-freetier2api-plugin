@@ -378,8 +378,3 @@ type ActivityProbeResult struct {
 type ActivityProbe interface {
 	ProbeActivity(ctx context.Context, cred *Credential) (ActivityProbeResult, error)
 }
-
-// RuntimeFieldsProvider 由需要声明管理页可改字段的供应商实现。
-type RuntimeFieldsProvider interface {
-	RuntimeFields() []pluginapi.ConfigField
-}

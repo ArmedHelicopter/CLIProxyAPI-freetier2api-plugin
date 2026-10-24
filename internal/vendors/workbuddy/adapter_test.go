@@ -21,8 +21,8 @@ func TestConfigureAppliesPromptAndUADefaults(t *testing.T) {
 		MachineSalt:   "salt-1",
 		StateDir:      dir,
 	}, map[string]string{
-		"workbuddy_prompt_mode":           "custom",
-		"workbuddy_prompt_file":           promptPath,
+		"prompt_mode":                     "custom",
+		"prompt_file":                     promptPath,
 		"workbuddy_client_version":        "9.9.9",
 		"workbuddy_sanitize_fingerprints": "false",
 	})
@@ -52,10 +52,10 @@ func TestWorkBuddyRuntimeIsolated(t *testing.T) {
 	second := newRuntime(core.Env{})
 
 	first.configure(core.Settings{MachineSalt: "salt-first"}, map[string]string{
-		"workbuddy_prompt_mode": "custom",
+		"prompt_mode": "custom",
 	})
 	second.configure(core.Settings{MachineSalt: "salt-second"}, map[string]string{
-		"workbuddy_prompt_mode": "append",
+		"prompt_mode": "append",
 	})
 	first.setEffortTables(
 		map[string]string{"glm-5.2": "high"},

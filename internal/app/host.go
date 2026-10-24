@@ -5,7 +5,6 @@ package app
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 
@@ -43,15 +42,12 @@ func (h *hostBridge) Settings() core.Settings {
 // configureVendors 把全局设置与原始配置键推给每个供应商。
 func (a *App) configureVendors(cfg pluginConfig) {
 	settings := a.host.Settings()
-	raw := make(map[string]string, len(cfg.Raw)+len(a.SnapshotState().VendorSettings))
+	raw := make(map[string]string, len(cfg.Raw)+1)
 	for key, value := range cfg.Raw {
 		raw[key] = value
 	}
-	for key, value := range a.SnapshotState().VendorSettings {
-		if strings.TrimSpace(key) != "" {
-			raw[key] = value
-		}
-	}
+	// 提示词过滤是全局设置：页面覆盖 > YAML > 内置默认，供应商读同一个键。
+	raw[admin.PromptModeKey] = admin.EffectivePromptMode(cfg, a.SnapshotState().PromptMode)
 	for _, vendor := range a.registry.Vendors() {
 		if configurable, okConfigurable := vendor.(core.Configurable); okConfigurable {
 			configurable.Configure(settings, raw)

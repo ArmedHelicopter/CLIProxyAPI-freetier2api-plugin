@@ -42,10 +42,25 @@ func TestDecodeValidation(t *testing.T) {
 		"enabled_realms: mars\n",
 		"log_level: verbose\n",
 		"auto_checkin_at: 25:00\n",
+		"prompt_mode: overwrite\n",
 	} {
 		if _, err := DecodePluginConfig([]byte(raw), DefaultPluginConfig()); err == nil {
 			t.Fatalf("expected error for %q", raw)
 		}
+	}
+}
+
+// TestDeprecatedPromptKeys 验证旧键名仍被解析成全局提示词配置。
+func TestDeprecatedPromptKeys(t *testing.T) {
+	cfg, err := DecodePluginConfig([]byte("workbuddy_prompt_mode: append\nworkbuddy_prompt_file: /tmp/p.md\n"), DefaultPluginConfig())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if cfg.PromptMode != PromptModeAppend {
+		t.Fatalf("prompt mode = %q", cfg.PromptMode)
+	}
+	if cfg.Raw[PromptFileKey] != "/tmp/p.md" {
+		t.Fatalf("prompt file = %q", cfg.Raw[PromptFileKey])
 	}
 }
 

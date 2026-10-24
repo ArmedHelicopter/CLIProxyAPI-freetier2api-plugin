@@ -202,7 +202,7 @@ tests/testhost                     共享假宿主
 
 internal/vendors/<name>            协议层 + 适配层同包，文件名是**封闭白名单**：
   ├─ adapter.go       [必需] core.Vendor 实现（嵌入 core.Meta）+ Instances/Configure/Match
-  │                          + 可选能力方法（薄转发）+ ConfigFields/RuntimeFields
+  │                          + 可选能力方法（薄转发）+ ConfigFields
   ├─ chat.go          [必需] HTTP 传输（端点表/请求头/签名/会话基建）
   │                          + 对话（请求体变换/协议转换/SSE 归一化/Chat/ChatStream）
   ├─ credential.go    [必需] 凭证类型/解析/归属判定/存储写回 + 设备指纹与身份头
@@ -227,9 +227,9 @@ internal/vendors/<name>            协议层 + 适配层同包，文件名是**�
   `Instances(env core.Env) []core.Vendor`。
 - 错误分类统一返回 `*core.Failure`（不再有 `type Error = core.Failure` 这类别名），
   兜底模型清单统一叫 `bundledModels()` / `bundledModelsFor(cfg)`。
-- 页面可改的运行期设置由各 adapter 的 `RuntimeFields()` 自己声明（键名、类型、
-  枚举值、说明），管理端只做汇总、校验与按供应商分组渲染，不认任何具体键；
-  字段语义与提示词过滤规则留在供应商包内。
+- 提示词过滤是**全局设置**（`prompt_mode` / `prompt_file`，页面可改模式）：
+  实现过滤的供应商在自己的包内读取同一份配置（当前是 WorkBuddy），管理端不按
+  供应商分别保存，也不在页面里硬编码某家的键。
 - 内嵌资源一律放 `assets/`，`go:embed` 写相对路径。
 
 刻意的差异（都不是漏改）：
@@ -299,7 +299,7 @@ core.CallbackSubmitter：控制台明示本机回调地址，用户把浏览器�
   夜猫子、活跃上报、token 保活，以及成长任务一键完成（17 个任务）与开学季活动；
   WorkBuddy 国际版支持每日活跃奖励（国际版签到，见下）；
   Qoder 国内版与国际版均支持每日签到（领取每日福利活动，见下）。
-- **提示词防御与脱敏**（WorkBuddy）：系统提示词三模式（透传 / 替换 / 追加）
+- **提示词防御与脱敏**（WorkBuddy）：全局 `prompt_mode` 三模式（透传 / 替换 / 追加）
   + 出站请求体指纹脱敏，两层叠加降低上游内容审核拦截率。
 - **敏感凭证脱敏与操作管理**：API key 类型账号在列表展示前4位与后4位、中间脱敏为 `***`，避免明文泄露；账号概览最后一列提供「操作」列，支持「删除」按钮直接删除本地凭证文件（带二次确认），宿主基于文件监听自动注销失效账号。
 - **零第三方依赖**：`go.mod` 只有 module 与 go 版本两行，构建不需要拉包。
@@ -402,8 +402,8 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 | `state_dir` | string | `~/.freetier2api-plugin` | 状态目录（机器盐、模型缓存、任务记录、日志）；若检测到 `~/.cli-proxy-api` 则默认用其下的 `freetier2api` 子目录（适配 Docker 挂载卷） |
 | `log_level` | enum | `info` | `debug` / `info` / `error` |
 | `log_to_file` | bool | `false` | 是否把日志写入 `<state_dir>/logs` |
-| `workbuddy_prompt_mode` | enum | `passthrough` | `passthrough` 透传 / `custom` 替换 / `append` 追加（WorkBuddy） |
-| `workbuddy_prompt_file` | string | 空 | 自定义提示词文件；留空用内置（WorkBuddy） |
+| `prompt_mode` | enum | `passthrough` | 提示词过滤模式（全局）：`passthrough` 透传 / `custom` 替换 / `append` 追加；控制台可改，页面覆盖优先于本项 |
+| `prompt_file` | string | 空 | 自定义提示词文件（全局）；留空用实现方内置提示词 |
 | `workbuddy_sanitize_fingerprints` | bool | `true` | 出站请求体指纹脱敏（WorkBuddy） |
 | `workbuddy_passthrough_ip` | bool | `false` | 是否把客户端 IP 透传给上游 |
 | `workbuddy_user_agent` / `workbuddy_client_version` / `workbuddy_cli_version` | string | 空 | 出站标识覆盖（WorkBuddy） |
@@ -418,6 +418,9 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 | `cline_base_url` | string | 空 | 覆盖 Cline 上游基地址（默认 `https://api.cline.bot/api/v1`） |
 | `zcode_base_url` | string | 空 | 覆盖 ZCode **对话**上游基地址（默认 `https://api.z.ai`） |
 | `zcode_claim_min_interval` | string | `15s` | 两次套餐领取的最小间隔，`0` 表示不节流 |
+
+提示词过滤的旧键名 `workbuddy_prompt_mode` / `workbuddy_prompt_file` 仍被接受，
+解析时归一化到 `prompt_mode` / `prompt_file`（老配置不会静默失效）。
 
 ## 管理接口
 
@@ -435,7 +438,7 @@ curl http://127.0.0.1:8317/v1/chat/completions \
 | POST | `/models/alias` | 设置/清除某个模型的别名（body `{"model":"<vendor>:<官方ID>","alias":"对外ID"}`，`alias` 留空清除） |
 | POST | `/models/refresh` | 从上游拉取模型清单并缓存 |
 | GET | `/logs?since=&limit=` | 读插件日志（环形缓冲，增量拉取） |
-| POST | `/settings` | 改插件运行期设置；`vendor_settings` 里的键必须是某供应商 `RuntimeFields()` 声明过的字段，枚举/布尔值就地校验，空串表示撤销运行期覆盖、回到 YAML 配置 |
+| POST | `/settings` | 改插件运行期设置（`auto_checkin` / `auto_checkin_at` / `auto_tasks` / `prompt_mode` / `task_schedules`）；`prompt_mode` 留空表示撤销页面覆盖、回到 YAML |
 | POST | `/tasks/scan` | 全账号任务扫描 |
 | POST | `/tasks/run` | 执行待办队列（账号内串行、账号间并发 1-4） |
 | GET | `/tasks/queue` | 队列进度 |

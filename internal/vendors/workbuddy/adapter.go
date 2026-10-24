@@ -529,10 +529,11 @@ func (r *runtime) configure(settings core.Settings, raw map[string]string) {
 	cfg.deviceToken = strings.TrimSpace(raw["workbuddy_device_token"])
 	cfg.deviceTokenFile = strings.TrimSpace(raw["workbuddy_device_token_file"])
 
-	if value := strings.ToLower(strings.TrimSpace(raw["workbuddy_prompt_mode"])); value != "" {
+	// 提示词过滤是全局设置（prompt_mode / prompt_file），WorkBuddy 只是实现方。
+	if value := strings.ToLower(strings.TrimSpace(raw["prompt_mode"])); value != "" {
 		cfg.promptMode = value
 	}
-	if path := strings.TrimSpace(raw["workbuddy_prompt_file"]); path != "" {
+	if path := strings.TrimSpace(raw["prompt_file"]); path != "" {
 		text, errRead := readPromptFile(path)
 		if errRead != nil {
 			logger.Error("load prompt file failed, falling back to built-in prompt: %v", errRead)
@@ -586,8 +587,6 @@ func (r *runtime) options(ctx context.Context) Options {
 // ConfigFields 声明 WorkBuddy 专属 YAML 配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{Name: "workbuddy_prompt_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"passthrough", "custom", "append"}, Description: "系统提示词处理模式。"},
-		{Name: "workbuddy_prompt_file", Type: pluginapi.ConfigFieldTypeString, Description: "自定义提示词文件路径。"},
 		{Name: "workbuddy_sanitize_fingerprints", Type: pluginapi.ConfigFieldTypeBoolean, Description: "出站请求体指纹脱敏，默认开启。"},
 		{Name: "workbuddy_passthrough_ip", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否透传客户端 IP，默认关闭。"},
 		{Name: "workbuddy_user_agent", Type: pluginapi.ConfigFieldTypeString, Description: "出站 User-Agent 覆盖。"},
@@ -596,13 +595,6 @@ func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 		{Name: "workbuddy_client_name", Type: pluginapi.ConfigFieldTypeString, Description: "归属头客户端名。"},
 		{Name: "workbuddy_device_token", Type: pluginapi.ConfigFieldTypeString, Description: "X-Device-Token 全局兜底。"},
 		{Name: "workbuddy_device_token_file", Type: pluginapi.ConfigFieldTypeString, Description: "设备令牌文件路径。"},
-	}
-}
-
-// RuntimeFields 声明管理页可改字段。
-func (v *adapter) RuntimeFields() []pluginapi.ConfigField {
-	return []pluginapi.ConfigField{
-		{Name: "workbuddy_prompt_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"passthrough", "custom", "append"}, Description: "系统提示词处理模式（页面覆盖 YAML）：passthrough=透传 / custom=替换 / append=追加。"},
 	}
 }
 
@@ -786,23 +778,22 @@ func (r *runtime) hostProbeCredential(region Region) *Credential {
 
 // 编译期断言：适配器实际具备的供应商能力。
 var (
-	_ core.Vendor                = (*adapter)(nil)
-	_ core.CheckinProvider       = (*adapter)(nil)
-	_ core.Configurable          = (*adapter)(nil)
-	_ core.ConfigFieldsProvider  = (*adapter)(nil)
-	_ core.ConsoleModelProvider  = (*adapter)(nil)
-	_ core.CreditsProvider       = (*adapter)(nil)
-	_ core.LoginProvider         = (*adapter)(nil)
-	_ core.ModelCacheLoader      = (*adapter)(nil)
-	_ core.ModelsProvider        = (*adapter)(nil)
-	_ core.QuotaProvider         = (*adapter)(nil)
-	_ core.Refresher             = (*adapter)(nil)
-	_ core.RuntimeFieldsProvider = (*adapter)(nil)
-	_ core.StorageMerger         = (*adapter)(nil)
-	_ core.TaskCatalogProvider   = (*adapter)(nil)
-	_ core.TaskInspector         = (*adapter)(nil)
-	_ core.TaskPreparer          = (*adapter)(nil)
-	_ core.TaskRunner            = (*adapter)(nil)
-	_ core.TaskStatusProvider    = (*adapter)(nil)
-	_ core.ScheduledRunner       = (*adapter)(nil)
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.CheckinProvider      = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.ConsoleModelProvider = (*adapter)(nil)
+	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+	_ core.ModelCacheLoader     = (*adapter)(nil)
+	_ core.ModelsProvider       = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+	_ core.Refresher            = (*adapter)(nil)
+	_ core.StorageMerger        = (*adapter)(nil)
+	_ core.TaskCatalogProvider  = (*adapter)(nil)
+	_ core.TaskInspector        = (*adapter)(nil)
+	_ core.TaskPreparer         = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
+	_ core.TaskStatusProvider   = (*adapter)(nil)
+	_ core.ScheduledRunner      = (*adapter)(nil)
 )

@@ -17,7 +17,7 @@ func TestStoreRoundTripPreservesFields(t *testing.T) {
 	enabled := true
 	store.Mutate(func(s *State) {
 		s.AutoCheckin = &enabled
-		s.VendorSettings = map[string]string{"workbuddy_prompt_mode": "append"}
+		s.PromptMode = "append"
 		s.DisabledModels = []string{"vendor:model"}
 		s.ModelAliases = map[string]string{"vendor:model": "alias"}
 		s.Checkin["u1"] = CheckinRecord{LastDate: "2026-10-18", Streak: 3}
@@ -30,7 +30,7 @@ func TestStoreRoundTripPreservesFields(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reload: %v", err)
 	}
-	if got.AutoCheckin == nil || !*got.AutoCheckin || got.VendorSettings["workbuddy_prompt_mode"] != "append" {
+	if got.AutoCheckin == nil || !*got.AutoCheckin || got.PromptMode != "append" {
 		t.Fatalf("pointer fields lost: %#v", got)
 	}
 	if len(got.DisabledModels) != 1 || got.ModelAliases["vendor:model"] != "alias" {
