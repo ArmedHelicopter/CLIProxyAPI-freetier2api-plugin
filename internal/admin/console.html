@@ -1869,6 +1869,12 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   var MAX_ACCOUNTS_PER_VENDOR = 10;
 
   function startVendorAdd(vendor) {
+    // AutoClaw 国际版：OAuth 授权链接需上游风控验证码（浏览器端 SDK），
+    // 控制台拿不到，改为凭证粘贴框（访问令牌/刷新令牌 JSON，可自动续期）。
+    if (vendor && vendor.id === "autoclawglobal") {
+      startCredentialPaste(vendor);
+      return;
+    }
     var loginBox = document.getElementById("loginBox");
     var apiKeyBox = document.getElementById("apiKeyBox");
     stopLoginPolling();
@@ -1901,6 +1907,27 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       document.getElementById("inputApiLabel").value = "";
       document.getElementById("inputApiKey").focus();
     }
+  }
+
+  // startCredentialPaste 打开通用凭证粘贴框（autoclawglobal 用）。
+  // 复用 apiKeyBox：单输入框贴 JSON，插件侧 ParseCredential 兼容。
+  function startCredentialPaste(vendor) {
+    stopLoginPolling();
+    currentApiKeyVendor = vendor;
+    var login = document.getElementById("loginBox");
+    var sms = document.getElementById("smsBox");
+    if (login) login.hidden = true;
+    if (sms) sms.hidden = true;
+    var apiKeyBox = document.getElementById("apiKeyBox");
+    if (!apiKeyBox) return;
+    apiKeyBox.hidden = false;
+    document.getElementById("apiKeyTitle").textContent = "粘贴 " + vendor.name + " 凭证";
+    document.getElementById("apiKeyHint").textContent =
+      "粘贴 AutoClaw 国际版凭证 JSON（含访问令牌与刷新令牌，可从 AutoClaw 桌面端登录态文件或 Agent2API 获取）。" +
+      "保存后插件会自动续期。";
+    document.getElementById("inputApiKey").value = "";
+    document.getElementById("inputApiLabel").value = "";
+    document.getElementById("inputApiKey").focus();
   }
 
   var currentSmsVendor = null;
@@ -2157,11 +2184,14 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     var btn = document.getElementById("btnSubmitApiKey");
     btn.disabled = true;
     btn.textContent = "保存中…";
-    api("POST", "/accounts/add", {
-      vendor: currentApiKeyVendor.id,
-      api_key: apiKey,
-      label: label
-    }).then(function (res) {
+    var payload = { vendor: currentApiKeyVendor.id, label: label };
+    if (currentApiKeyVendor.id === "autoclawglobal") {
+      // AutoClaw 国际版：输入框里是凭证 JSON（访问令牌/刷新令牌）。
+      payload.credential_json = apiKey;
+    } else {
+      payload.api_key = apiKey;
+    }
+    api("POST", "/accounts/add", payload).then(function (res) {
       btn.disabled = false;
       btn.textContent = "保存账号";
       if (!res || !res.ok) {

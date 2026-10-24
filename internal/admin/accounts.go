@@ -284,6 +284,9 @@ type accountAddRequest struct {
 	Vendor string `json:"vendor"`
 	APIKey string `json:"api_key"`
 	Label  string `json:"label"`
+	// CredentialJSON 是供应商原生凭证 JSON（token 对等复杂凭证）。
+	// 提供时优先于 api_key：原样交给供应商的 Parse 归一，不套 api_key 信封。
+	CredentialJSON string `json:"credential_json,omitempty"`
 }
 
 func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
@@ -297,28 +300,48 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 	if vendorID == "" {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "vendor 不能为空"})
 	}
-	if apiKey == "" {
+	credentialJSON := strings.TrimSpace(body.CredentialJSON)
+	if apiKey == "" && credentialJSON == "" {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "api_key 不能为空"})
 	}
 	vendor, okVendor := s.registry.ByID(vendorID)
 	if !okVendor {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": fmt.Sprintf("未知供应商 %q", vendorID)})
 	}
-	payload := map[string]any{
-		"type":         s.deps.Identity().ProviderKey,
-		core.VendorKey: vendor.ID(),
-		"api_key":      apiKey,
-	}
-	if label != "" {
-		payload["label"] = label
-	}
-	rawJSON, errMarshal := json.MarshalIndent(payload, "", "  ")
-	if errMarshal != nil {
-		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
-	}
+	var rawJSON []byte
 	seed := label
-	if seed == "" {
-		seed = maskedAPIKey(apiKey)
+	if credentialJSON != "" {
+		// 原生凭证 JSON：补 vendor 归属字段后原样落盘，交给供应商 Parse 归一。
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(credentialJSON), &doc); err != nil || doc == nil {
+			return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "credential_json 不是合法的 JSON 对象"})
+		}
+		doc[core.VendorKey] = vendor.ID()
+		encoded, errMarshal := json.MarshalIndent(doc, "", "  ")
+		if errMarshal != nil {
+			return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
+		}
+		rawJSON = encoded
+		if seed == "" {
+			seed = core.RandomHex(8)
+		}
+	} else {
+		payload := map[string]any{
+			"type":         s.deps.Identity().ProviderKey,
+			core.VendorKey: vendor.ID(),
+			"api_key":      apiKey,
+		}
+		if label != "" {
+			payload["label"] = label
+		}
+		encoded, errMarshal := json.MarshalIndent(payload, "", "  ")
+		if errMarshal != nil {
+			return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
+		}
+		rawJSON = encoded
+		if seed == "" {
+			seed = maskedAPIKey(apiKey)
+		}
 	}
 	if seed == "" {
 		seed = core.RandomHex(8)
