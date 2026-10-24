@@ -34,7 +34,42 @@ type Model struct {
 	ContextWindow   int64
 	MaxOutputTokens int64
 	IsReasoning     bool
+	SupportsImages  bool
 	SupportsTools   bool
+}
+
+// modelConfigEntry 是 autoclaw-model-config 里的一条模型记录。
+type modelConfigEntry struct {
+	ID            string   `json:"id"`
+	Name          string   `json:"name"`
+	Tooltip       string   `json:"tooltip"`
+	ContextWindow int64    `json:"contextWindow"`
+	MaxTokens     int64    `json:"maxTokens"`
+	Reasoning     bool     `json:"reasoning"`
+	Input         []string `json:"input"`
+}
+
+// modelConfigPayload 兼容上游两种响应形态：
+//   - 旧信封：{"code":0,"msg":"SUCCESS","data":{"models":[...]}}；
+//   - 实测国际版：顶层 {"models":[...]}（没有 code/msg/data 包装）。
+//
+// 只认后者会让前者之外的一切静默解析成空清单——宿主随后把「0 个模型」的
+// 凭证丢掉，页面就整片看不到 AutoClaw 的模型。
+type modelConfigPayload struct {
+	Code   *int64             `json:"code"`
+	Msg    string             `json:"msg"`
+	Models []modelConfigEntry `json:"models"`
+	Data   struct {
+		Models []modelConfigEntry `json:"models"`
+	} `json:"data"`
+}
+
+// entries 返回有效模型列表（顶层优先，回落信封）。
+func (p modelConfigPayload) entries() []modelConfigEntry {
+	if len(p.Models) > 0 {
+		return p.Models
+	}
+	return p.Data.Models
 }
 
 // cnStaticModels 是国内版沙箱 relay 通道的模型表（Agent2API 2026-09 快照）。
@@ -80,28 +115,22 @@ func fetchModelConfig(ctx context.Context, baseURL, token string) ([]Model, erro
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, Classify(resp.StatusCode, 0, string(body))
 	}
-	var envelope struct {
-		Code *int64 `json:"code"`
-		Msg  string `json:"msg"`
-		Data struct {
-			Models []struct {
-				ID            string `json:"id"`
-				Name          string `json:"name"`
-				Tooltip       string `json:"tooltip"`
-				ContextWindow int64  `json:"contextWindow"`
-				MaxTokens     int64  `json:"maxTokens"`
-				Reasoning     bool   `json:"reasoning"`
-			} `json:"models"`
-		} `json:"data"`
-	}
-	if errUnmarshal := json.Unmarshal(body, &envelope); errUnmarshal != nil {
+	var payload modelConfigPayload
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
 		return nil, fmt.Errorf("parse model config: %w", errUnmarshal)
 	}
-	if envelope.Code != nil && *envelope.Code != 0 {
-		return nil, Classify(resp.StatusCode, *envelope.Code, envelope.Msg)
+	if payload.Code != nil && *payload.Code != 0 {
+		return nil, Classify(resp.StatusCode, *payload.Code, payload.Msg)
 	}
-	out := make([]Model, 0, len(envelope.Data.Models))
-	for _, entry := range envelope.Data.Models {
+	entries := payload.entries()
+	if len(entries) == 0 {
+		// 解析成功却一条模型都没有：多半是响应形态又变了。必须报错——返回
+		// 空清单＋nil error 会让上传口只留下一行 "0 model(s)"，宿主再把该
+		// 凭证当成没有模型可用而淘汰，问题就被掩盖成「模型列表是空的」。
+		return nil, fmt.Errorf("model config returned 0 model(s)")
+	}
+	out := make([]Model, 0, len(entries))
+	for _, entry := range entries {
 		id := strings.TrimSpace(entry.ID)
 		if id == "" {
 			continue
@@ -121,10 +150,21 @@ func fetchModelConfig(ctx context.Context, baseURL, token string) ([]Model, erro
 			ContextWindow:   contextWindow,
 			MaxOutputTokens: maxTokens,
 			IsReasoning:     entry.Reasoning,
+			SupportsImages:  modelAcceptsImages(entry.Input),
 			SupportsTools:   true,
 		})
 	}
 	return out, nil
+}
+
+// modelAcceptsImages 报告上游声明的输入模态里是否含图片。
+func modelAcceptsImages(input []string) bool {
+	for _, modality := range input {
+		if strings.EqualFold(strings.TrimSpace(modality), "image") {
+			return true
+		}
+	}
+	return false
 }
 
 // staticCNModels 返回国内版静态模型表。

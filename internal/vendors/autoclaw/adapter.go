@@ -190,6 +190,7 @@ func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 			Description:        core.FirstNonEmpty(model.Description, "AutoClaw 上游模型"),
 			ContextLength:      model.ContextWindow,
 			MaxOutputTokens:    model.MaxOutputTokens,
+			SupportsImages:     model.SupportsImages,
 			SupportsTools:      model.SupportsTools,
 			CanDisableThinking: !model.IsReasoning,
 		}, true

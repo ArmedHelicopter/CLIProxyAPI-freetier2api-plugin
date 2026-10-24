@@ -883,17 +883,26 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
         row.appendChild(el("td", "无限"));
         row.appendChild(el("td", "—", "muted"));
       } else {
-        row.appendChild(el("td", quota.remain + " / " + quota.total));
-        var ratio = quota.total > 0 ? (quota.remain / quota.total) : 0;
+        // total=0 不等于「额度用尽」：有的上游只报可用余额（AutoClaw 的积分
+        // 钱包只有 balance，没有总额/已用）。把 0 当总额会拼出「10000 / 0」
+        // 再配一条红色 0% 空槽，既错又误导；此时按「余额 / —」展示，比例留空。
+        var hasTotal = quota.total > 0;
+        var remainCell = el("td", quota.remain + " / " + (hasTotal ? quota.total : "—"));
+        if (!hasTotal) {
+          remainCell.title = "上游只提供可用余额，没有总额 / 已用概念";
+        }
+        row.appendChild(remainCell);
+        var ratio = hasTotal ? (quota.remain / quota.total) : 0;
         var barCell = el("td");
-        // 阈值着色：剩余 >=50% 绿 / 20~50% 琥珀 / <20% 红（该列显示的即剩余比例）。
-        var bar = el("span", null, ratio >= 0.5 ? "bar" : (ratio >= 0.2 ? "bar warn" : "bar err"));
-        var fill = el("i");
-        fill.style.width = Math.round(ratio * 100) + "%";
-        bar.appendChild(fill);
-        barCell.appendChild(bar);
-        barCell.appendChild(el("span", quota.total > 0
-          ? Math.round(ratio * 100) + "%" : "—", "muted"));
+        if (hasTotal) {
+          // 阈值着色：剩余 >=50% 绿 / 20~50% 琥珀 / <20% 红（该列显示的即剩余比例）。
+          var bar = el("span", null, ratio >= 0.5 ? "bar" : (ratio >= 0.2 ? "bar warn" : "bar err"));
+          var fill = el("i");
+          fill.style.width = Math.round(ratio * 100) + "%";
+          bar.appendChild(fill);
+          barCell.appendChild(bar);
+        }
+        barCell.appendChild(el("span", hasTotal ? Math.round(ratio * 100) + "%" : "—", "muted"));
         row.appendChild(barCell);
       }
 
