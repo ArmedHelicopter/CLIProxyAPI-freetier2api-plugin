@@ -53,16 +53,16 @@ func TestChatHeadersMatchGenuineClient(t *testing.T) {
 		t.Fatalf("User-Agent = %q", ua)
 	}
 	for key, want := range map[string]string{
-		"X-Product":        "SaaS",
-		"X-IDE-Type":       "WorkBuddy",
-		"X-IDE-Name":       "WorkBuddy",
-		"X-IDE-Version":    "5.8.3",
-		"X-Agent-Intent":   "craft",
-		"X-Agent-Purpose":  "conversation",
-		"X-Agent-Type":     "main",
-		"X-Private-Data":   "false",
-		"X-User-Id":        cred.UID,
-		"X-Domain":         "www.workbuddy.cn",
+		"X-Product":           "SaaS",
+		"X-IDE-Type":          "WorkBuddy",
+		"X-IDE-Name":          "WorkBuddy",
+		"X-IDE-Version":       "5.8.3",
+		"X-Agent-Intent":      "craft",
+		"X-Agent-Purpose":     "conversation",
+		"X-Agent-Type":        "main",
+		"X-Private-Data":      "false",
+		"X-User-Id":           cred.UID,
+		"X-Domain":            "www.workbuddy.cn",
 		"X-CodeBuddy-Request": "1",
 	} {
 		if got := req.Header.Get(key); got != want {
