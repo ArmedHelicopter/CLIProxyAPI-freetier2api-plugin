@@ -325,6 +325,11 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 	}
 	fileName := core.FileNameFor(vendor.ID(), seed)
 	callbackID := hostbridge.RequestCallbackID(req)
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	if errLimit := s.pool.CheckVendorLimit(ctx, callbackID, vendor, fileName); errLimit != nil {
+		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": errLimit.Error()})
+	}
 
 	if errSave := saveAuthFile(callbackID, fileName, rawJSON); errSave != nil {
 		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errSave.Error()})

@@ -9,6 +9,8 @@ package auth
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
@@ -72,6 +74,7 @@ func (p *Pool) Load(ctx context.Context, callbackID string, opts Options) ([]Acc
 	accounts := make([]Account, 0, len(entries))
 	failures := make([]Failure, 0)
 	seen := map[string]bool{}
+	vendorCounts := map[string]int{}
 	for _, entry := range entries {
 		if !opts.IncludeDisabled && !entry.Usable() {
 			continue
@@ -104,11 +107,46 @@ func (p *Pool) Load(ctx context.Context, callbackID string, opts Options) ([]Acc
 			}
 			seen[uid] = true
 		}
+		if vendorCounts[vendor.ID()] >= core.MaxAccountsPerVendor {
+			failures = append(failures, Failure{Entry: entry, Message: fmt.Sprintf("超过单供应商 %d 个账号上限", core.MaxAccountsPerVendor)})
+			continue
+		}
 		account := Account{Entry: entry, Credential: credential, Vendor: vendor, RawJSON: raw, FilePath: filePath}
 		if opts.Filter != nil && !opts.Filter(account) {
 			continue
 		}
+		vendorCounts[vendor.ID()]++
 		accounts = append(accounts, account)
 	}
 	return accounts, failures
+}
+
+// CheckVendorLimit 校验目标供应商是否已达到单供应商账号上限（MaxAccountsPerVendor）。
+//
+// candidateFileName 非空时，若该文件对应同供应商下已存在的账号（同名覆盖更新），
+// 则放行；新增账号在已有数量达到上限时返回 400 PluginError。
+func (p *Pool) CheckVendorLimit(ctx context.Context, callbackID string, vendor core.Vendor, candidateFileName string) error {
+	if p == nil || vendor == nil {
+		return nil
+	}
+	loaded, _ := p.Load(ctx, callbackID, Options{IncludeDisabled: true})
+	candidateID := strings.TrimSuffix(strings.TrimSpace(candidateFileName), ".json")
+	count := 0
+	for _, account := range loaded {
+		if account.Vendor.ID() != vendor.ID() {
+			continue
+		}
+		if candidateID != "" && (account.Credential.FileIDValue() == candidateID ||
+			strings.TrimSuffix(strings.TrimSpace(account.Entry.Name), ".json") == candidateID ||
+			strings.TrimSuffix(strings.TrimSpace(account.Entry.ID), ".json") == candidateID) {
+			return nil
+		}
+		count++
+	}
+	if count >= core.MaxAccountsPerVendor {
+		return core.NewPluginError("account_limit_exceeded",
+			fmt.Sprintf("每个供应商最多添加 %d 个账号（%s 已达上限）", core.MaxAccountsPerVendor, vendor.Name()),
+			http.StatusBadRequest)
+	}
+	return nil
 }

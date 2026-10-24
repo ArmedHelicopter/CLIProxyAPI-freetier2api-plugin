@@ -230,6 +230,7 @@ input.aliasinput:focus { outline: none; border-color: var(--accent); box-shadow:
 .banner.ok   { background: var(--ok-soft);   border-left: 3px solid var(--ok);   color: var(--ok); }
 .banner.warn { background: var(--warn-soft); border-left: 3px solid var(--warn); color: var(--warn); }
 .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.disclaimer { padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 12.5px; background: var(--warn-soft); border: 1px solid transparent; border-left: 3px solid var(--warn); color: var(--fg); line-height: 1.55; }
 
 /* ---- 套餐领取弹窗 ---- */
 .modal { position: fixed; inset: 0; z-index: 60; display: none; align-items: center;
@@ -267,6 +268,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   <div class="sub">WorkBuddy / Qoder 账号、额度、模型与任务管理 · 本地零凭证存储</div>
 </header>
 <main>
+  <div class="disclaimer">
+    ⚠️ <b>合规与免责声明：</b>本项目仅供个人学习与技术研究使用（单供应商最多添加 10 个账号），严禁用于任何商业售卖、API 转售、代刷代充或违反各上游平台服务条款及法律法规的非法用途。使用本插件产生的一切风险（含账号封禁、权益清零等）均由使用者自行承担。
+  </div>
   <div class="card" id="keyBox" hidden>
     <h2>管理密钥</h2>
     <div class="row">
@@ -393,11 +397,11 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     <div class="card">
       <h2>运行期设置</h2>
       <div class="row">
-        <label><input type="checkbox" id="setAutoCheckin"> 每日自动任务</label>
+        <label><input type="checkbox" id="setAutoCheckin"> 每日自动签到</label>
         <label>执行时间 <input type="text" id="setCheckinAt" placeholder="10:00" style="width:80px"></label>
       </div>
       <div class="row" style="margin-top:8px">
-        <label><input type="checkbox" id="setAutoTasks"> 自动每日任务</label>
+        <label><input type="checkbox" id="setAutoTasks"> 每日自动任务</label>
       </div>
       <div class="row" style="margin-top:8px">
         <label>提示词防御模式
@@ -1847,10 +1851,21 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   //
   // 支持登录的供应商（Cline / WorkBuddy / Qoder）→ 发起设备授权；
   // 纯 API key 的供应商（OpenCode ZEN）→ 展开 API Key 输入框，保存后直写凭证文件。
+  var MAX_ACCOUNTS_PER_VENDOR = 10;
+
   function startVendorAdd(vendor) {
     var loginBox = document.getElementById("loginBox");
     var apiKeyBox = document.getElementById("apiKeyBox");
     stopLoginPolling();
+    var existingCount = ((lastStatus && lastStatus.accounts) || []).filter(function (a) {
+      return a.vendor_id === vendor.id;
+    }).length;
+    if (existingCount >= MAX_ACCOUNTS_PER_VENDOR) {
+      if (loginBox) loginBox.hidden = true;
+      if (apiKeyBox) apiKeyBox.hidden = true;
+      banner("err", "每个供应商最多添加 " + MAX_ACCOUNTS_PER_VENDOR + " 个账号（" + vendor.name + " 已达上限）");
+      return;
+    }
 
     if (vendor.supports_login !== false && vendor.auth_mode !== "apikey") {
       if (apiKeyBox) apiKeyBox.hidden = true;

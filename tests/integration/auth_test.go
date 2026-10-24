@@ -352,3 +352,29 @@ func TestSubmitLoginCallbackRejectsSessionlessVendor(t *testing.T) {
 		t.Fatal("没有本地回调的供应商必须拒绝粘贴")
 	}
 }
+
+// TestVendorAccountLimitEnforced 验证单个供应商最多允许添加 10 个账号（core.MaxAccountsPerVendor）。
+func TestVendorAccountLimitEnforced(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+
+	for i := 1; i <= core.MaxAccountsPerVendor; i++ {
+		id := string(rune(96 + i))
+		host.AddAccount(id, "codearts-user-"+id+".json", `{"vendor":"codearts","access_key_id":"ak","secret_access_key":"sk"}`)
+	}
+
+	// 同供应商已满 10 个账号时，发起第 11 个登录必须被拒绝。
+	_, errStart := testApp.HandleMethod(pluginabi.MethodAuthLoginStart, mustMarshal(map[string]any{
+		"metadata": map[string]any{core.VendorKey: "codearts"},
+	}))
+	if errStart == nil || !strings.Contains(errStart.Error(), "最多添加 10 个账号") {
+		t.Fatalf("expected account limit error for codearts, got %v", errStart)
+	}
+
+	// 其它未满 10 个账号的供应商不受影响。
+	if _, errOther := testApp.HandleMethod(pluginabi.MethodAuthLoginStart, mustMarshal(map[string]any{
+		"metadata": map[string]any{core.VendorKey: "qodercn"},
+	})); errOther != nil {
+		t.Fatalf("other vendor should still be allowed, got %v", errOther)
+	}
+}

@@ -22,7 +22,10 @@ const (
 	codeParameterError  = 3001 // 缺 X-Device-Mid 等必需参数
 	codeSessionExpired  = 3004 // OAuth 轮询会话过期
 	codeModelNotAllowed = 3006 // 该账号套餐不含此模型
-	codeCaptchaFailed   = 3007 // 验证码校验失败（Plan 通道）
+	codeCaptchaFailed   = 3007 // 安全/验证码校验失败
+	codeConcurrent3008  = 3008 // Start Plan 并发请求上限
+	codeConcurrent3009  = 3009 // Start Plan 模型并发上限
+	codeConcurrent3010  = 3010 // Start Plan 模型并发上限
 	codeDailyQuota      = 1005 // 每日额度用完（额度耗尽的判定依据之一）
 	codeMaxTokens       = 1210 // max_tokens 超出 [1,131072]
 	codeUnusualActivity = 3012 // 风控「unusual activity」
@@ -82,11 +85,11 @@ func Classify(status int, body string) *core.Failure {
 			Msg:    core.FirstNonEmpty(msg, "额度已用完"),
 		}
 
-	// 5) 限流
-	case status == http.StatusTooManyRequests:
+	// 5) 限流 / 并发上限（3008/3009/3010）
+	case status == http.StatusTooManyRequests || payload.Code == codeConcurrent3008 || payload.Code == codeConcurrent3009 || payload.Code == codeConcurrent3010:
 		return &core.Failure{
 			Kind:   core.FailureKindSoftRate,
-			Status: status,
+			Status: pickStatus(status, http.StatusTooManyRequests),
 			Msg:    core.FirstNonEmpty(msg, "上游限流"),
 		}
 

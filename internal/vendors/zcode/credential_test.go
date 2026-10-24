@@ -167,12 +167,12 @@ func TestParseCredentialRequiresSomeToken(t *testing.T) {
 }
 
 func TestOutboundTokenPrefersAPIKey(t *testing.T) {
-	// 对话只走 API Key 通道（Plan 通道需人机验证码），因此出站凭证必须优先它。
+	// OutboundToken 用于账号标签脱敏：有 API Key 时优先展示 API Key，否则回退 JWT。
 	cred := &Credential{APIKey: "key.s", JWTToken: "a.b.c"}
 	if got := cred.OutboundToken(); got != "key.s" {
 		t.Fatalf("OutboundToken = %q, want the API key", got)
 	}
-	// 只有 JWT 时回退（此时候选路径本身会拒绝，见 resolveTargetURL）。
+	// 只有 JWT 时回退 JWT。
 	if got := (&Credential{JWTToken: "a.b.c"}).OutboundToken(); got != "a.b.c" {
 		t.Fatalf("OutboundToken = %q, want the JWT", got)
 	}

@@ -13,14 +13,12 @@ import (
 
 // ZCode 凭证的解析、特征识别与脱敏。
 //
-// 一个 ZCode 账号可能同时持有两种凭证，语义完全不同：
+// 一个 ZCode 账号可能同时持有两种凭证：
 //
-//   - APIKey（api.z.ai，x-api-key）—— **对话通道**，免人机验证码；
-//   - JWTToken（zcode.z.ai，Bearer）—— Coding Plan 通道，上游强制校验
-//     X-Aliyun-Captcha-Verify-Param，没有真实浏览器求解器时不可用于对话。
+//   - JWTToken（zcode.z.ai，Bearer）—— Start Plan 对话通道、额度查询与套餐领取；
+//   - APIKey（x-api-key）—— 纯 API Key 账号的对话通道。
 //
-// 因此对话一律优先 APIKey；JWT 仅用于 billing 族（额度查询 / 套餐领取）。
-// OAuth 登录会一次拿到两者（JWT 直接下发，API Key 由 access_token 兑换）。
+// OAuth 登录一次拿到两者（JWT 直接下发，API Key 由 access_token 兑换）。
 
 // Credential 是归一化后的 ZCode 账号凭证。
 type Credential struct {
@@ -34,9 +32,7 @@ type Credential struct {
 	AuthMode string        `json:"auth_mode,omitempty"` // oauth / apikey
 }
 
-// UsesPlanChannel 报告本凭证是否具备 Coding Plan 通道能力。
-//
-// 只判断凭证形状，不代表当下可用：上游还要求验证码头，见 CanChatOverPlan。
+// UsesPlanChannel 报告本凭证是否具备 Start Plan（JWT）通道能力。
 func (c *Credential) UsesPlanChannel() bool {
 	return c != nil && strings.TrimSpace(c.JWTToken) != ""
 }

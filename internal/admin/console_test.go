@@ -525,3 +525,20 @@ func TestConsoleModelOptionalColumnsHiddenByDefault(t *testing.T) {
 		t.Fatal("column preferences must default to an empty object")
 	}
 }
+
+func TestConsolePageSettingsLabelsAndDisclaimer(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+	for _, required := range []string{
+		"每日自动签到",
+		"每日自动任务",
+		"合规与免责声明",
+		"MAX_ACCOUNTS_PER_VENDOR = 10",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("console page missing %q", required)
+		}
+	}
+	if strings.Contains(page, "自动每日任务") {
+		t.Fatal("console page must replace 自动每日任务 with 每日自动任务")
+	}
+}

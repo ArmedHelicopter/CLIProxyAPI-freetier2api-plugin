@@ -1,0 +1,149 @@
+# FreeTier 2API Plugin
+
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-Plugin-2496ED?style=flat)](https://github.com/router-for-me/CLIProxyAPI)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+A native dynamic library plugin that connects multiple free-tier AI providers to [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), reusing the host's OpenAI / Anthropic / Responses compatible routing, authentication, proxy, and load balancing.
+
+[中文](README.md) | English
+
+If this project helps you, a Star would mean a lot.
+
+> **⚠️ Important Compliance Notice**: This project is **strictly for personal learning and technical research only**. Commercial sale, API resale, paid account farming, public/paid shared pools, or any use violating upstream Terms of Service or applicable laws is strictly prohibited. Each provider is hard-limited to a maximum of **10 accounts**. By using this software, you agree to the [Disclaimer](#disclaimer) below.
+
+## Features
+
+- Native integration with CLIProxyAPI's Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`, and OpenAI `/v1/responses` endpoints without running a separate gateway service
+- Supports 13 free-tier provider instances across 8 vendor families with strict per-vendor credential isolation (capped at 10 accounts per provider)
+- Dynamic model catalog discovery, custom model aliases, and cross-provider load balancing / failover
+- Built-in single-page Web console for OAuth device login, localhost callback paste, API Key import, quota tracking, model toggling, and live logs
+- Automated daily check-in, automated daily tasks, and token keepalive refresh
+- Pure Go standard library implementation with zero third-party runtime dependencies
+
+## Supported Providers
+
+| Vendor ID | Display Name | Realm | Auth Mode | Credential File Prefix |
+| --- | --- | --- | --- | --- |
+| `workbuddycn` | WorkBuddy CN | `cn` | OAuth Device Flow | `workbuddycn-*.json` |
+| `workbuddyglobal` | WorkBuddy Global | `global` | OAuth Device Flow | `workbuddyglobal-*.json` |
+| `qodercn` | Qoder CN | `cn` | OAuth Device Flow | `qodercn-*.json` |
+| `qoderglobal` | Qoder Global | `global` | OAuth Device Flow | `qoderglobal-*.json` |
+| `opencodezen` | OpenCode ZEN | `global` | API Key | `opencodezen-*.json` |
+| `cline` | Cline | `global` | WorkOS Device Flow | `cline-*.json` |
+| `zcode` | ZCode | `global` | OAuth CLI Flow | `zcode-*.json` |
+| `traesolo` | TRAE SOLO | `cn` | OAuth Flow | `traesolo-*.json` |
+| `traecn` | Trae CN | `cn` | OAuth Flow | `traecn-*.json` |
+| `traeglobal` | Trae Global | `global` | OAuth Flow | `traeglobal-*.json` |
+| `codearts` | CodeArts | `cn` | OAuth Flow | `codearts-*.json` |
+| `minimaxcodecn` | MiniMax Code CN | `cn` | OAuth Device Flow | `minimaxcodecn-*.json` |
+| `minimaxcodeglobal` | MiniMax Code Global | `global` | OAuth Device Flow | `minimaxcodeglobal-*.json` |
+
+## Quick Start
+
+### Option 1: Install via CPA Plugin Store (Recommended)
+
+This plugin is listed in the official CLIProxyAPI plugin registry:
+
+1. Open the CLIProxyAPI Admin Panel → **Plugin Store**.
+2. Search for **FreeTier 2API** and click Install.
+
+### Option 2: Manual Installation from Releases
+
+Download the archive for your platform from [Releases](https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin/releases), extract the shared library (`freetier2api.so` / `freetier2api.dylib` / `freetier2api.dll`) into your CPA plugins directory, and enable it in `config.yaml`:
+
+```yaml
+plugins:
+  enabled: true
+  dir: "/path/to/cpa/plugins"
+  configs:
+    freetier2api:
+      enabled: true
+      enabled_realms: "cn,global"
+```
+
+### Option 3: Build from Source
+
+Requires Go 1.22+ and a C compiler (`CGO_ENABLED=1`), or use the bundled Docker build script (`golang:1.24` Debian glibc image):
+
+```bash
+git clone https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin.git
+cd CLIProxyAPI-freetier2api-plugin
+./scripts/build.sh
+```
+
+The compiled shared library is written to `dist/freetier2api.<so|dylib|dll>`.
+
+## Usage
+
+### 1. Open Console & Add Accounts
+
+Once CLIProxyAPI is running, open the embedded console:
+
+```text
+http://<CPA-HOST>:8317/v0/resource/plugins/freetier2api/console
+```
+
+- Click **"添加账号 ▾" (Add Account)**, choose a provider, and complete the browser OAuth flow or enter an API Key (up to 10 accounts per provider).
+- When running on a remote host, Docker, or WSL where `127.0.0.1` callbacks (such as Trae or CodeArts) cannot reach the container directly, expand **"回调没到插件？粘贴回调链接"** in the login box and paste the full localhost callback URL from your browser's address bar.
+
+### 2. Call the API
+
+Call standard CLIProxyAPI endpoints using bare model names or `<vendor>:<model>` prefixes:
+
+```bash
+# OpenAI Chat Completions
+curl http://localhost:8317/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <CPA_API_KEY>" \
+  -d '{"model":"GLM-5.3","messages":[{"role":"user","content":"Hello!"}]}'
+
+# Anthropic Messages
+curl http://localhost:8317/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-api-key: <CPA_API_KEY>" \
+  -d '{"model":"GLM-5.3-Flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+### 3. Model Aliases & Cross-Provider Routing
+
+In the Models table of the console, click any model ID or its `✎` icon to assign an external alias. Assigning the same alias to models across different providers merges them into a single logical model ID in CLIProxyAPI for automatic cross-provider load balancing and failover.
+
+## Configuration
+
+Configure under `plugins.configs.freetier2api` in `config.yaml` (runtime settings can also be toggled live in the web console):
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled_realms` | string | `cn,global` | Enabled regions (`cn` / `global`) |
+| `auto_checkin` | bool | `true` | Enable automated daily check-in |
+| `auto_checkin_at` | string | `10:00` | Daily check-in time (`HH:MM`, local time) |
+| `auto_tasks` | bool | `true` | Enable automated daily tasks |
+| `prompt_mode` | string | `passthrough` | System prompt filter mode: `passthrough` / `custom` / `append` |
+| `disabled_models` | string / list | empty | Disabled models (`vendor:model` or bare name) |
+| `extra_models` | string | empty | Additional model IDs to register (comma-separated) |
+| `state_dir` | string | `~/.freetier2api-plugin` | State and cache directory |
+| `log_level` | string | `info` | Log level: `debug` / `info` / `error` |
+
+## Acknowledgments & Third-Party Notices
+
+This project references or adapts protocol designs, ABI contracts, and metadata from the following open-source projects:
+
+- **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** (MIT): Host plugin ABI/API contracts (`cpasdk/`) and HTTP/SSE bridge design.
+- **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)** & **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)** (MIT): WorkBuddy protocol adaptation, prompt sanitization, and task system reference.
+
+## Contributing
+
+Friendly discussion is welcome. If you run into issues, try asking Claude Code, Codex, or similar tools for help first — most problems can be solved that way. PRs are even better.
+
+## Disclaimer
+
+1. **Personal & Educational Use Only**: This project is provided strictly for personal learning, technical research, and protocol interoperability testing. Commercial sale, API resale, paid hosting, automated reward farming, public shared pools, or any illegal use is strictly prohibited.
+2. **Non-Affiliation**: This project is an independent open-source work and is not affiliated with, endorsed by, or sponsored by Tencent (WorkBuddy / CodeBuddy), Alibaba (Qoder), Zhipu / Z.AI (ZCode), ByteDance (Trae), Huawei Cloud (CodeArts), MiniMax, Cline, OpenCode, or any other upstream provider.
+3. **Compliance & Assumption of Risk**: Accessing services via unofficial clients or using automated check-in/task features may violate the Terms of Service (ToS) of upstream platforms and may result in account suspension, quota revocation, or other legal/compliance consequences. Users are solely responsible for ensuring their usage complies with all applicable Terms of Service and laws. The authors and contributors assume no liability for any direct or indirect damages arising from the use of this software.
+4. **Takedown Contact**: If any upstream provider or rights holder believes any part of this repository infringes upon your legitimate rights, please open an Issue and the relevant adapter code will be promptly removed.
+
+## License
+
+[MIT](LICENSE)

@@ -15,9 +15,8 @@ import (
 // JWT 与兑换出的 API Key）。之所以声明为 oauth 而不是 apikey，是因为页面按
 // auth_mode 决定「添加账号」的动作——apikey 会直接弹输入框、不发起登录。
 //
-// 通道选择：对话只走 API Key 通道（api.z.ai，免人机验证码）。Plan 通道
-// （Bearer JWT）被上游强制要求 X-Aliyun-Captcha-Verify-Param，而本插件不内置
-// 浏览器验证码求解。JWT 仍保留，供额度查询与套餐领取使用。
+// 通道选择：具备 JWT 时优先走 Start Plan 通道（zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages）；
+// 纯 API Key 账号走 ZCode 官方网关转发通道（zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages）。
 
 // adapter 是 core.Vendor 在 ZCode 上的实现。
 type adapter struct {

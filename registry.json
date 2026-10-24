@@ -8,8 +8,23 @@
       "author": "jiandanc",
       "repository": "https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin",
       "homepage": "https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin",
-      "license": "GPL-3.0",
-      "tags": ["Provider", "WorkBuddy", "CodeBuddy", "Qoder", "OpenCode", "Cline", "ZCode", "Trae", "CodeArts", "MiniMaxCode", "Auth", "Quota", "Management", "Tasks"]
+      "license": "MIT",
+      "tags": [
+        "Provider",
+        "WorkBuddy",
+        "CodeBuddy",
+        "Qoder",
+        "OpenCode",
+        "Cline",
+        "ZCode",
+        "Trae",
+        "CodeArts",
+        "MiniMaxCode",
+        "Auth",
+        "Quota",
+        "Management",
+        "Tasks"
+      ]
     }
   ]
 }

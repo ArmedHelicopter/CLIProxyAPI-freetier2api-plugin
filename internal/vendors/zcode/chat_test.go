@@ -346,19 +346,34 @@ func TestClassifyEmbeddedError(t *testing.T) {
 	}
 }
 
-func TestResolveTargetURLRequiresAPIKey(t *testing.T) {
-	// 有 API Key 时打到 api.z.ai 的回退端点。
-	target, errResolve := resolveTargetURL("", &Credential{APIKey: "k.s"})
+func TestResolveTargetURLPrefersStartPlanAndUltraGateway(t *testing.T) {
+	// 具备 JWT 时优先走 Start Plan 通道。
+	target, errResolve := resolveTargetURL("", &Credential{JWTToken: "a.b.c", APIKey: "k.s"})
 	if errResolve != nil {
 		t.Fatalf("unexpected error: %v", errResolve)
 	}
-	if target != ZAIOrigin+PathAPIMessages {
-		t.Fatalf("target = %q", target)
+	if target != ZCodeOrigin+PathPlanMessages {
+		t.Fatalf("target = %q, want %q", target, ZCodeOrigin+PathPlanMessages)
 	}
 
-	// 只有 JWT 时必须明确拒绝，而不是发出必然 3007 的请求。
-	if _, errResolve := resolveTargetURL("", &Credential{JWTToken: "a.b.c"}); errResolve == nil {
-		t.Fatal("缺少 API Key 时必须拒绝，而不是走需要验证码的 Plan 通道")
+	// 仅持 API Key 时默认走 ZCode Ultra 网关（避免国内直连 api.z.ai DNS 失败）。
+	target, errResolve = resolveTargetURL("", &Credential{APIKey: "k.s"})
+	if errResolve != nil {
+		t.Fatalf("unexpected error: %v", errResolve)
+	}
+	if target != ZCodeOrigin+PathUltraZAIMessages {
+		t.Fatalf("target = %q, want %q", target, ZCodeOrigin+PathUltraZAIMessages)
+	}
+
+	// 显式指定 baseURL 时走自定义基地址。
+	target, errResolve = resolveTargetURL("https://custom.zcode.test/", &Credential{APIKey: "k.s"})
+	if errResolve != nil || target != "https://custom.zcode.test"+PathAPIMessages {
+		t.Fatalf("custom target = %q, err = %v", target, errResolve)
+	}
+
+	// 两者都缺失时报错。
+	if _, errResolve := resolveTargetURL("", &Credential{}); errResolve == nil {
+		t.Fatal("缺少 JWT 与 API Key 时必须拒绝")
 	}
 }
 
@@ -369,25 +384,56 @@ func TestApplyStartPlanSystemIsIdempotent(t *testing.T) {
 	}
 	applyStartPlanSystem(body, "GLM-5.3")
 	first, _ := body["system"].([]any)
-	if len(first) == 0 {
-		t.Fatal("身份块未注入")
+	if len(first) != 3 {
+		t.Fatalf("system 块数 = %d, want 3（cli_prefix / stable / dynamic）", len(first))
 	}
 
-	// 重复调用不得重复拼接（上游按内容审查，重复块会被判异常）。
+	// 重复调用不得重复拼接（上游按内容审查，超过 3 块会被判 3012 异常）。
 	applyStartPlanSystem(body, "GLM-5.3")
 	second, _ := body["system"].([]any)
 	if len(second) != len(first) {
 		t.Fatalf("重复注入改变了块数: %d != %d", len(second), len(first))
 	}
 
-	// 官方块在最前，用户原有 system 保留在后。
+	// 首块为 CLI prefix（无 cache_control），末块内嵌模型名与用户 system（Output Style 槽位）。
 	head, _ := second[0].(map[string]any)
 	if !strings.Contains(head["text"].(string), "ZCode") {
 		t.Fatalf("首块应为官方身份块: %v", head)
 	}
+	if head["cache_control"] != nil {
+		t.Fatalf("首块 CLI prefix 不应携带 cache_control: %v", head)
+	}
 	tail, _ := second[len(second)-1].(map[string]any)
-	if tail["text"] != "user instructions" {
-		t.Fatalf("用户 system 应保留: %v", tail)
+	tailText, _ := tail["text"].(string)
+	if !strings.Contains(tailText, "account:zai-start-plan/GLM-5.3") {
+		t.Fatalf("动态块应包含当前模型标识: %s", tailText)
+	}
+	if !strings.Contains(tailText, "# Output Style: custom\nuser instructions") {
+		t.Fatalf("用户 system 应内嵌在动态块的 Output Style 槽位: %s", tailText)
+	}
+}
+
+func TestConvertMessagesMergesConsecutiveToolResults(t *testing.T) {
+	body := anthropicBody(t, `{
+		"model": "GLM-5.3",
+		"messages": [
+			{"role": "user", "content": "check two files"},
+			{"role": "assistant", "content": null, "tool_calls": [
+				{"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{}"}},
+				{"id": "call_2", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+			]},
+			{"role": "tool", "tool_call_id": "call_1", "content": "file_a"},
+			{"role": "tool", "tool_call_id": "call_2", "content": "file_b"}
+		]
+	}`, nil)
+	messages, _ := body["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("连续 tool 消息应合并为单条 user 消息, got %d messages: %v", len(messages), messages)
+	}
+	toolUser, _ := messages[2].(map[string]any)
+	blocks, _ := toolUser["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("合并后应含 2 个 tool_result 块, got %d: %v", len(blocks), blocks)
 	}
 }
 
