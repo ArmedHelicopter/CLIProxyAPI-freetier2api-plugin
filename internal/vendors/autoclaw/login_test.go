@@ -2,9 +2,14 @@ package autoclaw
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 )
 
@@ -124,3 +129,227 @@ func TestLoginStartRegionGuards(t *testing.T) {
 
 // testContext 返回测试用背景 context。
 func testContext() context.Context { return context.Background() }
+
+// TestOAuthDefaultCallbackPorts 锁定两个变体的回调端口：Zai 只能用官方客户端
+// 登记的四个端口之一，Google 走 loopback 宽松匹配。
+func TestOAuthDefaultCallbackPorts(t *testing.T) {
+	if got := OAuthNavigateURI(oauthVendorZai, 0); got != "http://localhost:53699/auth/callback-zai" {
+		t.Fatalf("zai navigate uri = %q", got)
+	}
+	if got := OAuthNavigateURI(oauthVendorGoogle, 0); got != "http://localhost:46952/auth/callback-google" {
+		t.Fatalf("google navigate uri = %q", got)
+	}
+}
+
+func TestParseOAuthCallbackAcceptsLoopbackAliases(t *testing.T) {
+	for _, raw := range []string{
+		"http://127.0.0.1:46952/auth/callback-google?code=c1&state=s1",
+		"http://[::1]:46952/auth/callback-google?code=c1&state=s1",
+	} {
+		if _, code, _, ok := ParseOAuthCallback(raw); !ok || code != "c1" {
+			t.Fatalf("ParseOAuthCallback(%q) = %q, %v", raw, code, ok)
+		}
+	}
+}
+
+func TestOAuthCaptchaConfigParsesEnvelope(t *testing.T) {
+	useLoopbackHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != OAuthCaptchaConfigPath {
+			t.Errorf("path = %q, want %q", r.URL.Path, OAuthCaptchaConfigPath)
+		}
+		if r.Header.Get("X-Auth-Sign") == "" {
+			t.Error("captcha-config 请求缺少签名头")
+		}
+		_, _ = w.Write([]byte(`{"code":0,"msg":"SUCCESS","data":{"enabled":true,"region":"ga",
+			"prefix":"sq51tr","scene_id":"18vhnjxl","captcha_supplier":"aliyun"}}`))
+	}))
+	defer server.Close()
+
+	config, errConfig := OAuthCaptchaConfig(context.Background(), server.URL)
+	if errConfig != nil {
+		t.Fatalf("OAuthCaptchaConfig: %v", errConfig)
+	}
+	if !config.Enabled || config.SceneID != "18vhnjxl" || config.Region != "ga" || config.Prefix != "sq51tr" {
+		t.Fatalf("config = %#v", config)
+	}
+}
+
+func TestOAuthCaptchaConfigSurfacesUpstreamCode(t *testing.T) {
+	useLoopbackHost(t)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":630014,"msg":"Verification failed","data":null}`))
+	}))
+	defer server.Close()
+
+	_, errConfig := OAuthCaptchaConfig(context.Background(), server.URL)
+	if errConfig == nil || !strings.Contains(errConfig.Error(), "风控验证") {
+		t.Fatalf("err = %v, want 风控验证提示", errConfig)
+	}
+}
+
+func TestLoginStartRequiresCaptcha(t *testing.T) {
+	instances := Instances(envWithLogins())
+	oauth := instances[1].(*oauthLoginAdapter)
+	// 请求地址不可达也没关系：缺验证码必须在发请求之前就被挡下。
+	oauth.baseURL = "http://127.0.0.1:1"
+	_, errStart := oauth.LoginStart(testContext(), map[string]any{"oauth_variant": "google"})
+	if errStart == nil || !strings.Contains(errStart.Error(), "人机验证") {
+		t.Fatalf("err = %v, want 人机验证提示", errStart)
+	}
+}
+
+func TestLoginStartRequestsOAuthURLAndRegistersSession(t *testing.T) {
+	useLoopbackHost(t)
+	var gotPath string
+	var gotBody map[string]any
+	var gotHeaders http.Header
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotHeaders = r.Header.Clone()
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_, _ = w.Write([]byte(`{"code":0,"msg":"SUCCESS","data":{"oauth_url":"https://accounts.example/oauth?x=1"}}`))
+	}))
+	defer server.Close()
+
+	instances := Instances(envWithLogins())
+	oauth := instances[1].(*oauthLoginAdapter)
+	oauth.baseURL = server.URL
+	response, errStart := oauth.LoginStart(testContext(), map[string]any{
+		"oauth_variant":            "zai",
+		"ali_captcha_verify_param": "captcha-token-1",
+	})
+	if errStart != nil {
+		t.Fatalf("LoginStart: %v", errStart)
+	}
+	if response.URL != "https://accounts.example/oauth?x=1" {
+		t.Fatalf("url = %q", response.URL)
+	}
+	if !strings.HasPrefix(response.State, oauth.ID()+"_oauth_") {
+		t.Fatalf("state = %q", response.State)
+	}
+	if response.Metadata["callback_hint"] != "http://localhost:53699/auth/callback-zai" {
+		t.Fatalf("metadata = %#v", response.Metadata)
+	}
+	if gotPath != OAuthURLPathZai {
+		t.Fatalf("path = %q, want %q", gotPath, OAuthURLPathZai)
+	}
+	if gotBody["ali_captcha_verify_param"] != "captcha-token-1" {
+		t.Fatalf("body = %#v", gotBody)
+	}
+	if gotBody["navigate_uri"] != "http://localhost:53699/auth/callback-zai" {
+		t.Fatalf("navigate_uri = %#v", gotBody["navigate_uri"])
+	}
+	if gotBody["source_id"] != protocolName {
+		t.Fatalf("source_id = %#v", gotBody["source_id"])
+	}
+	// 阿里云 WAF 会以 405 HTML 拦掉 Go 默认 UA（实测只换 UA 就恢复）；
+	// OAuth 还必须带官方桌面端指纹，否则浏览器里生成的验证码令牌不被接受。
+	if ua := gotHeaders.Get("User-Agent"); !strings.HasPrefix(ua, "AutoClaw/") || strings.Contains(ua, "Go-http-client") {
+		t.Fatalf("User-Agent = %q, want AutoClaw desktop UA", ua)
+	}
+	if gotHeaders.Get("X-Client-Type") != "pc" || gotHeaders.Get("X-Harness-Type") != "zcode" {
+		t.Fatalf("desktop fingerprint headers missing: %#v", gotHeaders)
+	}
+
+	entry, pollState := oauth.Env.Logins.Poll(response.State)
+	if pollState != core.PollReady || entry == nil {
+		t.Fatalf("session not registered: %v", pollState)
+	}
+	pending, okPending := entry.Data.(*autoclawPendingLogin)
+	if !okPending {
+		t.Fatal("session data type mismatch")
+	}
+	if pending.Vendor != oauthVendorZai || pending.NavigateURI != "http://localhost:53699/auth/callback-zai" {
+		t.Fatalf("pending = %#v", pending)
+	}
+	if pending.DeviceID == "" || pending.DeviceID != gotBody["device_id"] {
+		t.Fatalf("device id mismatch: pending=%q body=%#v", pending.DeviceID, gotBody["device_id"])
+	}
+}
+
+func TestLoginStartRejectsUnknownVariant(t *testing.T) {
+	instances := Instances(envWithLogins())
+	oauth := instances[1].(*oauthLoginAdapter)
+	_, errStart := oauth.LoginStart(testContext(), map[string]any{
+		"oauth_variant": "github", "ali_captcha_verify_param": "x",
+	})
+	if errStart == nil || !strings.Contains(errStart.Error(), "未知的登录方式") {
+		t.Fatalf("err = %v", errStart)
+	}
+}
+
+func TestOAuthLoginCapabilitiesAndVariants(t *testing.T) {
+	instances := Instances(envWithLogins())
+	if _, okCaptcha := core.As[core.LoginCaptchaProvider](instances[1]); !okCaptcha {
+		t.Fatal("global instance should implement LoginCaptchaProvider")
+	}
+	if _, okCaptcha := core.As[core.LoginCaptchaProvider](instances[0]); okCaptcha {
+		t.Fatal("cn instance must NOT implement LoginCaptchaProvider")
+	}
+	variants, okVariants := core.As[core.LoginVariantProvider](instances[1])
+	if !okVariants {
+		t.Fatal("global instance should implement LoginVariantProvider")
+	}
+	list := variants.LoginVariants()
+	if len(list) != 2 || list[0].ID != "zai" || list[1].ID != "google" {
+		t.Fatalf("variants = %#v", list)
+	}
+	if list[1].CallbackHint != "http://localhost:46952/auth/callback-google" {
+		t.Fatalf("google hint = %q", list[1].CallbackHint)
+	}
+}
+
+// TestSubmitCallbackExchangesCodeWithSessionNavigateURI 锁定「粘贴回调 → 换码」
+// 这条链：第②跳与第③跳必须用同一个 navigate_uri / device_id，否则 Zai 会以
+// 回调地址不匹配或状态失效拒掉。
+func TestSubmitCallbackExchangesCodeWithSessionNavigateURI(t *testing.T) {
+	useLoopbackHost(t)
+	var gotBody map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != OAuthLoginPathZai {
+			t.Errorf("path = %q, want %q", r.URL.Path, OAuthLoginPathZai)
+		}
+		_ = json.NewDecoder(r.Body).Decode(&gotBody)
+		_, _ = w.Write([]byte(`{"code":0,"msg":"SUCCESS","data":{"access_token":"access-1",` +
+			`"refresh_token":"refresh-1","user_id":42,"user_name":"tester"}}`))
+	}))
+	defer server.Close()
+
+	instances := Instances(envWithLogins())
+	oauth := instances[1].(*oauthLoginAdapter)
+	oauth.baseURL = server.URL
+	sessionID := oauth.ID() + "_oauth_test"
+	navigateURI := "http://localhost:53699/auth/callback-zai"
+	oauth.Env.Logins.Register(oauth.ID(), sessionID, time.Hour, 0, &autoclawPendingLogin{
+		Region: RegionGlobal, Vendor: oauthVendorZai, DeviceID: "device-1", NavigateURI: navigateURI,
+	})
+
+	result, errSubmit := oauth.SubmitCallback(testContext(), sessionID,
+		"http://localhost:53699/auth/callback-zai?code=code-1&state=upstream-state")
+	if errSubmit != nil {
+		t.Fatalf("SubmitCallback: %v", errSubmit)
+	}
+	if result.Status != pluginapi.AuthLoginStatusSuccess {
+		t.Fatalf("status = %q, message = %q", result.Status, result.Message)
+	}
+	if result.Auth.FileName != "autoclawglobal-42.json" {
+		t.Fatalf("file name = %q", result.Auth.FileName)
+	}
+	if gotBody["code"] != "code-1" || gotBody["state"] != "upstream-state" {
+		t.Fatalf("body = %#v", gotBody)
+	}
+	if gotBody["navigate_uri"] != navigateURI || gotBody["device_id"] != "device-1" {
+		t.Fatalf("navigate/device mismatch: %#v", gotBody)
+	}
+	var storage map[string]any
+	if errUnmarshal := json.Unmarshal(result.Auth.StorageJSON, &storage); errUnmarshal != nil {
+		t.Fatalf("decode storage: %v", errUnmarshal)
+	}
+	if storage["accessToken"] != "access-1" || storage["refreshToken"] != "refresh-1" {
+		t.Fatalf("storage = %#v", storage)
+	}
+	if _, pollState := oauth.Env.Logins.Poll(sessionID); pollState != core.PollMissing {
+		t.Fatalf("session should be consumed after success, state = %v", pollState)
+	}
+}

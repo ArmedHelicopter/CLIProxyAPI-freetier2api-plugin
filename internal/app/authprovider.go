@@ -413,24 +413,74 @@ func (a *App) handleAuthLoginStart(request []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(hostbridge.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
 	defer cancel()
 
+	response, errStart := a.startVendorLogin(ctx, vendor, rpc.Metadata)
+	if errStart != nil {
+		return nil, errStart
+	}
+	logger.Info("started login (vendor=%s)", vendor.ID())
+	return core.OKEnvelope(response)
+}
+
+// StartLogin 发起一次供应商登录（控制台页面路径）。
+//
+// 与宿主 <provider>-auth-url 的调用共用 startVendorLogin，差别只在入口：
+// 页面路径要能拿到供应商给出的可读错误（例如「滑块验证过期了，重拖一次」），
+// 所以由插件自己的管理路由承接，而不是绕宿主那条只会回 500 的转发路径。
+func (a *App) StartLogin(ctx context.Context, vendorID string, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	vendor, okVendor := a.registry.ByID(strings.TrimSpace(vendorID))
+	if !okVendor {
+		return nil, core.NewPluginError("vendor_not_found", "vendor not found: "+vendorID, http.StatusNotFound)
+	}
+	if !a.vendorEnabled(vendor) {
+		return nil, core.NewPluginError("vendor_disabled",
+			fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
+	}
+	response, errStart := a.startVendorLogin(ctx, vendor, metadata)
+	if errStart != nil {
+		return nil, errStart
+	}
+	logger.Info("started login via console (vendor=%s)", vendor.ID())
+	return response, nil
+}
+
+// LoginCaptchaConfig 取登录前的人机验证控件参数。
+func (a *App) LoginCaptchaConfig(ctx context.Context, vendorID string) (core.CaptchaConfig, error) {
+	vendor, okVendor := a.registry.ByID(strings.TrimSpace(vendorID))
+	if !okVendor {
+		return core.CaptchaConfig{}, core.NewPluginError("vendor_not_found", "vendor not found: "+vendorID, http.StatusNotFound)
+	}
+	if !a.vendorEnabled(vendor) {
+		return core.CaptchaConfig{}, core.NewPluginError("vendor_disabled",
+			fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
+	}
+	provider, okCaptcha := core.As[core.LoginCaptchaProvider](vendor)
+	if !okCaptcha {
+		return core.CaptchaConfig{}, core.NewPluginError("captcha_unsupported",
+			vendor.Name()+" 的登录不需要页面内人机验证", http.StatusBadRequest)
+	}
+	config, errConfig := provider.LoginCaptchaConfig(ctx)
+	if errConfig != nil {
+		return core.CaptchaConfig{}, core.ToPluginError(errConfig)
+	}
+	return config, nil
+}
+
+// startVendorLogin 是两条登录入口（宿主 auth-url / 插件管理路由）的共同实现。
+//
+// 供应商标识由这里统一注入：宿主靠 metadata.vendor 把登录会话绑定回具体供应商，
+// 缺了它宿主拿不到授权链接，页面只会看到「获取授权链接失败」。
+func (a *App) startVendorLogin(ctx context.Context, vendor core.Vendor, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
 	login, okLogin := core.As[core.LoginProvider](vendor)
 	if !okLogin {
 		return nil, core.LoginUnsupported(vendor)
 	}
-	if errLimit := a.pool.CheckVendorLimit(ctx, rpc.HostCallbackID, vendor, ""); errLimit != nil {
+	if errLimit := a.pool.CheckVendorLimit(ctx, hostbridge.CallbackID(ctx), vendor, ""); errLimit != nil {
 		return nil, errLimit
 	}
-	response, errStart := login.LoginStart(ctx, rpc.Metadata)
+	response, errStart := login.LoginStart(ctx, metadata)
 	if errStart != nil {
 		return nil, core.ToPluginError(errStart)
 	}
-	// 供应商标识由根层统一注入，不交给各供应商自己记着。
-	//
-	// 宿主靠 metadata.vendor 把登录会话绑定回具体供应商；缺了它宿主拿不到
-	// 授权链接，页面只会看到「获取授权链接失败」。把这一步放在分发点而不是
-	// 各供应商的 LoginStart 里：新增供应商时没人会记得补，且漏掉时没有任何
-	// 编译期或运行期提示——本插件曾因此让 codearts / trae / traesolo 三个
-	// 供应商长期无法添加账号。
 	if response != nil {
 		if response.Metadata == nil {
 			response.Metadata = map[string]any{}
@@ -438,8 +488,7 @@ func (a *App) handleAuthLoginStart(request []byte) ([]byte, error) {
 		response.Metadata[core.VendorKey] = vendor.ID()
 		response.Metadata["region"] = vendor.Region()
 	}
-	logger.Info("started login (vendor=%s)", vendor.ID())
-	return core.OKEnvelope(response)
+	return response, nil
 }
 
 // handleAuthLoginPoll 轮询一次登录状态。

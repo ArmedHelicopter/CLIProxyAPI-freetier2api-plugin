@@ -51,6 +51,10 @@ type Deps interface {
 	VerifyLoginSMS(ctx context.Context, vendorID, sessionKey, phone, code string) (fileName, label, storageJSON string, err error)
 	// SubmitLoginCallback 处理用户粘贴回来的 localhost 授权回调链接。
 	SubmitLoginCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error)
+	// StartLogin 发起一次供应商登录（控制台在页面内完成人机验证后调用）。
+	StartLogin(ctx context.Context, vendorID string, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error)
+	// LoginCaptchaConfig 取登录前的人机验证控件参数。
+	LoginCaptchaConfig(ctx context.Context, vendorID string) (core.CaptchaConfig, error)
 	Reconfigure() error
 }
 
@@ -117,6 +121,8 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "POST", Path: prefix + "/activities/preview", Description: "只读探测账号当前活动资格，不执行领取。"},
 		{Method: "POST", Path: prefix + "/plans/claim", Description: "提交人机验证令牌并领取套餐。"},
 		{Method: "POST", Path: prefix + "/login/callback", Description: "提交用户粘贴的 localhost 授权回调链接（远程部署下的登录兜底）。"},
+		{Method: "POST", Path: prefix + "/login/start", Description: "发起一次供应商登录（可携带页面内人机验证令牌）。"},
+		{Method: "GET", Path: prefix + "/login/captcha-config", Description: "读取登录前的人机验证控件参数（阿里云场景 ID/region/prefix）。"},
 		{Method: "POST", Path: prefix + "/login/sms/send", Description: "发送短信验证码（支持手机验证码登录的供应商）。"},
 		{Method: "POST", Path: prefix + "/login/sms/verify", Description: "用短信验证码完成登录并保存账号。"},
 	}
@@ -216,6 +222,10 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 		return core.OKEnvelope(s.handlePlansClaim(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/callback"):
 		return core.OKEnvelope(s.handleLoginCallbackRequest(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/start"):
+		return core.OKEnvelope(s.handleLoginStartRequest(rpc))
+	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/login/captcha-config"):
+		return core.OKEnvelope(s.handleLoginCaptchaConfigRequest(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/sms/send"):
 		return core.OKEnvelope(s.handleLoginSMSSend(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/sms/verify"):
@@ -345,6 +355,19 @@ func ErrorResponse(err error) pluginapi.ManagementResponse {
 		}
 	}
 	return JSONResponse(status, map[string]any{"error": message, "ok": false})
+}
+
+// queryString 取第一个非空查询参数（缺失返回空串）。
+func queryString(query map[string][]string, key string) string {
+	if query == nil {
+		return ""
+	}
+	for _, value := range query[key] {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func queryInt64(query map[string][]string, key string, fallback int64) int64 {

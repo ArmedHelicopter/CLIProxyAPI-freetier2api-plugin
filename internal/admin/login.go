@@ -144,3 +144,78 @@ func (s *Service) handleLoginSMSVerify(req pluginapi.ManagementRequest) pluginap
 		"message": "登录成功，账号已添加",
 	})
 }
+
+// ---- 页面内登录（人机验证 → 授权链接）----
+//
+// 有些供应商的 OAuth 授权地址接口强制要求浏览器端人机验证（AutoClaw 国际版
+// 的阿里云滑块），令牌只能在用户的浏览器里生成。控制台因此先取控件参数、
+// 让用户拖一次滑块，再把得到的令牌交给 /login/start 换授权地址。
+//
+// 与宿主自带的 <provider>-auth-url 路径的差别：那条路径把上游错误统一折成
+// 一句 500（「failed to generate authorization url」），而这里最需要让用户
+// 看懂的恰恰是「滑块过期了，重拖一次」——业务失败一律 200 + message 回给页面。
+
+type loginStartRequest struct {
+	VendorID string         `json:"vendor_id"`
+	Metadata map[string]any `json:"metadata"`
+}
+
+// handleLoginStartRequest 发起一次登录并返回授权链接。
+func (s *Service) handleLoginStartRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	body, errDecode := decodeRequest[loginStartRequest](req.Body)
+	if errDecode != nil {
+		return JSONResponse(http.StatusBadRequest, map[string]any{
+			"ok": false, "status": string(pluginapi.AuthLoginStatusError),
+			"message": "请求体解析失败，请刷新页面后重试",
+		})
+	}
+	vendorID := strings.TrimSpace(body.VendorID)
+	if vendorID == "" {
+		return JSONResponse(http.StatusOK, map[string]any{
+			"ok": false, "status": string(pluginapi.AuthLoginStatusError), "message": "缺少供应商标识",
+		})
+	}
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	response, errStart := s.deps.StartLogin(ctx, vendorID, body.Metadata)
+	if errStart != nil {
+		return JSONResponse(http.StatusOK, map[string]any{
+			"ok": false, "status": string(pluginapi.AuthLoginStatusError), "message": errStart.Error(),
+		})
+	}
+	if response == nil || strings.TrimSpace(response.URL) == "" {
+		return JSONResponse(http.StatusOK, map[string]any{
+			"ok": false, "status": string(pluginapi.AuthLoginStatusError),
+			"message": "上游没有返回授权链接，请重试",
+		})
+	}
+	payload := map[string]any{
+		"ok":    true,
+		"url":   response.URL,
+		"state": response.State,
+	}
+	if !response.ExpiresAt.IsZero() {
+		payload["expires_at"] = response.ExpiresAt.Unix()
+	}
+	if response.Metadata != nil {
+		if hint, okHint := response.Metadata["callback_hint"].(string); okHint && strings.TrimSpace(hint) != "" {
+			payload["callback_hint"] = strings.TrimSpace(hint)
+		}
+	}
+	return JSONResponse(http.StatusOK, payload)
+}
+
+// handleLoginCaptchaConfigRequest 取登录前的人机验证控件参数。
+func (s *Service) handleLoginCaptchaConfigRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	vendorID := queryString(req.Query, "vendor")
+	if vendorID == "" {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": "缺少 vendor 参数"})
+	}
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	config, errConfig := s.deps.LoginCaptchaConfig(ctx, vendorID)
+	if errConfig != nil {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "message": errConfig.Error()})
+	}
+	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "captcha": config})
+}

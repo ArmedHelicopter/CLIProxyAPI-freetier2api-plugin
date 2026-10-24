@@ -13,8 +13,8 @@ package autoclaw
 //   - 积分额度查询（GET /agent-assetmgr/api/v2/wallets）；
 //   - 每日签到（POST .../autoclaw-task-complete，幂等）。
 //
-// 登录是手机验证码 / 桌面端 OAuth，插件侧无法托管验证码交互，不实现
-// LoginProvider：控制台不显示「添加账号」入口，凭证由用户粘贴 JSON 添加。
+// 登录按区域分派：国内版手机验证码；国际版 Zai / Google OAuth（控制台页面
+// 内完成阿里云人机验证 → 授权链接 → 粘贴回调 → 换码），也支持直接粘贴凭证。
 
 import (
 	"context"
@@ -47,7 +47,7 @@ func Instances(env core.Env) []core.Vendor {
 	// 供应商实例 = 协议 × 区域，登录方式也随地区不同（接口隔离：各家只实现
 	// 自己真实具备的能力，控制台据此渲染不同的添加表单）：
 	//   - 国内版：手机号 + 短信验证码（smsLoginAdapter）;
-	//   - 国际版：Google OAuth 网页登录（oauthLoginAdapter）。
+	//   - 国际版：Zai / Google OAuth 网页登录（oauthLoginAdapter）。
 	return []core.Vendor{
 		&smsLoginAdapter{newInstance(env, RegionCN).(*adapter)},
 		&oauthLoginAdapter{newInstance(env, RegionGlobal).(*adapter)},
@@ -57,7 +57,7 @@ func Instances(env core.Env) []core.Vendor {
 // smsLoginAdapter 是国内版实例：在共享适配器上追加短信验证码登录。
 type smsLoginAdapter struct{ *adapter }
 
-// oauthLoginAdapter 是国际版实例：在共享适配器上追加 Google OAuth 登录。
+// oauthLoginAdapter 是国际版实例：在共享适配器上追加 Zai / Google OAuth 登录。
 type oauthLoginAdapter struct{ *adapter }
 
 func newInstance(env core.Env, region Region) core.Vendor {
@@ -190,6 +190,7 @@ func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 			Description:        core.FirstNonEmpty(model.Description, "AutoClaw 上游模型"),
 			ContextLength:      model.ContextWindow,
 			MaxOutputTokens:    model.MaxOutputTokens,
+			SupportsImages:     model.SupportsImages,
 			SupportsTools:      model.SupportsTools,
 			CanDisableThinking: !model.IsReasoning,
 		}, true

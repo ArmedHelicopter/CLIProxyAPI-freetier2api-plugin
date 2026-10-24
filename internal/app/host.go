@@ -179,6 +179,14 @@ func (d adminDeps) SubmitLoginCallback(ctx context.Context, state, rawURL string
 	return d.app.SubmitLoginCallback(ctx, state, rawURL)
 }
 
+func (d adminDeps) StartLogin(ctx context.Context, vendorID string, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	return d.app.StartLogin(ctx, vendorID, metadata)
+}
+
+func (d adminDeps) LoginCaptchaConfig(ctx context.Context, vendorID string) (core.CaptchaConfig, error) {
+	return d.app.LoginCaptchaConfig(ctx, vendorID)
+}
+
 func (a *App) managementRegistration() pluginapi.ManagementRegistrationResponse {
 	return a.admin.Registration()
 }
