@@ -59,6 +59,12 @@ func vendorAuthMode(vendor core.Vendor) string {
 }
 
 func vendorSupportsLogin(vendor core.Vendor) bool {
-	_, okLogin := core.As[core.LoginProvider](vendor)
-	return okLogin
+	if _, okLogin := core.As[core.LoginProvider](vendor); okLogin {
+		return true
+	}
+	// 短信验证码登录也是登录（控制台渲染两步表单而不是授权链接）。
+	if _, okSMS := core.As[core.SMSLoginProvider](vendor); okSMS {
+		return true
+	}
+	return false
 }

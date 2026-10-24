@@ -13,6 +13,7 @@ package autoclaw
 import (
 	"context"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -58,38 +59,32 @@ type autoclawPendingLogin struct {
 	NavigateURI string
 }
 
-// LoginStart 发起一次国际版 OAuth 登录（Google）。
-//
-// 返回的 URL 是官方登录页；登录完成后浏览器停在本机回调地址上，用户把
-// 地址栏整条链接粘回控制台（SubmitCallback）完成换票。国内版没有 OAuth
-// （上游开关 enabled:false），返回说明性错误。
+// LoginStart 返回国际版 OAuth 的说明（上游 oauth-url 接口强制要求阿里云
+// 风控验证码参数——浏览器端 JS SDK 生成，插件控制台没有该组件的位置，
+// 实测不带参数得到 631002）。Agent2API 的解法是把官方 SDK 搬进自己的主
+// 窗口跑；本插件的宿主形态没有等价入口，因此这里返回指引文案页，
+// 用户按说明粘贴凭证或回调链接（LocalCallbackHint / SubmitCallback）。
 func (oauth *oauthLoginAdapter) LoginStart(ctx context.Context, meta map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	if !oauth.region.IsGlobal() {
-		return nil, core.NewPluginError("login_unsupported",
-			"AutoClaw 国内版使用「手机号 + 验证码」登录，请在添加账号面板选择对应入口", http.StatusBadRequest)
-	}
-	if oauth.Env.Logins == nil {
-		return nil, core.NewPluginError("login_unavailable", "登录会话表未初始化（宿主未就绪）", http.StatusInternalServerError)
-	}
-	deviceID := newDeviceID()
-	// Zai 的白名单只认官方客户端的四个登记端口且第②步要过风控验证码
-	// （插件侧无验证码组件），先只开放 Google。
-	vendor := oauthVendorGoogle
-	navigateURI := OAuthNavigateURI(vendor, 46952)
-	state := core.RandomHex(16)
-	sessionID := oauth.ID() + "_oauth_" + state
-	oauth.Env.Logins.Register(oauth.ID(), sessionID, autoclawOAuthTTL, autoclawOAuthPollInterval,
-		&autoclawPendingLogin{Region: oauth.region, Vendor: vendor, DeviceID: deviceID, NavigateURI: navigateURI})
-	oauthURL, errURL := OAuthRequestURL(ctx, oauth.resolveBaseURL(), vendor, navigateURI, "", deviceID)
-	if errURL != nil {
-		oauth.Env.Logins.Delete(sessionID)
-		return nil, errURL
-	}
+	html := `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>AutoClaw 国际版登录</title></head>
+<body style="font-family:-apple-system,sans-serif;max-width:640px;margin:48px auto;line-height:1.7">
+<h2>AutoClaw 国际版登录</h2>
+<p>国际版的 OAuth 授权链接由上游接口下发，且该接口强制要求<strong>阿里云风控验证码</strong>参数
+（浏览器端 SDK 生成，无法在本控制台完成）。</p>
+<p>请改用以下方式之一：</p>
+<ol>
+<li>在<strong>添加账号</strong>面板粘贴 <code>accessToken</code> / <code>refreshToken</code> 凭证 JSON
+（可从 AutoClaw 桌面端登录态文件 <code>auth.json</code> 获取）；</li>
+<li>或使用 Agent2API 等工具完成 OAuth 登录后，把拿到的凭证粘贴过来。</li>
+</ol>
+<p style="color:#888">凭证保存后插件会自动续期（refresh_token）。</p>
+</body></html>`
+	dataURL := "data:text/html;charset=utf-8," + url.PathEscape(html)
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
-		URL:       oauthURL,
-		State:     sessionID,
-		ExpiresAt: time.Now().Add(autoclawOAuthTTL),
+		URL:       dataURL,
+		State:     "",
+		ExpiresAt: time.Now().Add(time.Minute),
 		Metadata: map[string]any{
 			core.VendorKey: oauth.ID(),
 			"region":       string(oauth.region),

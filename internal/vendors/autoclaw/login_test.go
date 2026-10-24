@@ -108,7 +108,8 @@ func TestOAuthNavigateURI(t *testing.T) {
 
 func TestLoginStartRegionGuards(t *testing.T) {
 	instances := Instances(core.Env{})
-	cn, gl := instances[0], instances[1]
+	cn := instances[0]
+	_ = instances[1]
 	// 登录能力随实例类型分派：cn 只有短信登录（SMSLoginProvider），
 	// global 只有 OAuth（LoginProvider + CallbackSubmitter）。
 	if _, okSMS := core.As[core.SMSLoginProvider](cn); !okSMS {
@@ -117,9 +118,8 @@ func TestLoginStartRegionGuards(t *testing.T) {
 	if _, okLogin := core.As[core.LoginProvider](cn); okLogin {
 		t.Fatal("cn must NOT implement LoginProvider")
 	}
-	if _, okLogin := core.As[core.LoginProvider](gl); !okLogin {
-		t.Fatal("global should implement LoginProvider")
-	}
+	// 国际版 OAuth 第②步强制风控验证码（浏览器端 SDK），插件侧无法完成——
+	// LoginStart 返回指引文案页，不声明 LoginProvider（控制台回退凭证填写）。
 }
 
 // testContext 返回测试用背景 context。
