@@ -9,18 +9,18 @@
   color-scheme: light dark;
   --bg: #eef2f7; --fg: #171e28; --muted: #5d6b7d; --card: #ffffff;
   --border: #e3e9f1; --border-strong: #cdd6e2;
-  --accent: #1668dc; --accent-2: #0ea5e9; --accent-strong: #0f56ba;
+  --accent: #1668dc;
   --accent-soft: rgba(22,104,220,.08); --grad: linear-gradient(135deg,#1d4ed8 0%,#1668dc 45%,#0ea5e9 100%);
   --ok: #15803d; --ok-soft: rgba(34,197,94,.12);
   --warn: #b45309; --warn-soft: rgba(245,158,11,.14);
-  --err: #dc2626; --err-soft: rgba(239,68,68,.11);
+  --err: #b91c1c; --err-soft: rgba(239,68,68,.11);
   --row-hover: rgba(22,104,220,.05);
   --shadow-card: 0 1px 2px rgba(16,24,40,.05), 0 10px 28px -14px rgba(16,24,40,.14);
   --shadow-pop: 0 12px 32px -8px rgba(16,24,40,.22);
   --radius: 14px;
-  /* 供应商彩色芯片（JS 按供应商名哈希取 v0..v5） */
+  /* 供应商彩色芯片：vendorChipClass() 按 vendor_id 哈希取 v0..v5，两套主题各自覆盖 */
   --chip-0-bg: rgba(124,58,237,.1);  --chip-0-fg: #6d28d9;
-  --chip-1-bg: rgba(8,145,178,.12);  --chip-1-fg: #0e7490;
+  --chip-1-bg: rgba(8,145,178,.12);  --chip-1-fg: #155e75;
   --chip-2-bg: rgba(180,83,9,.12);   --chip-2-fg: #92400e;
   --chip-3-bg: rgba(225,29,72,.1);   --chip-3-fg: #be123c;
   --chip-4-bg: rgba(22,101,52,.12);  --chip-4-fg: #166534;
@@ -29,7 +29,7 @@
 @media (prefers-color-scheme: dark) {
   :root { --bg: #0a0f16; --fg: #e6ecf4; --muted: #8fa0b3; --card: #121a24;
           --border: #212d3d; --border-strong: #324154;
-          --accent: #5290f5; --accent-2: #38bdf8; --accent-strong: #6ea3f7;
+          --accent: #5290f5;
           --accent-soft: rgba(82,144,245,.16); --grad: linear-gradient(135deg,#1e3a8a 0%,#1d4ed8 45%,#0284c7 100%);
           --ok: #4ade80; --ok-soft: rgba(74,222,128,.13);
           --warn: #fbbf24; --warn-soft: rgba(251,191,36,.13);
@@ -70,14 +70,7 @@ header::before { content: ""; position: absolute; width: 300px; height: 300px; b
                  background: radial-gradient(circle, rgba(255,255,255,.26), transparent 65%); }
 header h1 { margin: 0; font-size: 19px; font-weight: 750; letter-spacing: -.01em; }
 .sub { color: var(--muted); font-size: 12.5px; }
-header .sub { color: rgba(255,255,255,.78); margin-top: 2px; }
-nav { display: flex; gap: 4px; padding: 14px 20px 0; flex-wrap: wrap; }
-nav button { padding: 6.5px 13px; border: 1px solid transparent; border-radius: 999px;
-             background: transparent; color: var(--muted); cursor: pointer; font-size: 13.5px; font-weight: 500;
-             transition: background .12s ease, color .12s ease; }
-nav button:hover { background: var(--accent-soft); color: var(--accent); }
-nav button.active { background: var(--card); border-color: var(--border); color: var(--fg); font-weight: 650;
-                    box-shadow: var(--shadow-card); }
+header .sub { color: rgba(255,255,255,.92); margin-top: 2px; }
 main { padding: 14px 20px 48px; }
 
 .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
@@ -96,7 +89,7 @@ button.act { padding: 6.5px 13px; border: 1px solid var(--border-strong); border
 button.act:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
 button.act:active { transform: scale(.98); }
 button.act:disabled { opacity: .5; cursor: not-allowed; }
-button.primary { background: var(--grad); border: none; color: #fff;
+button.primary { background: var(--grad); border: 1px solid transparent; color: #fff;
                  box-shadow: 0 4px 14px -4px rgba(22,104,220,.55); }
 button.primary:hover { background: var(--grad); filter: brightness(1.08); color: #fff;
                        transform: translateY(-1px); box-shadow: 0 6px 18px -6px rgba(22,104,220,.65); }
@@ -104,14 +97,14 @@ button.primary:active { transform: scale(.98); }
 /* 一键做任务：强调描边，主操作让位给「添加账号」 */
 #btnAutoAll { background: transparent; border: 1px solid var(--accent); color: var(--accent); box-shadow: none; }
 #btnAutoAll:hover { background: var(--accent-soft); transform: none; }
-/* 表格内小按钮：危险操作悬停才显红 */
-button.act.small { padding: 2.5px 10px; font-size: 12px; border-radius: 7px; background: transparent;
-                   border-color: transparent; color: var(--muted); box-shadow: none; }
-button.act.small:hover { color: var(--err); border-color: transparent; background: var(--err-soft); }
+/* 删除等危险操作：默认与普通按钮一致，悬停才转红（对应 JS 里的 "act danger"）。 */
+button.act.danger:hover:not(:disabled) { color: var(--err); border-color: var(--err); background: var(--err-soft); }
 
 table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12.5px;
         font-variant-numeric: tabular-nums; }
 th, td { text-align: left; padding: 7.5px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+/* 表头吸顶只对随页面滚动的表格生效。#models 是 overflow-x 滚动容器，
+   纵向也被计算为 auto，吸顶落不到视口上，故模型表不吸顶（预期，非缺陷）。 */
 thead th { position: sticky; top: -1px; z-index: 1;
            background: rgba(255,255,255,.86); backdrop-filter: blur(8px);
            color: var(--muted); font-size: 11.5px; font-weight: 650; letter-spacing: .05em;
@@ -170,18 +163,18 @@ th.sortable .th-sort-wrap { display: inline-flex; align-items: center; gap: 3px;
           border-radius: 10px; padding: 12px 14px; box-shadow: inset 0 1px 6px rgba(0,0,0,.35); }
 .logbox div { white-space: pre-wrap; word-break: break-all; }
 .logbox .ERROR { color: #f87171; }
-.logbox .DEBUG { color: #64748b; }
+.logbox .DEBUG { color: #7c8ca3; }
 .logbox .WARN { color: #fbbf24; }
 .logbox .INFO { color: #7dd3fc; }
 
 label { display: inline-flex; align-items: center; gap: 6px; }
-input[type=text], input[type=number], select {
+input[type=text], input[type=number], input[type=password], select {
   padding: 6.5px 10px; border: 1px solid var(--border-strong);
   border-radius: 9px; background: var(--card); color: var(--fg); font-size: 13px;
   transition: border-color .12s ease, box-shadow .12s ease; }
 select { cursor: pointer; }
-input[type=text]:hover, input[type=number]:hover, select:hover { border-color: var(--muted); }
-input[type=text]:focus, input[type=number]:focus, select:focus { outline: none; border-color: var(--accent);
+input[type=text]:hover, input[type=number]:hover, input[type=password]:hover, select:hover { border-color: var(--muted); }
+input[type=text]:focus, input[type=number]:focus, input[type=password]:focus, select:focus { outline: none; border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft); }
 input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
 /* 回调链接很长，用等宽字体 + 手动换行才看得出参数有没有粘全。 */
@@ -237,7 +230,6 @@ input.aliasinput:focus { outline: none; border-color: var(--accent); box-shadow:
 .banner.ok   { background: var(--ok-soft);   border-left: 3px solid var(--ok);   color: var(--ok); }
 .banner.warn { background: var(--warn-soft); border-left: 3px solid var(--warn); color: var(--warn); }
 .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
-progress { width: 160px; height: 8px; accent-color: var(--accent); }
 
 /* ---- 套餐领取弹窗 ---- */
 .modal { position: fixed; inset: 0; z-index: 60; display: none; align-items: center;
@@ -663,11 +655,12 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     return el("span", text, "pill" + (kind ? " " + kind : ""));
   }
 
-  // vendorChipClass 把供应商名哈希到 v0..v5，交给 CSS 上彩色芯片底色。
-  function vendorChipClass(name) {
+  // vendorChipClass 把供应商标识哈希到 v0..v5，交给 CSS 上彩色芯片底色。
+  // 优先用 vendor_id：展示名可以改，用名字哈希会让芯片颜色跟着变。
+  function vendorChipClass(vendorID, label) {
+    var key = String(vendorID || label || "");
     var h = 0;
-    name = String(name || "");
-    for (var i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    for (var i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
     return "v" + (h % 6);
   }
 
@@ -808,7 +801,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       var row = el("tr");
       var vendor = vendorLabel(account.vendor_id, account.realm);
       var vendorCell = el("td");
-      vendorCell.appendChild(pill(vendor, vendorChipClass(vendor)));
+      vendorCell.appendChild(pill(vendor, vendorChipClass(account.vendor_id, vendor)));
       row.appendChild(vendorCell);
 
       row.appendChild(el("td", accountDisplay(account)));
@@ -1448,7 +1441,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
 
   function modelVendorCell(model) {
     var vendor = vendorLabel(model.vendor_id, model.realm);
-    return cellWith(pill(vendor, vendorChipClass(vendor)));
+    return cellWith(pill(vendor, vendorChipClass(model.vendor_id, vendor)));
   }
 
   // formatCredits 归一化倍率样式为始终保留两位小数的 "0.50X"；剥除多余的 "credits" 字符，汉字（如 "免费" / "订阅"）保留。
