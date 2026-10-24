@@ -15,6 +15,28 @@ import (
 // 「当前询问的插件的 identifier」兜底填进 provider。归属判定过宽的前置插件
 // 会把本插件的文件抢走（provider 变成对方），只按 provider 过滤会让这些
 // 账号从页面凭空消失。文件名仍是本插件约定，因此按文件名兜底认领。
+func TestMergeHostAuthEntryPrefersActiveFileStatus(t *testing.T) {
+	tests := []struct {
+		name       string
+		target     string
+		source     string
+		wantStatus string
+	}{
+		{name: "stale error is cleared", target: "error", source: "active", wantStatus: "active"},
+		{name: "empty runtime status uses file status", target: "", source: "active", wantStatus: "active"},
+		{name: "non-error runtime status remains authoritative", target: "active", source: "disabled", wantStatus: "active"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			target := core.HostAuth{Status: test.target}
+			mergeHostAuthEntry(&target, core.HostAuth{Status: test.source})
+			if target.Status != test.wantStatus {
+				t.Fatalf("status = %q, want %q", target.Status, test.wantStatus)
+			}
+		})
+	}
+}
+
 func TestListHostAuthsClaimsHijackedCredentials(t *testing.T) {
 	registry := core.NewRegistry()
 	if !fileNameBelongsToPlugin("workbuddy-79fdc1fc-de43-40da-b6f0-fe05d9e4367b.json", registry) {
