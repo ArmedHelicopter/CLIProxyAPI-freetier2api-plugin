@@ -221,7 +221,7 @@ func (s *Service) runCheckinAll(ctx context.Context) {
 	logger.Info("checkin: starting for all accounts")
 	count := 0
 	s.forEachAccount(ctx, "", func(ctx context.Context, account *accountContext) error {
-		if !core.SupportsCheckin(account.vendor) {
+		if !core.SupportsCheckinFor(account.vendor, account.credential) {
 			return nil
 		}
 		checkin, okCheckin := core.As[core.CheckinProvider](account.vendor)

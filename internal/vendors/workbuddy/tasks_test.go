@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"strings"
 	"testing"
@@ -229,10 +230,10 @@ func TestParseBalanceMatchesUpstreamShape(t *testing.T) {
 
 	// Cycle 套餐：1000 总量、400 剩余；加油包：500/500。合计 1500 / 900。
 	if balance.Total != 1500 {
-		t.Fatalf("total = %d, want 1500", balance.Total)
+		t.Fatalf("total = %v, want 1500", balance.Total)
 	}
 	if balance.Remain != 900 {
-		t.Fatalf("remain = %d, want 900", balance.Remain)
+		t.Fatalf("remain = %v, want 900", balance.Remain)
 	}
 	if len(balance.Packages) != 2 {
 		t.Fatalf("packages = %d, want 2", len(balance.Packages))
@@ -273,11 +274,12 @@ type claimHost struct {
 	claimBody string
 }
 
-func installClaimHost(t *testing.T, host claimHost) {
+// installHostHTTP 用 responder 应答所有 host.http.do 调用，并在用例结束时复位。
+func installHostHTTP(t *testing.T, responder func(method, rawURL string) (status int, body string)) {
 	t.Helper()
 	hostbridge.Configure(func(_ string, method string, payload any) (json.RawMessage, error) {
 		if method != pluginabi.MethodHostHTTPDo {
-			return nil, fmt.Errorf("claim host: unsupported method %s", method)
+			return nil, fmt.Errorf("test host: unsupported method %s", method)
 		}
 		raw, errMarshal := json.Marshal(payload)
 		if errMarshal != nil {
@@ -290,17 +292,24 @@ func installClaimHost(t *testing.T, host claimHost) {
 		if errDecode := json.Unmarshal(raw, &req); errDecode != nil {
 			return nil, errDecode
 		}
-		body := host.taskBody
-		if strings.Contains(req.URL, "/claim") {
-			body = host.claimBody
-		}
+		status, body := responder(req.Method, req.URL)
 		return json.Marshal(map[string]any{
-			"StatusCode": http.StatusOK,
+			"StatusCode": status,
 			"Headers":    map[string][]string{"Content-Type": {"application/json"}},
 			"Body":       []byte(body),
 		})
 	})
 	t.Cleanup(func() { hostbridge.Configure(nil) })
+}
+
+func installClaimHost(t *testing.T, host claimHost) {
+	t.Helper()
+	installHostHTTP(t, func(_, rawURL string) (int, string) {
+		if strings.Contains(rawURL, "/claim") {
+			return http.StatusOK, host.claimBody
+		}
+		return http.StatusOK, host.taskBody
+	})
 }
 
 // TestRunGrowthTaskSurfacesClaimFailure 锁定领奖解析失败必须变成任务的错误结果。
@@ -342,5 +351,215 @@ func TestRunGrowthTaskReportsClaimedReward(t *testing.T) {
 	}
 	if !strings.Contains(message, "已领奖") {
 		t.Fatalf("message = %q, want 已领奖", message)
+	}
+}
+
+// balanceHost 按 URL 回不同的额度响应，并记录被请求过的地址。
+type balanceHost struct {
+	personalBody   string
+	enterpriseBody string
+	paths          []string
+}
+
+func installBalanceHost(t *testing.T, host *balanceHost) {
+	t.Helper()
+	installHostHTTP(t, func(_, rawURL string) (int, string) {
+		host.paths = append(host.paths, rawURL)
+		if strings.Contains(rawURL, "enterprise-user-usage") {
+			return http.StatusOK, host.enterpriseBody
+		}
+		return http.StatusOK, host.personalBody
+	})
+}
+
+func (h *balanceHost) called(substr string) bool {
+	for _, path := range h.paths {
+		if strings.Contains(path, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFetchBalanceFallsBackToEnterpriseUsage 企业账号在个人接口上拿到
+// 200 + 空 Accounts，必须回退到企业用量接口，否则面板恒为 0 / 0。
+func TestFetchBalanceFallsBackToEnterpriseUsage(t *testing.T) {
+	host := &balanceHost{
+		personalBody:   `{"code":0,"msg":"OK","data":{"Response":{"Data":{"TotalCount":0,"TotalDosage":0,"Accounts":null}}}}`,
+		enterpriseBody: `{"code":0,"msg":"OK","data":{"credit":4.11,"limitNum":2000,"cycleStartTime":"2026-10-01 00:00:00","cycleEndTime":"2026-10-31 23:59:59","cycleResetTime":"2026-11-01 00:00:00"}}`,
+	}
+	installBalanceHost(t, host)
+	client := NewClient(newRuntime(core.Env{}), Options{Context: context.Background()})
+	cred := testTaskCredential("uid-enterprise-balance")
+	cred.EnterpriseID = "fysxmvfpz6dc"
+
+	balance, errFetch := client.FetchBalance(cred)
+	if errFetch != nil {
+		t.Fatalf("fetch balance: %v", errFetch)
+	}
+	if !balance.Enterprise {
+		t.Fatal("企业账号的余额必须标记为 enterprise")
+	}
+	if balance.Total != 2000 || math.Abs(balance.Remain-1995.89) > 0.0001 {
+		t.Fatalf("balance = %v/%v, want 1995.89/2000", balance.Remain, balance.Total)
+	}
+	if !host.called("/v2/billing/meter/get-user-resource") {
+		t.Fatal("个人接口必须先被尝试（企业接口只是回退）")
+	}
+	if !host.called("get-enterprise-user-usage") {
+		t.Fatal("企业账号必须回退到企业用量接口")
+	}
+}
+
+// TestFetchBalanceKeepsEmptyForNonEnterpriseAccount 非企业账号的空额度是真
+// 空额度，不能去打企业接口。
+func TestFetchBalanceKeepsEmptyForNonEnterpriseAccount(t *testing.T) {
+	host := &balanceHost{
+		personalBody:   `{"code":0,"data":{"Response":{"Data":{"Accounts":null}}}}`,
+		enterpriseBody: `{"code":0,"data":{"credit":1,"limitNum":100}}`,
+	}
+	installBalanceHost(t, host)
+	client := NewClient(newRuntime(core.Env{}), Options{Context: context.Background()})
+	cred := testTaskCredential("uid-personal-balance")
+
+	balance, errFetch := client.FetchBalance(cred)
+	if errFetch != nil {
+		t.Fatalf("fetch balance: %v", errFetch)
+	}
+	if balance.Total != 0 || balance.Enterprise {
+		t.Fatalf("balance = %+v, want empty personal quota", balance)
+	}
+	if host.called("enterprise-user-usage") {
+		t.Fatal("非企业账号不应请求企业用量接口")
+	}
+}
+
+// TestFetchBalancePrefersPersonalPackages 企业账号若个人接口确实有额度，
+// 以个人资源包为准，不再叠加企业额度。
+func TestFetchBalancePrefersPersonalPackages(t *testing.T) {
+	host := &balanceHost{
+		personalBody:   `{"code":0,"data":{"Response":{"Data":{"Accounts":[{"PackageName":"加油包","CapacitySize":500,"CapacityRemain":500}]}}}}`,
+		enterpriseBody: `{"code":0,"data":{"credit":1,"limitNum":100}}`,
+	}
+	installBalanceHost(t, host)
+	client := NewClient(newRuntime(core.Env{}), Options{Context: context.Background()})
+	cred := testTaskCredential("uid-enterprise-personal")
+	cred.EnterpriseID = "ent-1"
+
+	balance, errFetch := client.FetchBalance(cred)
+	if errFetch != nil {
+		t.Fatalf("fetch balance: %v", errFetch)
+	}
+	if balance.Enterprise || balance.Total != 500 || balance.Remain != 500 {
+		t.Fatalf("balance = %+v, want personal 500/500", balance)
+	}
+	if host.called("enterprise-user-usage") {
+		t.Fatal("个人额度非空时不应请求企业接口")
+	}
+}
+
+// TestParseEnterpriseBalanceKeepsFractionalCredit 企业已用量是小数，
+// 截断成整数会让「消耗 0.9 积分」在面板上完全不可见。
+func TestParseEnterpriseBalanceKeepsFractionalCredit(t *testing.T) {
+	balance, errParse := parseEnterpriseBalance(json.RawMessage(`{
+	  "credit":4.11,"limitNum":2000,
+	  "cycleStartTime":"2026-10-01 00:00:00",
+	  "cycleEndTime":"2026-10-31 23:59:59",
+	  "cycleResetTime":"2026-11-01 00:00:00"}`))
+	if errParse != nil {
+		t.Fatalf("parse: %v", errParse)
+	}
+	if !balance.Enterprise || balance.Total != 2000 {
+		t.Fatalf("balance = %+v", balance)
+	}
+	if math.Abs(balance.Remain-1995.89) > 0.0001 {
+		t.Fatalf("remain = %v, want 1995.89", balance.Remain)
+	}
+	if len(balance.Packages) != 1 {
+		t.Fatalf("packages = %d, want 1", len(balance.Packages))
+	}
+	pkg := balance.Packages[0]
+	if pkg.Name != "企业额度" {
+		t.Fatalf("package name = %q", pkg.Name)
+	}
+	if pkg.ExpireAt != 0 {
+		t.Fatal("企业额度到点回满，不能设 ExpireAt（会被显示成即将过期）")
+	}
+	if pkg.ResetAt == 0 {
+		t.Fatal("企业额度必须带周期回满时刻")
+	}
+	if !strings.Contains(pkg.Period, "2026-10-01") || !strings.Contains(pkg.Period, "2026-10-31") {
+		t.Fatalf("period = %q", pkg.Period)
+	}
+}
+
+// TestParseEnterpriseBalanceRejectsMissingLimit 缺 limitNum 的响应不能当成
+// 0 / 0 展示：那正是本 issue 要消除的假象。
+func TestParseEnterpriseBalanceRejectsMissingLimit(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"credit":1}`, `null`, `<html>error</html>`} {
+		if _, errParse := parseEnterpriseBalance(json.RawMessage(raw)); errParse == nil {
+			t.Fatalf("parseEnterpriseBalance(%s) 必须报错", raw)
+		}
+	}
+}
+
+// TestBuildQuotaResponseEnterprisePlan 企业额度不能显示成个人 CN 套餐。
+func TestBuildQuotaResponseEnterprisePlan(t *testing.T) {
+	cred := testTaskCredential("uid-enterprise-quota")
+	cred.EnterpriseID = "ent-1"
+	balance, errParse := parseEnterpriseBalance(json.RawMessage(`{
+	  "credit":4.11,"limitNum":2000,
+	  "cycleStartTime":"2026-10-01 00:00:00",
+	  "cycleEndTime":"2026-10-31 23:59:59",
+	  "cycleResetTime":"2026-11-01 00:00:00"}`))
+	if errParse != nil {
+		t.Fatalf("parse: %v", errParse)
+	}
+	response := BuildQuotaResponse(cred, balance)
+	if response.Subscription == nil || response.Subscription.Plan != "enterprise" {
+		t.Fatalf("subscription = %+v, want plan=enterprise", response.Subscription)
+	}
+	if response.Subscription.TierName != "企业额度" {
+		t.Fatalf("tier = %q", response.Subscription.TierName)
+	}
+	metrics := map[string]float64{}
+	for _, metric := range response.Summary {
+		metrics[metric.Key] = metric.Value
+	}
+	if math.Abs(metrics["credit_used"]-4.11) > 0.0001 {
+		t.Fatalf("credit_used = %v, want 4.11", metrics["credit_used"])
+	}
+	if math.Abs(metrics["credit_remain"]-1995.89) > 0.0001 {
+		t.Fatalf("credit_remain = %v, want 1995.89", metrics["credit_remain"])
+	}
+	if len(response.Groups) != 1 || len(response.Groups[0].Buckets) != 1 {
+		t.Fatalf("groups = %+v, want 1 bucket", response.Groups)
+	}
+	bucket := response.Groups[0].Buckets[0]
+	if bucket.Window != "企业额度" {
+		t.Fatalf("window = %q", bucket.Window)
+	}
+	if !strings.Contains(bucket.Description, "1995.89 / 2000") || !strings.Contains(bucket.Description, "2026-10-01") {
+		t.Fatalf("description = %q", bucket.Description)
+	}
+	if bucket.ResetTime == "" {
+		t.Fatal("企业额度应展示周期回满时刻")
+	}
+}
+
+// TestBuildQuotaResponsePersonalDescription 个人额度是整数，不能显示成
+// 400.00 / 1000.00 这种形态。
+func TestBuildQuotaResponsePersonalDescription(t *testing.T) {
+	var payload billingResourceResponse
+	raw := `{"Response":{"Data":{"Accounts":[{"PackageName":"基础套餐","CycleCapacitySize":1000,"CycleCapacityRemain":400}]}}}`
+	if errUnmarshal := json.Unmarshal([]byte(raw), &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal: %v", errUnmarshal)
+	}
+	response := BuildQuotaResponse(testTaskCredential("uid-plain-quota"), parseBalance(payload))
+	if len(response.Groups) != 1 || len(response.Groups[0].Buckets) != 1 {
+		t.Fatalf("groups = %+v", response.Groups)
+	}
+	if got := response.Groups[0].Buckets[0].Description; got != "400 / 1000" {
+		t.Fatalf("description = %q, want 400 / 1000", got)
 	}
 }

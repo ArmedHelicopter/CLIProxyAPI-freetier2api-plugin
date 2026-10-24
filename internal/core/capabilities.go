@@ -118,6 +118,19 @@ type CheckinProvider interface {
 	Checkin(ctx context.Context, cred *Credential) (*CheckinResult, error)
 }
 
+// CheckinCapability 由「能按账号判定签到」的供应商实现。
+//
+// 供应商级的 SupportsCheckin 只能表达「这个供应商/区域有没有签到活动」，
+// 表达不了「同类凭证里有一部分账号天生不支持签到」——WorkBuddy 企业账号
+// 打 daily-checkin 会被上游以 400 code 10001 拒绝。实现该接口后，控制台
+// 按钮、自动任务与额度重置都按账号判定，避免出现必然失败的入口。
+type CheckinCapability interface {
+	// SupportsCheckinFor 报告该凭证是否支持签到。
+	SupportsCheckinFor(cred *Credential) bool
+	// CheckinUnsupportedReason 返回不可签到的可读原因（可签到或未知时为空串）。
+	CheckinUnsupportedReason(cred *Credential) string
+}
+
 // AuthModeReporter 由「凭证本身就是敏感材料」的供应商实现。
 //
 // 目前只有 apikey 型供应商需要它：页面据此脱敏展示。
@@ -238,6 +251,29 @@ func As[T any](vendor Vendor) (T, bool) {
 func SupportsCheckin(vendor Vendor) bool {
 	provider, okProvider := As[CheckinProvider](vendor)
 	return okProvider && provider.SupportsCheckin()
+}
+
+// SupportsCheckinFor 报告某个凭证是否支持签到。
+//
+// 未实现 CheckinCapability 的供应商回落到供应商级判定，保持既有行为。
+func SupportsCheckinFor(vendor Vendor, cred *Credential) bool {
+	if !SupportsCheckin(vendor) {
+		return false
+	}
+	capability, okCapability := As[CheckinCapability](vendor)
+	if !okCapability {
+		return true
+	}
+	return capability.SupportsCheckinFor(cred)
+}
+
+// CheckinUnsupportedReason 返回某凭证不可签到的可读原因；无原因时返回空串。
+func CheckinUnsupportedReason(vendor Vendor, cred *Credential) string {
+	capability, okCapability := As[CheckinCapability](vendor)
+	if !okCapability {
+		return ""
+	}
+	return strings.TrimSpace(capability.CheckinUnsupportedReason(cred))
 }
 
 // ModelsFor 返回某凭证可用的模型：可选实现优先，否则回落 StaticModels。

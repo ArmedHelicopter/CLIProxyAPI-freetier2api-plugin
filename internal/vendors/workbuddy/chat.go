@@ -501,10 +501,13 @@ const (
 	billingMeterPathV2 = "/v2/billing/meter/get-user-resource"
 	dailyCheckinPath   = "/billing/meter/daily-checkin"
 	dailyCheckinPathV2 = "/v2/billing/meter/daily-checkin"
-	claimGiftPath      = "/billing/meter/claim-gift"
-	claimCompPath      = "/billing/meter/claim-compensation"
-	reportPath         = "/v2/report"
-	trialPath          = "/billing/ide/trial"
+	// 企业用量接口：个人资源接口对企业账号返回空 Accounts，企业额度只能从这里取。
+	enterpriseUsagePath   = "/billing/meter/get-enterprise-user-usage"
+	enterpriseUsagePathV2 = "/v2/billing/meter/get-enterprise-user-usage"
+	claimGiftPath         = "/billing/meter/claim-gift"
+	claimCompPath         = "/billing/meter/claim-compensation"
+	reportPath            = "/v2/report"
+	trialPath             = "/billing/ide/trial"
 )
 
 // 成长 / 任务域路径（挂在 ChatBase 之下）。
