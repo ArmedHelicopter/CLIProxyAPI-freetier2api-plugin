@@ -15,7 +15,7 @@
 ## 功能特性
 
 - 复用宿主 Anthropic `/v1/messages`、OpenAI `/v1/chat/completions` 与 OpenAI `/v1/responses` 接口，无需额外部署独立网关
-- 支持 8 大体系共 13 个国内外免费额度供应商实例（另有 AutoClaw 国内/国际与小浣熊 3 个骨架实例，待上游资料回填后启用），凭证严格按供应商隔离（单供应商上限 10 个账号）
+- 支持 8 大体系共 16 个国内外免费额度供应商实例（AutoClaw 国内/国际与小浣熊已接入），凭证严格按供应商隔离（单供应商上限 10 个账号）
 - 模型清单动态探测、自定义模型别名与跨供应商同名模型自动负载均衡/故障转移
 - 内嵌单页 Web 控制台：支持 OAuth 设备授权 / 本地回调粘贴 / API Key 添加账号、额度可视化、模型启停与运行日志
 - 支持每日自动签到、每日自动任务与 Token 自动续期保活
@@ -42,7 +42,7 @@
 | `minimaxcodecn` | MiniMax Code 国内版 | `cn` | OAuth 设备授权 | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code 国际版 | `global` | OAuth 设备授权 | `minimaxcodeglobal-*.json` |
 
-> **骨架供应商提示**：`autoclawcn` / `autoclawglobal`（AutoClaw 国内版/国际版）与 `raccoon`（小浣熊）当前为骨架实现：凭证管理与转发链路已就绪，但上游域名未经实测确认，默认端点为空。使用前请在配置中设置 `autoclawcn_base_url` / `autoclawglobal_base_url` / `raccoon_base_url`，详见 [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md)。
+> **新供应商**：`autoclawcn` / `autoclawglobal`（AutoClaw 国内版/国际版）与 `raccoon`（小浣熊）。AutoClaw 凭证为 `accessToken`/`refreshToken` JSON（无控制台登录入口，手工粘贴添加）；小浣熊支持控制台微信扫码登录。协议细节与配置项见 [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md)。
 
 ## 快速开始
 
@@ -137,6 +137,8 @@ curl http://localhost:8317/v1/messages \
 
 - **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**（MIT）：宿主插件 ABI/API 契约（`cpasdk/`）与 HTTP/SSE 桥接设计。
 - **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)** 与 **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)**（MIT）：WorkBuddy 协议适配、提示词过滤与日常任务体系参考。
+- **[Zhengyuuuui/autoclaw2api](https://github.com/Zhengyuuuui/autoclaw2api)**：AutoClaw 协议适配（userapi 签名、proxy 通道、任务签到）参考。
+- **[misakano7545/xiaohuanxiong2api-panel](https://github.com/misakano7545/xiaohuanxiong2api-panel)**：小浣熊协议适配（扫码登录、模型目录、积分与签到口径）参考。
 
 ## 参与贡献
 
@@ -145,7 +147,7 @@ curl http://localhost:8317/v1/messages \
 ## 免责声明
 
 1. **仅限个人学习与研究**：本项目仅用于个人学习、技术交流与协议互操作性研究，严禁将本项目（或其编译产物、衍生服务）用于任何形式的商业售卖、API 转售、有偿代搭、代刷代充、公开算力池分发或任何非法用途。
-2. **无官方关联**：本项目为独立开源项目，与腾讯（WorkBuddy / CodeBuddy）、阿里（Qoder）、智谱 / Z.AI（ZCode）、字节跳动（Trae）、华为云（CodeArts）、MiniMax、Cline、OpenCode 等任何上游厂商均无任何隶属、合作或背书关系。
+2. **无官方关联**：本项目为独立开源项目，与腾讯（WorkBuddy / CodeBuddy）、阿里（Qoder）、智谱 / Z.AI（ZCode、AutoClaw）、字节跳动（Trae）、华为云（CodeArts）、MiniMax、商汤（小浣熊）、Cline、OpenCode 等任何上游厂商均无任何隶属、合作或背书关系。
 3. **合规与风险自负**：通过非官方客户端调用接口、执行自动签到或自动任务可能违反各上游平台的用户服务协议（ToS），并可能导致账号受限、积分清零、封禁或其他法律与合规风险。使用者必须在合法合规及个人自用范围内使用本项目，因使用或滥用本项目产生的一切直接或间接后果均由使用者本人承担，项目作者及贡献者不承担任何责任。
 4. **权利人联系**：如任何上游平台或权利人认为本项目中的部分实现影响了您的合法权益，请通过 Issue 联系作者，我们将在核实后第一时间移除相关供应商适配代码。
 

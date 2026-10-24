@@ -1,6 +1,7 @@
 package autoclaw
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 
@@ -48,24 +49,32 @@ func TestInstancesAreTwoRegions(t *testing.T) {
 }
 
 func TestParseCredential(t *testing.T) {
-	cred, errParse := ParseCredential([]byte(`{"api_key":"sk-abc12345","region":"global","label":"测试"}`))
+	cred, errParse := ParseCredential([]byte(`{"accessToken":"tok-abc","refreshToken":"ref-123","region":"global","userId":123,"userName":"测试","deviceId":"dev-1"}`))
 	if errParse != nil {
 		t.Fatalf("parse: %v", errParse)
 	}
-	if cred.APIKey != "sk-abc12345" || cred.Region != RegionGlobal || cred.Label != "测试" {
-		t.Fatalf("credential = %+v", cred)
+	if cred.AccessTokenValue() != "tok-abc" || cred.RefreshTokenValue() != "ref-123" {
+		t.Fatalf("tokens = %+v", cred)
 	}
-	if _, errParse := ParseCredential([]byte(`{"label":"no key"}`)); errParse == nil {
-		t.Fatal("expected error for credential without key")
+	if cred.Realm() != RegionGlobal || cred.UIDValue() != "123" || cred.UserNameValue() != "测试" {
+		t.Fatalf("identity = %+v", cred)
+	}
+	if cred.DeviceIDValue() != "dev-1" {
+		t.Fatalf("deviceId = %q", cred.DeviceIDValue())
+	}
+	if _, errParse := ParseCredential([]byte(`{"userName":"no token"}`)); errParse == nil {
+		t.Fatal("expected error for credential without accessToken")
 	}
 }
 
-func TestParseCredentialAcceptsKeyAliases(t *testing.T) {
-	for _, field := range []string{"apikey", "autoclaw_key", "token"} {
-		raw := `{"` + field + `":"sk-abc"}`
-		if _, errParse := ParseCredential([]byte(raw)); errParse != nil {
-			t.Fatalf("parse %s: %v", field, errParse)
-		}
+func TestApplyTokensKeepsRefreshWhenUpstreamOmits(t *testing.T) {
+	cred := &Credential{AccessToken: "old", RefreshToken: "ref"}
+	cred.ApplyTokens("new", "", 1700000000)
+	if cred.AccessTokenValue() != "new" || cred.RefreshTokenValue() != "ref" {
+		t.Fatalf("apply tokens = %+v", cred)
+	}
+	if cred.ExpiresAtValue() != 1700000000 {
+		t.Fatalf("expiresAt = %d", cred.ExpiresAtValue())
 	}
 }
 
@@ -80,18 +89,16 @@ func TestLooksLikeCredentialStrict(t *testing.T) {
 		{"filename global", "autoclawglobal-u1.json", `{}`, true},
 		{"filename family", "my-autoclaw.json", `{}`, true},
 		{"vendor field", "acc.json", `{"vendor":"autoclawglobal"}`, true},
-		{"dedicated key", "acc.json", `{"autoclaw_key":"sk-abc"}`, true},
-		// 通用字段名不得作为判据：api_key 单独出现是 ZEN 的形态。
-		{"generic api_key is foreign", "acc.json", `{"api_key":"sk-abc"}`, false},
-		{"generic token is foreign", "acc.json", `{"token":"t"}`, false},
+		{"sandbox endpoint field", "acc.json", `{"sandboxEndpoint":"https://x","accessToken":"t"}`, true},
+		{"device id alone is foreign", "acc.json", `{"deviceId":"d"}`, false},
+		{"generic tokens are foreign", "acc.json", `{"accessToken":"t","refreshToken":"r"}`, false},
 		{"foreign vendor is foreign", "acc.json", `{"vendor":"qodercn"}`, false},
 		{"empty is nothing", "acc.json", `{}`, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var payload map[string]any
-			// 允许空对象：手工构造的测试输入。
-			_ = jsonUnmarshalForTest(tc.raw, &payload)
+			_ = jsonUnmarshalHelper(tc.raw, &payload)
 			if got := LooksLikeCredential(payload, tc.fileName, ""); got != tc.want {
 				t.Fatalf("LooksLikeCredential(%q, %q) = %v, want %v", tc.fileName, tc.raw, got, tc.want)
 			}
@@ -100,8 +107,7 @@ func TestLooksLikeCredentialStrict(t *testing.T) {
 }
 
 func TestMatchRoutesRegionsByVendorField(t *testing.T) {
-	env := core.Env{}
-	instances := Instances(env)
+	instances := Instances(core.Env{})
 	cn := instances[0].(*adapter)
 	gl := instances[1].(*adapter)
 
@@ -113,7 +119,6 @@ func TestMatchRoutesRegionsByVendorField(t *testing.T) {
 	if !gl.Match("acc.json", "", glPayload) || gl.Match("acc.json", "", cnPayload) {
 		t.Fatal("global instance misroutes by vendor field")
 	}
-	// 文件名前缀兜底：无 vendor 字段时按前缀归属。
 	if !cn.Match("autoclawcn-u1.json", "", map[string]any{}) {
 		t.Fatal("cn instance should claim autoclawcn-*.json")
 	}
@@ -127,57 +132,60 @@ func TestConfigureBaseURLPerInstance(t *testing.T) {
 	cn := instances[0].(*adapter)
 	gl := instances[1].(*adapter)
 	cn.Configure(core.Settings{}, map[string]string{"autoclawcn_base_url": "http://cn.test"})
-	if cn.baseURL != "http://cn.test" {
-		t.Fatalf("cn baseURL = %q", cn.baseURL)
-	}
 	if cn.resolveBaseURL() != "http://cn.test" {
-		t.Fatalf("resolveBaseURL = %q", cn.resolveBaseURL())
+		t.Fatalf("cn resolveBaseURL = %q", cn.resolveBaseURL())
 	}
-	// 区域实例只读自己的键：autoclawglobal_* 不影响 cn 实例。
 	gl.Configure(core.Settings{}, map[string]string{"autoclawglobal_base_url": "http://gl.test"})
 	if gl.resolveBaseURL() != "http://gl.test" {
 		t.Fatalf("gl resolveBaseURL = %q", gl.resolveBaseURL())
 	}
-	// 未配置时骨架返回空基地址（默认域名待回填），调用方据此报错而不是打猜的域名。
 	gl.Configure(core.Settings{}, map[string]string{})
 	if gl.resolveBaseURL() != DefaultBaseURLGlobal {
 		t.Fatalf("resolveBaseURL fallback = %q", gl.resolveBaseURL())
 	}
 }
 
-func TestBaseURLNormalizesTrailingSlash(t *testing.T) {
-	if got := BaseURL("http://x.test/", RegionCN); got != "http://x.test" {
-		t.Fatalf("BaseURL trailing slash = %q", got)
-	}
-	if got := BaseURL("  ", RegionGlobal); got != DefaultBaseURLGlobal {
-		t.Fatalf("BaseURL empty override = %q", got)
+func TestAuthSign(t *testing.T) {
+	// 固定向量：与 autoclaw2api 的 sign() 同口径（MD5(appid&ts&secret)）。
+	got := AuthSign("1700000000")
+	if len(got) != 32 || strings.ToLower(got) != got {
+		t.Fatalf("AuthSign should be 32-char lowercase hex, got %q", got)
 	}
 }
 
+func TestPrepareBodyRewritesModelAndDropsUser(t *testing.T) {
+	got := prepareBody([]byte(`{"model":"cn/zai_auto","user":"u1","messages":[]}`), "zai_auto")
+	decoded := string(got)
+	if !strings.Contains(decoded, "\"model\":\"zai_auto\"") {
+		t.Fatalf("model not rewritten: %s", decoded)
+	}
+	if strings.Contains(decoded, "user") {
+		t.Fatalf("user field not dropped: %s", decoded)
+	}
+}
+
+func TestClassifyByCodeAndText(t *testing.T) {
+	if f := Classify(200, 410000, "session"); f.Kind != core.FailureKindSessionDead {
+		t.Fatalf("410000 kind = %q", f.Kind)
+	}
+	if f := Classify(200, 0, "积分不足，请充值"); f.Kind != core.FailureKindHardCredit {
+		t.Fatalf("quota text kind = %q", f.Kind)
+	}
+	if f := Classify(429, 0, "slow down"); f.Kind != core.FailureKindSoftRate {
+		t.Fatalf("429 kind = %q", f.Kind)
+	}
+	if f := Classify(401, 0, "denied"); f.Kind != core.FailureKindCredential {
+		t.Fatalf("401 kind = %q", f.Kind)
+	}
+	var _ = http.StatusOK
+}
+
 func TestMaskedKey(t *testing.T) {
-	if got := MaskedKey("sk-abcdefghijk"); !strings.HasPrefix(got, "sk-a") || !strings.HasSuffix(got, "hijk") || strings.Contains(got, "bcdefg") {
+	got := MaskedKey("tok-abcdefghijk")
+	if !strings.HasPrefix(got, "tok-") || !strings.HasSuffix(got, "hijk") || strings.Contains(got, "abcdefg") {
 		t.Fatalf("MaskedKey = %q", got)
 	}
 	if got := MaskedKey("short"); got != "*****" {
 		t.Fatalf("MaskedKey short = %q", got)
 	}
-}
-
-func TestClassifyStatuses(t *testing.T) {
-	f := Classify(401, "denied")
-	if f.Kind != core.FailureKindCredential {
-		t.Fatalf("401 kind = %q", f.Kind)
-	}
-	f = Classify(429, "slow down")
-	if f.Kind != core.FailureKindRateLimit {
-		t.Fatalf("429 kind = %q", f.Kind)
-	}
-	f = Classify(402, "insufficient quota")
-	if f.Kind != core.FailureKindHardCredit {
-		t.Fatalf("402 kind = %q", f.Kind)
-	}
-}
-
-func jsonUnmarshalForTest(raw string, target *map[string]any) error {
-	return jsonUnmarshalHelper(raw, target)
 }

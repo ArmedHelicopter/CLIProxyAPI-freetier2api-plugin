@@ -1,104 +1,104 @@
-# AutoClaw 与小浣熊（Raccoon）骨架实现说明
+# AutoClaw 与小浣熊（Raccoon）实现说明
 
-> 状态：**骨架（skeleton）** —— 结构性能力已就绪，上游协议细节待补充。
+> 状态：**完整实现**（协议依据两个开源逆向项目，见下）。
 > 关联 Issue：[#24 autuclaw国内/国际、小浣熊支持](https://github.com/jiandanc/CLIProxyAPI-freetier2api-plugin/issues/24)
 
-## 1. 为什么是骨架而不是完整实现
+## 1. 协议来源
 
-Issue #24 只有一句话：「能不能加个autoclaw国内/国际、小浣熊呢」，没有附带：
+| 供应商 | 参考项目 | 依据 |
+| --- | --- | --- |
+| AutoClaw（国内/国际） | [Zhengyuuuui/autoclaw2api](https://github.com/Zhengyuuuui/autoclaw2api) | `docs/reverse-notes.md`（2026-09 Web bundle + 桌面端 1.18.5 静态逆向与抓包） |
+| 小浣熊（商汤 Raccoon） | [misakano7545/xiaohuanxiong2api-panel](https://github.com/misakano7545/xiaohuanxiong2api-panel) | `internal/upstream`（v1.1.0 桌面客户端抓包） |
 
-- 上游 API 域名（国内版 / 国际版分别是什么）；
-- 鉴权形态（是 Bearer API key、自定义头，还是 OAuth）；
-- chat-completions 是否为 OpenAI 兼容协议、真实路径；
-- 模型清单接口与响应形态；
-- 额度 / 签到等扩展接口是否存在。
-
-本仓库的既有供应商实现（workbuddy、qoder 等）全部基于**实测协议**
-（多数参考对应的开源 2API 项目）。没有实测依据就写死域名与请求体，
-等于臆造端点——用户配置后会得到必然失败的模型与账号。因此本 PR
-按仓库纪律只落实**结构**，把协议细节的回填点全部显式标出。
-
-## 2. 已实现的内容
-
-### 2.1 AutoClaw（国内版 / 国际版双实例）
+## 2. AutoClaw（`autoclawcn` / `autoclawglobal`）
 
 | 项 | 值 |
 | --- | --- |
 | 供应商 ID | `autoclawcn` / `autoclawglobal` |
 | 展示名 | AutoClaw 国内版 / AutoClaw 国际版 |
-| 区域 | `cn` / `global` |
-| 认证方式 | API key（Bearer） |
-| 凭证文件名前缀 | `autoclawcn-*.json` / `autoclawglobal-*.json`（或任意含 `autoclaw` 段的文件名） |
+| 上游基址 | cn: `https://autoglm-acceleration-api.zhipuai.cn`；global: `https://autoglm-api.autoglm.ai` |
+| 认证方式 | 用户粘贴 `accessToken` / `refreshToken` 凭证 JSON（登录是手机验证码 / 桌面端 OAuth，插件侧无法托管验证码交互，无登录入口） |
+| 凭证文件名前缀 | `autoclawcn-*.json` / `autoclawglobal-*.json` |
 | 配置键 | `autoclawcn_base_url` / `autoclawglobal_base_url` |
 
-- `internal/vendors/autoclaw`：协议 × 区域的双实例适配器，实例在构造期固定区域；
-- 凭证解析：`api_key` / `apikey` / `autoclaw_key` / `token` 等字段名均接受；
-- 归属判定**偏严**：只认文件名约定、`vendor: autoclaw*` 声明或
-  `autoclaw_key` 专有字段；通用的 `api_key` / `token` 不作为判据
-  （避免误吞 OpenCode ZEN 等别家凭证）；
-- 对话与模型清单：OpenAI 兼容路径（`/v1/chat/completions`、`/v1/models`），
-  支持流式透传；
-- 能力边界（刻意的）：无登录流程、无额度接口、无签到——页面会如实显示
-  「不支持」，而不是假装支持然后失败。
+实现要点：
 
-### 2.2 小浣熊（Raccoon，单实例）
+- **签名**：全部 userapi 请求带 `X-Auth-Appid: 100003` + `X-Auth-TimeStamp` +
+  `X-Auth-Sign`（`MD5("100003&<unix秒>&<secret>")`，secret 与客户端版本常量
+  逆向自 Web bundle，见 `protocol.go`）；
+- **对话**：`POST {region基址}/autoclaw-proxy/proxy/autoclaw/v1/chat/completions`，
+  模型经 `X-Request-Model` 头与 body `model` 双通道声明（autoclaw2api 的
+  proxy 通道；沙箱 relay 通道依赖常驻 WebSocket 会话，与插件按请求出站的
+  模型不符，未实现，凭证字段已预留）；
+- **模型清单**：global 实时拉 `autoclaw-model-config`；cn 用静态表
+  （上游无对应的可直拉目录，模型表来自 autoclaw2api 快照）；
+- **续期**：`POST /userapi/v1/refresh`（body 带 `source_id` / `device_id` /
+  `refresh_token`；上游响应无 `expires_in`，按 28 天保守记录）；
+- **额度**：`GET /agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw` 的
+  `total_balance`；
+- **签到**：`POST .../autoclaw-task-complete` body `{"task_id":"daily_signin"}`，
+  服务端幂等（`already_completed=true` 表示今日已签）；
+- **错误分类**：业务码 `410000` = 会话失效；余额/额度文案 → hard_credit；
+  429 → soft_rate。
+
+## 3. 小浣熊（`raccoon`）
 
 | 项 | 值 |
 | --- | --- |
 | 供应商 ID | `raccoon` |
 | 展示名 | 小浣熊 |
-| 区域 | 无（单部署） |
-| 认证方式 | API key（Bearer） |
+| 上游基址 | `https://xiaohuanxiong.com`（四域：`/api/web/llm/v2`、`/api/web/auth/v1`、`/api/web/points/v1`、主站 origin） |
+| 认证方式 | **微信扫码登录**（控制台「添加账号」入口）+ 授权码回调粘贴兜底 + 手工粘贴凭证 JSON |
 | 凭证文件名前缀 | `raccoon-*.json`（含拼音 `xiaohuanxiong` 段亦可） |
-| 配置键 | `raccoon_base_url` |
+| 配置键 | `raccoon_llm_base_url` / `raccoon_auth_base_url` / `raccoon_points_base_url` / `raccoon_origin` |
 
-结构与 AutoClaw 相同；若后续确认有国内/国际双部署，按 workbuddy /
-autoclaw 的双实例模式扩展即可。
+实现要点：
 
-### 2.3 注册与兼容性
+- **扫码登录**：`qrcode_code` 由客户端本地生成（32 位 hex），二维码编的是公开
+  网页 `{origin}/login/mp?code=…&appname=商汤小浣熊官网`；轮询
+  `POST {auth_base}/login_with_qrcode_code` 取票——无需回调地址，最适合
+  远程部署的插件形态。另有 `office-raccoon://auth/callback` 授权码换票兜底
+  （业务码 `200035` = 授权码失效）；
+- **对话**：`POST {llm_base}/chat/completions`，上游即 OpenAI 形状，原样转发；
+- **模型目录**：`GET {llm_base}/model_catalog`（`categories[].models` 平铺、
+  同名首见者胜、`context_window`/`max_tokens` 数字/字符串/params 嵌套三形态
+  兼容、`visible=false` 过滤）；目录失败回落静态单条 `raccoon-8c4485`；
+- **续期**：`POST {auth_base}/refresh`，refresh_token **可能轮换**，新票写回；
+- **额度**：`GET {points_base}/balance` 的 `available_points`；
+- **签到**：每日发放由服务端 00:00 自动入账；登录领取走
+  `POST {origin}/api/web/desktop/v1/login/points/grant`（幂等，已领回
+  `granted:false`）；
+- **错误分类**：401/403 → 会话失效；429 → 限流；积分/额度文案（含业务码
+  `14018`）→ hard_credit；`insufficient` 单独出现不判额度（避免
+  "context window is insufficient" 误伤）；
+- 出站带 v1.1.0 桌面客户端识别头（`x-client-name` 等）。
 
-- `internal/app/vendors.go`：组合根新增 `autoclaw.Instances` 与
-  `raccoon.Instances`（autoclaw 双实例排在最前，与字母序一致）；
-- `tests/integration/vendor_compat_test.go`：对外契约快照更新为
-  16 个实例，并锁定新供应商的能力集合（apikey 型、无 quota）；
-- `tests/integration/quota_capability_generic_test.go`：no-quota 快照
-  加入 `autoclawcn` / `autoclawglobal` / `raccoon`；
-- `tests/integration/auth_test.go`：跨供应商归属判别用例加入新前缀
-  与「通用字段名不误吞」回归。
+## 4. 归属判定纪律
 
-## 3. 默认端点为空：运行期行为
+两家都遵循仓库「凭证归属必须偏严」的同一纪律（误吞别家凭证 = 宿主静默
+覆盖对方账号；漏认 = 加载失败，代价小得多）：
 
-两个供应商的默认基地址都是**空串**（见 `protocol.go` 的
-`DefaultBaseURL*`）。这意味着在管理员配置 `*_base_url` 之前：
+- AutoClaw：文件名约定 / `vendor: autoclaw*` 声明 / `sandboxEndpoint`
+  专有字段；通用 `accessToken` 对、单独 `deviceId` 不作判据；
+- 小浣熊：文件名约定 / `vendor: raccoon` / snake_case
+  `access_token`+`refresh_token`+`uid` 三件套；驼峰 token 对、单独
+  `token` 不作判据。
 
-- 模型探测与对话请求会返回明确的「upstream base URL is not configured」
-  错误，而不是把猜测的域名当成可用端点；
-- 控制台仍会显示供应商与账号（凭证解析、归属、脱敏展示均已生效）。
+## 5. 配置项
 
-这遵循本插件一贯的原则：**宁可明确失败，不可静默打错地方**。
+```yaml
+freetier2api:
+  autoclawcn_base_url: ""      # 覆盖国内版上游基址
+  autoclawglobal_base_url: ""  # 覆盖国际版上游基址
+  raccoon_llm_base_url: ""     # 覆盖 LLM 网关基址
+  raccoon_auth_base_url: ""    # 覆盖鉴权基址
+  raccoon_points_base_url: ""  # 覆盖积分基址
+  raccoon_origin: ""           # 覆盖主站 origin
+```
 
-## 4. 回填上游信息的最小清单（TODO(upstream)）
+全部留空即用内置默认值（与参考项目一致的实测域名）。
 
-拿到以下任一信息后即可把骨架升级为完整实现（改动集中在各包的
-`protocol.go`，必要时加 `payload.go`）：
-
-1. **域名**：国内版 / 国际版的 API 基地址 → 回填 `DefaultBaseURLCN` /
-   `DefaultBaseURLGlobal` / `raccoon.DefaultBaseURL`；
-2. **鉴权头**：确认是否为标准 `Authorization: Bearer <key>`，有无专有
-   客户端标识头（UA、版本、设备指纹等） → 调整 `ApplyChatHeaders`；
-3. **路径与请求体**：chat-completions 真实路径；请求体是否需要额外字段
-   （session、user、提示词注入等） → 调整 `ChatPath` / `prepareBody`；
-4. **模型清单**：路径与响应形态（本实现按 OpenAI `{"data":[{"id":...}]}`
-   解析并兼容裸数组） → 调整 `ModelsPath` / `parseModels`；
-5. **错误码**：业务错误码到 `core.FailureKind` 的映射（额度耗尽、限流、
-   内容风控等） → 细化 `Classify`；
-6. **扩展能力**：是否存在额度查询、签到、成长任务接口 → 按需实现
-   `QuotaProvider` / `CheckinProvider` 等可选接口。
-
-信息可以直接回复在 Issue #24，或以 PR 形式补充到本文件与对应包的
-注释里。
-
-## 5. 验证方式
+## 6. 验证方式
 
 ```bash
 go build ./...
@@ -106,7 +106,4 @@ go vet ./...
 go test ./internal/vendors/autoclaw/... ./internal/vendors/raccoon/...
 go test ./tests/integration/ -run 'TestVendorRegistryCompatibility|TestVendorCapabilities|TestSupportsQuotaIsGenericAcrossVendors|TestAuthParseVendorOwnershipDiscrimination'
 ```
-
-沙箱内无法绑定 TCP 端口的测试（trae/codearts/qoder/zcode 的回调监听与
-httptest 用例）在本机基线上同样失败，与本次改动无关。
 

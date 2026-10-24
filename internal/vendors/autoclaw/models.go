@@ -1,13 +1,14 @@
 package autoclaw
 
-// 本文件实现 AutoClaw 的模型清单获取（骨架）。
+// 本文件实现 AutoClaw 的模型清单与账号信息获取。
 //
-// 清单完全动态：上游 GET {base}/v1/models 返回可用模型。本插件不编
-// 硬编码清单——编出来的清单一旦与上游不一致，用户会看到调用必失败的
-// 模型。探测需要一把有效 key；探测失败时返回空清单而不是兜底表。
+// 清单来源（与 autoclaw2api 一致）：
+//   - global：GET {base}/autoclaw-proxy/proxy/autoclaw-model-config（实时目录，
+//     含 contextWindow / maxTokens / reasoning 等元数据）；
+//   - cn：静态表（沙箱 relay 通道的模型，上游无对应实时目录接口可从
+//     userapi 直接拉取；实时性以模型可用性实测为准）。
 //
-// **骨架说明**：真实路径与响应形态待上游资料确认（TODO(upstream)）；
-// 当前按 OpenAI 风格 {"data":[{"id":...}]} 解析，兼容裸数组形态。
+// 探测需要一把有效凭证；探测失败返回空清单而不是编造清单。
 
 import (
 	"context"
@@ -25,120 +26,241 @@ import (
 // modelsHTTPTimeout 是模型清单请求的上限。
 const modelsHTTPTimeout = 30 * time.Second
 
-// Model 是一个 AutoClaw 上游模型。
+// Model 是一条归一化后的模型条目。
 type Model struct {
-	// ID 是模型标识（上游原样）。
-	ID string
-	// Name 是展示名（上游没给时用 ID）。
-	Name string
-	// ContextWindow 是上下文窗口（上游给了才有）。
-	ContextWindow int64
-	// MaxOutputTokens 是输出上限（上游给了才有）。
+	ID              string
+	Name            string
+	Description     string
+	ContextWindow   int64
 	MaxOutputTokens int64
-	// SupportsTools 报告是否支持工具调用。
-	SupportsTools bool
-	// IsReasoning 报告是否是推理模型。
-	IsReasoning bool
+	IsReasoning     bool
+	SupportsTools   bool
 }
 
-// FetchModels 拉取上游模型清单。
-func FetchModels(ctx context.Context, baseURL string, apiKey string) ([]Model, error) {
-	if strings.TrimSpace(apiKey) == "" {
-		return nil, fmt.Errorf("api key is required to list models")
+// cnStaticModels 是国内版沙箱 relay 通道的模型表（autoclaw2api 2026-09 快照）。
+var cnStaticModels = []string{
+	"openclaw", "openclaw/default", "glm-5.3-flash", "glm-2", "zai_auto",
+	"zai_auto-fast", "zai_glm-5.3-flash", "zaicoding_glm-5.3",
+	"tdpsk_deepseek-v4-flash-202605", "tdpsk_deepseek-v4-pro-202606",
+}
+
+// FetchModels 拉取区域模型清单。
+func FetchModels(ctx context.Context, baseURL string, token string, region Region) ([]Model, error) {
+	if strings.TrimSpace(token) == "" {
+		return nil, fmt.Errorf("access token is required to list models")
 	}
 	if strings.TrimSpace(baseURL) == "" {
-		return nil, fmt.Errorf("upstream base URL is not configured (set autoclaw_base_url or fill DefaultBaseURL after upstream research)")
+		return nil, fmt.Errorf("upstream base URL is not configured")
 	}
-	endpoint := baseURL + ModelsPath
+	if region.IsGlobal() {
+		return fetchModelConfig(ctx, baseURL, token)
+	}
+	return staticCNModels(), nil
+}
+
+// fetchModelConfig 拉取国际版实时模型配置。
+func fetchModelConfig(ctx context.Context, baseURL, token string) ([]Model, error) {
+	endpoint := baseURL + ModelsConfigPath
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if errReq != nil {
-		return nil, fmt.Errorf("build models request: %w", errReq)
+		return nil, fmt.Errorf("build model config request: %w", errReq)
 	}
-	ApplyModelsHeaders(req, apiKey)
+	ApplyModelsHeaders(req, token)
 
 	resp, errDo := hostbridge.Client(ctx, modelsHTTPTimeout).Do(req)
 	if errDo != nil {
-		return nil, fmt.Errorf("fetch models: %w", errDo)
+		return nil, fmt.Errorf("fetch model config: %w", errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
 	if errRead != nil {
-		return nil, fmt.Errorf("read models response: %w", errRead)
+		return nil, fmt.Errorf("read model config response: %w", errRead)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, Classify(resp.StatusCode, string(body))
+		return nil, Classify(resp.StatusCode, 0, string(body))
 	}
-	return parseModels(body)
-}
-
-// parseModels 解析上游模型清单（OpenAI 风格，兼容裸数组）。
-func parseModels(body []byte) ([]Model, error) {
-	type rawModel struct {
-		ID            string `json:"id"`
-		Name          string `json:"name"`
-		DisplayName   string `json:"display_name"`
-		ContextLength int64  `json:"context_length"`
-		ContextWindow int64  `json:"context_window"`
-		MaxOutput     int64  `json:"max_output_tokens"`
-		MaxTokens     int64  `json:"max_tokens"`
-		SupportsTools *bool  `json:"supports_tools"`
-		ToolCall      *bool  `json:"tool_call"`
-		IsReasoning   *bool  `json:"is_reasoning"`
-		Reasoning     *bool  `json:"reasoning"`
+	var envelope struct {
+		Code *int64 `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			Models []struct {
+				ID            string `json:"id"`
+				Name          string `json:"name"`
+				Tooltip       string `json:"tooltip"`
+				ContextWindow int64  `json:"contextWindow"`
+				MaxTokens     int64  `json:"maxTokens"`
+				Reasoning     bool   `json:"reasoning"`
+			} `json:"models"`
+		} `json:"data"`
 	}
-
-	var entries []rawModel
-	var wrapper struct {
-		Data   []rawModel `json:"data"`
-		Models []rawModel `json:"models"`
+	if errUnmarshal := json.Unmarshal(body, &envelope); errUnmarshal != nil {
+		return nil, fmt.Errorf("parse model config: %w", errUnmarshal)
 	}
-	if errWrapper := json.Unmarshal(body, &wrapper); errWrapper == nil {
-		switch {
-		case len(wrapper.Data) > 0:
-			entries = wrapper.Data
-		case len(wrapper.Models) > 0:
-			entries = wrapper.Models
-		}
+	if envelope.Code != nil && *envelope.Code != 0 {
+		return nil, Classify(resp.StatusCode, *envelope.Code, envelope.Msg)
 	}
-	if len(entries) == 0 {
-		if errArray := json.Unmarshal(body, &entries); errArray != nil && !json.Valid(body) {
-			return nil, fmt.Errorf("models response is not valid JSON: %w", errArray)
-		}
-	}
-
-	out := make([]Model, 0, len(entries))
-	for _, entry := range entries {
+	out := make([]Model, 0, len(envelope.Data.Models))
+	for _, entry := range envelope.Data.Models {
 		id := strings.TrimSpace(entry.ID)
 		if id == "" {
 			continue
 		}
 		contextWindow := entry.ContextWindow
 		if contextWindow == 0 {
-			contextWindow = entry.ContextLength
+			contextWindow = core.DefaultContextWindow(id)
 		}
-		maxOutput := entry.MaxOutput
-		if maxOutput == 0 {
-			maxOutput = entry.MaxTokens
+		maxTokens := entry.MaxTokens
+		if maxTokens == 0 {
+			maxTokens = core.DefaultMaxOutputTokens
 		}
 		out = append(out, Model{
 			ID:              id,
-			Name:            core.FirstNonEmpty(entry.DisplayName, entry.Name, id),
+			Name:            core.FirstNonEmpty(entry.Name, id),
+			Description:     entry.Tooltip,
 			ContextWindow:   contextWindow,
-			MaxOutputTokens: maxOutput,
-			SupportsTools:   firstBool(entry.SupportsTools, entry.ToolCall),
-			IsReasoning:     firstBool(entry.IsReasoning, entry.Reasoning),
+			MaxOutputTokens: maxTokens,
+			IsReasoning:     entry.Reasoning,
+			SupportsTools:   true,
 		})
 	}
 	return out, nil
 }
 
-// firstBool 返回第一个非 nil 的布尔值（全 nil 时 false）。
-func firstBool(values ...*bool) bool {
+// staticCNModels 返回国内版静态模型表。
+func staticCNModels() []Model {
+	out := make([]Model, 0, len(cnStaticModels))
+	for _, id := range cnStaticModels {
+		out = append(out, Model{
+			ID:              id,
+			Name:            id,
+			Description:     "AutoClaw 国内版沙箱模型",
+			ContextWindow:   core.DefaultContextWindow(id),
+			MaxOutputTokens: core.DefaultMaxOutputTokens,
+			SupportsTools:   true,
+		})
+	}
+	return out
+}
+
+// RefreshTokenResult 是一次 token 刷新的结果。
+type RefreshTokenResult struct {
+	AccessToken  string
+	RefreshToken string
+}
+
+// RefreshToken 用 refresh token 换新 access token
+// （POST {base}/userapi/v1/refresh，body {source_id, device_id, refresh_token}）。
+//
+// refresh_token 为空表示上游未轮换，沿用旧值。
+func RefreshToken(ctx context.Context, baseURL string, cred *Credential) (*RefreshTokenResult, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, fmt.Errorf("upstream base URL is not configured")
+	}
+	payload := map[string]any{
+		"source_id":     protocolName,
+		"device_id":     cred.DeviceIDValue(),
+		"refresh_token": cred.RefreshTokenValue(),
+	}
+	body, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return nil, fmt.Errorf("marshal refresh request: %w", errMarshal)
+	}
+	endpoint := baseURL + RefreshPath
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, strings.NewReader(string(body)))
+	if errReq != nil {
+		return nil, fmt.Errorf("build refresh request: %w", errReq)
+	}
+	ApplyUserAPIHeaders(req, cred.AccessTokenValue())
+
+	resp, errDo := hostbridge.Client(ctx, 30*time.Second).Do(req)
+	if errDo != nil {
+		return nil, &core.Failure{Msg: "refresh: " + errDo.Error(), Kind: core.FailureKindTransient}
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if errRead != nil {
+		return nil, &core.Failure{Status: resp.StatusCode, Msg: "read refresh response: " + errRead.Error(), Kind: core.FailureKindTransient}
+	}
+	var envelope struct {
+		Code *int64 `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			AccessToken  string `json:"access_token"`
+			RefreshToken string `json:"refresh_token"`
+		} `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		return nil, Classify(resp.StatusCode, 0, string(raw))
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, Classify(resp.StatusCode, int64Value(envelope.Code), string(raw))
+	}
+	if envelope.Code != nil && *envelope.Code != 0 {
+		return nil, Classify(resp.StatusCode, *envelope.Code, envelope.Msg)
+	}
+	if strings.TrimSpace(envelope.Data.AccessToken) == "" {
+		return nil, &core.Failure{Status: resp.StatusCode, Msg: "refresh succeeded but no access_token", Kind: core.FailureKindSessionDead}
+	}
+	return &RefreshTokenResult{
+		AccessToken:  envelope.Data.AccessToken,
+		RefreshToken: envelope.Data.RefreshToken,
+	}, nil
+}
+
+// WalletBalance 是积分钱包余额。
+type WalletBalance struct {
+	TotalBalance float64
+}
+
+// FetchBalance 查询积分余额（GET {base}/agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw）。
+func FetchBalance(ctx context.Context, baseURL string, token string) (*WalletBalance, error) {
+	if strings.TrimSpace(baseURL) == "" {
+		return nil, fmt.Errorf("upstream base URL is not configured")
+	}
+	endpoint := baseURL + WalletsPath
+	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if errReq != nil {
+		return nil, fmt.Errorf("build wallets request: %w", errReq)
+	}
+	ApplyUserAPIHeaders(req, token)
+
+	resp, errDo := hostbridge.Client(ctx, 20*time.Second).Do(req)
+	if errDo != nil {
+		return nil, &core.Failure{Msg: "wallets: " + errDo.Error(), Kind: core.FailureKindTransient}
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if errRead != nil {
+		return nil, &core.Failure{Status: resp.StatusCode, Msg: "read wallets response: " + errRead.Error(), Kind: core.FailureKindTransient}
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, Classify(resp.StatusCode, 0, string(raw))
+	}
+	var envelope struct {
+		Code *int64 `json:"code"`
+		Msg  string `json:"msg"`
+		Data struct {
+			TotalBalance any `json:"total_balance"`
+		} `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		return nil, Classify(resp.StatusCode, 0, string(raw))
+	}
+	if envelope.Code != nil && *envelope.Code != 0 {
+		return nil, Classify(resp.StatusCode, *envelope.Code, envelope.Msg)
+	}
+	return &WalletBalance{TotalBalance: float64(core.IntFromAny(envelope.Data.TotalBalance))}, nil
+}
+
+// int64Value 返回第一个非 nil 的 int64 指针值（全 nil 时 0）。
+func int64Value(values ...*int64) int64 {
 	for _, value := range values {
 		if value != nil {
 			return *value
 		}
 	}
-	return false
+	return 0
 }

@@ -1,60 +1,83 @@
 package raccoon
 
-// 本文件定义小浣熊（Raccoon）的上游端点与请求头。
+// 本文件定义小浣熊的上游端点与请求头。
 //
-// **骨架说明（2026-10）**：截至本文件编写时，小浣熊的上游 API 契约
-// （域名、鉴权头、请求/响应体）在仓库内没有任何实测依据，Issue #24
-// 也未附接口文档。为了不臆造端点，这里只落实确定的结构：
+// 协议依据：xiaohuanxiong2api（haoxinyu1）与 xiaohuanxiong2api-panel
+// （misakano7545，v1.1.0 抓包）两份逆向实现，Issue #24 指定为实现参考。
 //
-//  1. 基地址可配置（raccoon_base_url），默认值待上游资料回填；
-//  2. chat-completions 与模型清单走 OpenAI 兼容路径（真实路径以实测为准）。
-//
-// 待上游资料确认后需要回填的位置都以 TODO(upstream) 标出：
-//   - DefaultBaseURL
-//   - ApplyChatHeaders / ApplyModelsHeaders 的专有头
-//
-// 运维路径：管理员可通过 raccoon_base_url 配置项指向已知的上游（或自建
-// 网关），无需改代码。
+// 要点：
+//   - 单一部署 https://xiaohuanxiong.com（无国内/国际之分）；
+//   - 四个域：LLM 网关 / 鉴权 / 积分 / 主站 origin（签到挂在 origin）；
+//   - 业务信封 {"code","message","data"}，code=0 成功；
+//   - 出站带 v1.1.0 桌面客户端识别头（x-client-name 等）。
 
 import (
 	"net/http"
 	"strings"
 )
 
-// DefaultBaseURL 是小浣熊的默认基地址。**占位值**：上游域名未经实测
-// 确认，留空并在运行期报「未配置上游地址」错误，而不是把猜测的域名
-// 当成可用端点。
-const DefaultBaseURL = ""
-
-// OpenAI 兼容路径。真实路径若与实测不符，只需改这里。
+// 上游基址（可被配置覆盖）。
 const (
-	// ChatPath 是 chat-completions 的路径。
-	ChatPath = "/v1/chat/completions"
-	// ModelsPath 是模型清单的路径。
-	ModelsPath = "/v1/models"
+	DefaultLLMBase    = "https://xiaohuanxiong.com/api/web/llm/v2"
+	DefaultAuthBase   = "https://xiaohuanxiong.com/api/web/auth/v1"
+	DefaultPointsBase = "https://xiaohuanxiong.com/api/web/points/v1"
+	DefaultOrigin     = "https://xiaohuanxiong.com"
 )
 
-// BaseURL 返回上游基地址（末尾无斜杠）：override 优先，否则默认值。
-func BaseURL(override string) string {
+// 业务路径（分别挂在对应域下）。
+const (
+	ChatPath        = "/chat/completions"
+	CatalogPath     = "/model_catalog"
+	RefreshPath     = "/refresh"
+	LoginCodePath   = "/login_with_authorization_code"
+	BalancePath     = "/balance"
+	UserInfoPath    = "/user_info"
+	EntitlementPath = "/entitlement_info"
+	PointsGrantPath = "/login/points/grant"
+	PointsBillsPath = "/bills"
+	DesktopBasePath = "/api/web/desktop/v1"
+	AuthorizePath   = "/code/authorize"
+	// DefaultConfigName 是上游默认对话模型（v1.1.0 抓包：目录 default_model）。
+	DefaultConfigName = "raccoon-8c4485"
+	// DefaultClientVersion 是出站 x-client-version 头的内置值（抓包实测）。
+	DefaultClientVersion = "v1.1.0"
+)
+
+// BaseURL 归一化基址：override 优先（末尾无斜杠），否则默认值。
+func BaseURL(override, fallback string) string {
 	trimmed := strings.TrimRight(strings.TrimSpace(override), "/")
 	if trimmed != "" {
 		return trimmed
 	}
-	return DefaultBaseURL
+	return fallback
 }
 
-// ApplyChatHeaders 写入 chat-completions 请求所需的全部头。
-//
-// 目前只有 OpenAI 兼容的最小集（Bearer 认证）。小浣熊专有的客户端
-// 标识头（UA、版本头等，若上游有要求）待实测后补齐 —— TODO(upstream)。
-func ApplyChatHeaders(req *http.Request, apiKey string) {
+// ApplyClientHeaders 写入小浣熊桌面客户端识别头（抓包实测：上游按客户端
+// 渠道做风控，带上最贴近真实流量）。
+func ApplyClientHeaders(req *http.Request) {
+	req.Header.Set("x-client-name", "@raccoon/office-desktop")
+	req.Header.Set("x-client-platform", "desktop-windows-x64")
+	req.Header.Set("x-client-version", DefaultClientVersion)
+	req.Header.Set("x-client-channel", "official")
+}
+
+// ApplyChatHeaders 写入 chat 请求所需的全部头。
+func ApplyChatHeaders(req *http.Request, token string) {
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("Cache-Control", "no-cache")
+	req.Header.Set("Accept-Encoding", "identity")
+	ApplyClientHeaders(req)
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	}
 }
 
-// ApplyModelsHeaders 写入模型清单请求的头（只需认证）。
-func ApplyModelsHeaders(req *http.Request, apiKey string) {
+// ApplyAPIHeaders 写入鉴权 / 积分域 JSON 请求的头（Accept + 客户端识别 + Bearer）。
+func ApplyAPIHeaders(req *http.Request, token string) {
 	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	ApplyClientHeaders(req)
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", "Bearer "+strings.TrimSpace(token))
+	}
 }

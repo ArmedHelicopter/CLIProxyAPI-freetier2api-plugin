@@ -15,7 +15,7 @@ If this project helps you, a Star would mean a lot.
 ## Features
 
 - Native integration with CLIProxyAPI's Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`, and OpenAI `/v1/responses` endpoints without running a separate gateway service
-- Supports 13 free-tier provider instances across 8 vendor families (plus 3 skeleton instances: AutoClaw CN/Global and Raccoon, pending upstream details) with strict per-vendor credential isolation (capped at 10 accounts per provider)
+- Supports 16 free-tier provider instances across 8 vendor families (AutoClaw CN/Global and Raccoon included) with strict per-vendor credential isolation (capped at 10 accounts per provider)
 - Dynamic model catalog discovery, custom model aliases, and cross-provider load balancing / failover
 - Built-in single-page Web console for OAuth device login, localhost callback paste, API Key import, quota tracking, model toggling, and live logs
 - Automated daily check-in, automated daily tasks, and token keepalive refresh
@@ -42,7 +42,7 @@ If this project helps you, a Star would mean a lot.
 | `minimaxcodecn` | MiniMax Code CN | `cn` | OAuth Device Flow | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code Global | `global` | OAuth Device Flow | `minimaxcodeglobal-*.json` |
 
-> **Skeleton vendors**: `autoclawcn` / `autoclawglobal` (AutoClaw CN/Global) and `raccoon` are currently skeleton implementations: credential handling and the forwarding pipeline are ready, but the upstream domains are unverified, so the default endpoints are empty. Set `autoclawcn_base_url` / `autoclawglobal_base_url` / `raccoon_base_url` before use; see [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md).
+> **New vendors**: `autoclawcn` / `autoclawglobal` (AutoClaw CN/Global) and `raccoon` (SenseTime Raccoon). AutoClaw credentials are `accessToken`/`refreshToken` JSON (paste manually; no console login entry); Raccoon supports QR-code login from the console. See [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md) for protocol details and configuration keys.
 
 ## Quick Start
 
@@ -137,6 +137,8 @@ This project references or adapts protocol designs, ABI contracts, and metadata 
 
 - **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** (MIT): Host plugin ABI/API contracts (`cpasdk/`) and HTTP/SSE bridge design.
 - **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)** & **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)** (MIT): WorkBuddy protocol adaptation, prompt sanitization, and task system reference.
+- **[Zhengyuuuui/autoclaw2api](https://github.com/Zhengyuuuui/autoclaw2api)**: AutoClaw protocol adaptation (userapi signing, proxy channel, task check-in) reference.
+- **[misakano7545/xiaohuanxiong2api-panel](https://github.com/misakano7545/xiaohuanxiong2api-panel)**: Raccoon protocol adaptation (QR login, model catalog, points & check-in semantics) reference.
 
 ## Contributing
 

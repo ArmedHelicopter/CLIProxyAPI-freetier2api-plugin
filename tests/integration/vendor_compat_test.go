@@ -73,8 +73,8 @@ func TestVendorCapabilities(t *testing.T) {
 		authMode  string
 	}
 	cases := map[string]want{
-		"autoclawcn":        {refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
-		"autoclawglobal":    {refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
+		"autoclawcn":        {refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
+		"autoclawglobal":    {refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
 		"cline":             {login: true, refresh: true, merge: true, configure: true, authMode: "oauth"},
 		"codearts":          {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true},
 		"minimaxcodecn":     {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},
@@ -82,7 +82,7 @@ func TestVendorCapabilities(t *testing.T) {
 		"opencodezen":       {refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
 		"qodercn":           {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
 		"qoderglobal":       {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
-		"raccoon":           {refresh: true, models: true, merge: true, configure: true, authMode: "apikey"},
+		"raccoon":           {login: true, refresh: true, quota: true, checkin: true, models: true, merge: true, configure: true},
 		"traecn":            {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},
 		"traeglobal":        {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},
 		"traesolo":          {login: true, refresh: true, quota: true, checkin: true, merge: true, configure: true},

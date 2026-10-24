@@ -1,25 +1,26 @@
 package autoclaw
 
-// 本文件把 AutoClaw 协议适配成 core.Vendor（骨架）。
+// 本文件把 AutoClaw 协议适配成 core.Vendor。
 //
-// 供应商实例 = 协议 × 区域。国内版与国际版是两套独立部署：域名不同、
-// key 不通用（与 WorkBuddy / Qoder 的双实例约定一致）。区域在构造期
-// 固定，实例方法内不再分支。
+// 供应商实例 = 协议 × 区域。国内版与国际版是两套独立部署（userapi 基址
+// 不同），token 不通用；区域在构造期固定，实例方法内不再分支。
 //
-// **骨架边界（Issue #24）**：AutoClaw 的上游 API 契约（域名、鉴权形态、
-// 请求体细节）在仓库内没有实测依据，因此本实现只落实结构性能力：
+// 能力面（对齐 autoclaw2api 实测协议）：
+//   - 凭证解析与偏严归属（accessToken/refreshToken 结构）；
+//   - chat 走 region proxy 通道（X-Request-Model 声明模型）；
+//   - 模型清单：global 实时拉 autoclaw-model-config，cn 用静态表；
+//   - token 自动续期（POST /userapi/v1/refresh）；
+//   - 积分额度查询（GET /agent-assetmgr/api/v2/wallets）；
+//   - 每日签到（POST .../autoclaw-task-complete，幂等）。
 //
-//   - 凭证解析与归属（API key 型，偏严判定）；
-//   - 可配置基地址（autoclawcn_base_url / autoclawglobal_base_url）；
-//   - OpenAI 兼容的对话与模型清单转发；
-//   - 明确的「不支持」语义：没有登录流程、没有额度接口、没有签到。
-//
-// 端点回填与协议细化见 docs/vendor-autoclaw-raccoon.md 的清单。
+// 登录是手机验证码 / 桌面端 OAuth，插件侧无法托管验证码交互，不实现
+// LoginProvider：控制台不显示「添加账号」入口，凭证由用户粘贴 JSON 添加。
 
 import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
@@ -42,6 +43,8 @@ func Instances(env core.Env) []core.Vendor {
 
 func newInstance(env core.Env, region Region) core.Vendor {
 	inst := &adapter{region: region}
+	// 钩子捕获 inst：钩子在构造完成后才执行，Configure 写入的 baseURL 覆盖
+	// 对续期同样生效（不必把覆盖值复制进 spec）。
 	inst.NativeAdapter = core.NewNativeAdapter(core.NativeSpec[*Credential]{
 		Meta: core.Meta{VendorID: VendorIDFor(region), VendorName: VendorNameFor(region), VendorRegion: string(region)},
 		Env:  env,
@@ -54,12 +57,37 @@ func newInstance(env core.Env, region Region) core.Vendor {
 			if errParse != nil {
 				return core.CredentialSeed{}, nil, errParse
 			}
+			if native.Realm() != region {
+				return core.CredentialSeed{}, nil, fmt.Errorf("credential region %q does not match vendor %q", native.Realm(), VendorIDFor(region))
+			}
 			return core.CredentialSeed{
 				VendorID: VendorIDFor(region), Region: string(region),
-				Label:  core.FirstNonEmpty(native.Label, MaskedKey(native.APIKey)),
-				FileID: core.FileIDFromFileName(fileName),
-				Token:  native.APIKey, AuthMode: "apikey",
+				Label:  core.FirstNonEmpty(native.UserNameValue(), native.UIDValue(), MaskedKey(native.AccessTokenValue())),
+				FileID: core.FileIDFromFileName(fileName), UID: native.UIDValue(),
+				Token: native.AccessTokenValue(), RefreshToken: native.RefreshTokenValue(),
+				ExpiresAt: native.ExpiresAtValue(), AuthMode: "oauth",
 			}, native, nil
+		},
+		RefreshNative: func(ctx context.Context, native *Credential) (core.NativeRefresh[*Credential], error) {
+			accessBefore, refreshBefore := native.Snapshot()
+			result, errRefresh := RefreshToken(ctx, inst.resolveBaseURL(), native)
+			if errRefresh != nil {
+				return core.NativeRefresh[*Credential]{}, errRefresh
+			}
+			// 上游响应无 expires_in：按 autoclaw2api 口径保守记 28 天。
+			expiresAt := native.ExpiresAtValue()
+			if result.AccessToken != accessBefore {
+				expiresAt = time.Now().Add(28 * 24 * time.Hour).Unix()
+			}
+			native.ApplyTokens(result.AccessToken, result.RefreshToken, expiresAt)
+			refreshed := !native.UnchangedSince(accessBefore, refreshBefore)
+			return core.NativeRefresh[*Credential]{
+				Native: native, Token: native.AccessTokenValue(), RefreshToken: native.RefreshTokenValue(),
+				ExpiresAt: native.ExpiresAtValue(), Changed: refreshed,
+			}, nil
+		},
+		MergeNative: func(original []byte, native *Credential) ([]byte, error) {
+			return MergeCredentialJSON(original, native)
 		},
 	})
 	return inst
@@ -67,19 +95,15 @@ func newInstance(env core.Env, region Region) core.Vendor {
 
 // Configure 解析 AutoClaw 专属配置（区域基地址覆盖）。
 func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
-	key := v.ID() + "_base_url"
-	v.baseURL = strings.TrimSpace(raw[key])
+	v.baseURL = strings.TrimSpace(raw[v.ID()+"_base_url"])
 }
 
 // ConfigFields 声明 AutoClaw 专属配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{Name: v.ID() + "_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "AutoClaw 上游基地址覆盖（骨架阶段必填，上游默认域名待回填）。"},
+		{Name: v.ID() + "_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "AutoClaw 上游基地址覆盖（默认 " + DefaultBaseURLFor(v.region) + "）。"},
 	}
 }
-
-// AuthMode 报告凭证形态（页面据此脱敏展示）。
-func (v *adapter) AuthMode() string { return "apikey" }
 
 // Match 判断一份凭证是否属于本区域实例。
 func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
@@ -89,7 +113,6 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 	if vendorID, okVendor := raw[core.VendorKey].(string); okVendor {
 		return strings.EqualFold(strings.TrimSpace(vendorID), v.ID())
 	}
-	// 没有显式 vendor 字段时按区域字段 / 文件名约定归属。
 	if region := RegionForCredential(raw); region != "" {
 		return region == string(v.region)
 	}
@@ -100,15 +123,13 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 
 // StaticModels 返回本区域的模型清单。
 //
-// 需要一把有效 key 才能探测（上游模型接口要认证）。借一个本实例的可用
-// 凭证去打；借不到就报错——不编一份假清单，否则用户会看到调用必失败的
-// 模型。
+// 探测需要一把有效凭证；借不到就返回错误（不编清单）。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	apiKey, baseURL := v.probe()
-	if apiKey == "" {
+	token := v.probeToken()
+	if token == "" {
 		return nil, fmt.Errorf("no autoclaw credential available for model probe")
 	}
-	models, errModels := FetchModels(ctx, baseURL, apiKey)
+	models, errModels := FetchModels(ctx, v.resolveBaseURL(), token, v.region)
 	if errModels != nil {
 		return nil, errModels
 	}
@@ -117,14 +138,14 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 
 // ModelsForAuth 返回该凭证可用的模型。
 //
-// 用**该凭证自己的 key** 去探测：key 失效时该账号自然拿不到模型，
+// 用**该凭证自己的 token** 去探测：token 失效时该账号自然拿不到模型，
 // 宿主据此把它从选号里淘汰。
 func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
 	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
 	}
-	models, errModels := FetchModels(ctx, v.resolveBaseURL(), native.APIKey)
+	models, errModels := FetchModels(ctx, v.resolveBaseURL(), native.AccessTokenValue(), v.region)
 	if errModels != nil {
 		// 探测失败返回空清单而不是报错：宿主会因为空清单跳过该凭证。
 		// 必须用 Info：宿主日志默认 info 级别，Debug 会被完全吞掉。
@@ -141,24 +162,12 @@ func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 		if id == "" {
 			return core.ModelDescriptor{}, false
 		}
-		name := strings.TrimSpace(model.Name)
-		if name == "" {
-			name = id
-		}
-		contextWindow := model.ContextWindow
-		if contextWindow == 0 {
-			contextWindow = core.DefaultContextWindow(id)
-		}
-		maxOutput := model.MaxOutputTokens
-		if maxOutput == 0 {
-			maxOutput = core.DefaultMaxOutputTokens
-		}
 		return core.ModelDescriptor{
 			ID:                 id,
-			Name:               name,
-			Description:        "AutoClaw 上游模型",
-			ContextLength:      contextWindow,
-			MaxOutputTokens:    maxOutput,
+			Name:               core.FirstNonEmpty(model.Name, id),
+			Description:        core.FirstNonEmpty(model.Description, "AutoClaw 上游模型"),
+			ContextLength:      model.ContextWindow,
+			MaxOutputTokens:    model.MaxOutputTokens,
 			SupportsTools:      model.SupportsTools,
 			CanDisableThinking: !model.IsReasoning,
 		}, true
@@ -174,9 +183,9 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 		return nil, errNative
 	}
 	payload, errChat := Chat(ctx, v.resolveBaseURL(), ChatRequest{
-		APIKey: native.APIKey,
-		Body:   req.Payload,
-		Stream: false,
+		Token: native.AccessTokenValue(),
+		Body:  req.Payload,
+		Model: req.Model,
 	})
 	if errChat != nil {
 		return nil, core.ToPluginError(errChat)
@@ -197,9 +206,9 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		return errNative
 	}
 	resp, errStream := ChatStream(ctx, v.resolveBaseURL(), ChatRequest{
-		APIKey: native.APIKey,
-		Body:   req.Payload,
-		Stream: true,
+		Token: native.AccessTokenValue(),
+		Body:  req.Payload,
+		Model: req.Model,
 	})
 	if errStream != nil {
 		return core.ToPluginError(errStream)
@@ -208,6 +217,53 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	return hostbridge.ForwardRawSSE(resp.Body, sink.Emit)
 }
 
+// ---- 额度与签到 ----
+
+// Quota 查询账号积分余额。
+func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return nil, errNative
+	}
+	balance, errBalance := FetchBalance(ctx, v.resolveBaseURL(), native.AccessTokenValue())
+	if errBalance != nil {
+		return nil, core.ToPluginError(errBalance)
+	}
+	response := pluginapi.QuotaFetchResponse{
+		Subscription: &pluginapi.QuotaSubscription{
+			Plan:     string(v.region),
+			TierName: VendorNameFor(v.region),
+		},
+		Summary: []pluginapi.QuotaMetric{
+			{Key: "credit_remain", Label: "剩余积分", Value: balance.TotalBalance, Format: "number"},
+		},
+	}
+	return &response, nil
+}
+
+// Checkin 执行一次每日签到。
+func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.CheckinResult, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return nil, errNative
+	}
+	result, errCheckin := Checkin(ctx, v.resolveBaseURL(), native)
+	if errCheckin != nil {
+		return nil, core.ToPluginError(errCheckin)
+	}
+	message := fmt.Sprintf("签到成功：+%d 积分", result.Points)
+	if result.Already {
+		message = "今天已经签到过了（幂等，无新增）"
+	}
+	return &core.CheckinResult{
+		Already: result.Already,
+		Credit:  result.Points,
+		Message: message,
+	}, nil
+}
+
+func (v *adapter) SupportsCheckin() bool { return true }
+
 // ---- 内部工具 ----
 
 // resolveBaseURL 返回实例当前生效的基地址。
@@ -215,23 +271,26 @@ func (v *adapter) resolveBaseURL() string {
 	return BaseURL(v.baseURL, v.region)
 }
 
-// probe 借一个本实例的可用凭证取 API key（供模型探测用），同时返回基地址。
-func (v *adapter) probe() (string, string) {
+// probeToken 借一个本实例的可用凭证取 access token（供模型探测用）。
+func (v *adapter) probeToken() string {
 	native, okNative := core.ProbeNativeCredential(v.Env, v.ID(), func(cred *core.Credential) (*Credential, bool) {
 		value, okValue := cred.Native.(*Credential)
 		return value, okValue
 	})
 	if !okNative || native == nil {
-		return "", v.resolveBaseURL()
+		return ""
 	}
-	return native.APIKey, v.resolveBaseURL()
+	return native.AccessTokenValue()
 }
 
 // 编译期断言：适配器实际具备的供应商能力。
 var (
 	_ core.Vendor               = (*adapter)(nil)
-	_ core.AuthModeReporter     = (*adapter)(nil)
+	_ core.CheckinProvider      = (*adapter)(nil)
 	_ core.Configurable         = (*adapter)(nil)
 	_ core.ConfigFieldsProvider = (*adapter)(nil)
 	_ core.ModelsProvider       = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+	_ core.Refresher            = (*adapter)(nil)
+	_ core.StorageMerger        = (*adapter)(nil)
 )
