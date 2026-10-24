@@ -206,11 +206,7 @@ func mergeHostAuthEntry(target *core.HostAuth, source core.HostAuth) {
 	if target.Label == "" && source.Label != "" {
 		target.Label = source.Label
 	}
-	// The runtime auth entry can retain a stale error after a successful
-	// file-backed reload. Prefer an explicit active file status so a transient
-	// runtime failure does not remain visible indefinitely.
-	if (target.Status == "" || strings.EqualFold(target.Status, "error")) &&
-		source.Status != "" {
+	if target.Status == "" && source.Status != "" {
 		target.Status = source.Status
 	}
 	if target.RuntimeOnly && !source.RuntimeOnly {
