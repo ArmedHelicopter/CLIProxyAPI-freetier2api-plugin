@@ -7,8 +7,8 @@
 
 | 供应商 | 参考项目 | 依据 |
 | --- | --- | --- |
-| AutoClaw（国内/国际） | [Zhengyuuuui/autoclaw2api](https://github.com/Zhengyuuuui/autoclaw2api) | `docs/reverse-notes.md`（2026-09 Web bundle + 桌面端 1.18.5 静态逆向与抓包） |
-| 小浣熊（商汤 Raccoon） | [misakano7545/xiaohuanxiong2api-panel](https://github.com/misakano7545/xiaohuanxiong2api-panel) | `internal/upstream`（v1.1.0 桌面客户端抓包） |
+| AutoClaw（国内/国际） | [aimod-cc/Agent2API](https://github.com/aimod-cc/Agent2API) | `providers/autoclaw`（桌面端 1.17.8 头集合、proxy 通道、签名与签到链路实测） |
+| 小浣熊（商汤 Raccoon） | [aimod-cc/Agent2API](https://github.com/aimod-cc/Agent2API) | `providers/raccoon`（网页授权登录、目录、积分与签到口径） |
 
 ## 2. AutoClaw（`autoclawcn` / `autoclawglobal`）
 
@@ -23,17 +23,17 @@
 
 实现要点：
 
-- **签名**：全部 userapi 请求带 `X-Auth-Appid: 100003` + `X-Auth-TimeStamp` +
+- **认证头**：对话走 `X-Authorization: Bearer <token>`（源实现口径，发 `Authorization` 反而 401）；brand 头集合 `X-Product: autoclaw` / `X-Client-Type: pc` / `X-Tm: mac` / `X-Version: 1.17.8` / `X-Lang` / `X-Channel: official` / `x_trace_id`（**不发** `X-Harness-Type`，带上会被区别对待）； `X-Auth-Appid: 100003` + `X-Auth-TimeStamp` +
   `X-Auth-Sign`（`MD5("100003&<unix秒>&<secret>")`，secret 与客户端版本常量
   逆向自 Web bundle，见 `protocol.go`）；
-- **对话**：`POST {region基址}/autoclaw-proxy/proxy/autoclaw/v1/chat/completions`，
-  模型经 `X-Request-Model` 头与 body `model` 双通道声明（autoclaw2api 的
+- **对话**：`POST {region基址}/autoclaw-proxy/proxy/autoclaw/chat/completions`，
+  模型经 `X-Request-Model` 头与 body `model` 双通道声明（Agent2API 的
   proxy 通道；沙箱 relay 通道依赖常驻 WebSocket 会话，与插件按请求出站的
   模型不符，未实现，凭证字段已预留）；
 - **模型清单**：global 实时拉 `autoclaw-model-config`；cn 用静态表
-  （上游无对应的可直拉目录，模型表来自 autoclaw2api 快照）；
+  （上游无对应的可直拉目录，模型表来自 Agent2API 快照）；
 - **续期**：`POST /userapi/v1/refresh`（body 带 `source_id` / `device_id` /
-  `refresh_token`；上游响应无 `expires_in`，按 28 天保守记录）；
+  `refresh_token`；上游响应无 `expires_in`，按 28 天保守记录；签名校验失败降级 `agent-refresh`）；
 - **额度**：`GET /agent-assetmgr/api/v2/wallets?biz_app_id=autoclaw` 的
   `total_balance`；
 - **签到**：`POST .../autoclaw-task-complete` body `{"task_id":"daily_signin"}`，
@@ -48,17 +48,13 @@
 | 供应商 ID | `raccoon` |
 | 展示名 | 小浣熊 |
 | 上游基址 | `https://xiaohuanxiong.com`（四域：`/api/web/llm/v2`、`/api/web/auth/v1`、`/api/web/points/v1`、主站 origin） |
-| 认证方式 | **微信扫码登录**（控制台「添加账号」入口）+ 授权码回调粘贴兜底 + 手工粘贴凭证 JSON |
+| 认证方式 | **网页授权登录**（官方授权页 `/code/authorize`，控制台「添加账号」入口）+ 回调链接粘贴 + 手工粘贴凭证 JSON |
 | 凭证文件名前缀 | `raccoon-*.json`（含拼音 `xiaohuanxiong` 段亦可） |
 | 配置键 | `raccoon_llm_base_url` / `raccoon_auth_base_url` / `raccoon_points_base_url` / `raccoon_origin` |
 
 实现要点：
 
-- **扫码登录**：`qrcode_code` 由客户端本地生成（32 位 hex），二维码编的是公开
-  网页 `{origin}/login/mp?code=…&appname=商汤小浣熊官网`；轮询
-  `POST {auth_base}/login_with_qrcode_code` 取票——无需回调地址，最适合
-  远程部署的插件形态。另有 `office-raccoon://auth/callback` 授权码换票兜底
-  （业务码 `200035` = 授权码失效）；
+- **网页授权登录**：`{origin}/code/authorize?login_source=desktop&appname=办公小浣熊客户端&state=<state>`（Agent2API oauth.rs 口径）；登录成功后官方页跳 `office-raccoon://auth/callback?code=…&state=…`，用户把整条链接粘回控制台，`POST {auth_base}/login_with_authorization_code` 换票（业务码 `200035` = 授权码失效）。state 由插件生成、一次性消费、逐字比对；
 - **对话**：`POST {llm_base}/chat/completions`，上游即 OpenAI 形状，原样转发；
 - **模型目录**：`GET {llm_base}/model_catalog`（`categories[].models` 平铺、
   同名首见者胜、`context_window`/`max_tokens` 数字/字符串/params 嵌套三形态
@@ -71,7 +67,7 @@
 - **错误分类**：401/403 → 会话失效；429 → 限流；积分/额度文案（含业务码
   `14018`）→ hard_credit；`insufficient` 单独出现不判额度（避免
   "context window is insufficient" 误伤）；
-- 出站带 v1.1.0 桌面客户端识别头（`x-client-name` 等）。
+- 出站带桌面客户端识别头。早期参考项目里的微信扫码通道（`/login/mp` 承载页）已随上游页面下线而不可用（实测 404，2026-10-24），故未采用。
 
 ## 4. 归属判定纪律
 

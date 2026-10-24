@@ -2,7 +2,7 @@ package autoclaw
 
 // 本文件实现 AutoClaw 凭证的解析与归属判定。
 //
-// 凭证形态（与 autoclaw2api 的 auths/autoclaw-*.json 对齐）：
+// 凭证形态（与 Agent2API 的 auths/autoclaw-*.json 对齐）：
 //
 //	{
 //	  "vendor": "autoclawcn",
@@ -15,7 +15,7 @@ package autoclaw
 //	}
 //
 // 登录是手机验证码 / OAuth（国内短信、海外 OAuth），本插件不实现登录流程，
-// 凭证由用户从 autoclaw2api 或抓包获取后手工添加；refresh_token 支持自动续期。
+// 凭证由用户从 Agent2API 或抓包获取后手工添加；refresh_token 支持自动续期。
 
 import (
 	"encoding/json"
@@ -107,7 +107,7 @@ type Credential struct {
 	AccessToken  string
 	RefreshToken string
 	// ExpiresAt 是 access token 过期时刻（Unix 秒）；0 表示未知。
-	// 上游登录响应无 expires_in，autoclaw2api 按 28 天保守缓存。
+	// 上游登录响应无 expires_in，Agent2API 按 28 天保守缓存。
 	ExpiresAt int64
 	UID       string
 	UserName  string
@@ -158,7 +158,7 @@ func ParseCredential(raw []byte) (*Credential, error) {
 		cred.UID = getStr("uid", "user_id")
 	}
 	if cred.DeviceID == "" {
-		// 与 autoclaw2api 一致：deviceId 允许留空，留空时用 uid 兜底
+		// 与 Agent2API 一致：deviceId 允许留空，留空时用 uid 兜底
 		//（刷新请求按账号原样回传，上游只要求稳定性）。
 		cred.DeviceID = strings.TrimSpace(cred.UID)
 	}
@@ -207,7 +207,7 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
 			return true
 		}
 	}
-	// 特征组合：autoclaw2api 凭证专属的沙箱端点字段。
+	// 特征组合：Agent2API 凭证专属的沙箱端点字段。
 	// deviceId / device_id 单独出现太宽（qoder 等也用），不作判据。
 	for _, key := range []string{"sandboxEndpoint", "sandbox_endpoint"} {
 		if _, okKey := raw[key]; okKey {

@@ -2,17 +2,17 @@ package raccoon
 
 // 本文件定义小浣熊的上游端点与请求头。
 //
-// 协议依据：xiaohuanxiong2api（haoxinyu1）与 xiaohuanxiong2api-panel
-// （misakano7545，v1.1.0 抓包）两份逆向实现，Issue #24 指定为实现参考。
+// 协议依据：aimod-cc/Agent2API（v1.1.0 桌面客户端抓包与实测），Issue #24 指定为实现参考。
 //
 // 要点：
 //   - 单一部署 https://xiaohuanxiong.com（无国内/国际之分）；
-//   - 四个域：LLM 网关 / 鉴权 / 积分 / 主站 origin（签到挂在 origin）；
+//   - 四个域：LLM 网关 / 鉴权 / 积分 / 主站 origin（登录授权页挂在 origin）；
 //   - 业务信封 {"code","message","data"}，code=0 成功；
 //   - 出站带 v1.1.0 桌面客户端识别头（x-client-name 等）。
 
 import (
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -50,6 +50,19 @@ func BaseURL(override, fallback string) string {
 		return trimmed
 	}
 	return fallback
+}
+
+// AuthorizeURLWith 构造官方授权页 URL（panel 的 AuthorizeURL 口径：
+// login_source=desktop & client=desktop & app_name=<中文客户端名>）。
+func AuthorizeURLWith(origin, appName, state string) string {
+	query := url.Values{}
+	query.Set("login_source", "desktop")
+	query.Set("client", "desktop")
+	query.Set("app_name", appName)
+	if strings.TrimSpace(state) != "" {
+		query.Set("state", state)
+	}
+	return strings.TrimRight(origin, "/") + AuthorizePath + "?" + query.Encode()
 }
 
 // ApplyClientHeaders 写入小浣熊桌面客户端识别头（抓包实测：上游按客户端

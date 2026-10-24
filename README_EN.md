@@ -42,7 +42,7 @@ If this project helps you, a Star would mean a lot.
 | `minimaxcodecn` | MiniMax Code CN | `cn` | OAuth Device Flow | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code Global | `global` | OAuth Device Flow | `minimaxcodeglobal-*.json` |
 
-> **New vendors**: `autoclawcn` / `autoclawglobal` (AutoClaw CN/Global) and `raccoon` (SenseTime Raccoon). AutoClaw credentials are `accessToken`/`refreshToken` JSON (paste manually; no console login entry); Raccoon supports QR-code login from the console. See [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md) for protocol details and configuration keys.
+> **New vendors**: `autoclawcn` / `autoclawglobal` (AutoClaw CN/Global) and `raccoon` (SenseTime Raccoon). AutoClaw credentials are `accessToken`/`refreshToken` JSON (paste manually; no console login entry); Raccoon supports web authorize login from the console (official authorize page + callback link paste). See [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md) for protocol details and configuration keys.
 
 ## Quick Start
 
@@ -137,8 +137,7 @@ This project references or adapts protocol designs, ABI contracts, and metadata 
 
 - **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** (MIT): Host plugin ABI/API contracts (`cpasdk/`) and HTTP/SSE bridge design.
 - **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)** & **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)** (MIT): WorkBuddy protocol adaptation, prompt sanitization, and task system reference.
-- **[Zhengyuuuui/autoclaw2api](https://github.com/Zhengyuuuui/autoclaw2api)**: AutoClaw protocol adaptation (userapi signing, proxy channel, task check-in) reference.
-- **[misakano7545/xiaohuanxiong2api-panel](https://github.com/misakano7545/xiaohuanxiong2api-panel)**: Raccoon protocol adaptation (QR login, model catalog, points & check-in semantics) reference.
+- **[aimod-cc/Agent2API](https://github.com/aimod-cc/Agent2API)**: AutoClaw and Raccoon protocol adaptation (header set/signing, proxy channel, authorize login, model catalog, points & check-in semantics) reference.
 
 ## Contributing
 

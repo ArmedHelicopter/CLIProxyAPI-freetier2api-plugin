@@ -2,7 +2,7 @@ package raccoon
 
 // 本文件把小浣熊（商汤 Raccoon）协议适配成 core.Vendor。
 //
-// 能力面（对齐 xiaohuanxiong2api 系列实测协议）：
+// 能力面（对齐 Agent2API 系列实测协议）：
 //   - 凭证解析与偏严归属（JWT access/refresh 对 + uid）；
 //   - chat 走 LLM 网关（OpenAI 形状，原样转发）；
 //   - 模型目录实时拉取（model_catalog），拉不到回落静态单条；
@@ -242,78 +242,38 @@ func (v *adapter) SupportsCheckin() bool { return true }
 
 // ---- 登录与续期 ----
 
-// LoginStart 发起一次扫码登录：生成 qrcode_code 并登记会话，
-// 返回二维码承载页 URL（用户微信扫码完成授权）。
+// LoginStart 发起一次网页授权登录：生成一次性 state 并登记会话，
+// 返回官方授权页 URL（用户在页面登录后浏览器跳 office-raccoon:// 回调，
+// 把整条链接粘回控制台由 SubmitCallback 完成换票）。
 func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
-	code, errCode := newQRCode()
-	if errCode != nil {
-		return nil, errCode
-	}
-	sessionID := VendorID + "_" + code
-	StoreLoginSession(v.Env.Logins, sessionID, &PendingLogin{Code: code})
+	state := core.RandomHex(32)
+	sessionID := VendorID + "_" + state
+	StoreLoginSession(v.Env.Logins, sessionID, &PendingLogin{State: state})
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
-		URL:       QRContent(v.resolveOrigin(), code),
+		URL:       AuthorizeURLWith(v.resolveOrigin(), loginAppName, state),
 		State:     sessionID,
 		ExpiresAt: time.Now().Add(qrLoginTTL),
 		Metadata:  map[string]any{core.VendorKey: VendorID},
 	}, nil
 }
 
-// LoginPoll 轮询一次扫码状态。
+// LoginPoll 轮询一次登录状态。
+//
+// 授权页模式没有可轮询的上游端点：凭证只在用户把回调链接粘回来时
+// 经 SubmitCallback 到达。这里只回报进度；state 失配（用户粘贴）由
+// SubmitCallback 拒绝。
 func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthLoginPollResponse, error) {
-	session, exists, shouldPoll := CheckLoginSession(v.Env.Logins, state)
+	_, exists, _ := CheckLoginSession(v.Env.Logins, state)
 	if !exists {
 		return &pluginapi.AuthLoginPollResponse{
 			Status:  pluginapi.AuthLoginStatusError,
 			Message: "登录会话不存在或已过期，请重新发起登录",
 		}, nil
 	}
-	if !shouldPoll {
-		return &pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "等待用户扫码…",
-		}, nil
-	}
-	access, refresh, errToken := PollQrLogin(ctx, v.resolveAuthBase(), session.Code)
-	if errToken != nil {
-		RemoveLoginSession(v.Env.Logins, state)
-		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: errToken.Error()}, nil
-	}
-	if strings.TrimSpace(access) == "" {
-		return &pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusPending,
-			Message: "等待用户扫码…",
-		}, nil
-	}
-	credential := &Credential{AccessToken: access, RefreshToken: refresh, ExpiresAt: jwtExpiry(access)}
-	if uid, nickname, errInfo := FetchUserInfo(ctx, v.resolveAuthBase(), credential); errInfo == nil {
-		credential.ApplyIdentity(uid, nickname)
-	}
-	if credential.UIDOrTokenID() == "" {
-		RemoveLoginSession(v.Env.Logins, state)
-		return &pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusError,
-			Message: "扫码登录成功但取不到用户标识，请重试",
-		}, nil
-	}
-	storageJSON, errStorage := credential.StorageJSON()
-	if errStorage != nil {
-		return &pluginapi.AuthLoginPollResponse{
-			Status:  pluginapi.AuthLoginStatusError,
-			Message: "构建凭证失败：" + errStorage.Error(),
-		}, nil
-	}
-	RemoveLoginSession(v.Env.Logins, state)
-	logger.Info("completed raccoon qr login for %s", core.FirstNonEmpty(credential.NicknameValue(), credential.UIDOrTokenID()))
 	return &pluginapi.AuthLoginPollResponse{
-		Status: pluginapi.AuthLoginStatusSuccess,
-		Auth: pluginapi.AuthData{
-			Provider:    core.ProviderKey,
-			FileName:    core.FileNameFor(VendorID, credential.UIDOrTokenID()),
-			Label:       core.FirstNonEmpty(credential.NicknameValue(), credential.UIDOrTokenID()),
-			StorageJSON: storageJSON,
-		},
+		Status:  pluginapi.AuthLoginStatusPending,
+		Message: pendingMessage,
 	}, nil
 }
 
@@ -327,14 +287,23 @@ func (v *adapter) LocalCallbackHint() string {
 // 这是扫码登录的兜底：用户也可以在官方页面走 office-raccoon:// 回调，
 // 把地址栏整条链接粘回来换票。
 func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
-	_, pollState := v.Env.Logins.Poll(strings.TrimSpace(state))
+	session, pollState := v.Env.Logins.Poll(strings.TrimSpace(state))
 	if pollState == core.PollMissing {
 		return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
 	}
-	code, _, okCode := ParseCallbackCode(rawURL)
+	pending, okPending := session.Data.(*PendingLogin)
+	if !okPending {
+		return nil, core.NewPluginError("login_session_broken", "登录会话数据已损坏，请重新发起登录", http.StatusBadRequest)
+	}
+	code, callbackState, okCode := ParseCallbackCode(rawURL)
 	if !okCode {
 		return nil, core.NewPluginError("callback_parse_failed",
-			"回调链接解析失败，请确认粘贴的是完整回调链接（office-raccoon://auth/callback?code=…）或裸授权码（ac_ 开头）",
+			"回调链接解析失败，请确认粘贴的是完整回调链接（office-raccoon://auth/callback?code=…）",
+			http.StatusBadRequest)
+	}
+	if !CheckCallbackState(pending, callbackState) {
+		return nil, core.NewPluginError("callback_state_mismatch",
+			"登录回调 state 校验失败，请重新发起登录",
 			http.StatusBadRequest)
 	}
 	access, refresh, expiresAt, uid, errExchange := ExchangeAuthorizationCode(ctx, v.resolveAuthBase(), code)

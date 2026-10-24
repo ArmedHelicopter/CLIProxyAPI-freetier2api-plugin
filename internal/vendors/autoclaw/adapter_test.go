@@ -146,7 +146,7 @@ func TestConfigureBaseURLPerInstance(t *testing.T) {
 }
 
 func TestAuthSign(t *testing.T) {
-	// 固定向量：与 autoclaw2api 的 sign() 同口径（MD5(appid&ts&secret)）。
+	// 固定向量：与 Agent2API 的 sign() 同口径（MD5(appid&ts&secret)）。
 	got := AuthSign("1700000000")
 	if len(got) != 32 || strings.ToLower(got) != got {
 		t.Fatalf("AuthSign should be 32-char lowercase hex, got %q", got)

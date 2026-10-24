@@ -2,7 +2,7 @@ package autoclaw
 
 // 本文件实现 AutoClaw 的模型清单与账号信息获取。
 //
-// 清单来源（与 autoclaw2api 一致）：
+// 清单来源（与 Agent2API 一致）：
 //   - global：GET {base}/autoclaw-proxy/proxy/autoclaw-model-config（实时目录，
 //     含 contextWindow / maxTokens / reasoning 等元数据）；
 //   - cn：静态表（沙箱 relay 通道的模型，上游无对应实时目录接口可从
@@ -37,7 +37,7 @@ type Model struct {
 	SupportsTools   bool
 }
 
-// cnStaticModels 是国内版沙箱 relay 通道的模型表（autoclaw2api 2026-09 快照）。
+// cnStaticModels 是国内版沙箱 relay 通道的模型表（Agent2API 2026-09 快照）。
 var cnStaticModels = []string{
 	"openclaw", "openclaw/default", "glm-5.3-flash", "glm-2", "zai_auto",
 	"zai_auto-fast", "zai_glm-5.3-flash", "zaicoding_glm-5.3",

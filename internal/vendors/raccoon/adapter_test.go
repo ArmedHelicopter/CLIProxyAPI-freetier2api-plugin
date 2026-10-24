@@ -138,8 +138,7 @@ func TestParseCallbackCode(t *testing.T) {
 		want bool
 	}{
 		{"official scheme", "office-raccoon://auth/callback?code=ac_1&state=s1", "ac_1", true},
-		{"loopback", "http://127.0.0.1:17867/auth/callback?code=ac_2&state=s2", "ac_2", true},
-		{"bare code", "ac_3", "ac_3", true},
+		{"loopback callback rejected (authorize-page flow only)", "http://127.0.0.1:17867/auth/callback?code=ac_2&state=s2", "", false},
 		{"evil host", "office-raccoon://evil.com/callback?code=x", "", false},
 		{"wrong path", "http://127.0.0.1:1/other?code=x", "", false},
 		{"garbage", "not a url ::", "", false},

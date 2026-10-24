@@ -5,7 +5,7 @@ package autoclaw
 // 供应商实例 = 协议 × 区域。国内版与国际版是两套独立部署（userapi 基址
 // 不同），token 不通用；区域在构造期固定，实例方法内不再分支。
 //
-// 能力面（对齐 autoclaw2api 实测协议）：
+// 能力面（对齐 Agent2API 实测协议）：
 //   - 凭证解析与偏严归属（accessToken/refreshToken 结构）；
 //   - chat 走 region proxy 通道（X-Request-Model 声明模型）；
 //   - 模型清单：global 实时拉 autoclaw-model-config，cn 用静态表；
@@ -74,7 +74,7 @@ func newInstance(env core.Env, region Region) core.Vendor {
 			if errRefresh != nil {
 				return core.NativeRefresh[*Credential]{}, errRefresh
 			}
-			// 上游响应无 expires_in：按 autoclaw2api 口径保守记 28 天。
+			// 上游响应无 expires_in：按 Agent2API 口径保守记 28 天。
 			expiresAt := native.ExpiresAtValue()
 			if result.AccessToken != accessBefore {
 				expiresAt = time.Now().Add(28 * 24 * time.Hour).Unix()

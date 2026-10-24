@@ -2,7 +2,7 @@ package raccoon
 
 // 本文件实现小浣熊的凭证续期、额度查询、每日签到与登录换票。
 //
-// 端点口径（xiaohuanxiong2api-panel 抓包实测）：
+// 端点口径（Agent2API 抓包实测）：
 //   - 续期：POST {auth_base}/refresh body {"refresh_token":…}，响应可能
 //     轮换 refresh_token（空 = 未轮换，沿用旧值）；
 //   - 积分：GET {points_base}/balance（available_points 及各来源分类）；
@@ -314,43 +314,34 @@ func AuthorizeURL(origin, appName, state string) string {
 	query.Set("login_source", "desktop")
 	query.Set("appname", appName)
 	query.Set("state", state)
-	return strings.TrimRight(origin, "/") + AuthorizePath + "?" + query.Encode()
+	return AuthorizeURLWith(origin, appName, state)
 }
 
 // ParseCallbackCode 从回调链接里取授权码与 state。
 //
-// 只认 office-raccoon://auth/callback（官方客户端回调）与
-// http(s)://…/auth/callback（环回回调）两种形状；裸授权码（ac_ 前缀）也认。
+// 只认官方客户端回调的固定形态 office-raccoon://auth/callback?code=…&state=…
+// （Agent2API oauth.rs 同口径）：scheme/host/path 逐项比对，不用前缀匹配——
+// office-raccoon://auth/callback@evil.com 这类形态用 startsWith 会全部放行。
+// 回调落在自定义协议上，任何本机程序都能构造一条丢进登录窗口，不校验 state
+// 就等于把「用别人的 code 换来的凭证写进你的账号库」敞开。
 func ParseCallbackCode(raw string) (code, state string, ok bool) {
 	raw = strings.TrimSpace(raw)
 	if index := strings.IndexAny(raw, "\r\n"); index >= 0 {
 		raw = raw[:index]
 	}
-	if strings.HasPrefix(raw, "ac_") && !strings.Contains(raw, "://") && !strings.Contains(raw, "?") {
-		return raw, "", true
-	}
 	parsed, errParse := url.Parse(raw)
 	if errParse != nil {
 		return "", "", false
 	}
-	query := parsed.Query()
-	switch {
-	case strings.EqualFold(parsed.Scheme, "office-raccoon"):
-		// 官方客户端回调：office-raccoon://auth/callback?code=…&state=…
-		// host 与 path 逐项比对（前缀匹配会被 evil.com 形态绕过）。
-		if !strings.EqualFold(parsed.Host, "auth") || parsed.Path != "/callback" {
-			return "", "", false
-		}
-	case parsed.Scheme == "http" || parsed.Scheme == "https":
-		if parsed.Path != "/auth/callback" {
-			return "", "", false
-		}
-	default:
+	if !strings.EqualFold(parsed.Scheme, loginCallbackScheme) ||
+		!strings.EqualFold(parsed.Host, loginCallbackHost) ||
+		parsed.Path != loginCallbackPath {
 		return "", "", false
 	}
-	code = query.Get("code")
+	query := parsed.Query()
+	code = strings.TrimSpace(query.Get("code"))
 	if code == "" {
-		code = query.Get("authorization_code")
+		code = strings.TrimSpace(query.Get("authorization_code"))
 	}
 	return code, query.Get("state"), code != ""
 }

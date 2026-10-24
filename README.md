@@ -42,7 +42,7 @@
 | `minimaxcodecn` | MiniMax Code 国内版 | `cn` | OAuth 设备授权 | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code 国际版 | `global` | OAuth 设备授权 | `minimaxcodeglobal-*.json` |
 
-> **新供应商**：`autoclawcn` / `autoclawglobal`（AutoClaw 国内版/国际版）与 `raccoon`（小浣熊）。AutoClaw 凭证为 `accessToken`/`refreshToken` JSON（无控制台登录入口，手工粘贴添加）；小浣熊支持控制台微信扫码登录。协议细节与配置项见 [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md)。
+> **新供应商**：`autoclawcn` / `autoclawglobal`（AutoClaw 国内版/国际版）与 `raccoon`（小浣熊）。AutoClaw 凭证为 `accessToken`/`refreshToken` JSON（无控制台登录入口，手工粘贴添加）；小浣熊支持控制台网页授权登录（官方授权页 + 回调链接粘贴）。协议细节与配置项见 [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md)。
 
 ## 快速开始
 
@@ -137,8 +137,7 @@ curl http://localhost:8317/v1/messages \
 
 - **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)**（MIT）：宿主插件 ABI/API 契约（`cpasdk/`）与 HTTP/SSE 桥接设计。
 - **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)** 与 **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)**（MIT）：WorkBuddy 协议适配、提示词过滤与日常任务体系参考。
-- **[Zhengyuuuui/autoclaw2api](https://github.com/Zhengyuuuui/autoclaw2api)**：AutoClaw 协议适配（userapi 签名、proxy 通道、任务签到）参考。
-- **[misakano7545/xiaohuanxiong2api-panel](https://github.com/misakano7545/xiaohuanxiong2api-panel)**：小浣熊协议适配（扫码登录、模型目录、积分与签到口径）参考。
+- **[aimod-cc/Agent2API](https://github.com/aimod-cc/Agent2API)**：AutoClaw 与小浣熊协议适配（头集合/签名、proxy 通道、授权登录、模型目录、积分与签到口径）参考。
 
 ## 参与贡献
 

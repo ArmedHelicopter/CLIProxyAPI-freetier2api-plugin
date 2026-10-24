@@ -3,10 +3,10 @@ package autoclaw
 // 本文件实现 AutoClaw 的 chat-completions 转发。
 //
 // 通道：region 基址下的 /autoclaw-proxy/proxy/autoclaw/v1/chat/completions
-// （autoclaw2api 的 chat_proxy 通道，模型经 X-Request-Model 头声明）。
+// （Agent2API 的 chat_proxy 通道，模型经 X-Request-Model 头声明）。
 // 上游返回 OpenAI 兼容的 JSON / SSE，插件原样透传。
 //
-// 说明：autoclaw2api 还有「沙箱 relay」通道（wss 设备上线 + agent/send +
+// 说明：Agent2API 还有「沙箱 relay」通道（wss 设备上线 + agent/send +
 // /api/events），依赖 per-account 云端沙箱与 WebSocket 长连接。本插件按
 // 「凭证驻留宿主进程、按请求出站」的形态选择 proxy 通道；relay 通道需要
 // 的常驻会话状态与插件模型不符，暂不实现（凭证里保留 sandbox 字段以备扩展）。
@@ -102,7 +102,7 @@ func doChat(ctx context.Context, baseURL string, req ChatRequest) (*http.Respons
 }
 
 // prepareBody 是请求体出站前的钩子：把 model 改写为上游路由名并去掉 user 字段
-// （与 autoclaw2api 的 _prepare_proxy_body 一致；user 字段会被上游拒绝）。
+// （与 Agent2API 的 _prepare_proxy_body 一致；user 字段会被上游拒绝）。
 func prepareBody(body []byte, model string) []byte {
 	if len(body) == 0 {
 		return body

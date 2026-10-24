@@ -1,40 +1,46 @@
 package raccoon
 
-// 本文件实现小浣熊的扫码登录（POST {auth_base}/login_with_qrcode_code 轮询）。
+// 本文件实现小浣熊的网页授权登录（/code/authorize 授权页 + 回调链接粘贴）。
 //
-// 协议（xiaohuanxiong2api-panel 抓包 + 实测）：qrcode_code 由**客户端自己
-// 生成**（32 位小写 hex），服务端把扫码结果挂在这个 code 上；二维码里编
-// 的是公开网页 {origin}/login/mp?code=<code>&appname=…，用户微信扫码后
-// 本侧轮询取票——不需要回调地址，比 office-raccoon:// 自定义协议链路更
-// 适合插件部署形态。
+// 流程（与 Agent2API 的网页授权登录一致）：
 //
-// 轮询状态机：pending（没人扫）→ logging（已扫待确认）→ success（带票）/
-// canceled（取消或失效）。
+//  1. LoginStart 生成一次性 state（64 位小写 hex），返回官方授权页 URL：
+//     {origin}/code/authorize?login_source=desktop&appname=…&state=<state>
+//  2. 用户在官方页面登录（微信/验证码/密码均可）；
+//  3. 官方页面跳转自定义协议 office-raccoon://auth/callback?code=…&state=…
+//     （浏览器打不开这个协议是正常的——地址栏里留着整条链接）；
+//  4. 用户把整条回调链接粘回控制台，SubmitCallback 用 code 换票完成登录。
+//
+// 说明：panel 项目早期的微信扫码通道（/login/mp 承载页 +
+// login_with_qrcode_code 轮询）已随上游页面下线而不可用（实测 404，
+// 2026-10-24），因此本实现只保留授权页通道。
+//
+// state 的安全语义（Agent2API 同口径）：由插件生成、登记进共享会话表
+// （带 TTL 与轮询节流）；回调里的 state 必须逐字相等才消费，一次性。
 
 import (
-	"context"
-	"crypto/rand"
-	"encoding/hex"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net/http"
 	"strings"
 	"time"
 
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostbridge"
 )
 
-// QrCodePath 是扫码登录的轮询端点（挂在 auth 域下）。
-const QrCodePath = "/login_with_qrcode_code"
+// loginAuthorizePath 是官方授权页路径。
+const loginAuthorizePath = "/code/authorize"
 
-// qrAppName 是二维码承载页展示的应用名（与官方客户端一致）。
-const qrAppName = "商汤小浣熊官网"
+// loginAppName 是授权页上报的客户端名（与官方桌面客户端一致）。
+const loginAppName = "办公小浣熊客户端"
+
+// loginCallbackScheme / Host / Path 是官方客户端回调的固定形状。
+const (
+	loginCallbackScheme = "office-raccoon"
+	loginCallbackHost   = "auth"
+	loginCallbackPath   = "/callback"
+)
 
 // qrLoginTTL / qrPollInterval 是登录会话有效期与轮询节流。
 const (
-	qrLoginTTL     = 10 * time.Minute
+	qrLoginTTL     = 15 * time.Minute
 	qrPollInterval = 2 * time.Second
 )
 
@@ -42,7 +48,7 @@ const (
 //
 // TTL 与轮询节流由 internal/auth 的会话表统一管理，这里只保留协议状态。
 type PendingLogin struct {
-	Code string
+	State string
 }
 
 // StoreLoginSession 登记一次进行中的登录会话。
@@ -72,82 +78,11 @@ func CheckLoginSession(logins core.LoginSessions, sessionID string) (*PendingLog
 	return pending, true, pollState == core.PollReady
 }
 
-// newQRCode 生成 16 字节随机数的 hex（32 位小写），服务端据此关联扫码结果。
-func newQRCode() (string, error) {
-	buf := make([]byte, 16)
-	if _, errRead := rand.Read(buf); errRead != nil {
-		return "", fmt.Errorf("generate qrcode: %w", errRead)
-	}
-	return hex.EncodeToString(buf), nil
-}
+// pendingMessage 是轮询等待时的进度文案（告诉用户下一步做什么）。
+const pendingMessage = "等待用户在授权页完成登录…登录成功后浏览器会跳转 office-raccoon:// 开头的链接，" +
+	"请把地址栏里的整条链接复制回控制台完成登录"
 
-// QRContent 返回二维码里要编的 URL（微信扫这个页面完成授权）。
-func QRContent(origin, code string) string {
-	return strings.TrimRight(origin, "/") + "/login/mp?code=" + code + "&appname=" + qrAppName
-}
-
-// PollQrLogin 查一次扫码状态。
-//
-// 任何异常都降级为「没完成」：这是 2 秒一次的循环，偶发网络抖动不该中断
-// 登录；把未知状态当 success 会拿到空票卡死，当 canceled 会无故刷新用户
-// 正在扫的码。success 但缺 access_token 同样按未完成处理。
-func PollQrLogin(ctx context.Context, authBase string, code string) (access, refresh string, err error) {
-	body, errMarshal := json.Marshal(map[string]string{"qrcode_code": code})
-	if errMarshal != nil {
-		return "", "", fmt.Errorf("marshal qrcode poll: %w", errMarshal)
-	}
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, authBase+QrCodePath, strings.NewReader(string(body)))
-	if errReq != nil {
-		return "", "", fmt.Errorf("build qrcode poll: %w", errReq)
-	}
-	ApplyAPIHeaders(req, "")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, errDo := hostbridge.Client(ctx, apiHTTPTimeout).Do(req)
-	if errDo != nil {
-		// 轮询循环里的偶发网络抖动：降级为未完成。
-		return "", "", nil
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if errRead != nil {
-		return "", "", nil
-	}
-	var envelope struct {
-		Code    *int64          `json:"code"`
-		Message string          `json:"message"`
-		Data    json.RawMessage `json:"data"`
-	}
-	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
-		return "", "", nil
-	}
-	if envelope.Code != nil && *envelope.Code != 0 {
-		return "", "", ClassifyBusiness(resp.StatusCode, *envelope.Code, envelope.Message)
-	}
-	var data struct {
-		Status       string `json:"status"`
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-	}
-	if len(envelope.Data) > 0 && string(envelope.Data) != "null" {
-		if errUnmarshal := json.Unmarshal(envelope.Data, &data); errUnmarshal != nil {
-			return "", "", nil
-		}
-	}
-	switch strings.TrimSpace(data.Status) {
-	case "canceled":
-		return "", "", fmt.Errorf("二维码已失效或已取消，请刷新后重新扫码")
-	case "success":
-		access = strings.TrimSpace(data.AccessToken)
-		refresh = strings.TrimSpace(data.RefreshToken)
-		if access == "" {
-			// 缺票的 success：当没完成，继续轮。
-			return "", "", nil
-		}
-		return access, refresh, nil
-	default:
-		// pending / logging / 未知状态：继续轮。
-		return "", "", nil
-	}
+// CheckCallbackState 校验回调链接里的 state 与当前会话一致（逐字比对）。
+func CheckCallbackState(session *PendingLogin, callbackState string) bool {
+	return session != nil && strings.TrimSpace(callbackState) == session.State
 }

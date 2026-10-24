@@ -2,7 +2,7 @@ package autoclaw
 
 // 本文件实现 AutoClaw 的上游错误分类。
 //
-// 分类依据 autoclaw2api 的 classify()：
+// 分类依据 Agent2API 的 classify()：
 //   - 业务码 410000 → 会话失效（凭证禁用，需重新登录）；
 //   - 余额/额度文案与 HTTP 402 → hard_credit（长冷却）；
 //   - HTTP 429 → 限流（短冷却）；

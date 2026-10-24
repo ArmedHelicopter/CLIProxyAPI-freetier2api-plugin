@@ -2,7 +2,7 @@ package raccoon
 
 // 本文件实现小浣熊的上游错误分类。
 //
-// 分类依据 xiaohuanxiong2api-panel 的 Classify()（HTTP 与流内共用同一套
+// 分类依据 Agent2API 的 Classify()（HTTP 与流内共用同一套
 // 信号判据，避免两条路径漂移）：
 //   - 401/403 → 会话失效；
 //   - 429 → 限流；

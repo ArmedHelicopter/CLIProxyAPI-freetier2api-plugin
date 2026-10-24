@@ -2,7 +2,7 @@ package autoclaw
 
 // 本文件定义 AutoClaw 的上游端点、请求头与请求签名。
 //
-// 协议依据：Zhengyuuuui/autoclaw2api（docs/reverse-notes.md，2026-09 对
+// 协议依据：Agent2API（docs/reverse-notes.md，2026-09 对
 // Web 前端 bundle 与桌面端 1.18.5 的静态逆向结论），Issue #24 指定为本
 // 供应商的实现参考。
 //

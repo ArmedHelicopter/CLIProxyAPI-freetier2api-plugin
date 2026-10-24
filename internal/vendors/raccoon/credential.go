@@ -2,7 +2,7 @@ package raccoon
 
 // 本文件实现小浣熊凭证的解析与归属判定。
 //
-// 凭证形态（与 xiaohuanxiong2api / xiaohuanxiong2api-panel 的账号文件对齐）：
+// 凭证形态（与 Agent2API / Agent2API 的账号文件对齐）：
 //
 //	{
 //	  "vendor": "raccoon",
@@ -136,7 +136,7 @@ func jwtUserID(token string) string {
 //
 // 刻意不接受 accessToken / refreshToken 驼峰对做判据：workbuddy / trae 等
 // 也用它们；snake_case 的 access_token/refresh_token + uid 组合是小浣熊
-// 帐号文件的固定形态（xiaohuanxiong2api 系列的落盘格式）。
+// 帐号文件的固定形态（Agent2API 系列的落盘格式）。
 func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
 	if core.FileNameMatchesConvention(fileName, VendorID, protocolName, "xiaohuanxiong") {
 		return true
@@ -149,7 +149,7 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string) bool {
 			return true
 		}
 	}
-	// 特征组合：xiaohuanxiong2api 落盘的 snake_case 对 + uid。
+	// 特征组合：Agent2API 落盘的 snake_case 对 + uid。
 	_, hasAccess := raw["access_token"]
 	_, hasRefresh := raw["refresh_token"]
 	_, hasUID := raw["uid"]
