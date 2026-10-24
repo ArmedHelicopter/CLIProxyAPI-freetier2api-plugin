@@ -95,6 +95,39 @@ func ApplyUserAPIHeaders(req *http.Request, token string) {
 	req.Header.Set("X-Auth-Sign", AuthSign(ts))
 	req.Header.Set("X-Trace-Id", core.RandomHex(16))
 	req.Header.Set("X-Lang", "en")
+	// 不能留空：Go 默认的 "Go-http-client/1.1" 会被阿里云 WAF 以 405 HTML 拦截
+	// （实测同一请求只换 UA 就恢复；OAuth 的 405 就是这么来的）。
+	req.Header.Set("User-Agent", "AutoClaw/"+clientVer)
+	if strings.TrimSpace(token) != "" {
+		req.Header.Set("Authorization", bearer(token))
+	}
+}
+
+// ApplyOAuthHeaders 写入国际版 OAuth 两跳（oauth-url / oauth-login）的请求头。
+//
+// 与 ApplyUserAPIHeaders 的差别（别合并）：OAuth 走的是官方**桌面端**链路，
+// 客户端指纹是 pc / zcode / linux / zh-CN（Agent2API signed_auth_headers 同口径）。
+// User-Agent 尤其不能留空：浏览器里生成的阿里云验证码令牌由服务端原样转发，
+// 而 Go 默认 UA 会被阿里云 WAF 判成机器人并回 405 HTML（现象是「Google 能过、
+// Zai 一直失败」——WAF 规则按路径命中，不是端点形状问题）。
+func ApplyOAuthHeaders(req *http.Request, token string) {
+	ts := strconv.FormatInt(time.Now().Unix(), 10)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "*/*")
+	req.Header.Set("User-Agent", "AutoClaw/"+clientVer)
+	req.Header.Set("X-Version", clientVer)
+	req.Header.Set("X-Product", "autoclaw")
+	req.Header.Set("X-Client-Type", "pc")
+	req.Header.Set("X-Harness-Type", "zcode")
+	// 与参考实现一致：非 Windows 构建发 linux。WAF 与业务层都不按它区分
+	// 浏览器所在的桌面系统，改 mac 没有任何收益（agent2api 在 macOS 上也发 linux）。
+	req.Header.Set("X-Tm", "linux")
+	req.Header.Set("X-Lang", "zh-CN")
+	req.Header.Set("X-Channel", "official")
+	req.Header.Set("X-Auth-Appid", authAppID)
+	req.Header.Set("X-Auth-TimeStamp", ts)
+	req.Header.Set("X-Auth-Sign", AuthSign(ts))
+	req.Header.Set("X-Trace-Id", core.RandomHex(16))
 	if strings.TrimSpace(token) != "" {
 		req.Header.Set("Authorization", bearer(token))
 	}

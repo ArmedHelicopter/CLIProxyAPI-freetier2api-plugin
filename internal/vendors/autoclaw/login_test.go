@@ -203,8 +203,10 @@ func TestLoginStartRequestsOAuthURLAndRegistersSession(t *testing.T) {
 	useLoopbackHost(t)
 	var gotPath string
 	var gotBody map[string]any
+	var gotHeaders http.Header
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotPath = r.URL.Path
+		gotHeaders = r.Header.Clone()
 		_ = json.NewDecoder(r.Body).Decode(&gotBody)
 		_, _ = w.Write([]byte(`{"code":0,"msg":"SUCCESS","data":{"oauth_url":"https://accounts.example/oauth?x=1"}}`))
 	}))
@@ -240,6 +242,14 @@ func TestLoginStartRequestsOAuthURLAndRegistersSession(t *testing.T) {
 	}
 	if gotBody["source_id"] != protocolName {
 		t.Fatalf("source_id = %#v", gotBody["source_id"])
+	}
+	// 阿里云 WAF 会以 405 HTML 拦掉 Go 默认 UA（实测只换 UA 就恢复）；
+	// OAuth 还必须带官方桌面端指纹，否则浏览器里生成的验证码令牌不被接受。
+	if ua := gotHeaders.Get("User-Agent"); !strings.HasPrefix(ua, "AutoClaw/") || strings.Contains(ua, "Go-http-client") {
+		t.Fatalf("User-Agent = %q, want AutoClaw desktop UA", ua)
+	}
+	if gotHeaders.Get("X-Client-Type") != "pc" || gotHeaders.Get("X-Harness-Type") != "zcode" {
+		t.Fatalf("desktop fingerprint headers missing: %#v", gotHeaders)
 	}
 
 	entry, pollState := oauth.Env.Logins.Poll(response.State)

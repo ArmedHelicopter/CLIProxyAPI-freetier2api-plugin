@@ -116,7 +116,7 @@ func postSigned(ctx context.Context, baseURL, path string, body any, what string
 	if errReq != nil {
 		return nil, fmt.Errorf("build %s request: %w", what, errReq)
 	}
-	ApplyUserAPIHeaders(req, "")
+	ApplyOAuthHeaders(req, "")
 
 	resp, errDo := hostbridge.Client(ctx, 15*time.Second).Do(req)
 	if errDo != nil {
