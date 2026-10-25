@@ -180,6 +180,7 @@ func (v *adapter) fetchQuota(ctx context.Context, cred *Credential) (*pluginapi.
 	applySubscription(snapshot, response)
 	response.Claim = claimStatusOf(snapshot)
 	response.Summary = append(response.Summary, snapshot.metrics...)
+	response.Groups = append(response.Groups, snapshot.groups...)
 	if snapshot.errBalance != nil {
 		return nil, snapshot.errBalance
 	}
@@ -211,17 +212,22 @@ func applySubscription(snapshot planSnapshot, response *pluginapi.QuotaFetchResp
 	}
 }
 
-// balanceMetrics 把 billing/balance 的额度桶转成指标。
+// balanceQuota 把 billing/balance 的额度桶一次遍历折成（指标, 窗口组）。
 //
-// balance 同时给出持有套餐（data.plans）与余量（data.balances），一次请求供两者，
-// 这也是取代废弃 billing/current 的原因。
-func balanceMetrics(body map[string]any) []pluginapi.QuotaMetric {
+// 单遍历同时产出两份：逐桶指标进摘要串，窗口组驱动宿主卡片的进度条；
+// 分两趟各自解析同一响应曾让口径漂移（P1 审查意见）。
+// 同名桶按出现顺序去重计入汇总（上游同模型多条时只计首条，避免重复加总）。
+func balanceQuota(body map[string]any) ([]pluginapi.QuotaMetric, []pluginapi.QuotaGroup) {
 	balances, _ := dataMap(body)["balances"].([]any)
 	if len(balances) == 0 {
-		return nil
+		return nil, nil
 	}
 
+	var totalRemaining, totalTotal, totalUsed float64
+	seen := map[string]bool{}
+	parsed := 0
 	metrics := make([]pluginapi.QuotaMetric, 0, len(balances))
+	group := pluginapi.QuotaGroup{DisplayName: "模型额度"}
 	for _, item := range balances {
 		entry, ok := item.(map[string]any)
 		if !ok {
@@ -231,14 +237,116 @@ func balanceMetrics(body map[string]any) []pluginapi.QuotaMetric {
 		if name == "" {
 			continue
 		}
+		parsed++
+		remaining := floatField(entry, "remaining_units")
+		used := floatField(entry, "used_units")
+		total := floatField(entry, "total_units")
+		if !seen[name] {
+			seen[name] = true
+			totalRemaining += remaining
+			totalTotal += total
+			totalUsed += used
+		}
 		metrics = append(metrics, pluginapi.QuotaMetric{
 			Key:   "remaining_" + sanitizeMetricKey(name),
 			Label: name + " 剩余",
-			Value: floatField(entry, "remaining_units"),
+			Value: remaining,
 			Unit:  "tokens",
 		})
+		if used > 0 {
+			metrics = append(metrics, pluginapi.QuotaMetric{
+				Key:   "used_" + sanitizeMetricKey(name),
+				Label: name + " 已用",
+				Value: used,
+				Unit:  "tokens",
+			})
+		}
+
+		fraction := 0.0
+		if total > 0 {
+			fraction = remaining / total
+			if fraction < 0 {
+				fraction = 0
+			} else if fraction > 1 {
+				fraction = 1
+			}
+		}
+		bucket := pluginapi.QuotaBucket{
+			Window:            name,
+			RemainingFraction: fraction,
+			Description:       fmt.Sprintf("已用 %s / 共 %s tokens", formatTokens(used), formatTokens(total)),
+		}
+		if expires := int64(floatField(entry, "expires_at")); expires > 0 {
+			// ResetTime 的既定语义是「重置时间」，而 one_time 礼包不重置、
+			// 到期即失效——这里按桶粒度放 expires_at 供「失效」参考，
+			// 套餐级的到期展示见 planExpiryGroup（走 Description）。
+			bucket.ResetTime = time.Unix(expires, 0).UTC().Format(time.RFC3339)
+		}
+		group.Buckets = append(group.Buckets, bucket)
 	}
-	return metrics
+	if parsed == 0 {
+		// 全部条目解析失败：不给「剩余 0」的假汇总，交回空指标。
+		return nil, nil
+	}
+	// default 族汇总放最前：账号表的「剩余 / 总额」靠这两个键算比例。
+	summary := []pluginapi.QuotaMetric{
+		{Key: "remaining", Label: "剩余", Value: totalRemaining, Unit: "tokens"},
+	}
+	if totalTotal > 0 {
+		summary = append(summary, pluginapi.QuotaMetric{Key: "total", Label: "总量", Value: totalTotal, Unit: "tokens"})
+	}
+	if totalUsed > 0 {
+		summary = append(summary, pluginapi.QuotaMetric{Key: "used", Label: "已用", Value: totalUsed, Unit: "tokens"})
+	}
+	return append(summary, metrics...), []pluginapi.QuotaGroup{group}
+}
+
+// planExpiryGroup 从仍生效的套餐里取**最近一个到期时刻**作为套餐有效期提示。
+//
+// 口径与 heldPlanIDs 一致（经 activePlans 共用）：空 status 视作 active、
+// active 但已过 ends_at 视作 expired。多套餐并存时取最近的到期——用户
+// 关心的是「下一份什么时候没」，取最晚会把近期到期藏起来。
+// 不占 ResetTime（那是「重置时间」语义，礼包不重置），走 Description。
+func planExpiryGroup(plans []map[string]any, serverTime int64) *pluginapi.QuotaGroup {
+	nearest := int64(0)
+	for _, plan := range activePlans(plans, serverTime) {
+		if ends := int64(floatField(plan, "ends_at")); ends > 0 && (nearest == 0 || ends < nearest) {
+			nearest = ends
+		}
+	}
+	if nearest == 0 {
+		return nil
+	}
+	return &pluginapi.QuotaGroup{DisplayName: "套餐有效期", Buckets: []pluginapi.QuotaBucket{{
+		Window:      "有效期",
+		Description: "套餐到期 " + time.Unix(nearest, 0).UTC().Format(time.RFC3339),
+	}}}
+}
+
+// activePlans 返回仍生效的套餐条目（原样引用，不拷贝）。
+//
+// 判定口径唯一：status 缺失视作 active（上游历史形态），status 非 active
+// 排除；active 但已过 ends_at 同样排除（官方客户端 normalizeStartPlanExpiry
+// 的归一）。heldPlanIDs 与 planExpiryGroup 共用本函数，保证「已持有」
+// 与「有效期」两张视图永远一致。
+func activePlans(plans []map[string]any, serverTime int64) []map[string]any {
+	out := make([]map[string]any, 0, len(plans))
+	for _, entry := range plans {
+		status := strings.ToLower(strings.TrimSpace(core.RawStringField(entry, "status")))
+		if status != "" && status != "active" {
+			continue
+		}
+		if endsAt := floatField(entry, "ends_at"); endsAt > 0 && serverTime > 0 && endsAt <= float64(serverTime) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// formatTokens 把 token 数格式化为整数字符串（小数四舍五入）。
+func formatTokens(value float64) string {
+	return strconv.FormatFloat(value, 'f', 0, 64)
 }
 
 // sanitizeMetricKey 把模型名转成稳定的指标键。
@@ -426,6 +534,8 @@ type planSnapshot struct {
 	plans []map[string]any
 	// metrics 是 balance 换算出的各模型余量。
 	metrics []pluginapi.QuotaMetric
+	// groups 是 balance 换算出的窗口组（宿主卡片渲染进度条与到期时间）。
+	groups []pluginapi.QuotaGroup
 	// errPreview 是 preview 请求的失败原因（balance 失败时 held 为空）。
 	errPreview error
 	// errBalance 是 balance 请求的失败原因；非空时额度结果不完整。
@@ -467,7 +577,10 @@ func (v *adapter) fetchPlanSnapshot(ctx context.Context, cred *Credential) planS
 	default:
 		snapshot.plans = planRows(body)
 		snapshot.held = heldPlanIDs(snapshot.plans, serverSeconds(body))
-		snapshot.metrics = balanceMetrics(body)
+		snapshot.metrics, snapshot.groups = balanceQuota(body)
+		if expiry := planExpiryGroup(snapshot.plans, serverSeconds(body)); expiry != nil {
+			snapshot.groups = append(snapshot.groups, *expiry)
+		}
 	}
 
 	offered, code, errOffered := fetchOfferedPlans(ctx, cred)
@@ -510,20 +623,11 @@ func serverSeconds(body map[string]any) int64 {
 
 // heldPlanIDs 从 balance 的 data.plans 里取账号已持有且生效的套餐 ID。
 //
-// status 非 active（已过期 / 已停用）的不算持有，否则活动下线后按钮会永远灰着。
-// status 缺失时按 active 处理（上游历史形态），但仍受 ends_at 约束。
+// 生效口径见 activePlans（status 缺失视作 active、过 ends_at 视作 expired）：
+// status 非 active 的不算持有，否则活动下线后按钮会永远灰着。
 func heldPlanIDs(plans []map[string]any, serverTime int64) map[string]bool {
 	held := map[string]bool{}
-	for _, entry := range plans {
-		status := strings.ToLower(strings.TrimSpace(core.RawStringField(entry, "status")))
-		if status != "" && status != "active" {
-			continue
-		}
-		// 官方客户端同样把「active 但已过 ends_at」归一成 expired
-		// （zaiStartPlanBilling.ts 的 normalizeStartPlanExpiry）。
-		if endsAt := floatField(entry, "ends_at"); endsAt > 0 && serverTime > 0 && endsAt <= float64(serverTime) {
-			continue
-		}
+	for _, entry := range activePlans(plans, serverTime) {
 		planID := normalizePlanID(core.FirstNonEmpty(
 			core.RawStringField(entry, "plan_id"),
 			core.RawStringField(entry, "planId"),
