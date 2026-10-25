@@ -37,6 +37,11 @@ type PluginConfig struct {
 	// PromptMode 是提示词过滤模式（全局）：passthrough / custom / append。
 	PromptMode string
 
+	// ModelNameTag 是模型名的渠道标识模式（全局）：off / prefix / suffix。
+	// 开启后每个供应商的模型对外 ID 自动带上供应商前缀或后缀（如
+	// zcode-GLM-5.3 / GLM-5.3-zcode），不同渠道同名模型因此可区分。
+	ModelNameTag string
+
 	// Raw 是配置的原始键值表（key → 原文），供供应商解析专属键。
 	Raw map[string]string
 }
@@ -68,10 +73,18 @@ const (
 	PromptModeKey = "prompt_mode"
 	PromptFileKey = "prompt_file"
 
+	// ModelNameTagKey 是模型名渠道标识的全局配置键（off/prefix/suffix）。
+	ModelNameTagKey = "model_name_tag"
+
 	// PromptModePassThrough / PromptModeCustom / PromptModeAppend 是合法模式。
 	PromptModePassThrough = "passthrough"
-	PromptModeCustom      = "custom"
-	PromptModeAppend      = "append"
+
+	// ModelNameTagOff / Prefix / Suffix 是模型名渠道标识的三种模式。
+	ModelNameTagOff    = "off"
+	ModelNameTagPrefix = "prefix"
+	ModelNameTagSuffix = "suffix"
+	PromptModeCustom   = "custom"
+	PromptModeAppend   = "append"
 )
 
 // deprecatedConfigKeys 是改名后的旧配置键：解析时直接归一化到当前键，
@@ -98,6 +111,7 @@ func DefaultPluginConfig() PluginConfig {
 		AutoCheckinAt: DefaultCheckinAt,
 		AutoTasks:     true,
 		PromptMode:    PromptModePassThrough,
+		ModelNameTag:  ModelNameTagOff,
 	}
 }
 
@@ -190,6 +204,12 @@ func applyConfigLine(cfg *PluginConfig, key, value string) error {
 		if mode != "" {
 			cfg.PromptMode = mode
 		}
+	case ModelNameTagKey:
+		tag, errTag := NormalizeModelNameTag(value)
+		if errTag != nil {
+			return errTag
+		}
+		cfg.ModelNameTag = tag
 	}
 	return nil
 }
@@ -206,6 +226,11 @@ func ValidatePluginConfig(cfg PluginConfig) error {
 	case PromptModePassThrough, PromptModeCustom, PromptModeAppend:
 	default:
 		return fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", cfg.PromptMode)
+	}
+	switch cfg.ModelNameTag {
+	case ModelNameTagOff, ModelNameTagPrefix, ModelNameTagSuffix:
+	default:
+		return fmt.Errorf("model_name_tag %q is not supported (want off, prefix or suffix)", cfg.ModelNameTag)
 	}
 	switch cfg.LogLevel {
 	case "debug", "info", "error":
@@ -250,6 +275,30 @@ func ParsePromptMode(raw string) (string, error) {
 		return mode, nil
 	}
 	return "", fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", raw)
+}
+
+// NormalizeModelNameTag 归一化渠道标识模式；空串回落 off。
+func NormalizeModelNameTag(value string) (string, error) {
+	trimmed := strings.ToLower(strings.TrimSpace(value))
+	if trimmed == "" {
+		return ModelNameTagOff, nil
+	}
+	switch trimmed {
+	case ModelNameTagOff, ModelNameTagPrefix, ModelNameTagSuffix:
+		return trimmed, nil
+	}
+	return "", fmt.Errorf("model_name_tag %q is not supported (want off, prefix or suffix)", value)
+}
+
+// EffectiveModelNameTag 返回当前生效的渠道标识模式：页面覆盖 > YAML > 内置默认。
+func EffectiveModelNameTag(cfg PluginConfig, page string) string {
+	if tag := strings.ToLower(strings.TrimSpace(page)); tag != "" {
+		return tag
+	}
+	if cfg.ModelNameTag == "" {
+		return ModelNameTagOff
+	}
+	return cfg.ModelNameTag
 }
 
 // EffectivePromptMode 返回当前生效的提示词过滤模式：页面覆盖 > YAML > 内置默认。

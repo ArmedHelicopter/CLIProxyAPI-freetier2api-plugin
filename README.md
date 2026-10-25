@@ -124,6 +124,7 @@ curl http://localhost:8317/v1/messages \
 | `auto_checkin_at` | string | `10:00` | 每日自动签到执行时间（`HH:MM`） |
 | `auto_tasks` | bool | `true` | 每日自动任务开关 |
 | `prompt_mode` | string | `passthrough` | 提示词防御模式：`passthrough`（透传）/ `custom`（替换）/ `append`（追加） |
+| `model_name_tag` | 模型名渠道标识：`off`（默认）/ `prefix` / `suffix`。开启后各供应商的模型对外 ID 自动带渠道前缀或后缀（如 `zcode-GLM-5.3`），同名模型可按渠道定点选择；标识按供应商统一生成、不区分账号。改动后需宿主重建模型注册表生效（重启或等凭据重载，控制台会提示「待生效」） |
 | `disabled_models` | string / list | 空 | 禁用模型列表（支持 `vendor:model` 或裸名，与控制台勾选合并） |
 | `extra_models` | string | 空 | 额外补充注册的模型名（逗号分隔） |
 | `state_dir` | string | `~/.freetier2api-plugin` | 状态与缓存目录（若存在 `~/.cli-proxy-api` 则默认使用其下 `freetier2api` 子目录） |

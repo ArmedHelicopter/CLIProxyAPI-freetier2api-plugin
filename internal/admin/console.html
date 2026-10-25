@@ -436,6 +436,16 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
           </select>
         </label>
       </div>
+      <div class="row" style="margin-top:8px">
+        <label>模型名渠道标识
+          <select id="setModelNameTag" style="margin-left:8px;padding:3px 6px">
+            <option value="off">关闭（模型名保持原样）</option>
+            <option value="prefix">前缀（如 zcode-GLM-5.3）</option>
+            <option value="suffix">后缀（如 GLM-5.3-zcode）</option>
+          </select>
+        </label>
+        <span class="hint">给各供应商的模型名自动加渠道标识，改后需等模型清单刷新（或重启宿主）生效</span>
+      </div>
       <details class="fold" id="scheduleFold">
         <summary>任务排程</summary>
         <div id="taskSchedule"></div>
@@ -947,6 +957,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       document.getElementById("setAutoTasks").checked = !!settings.auto_tasks;
       var promptSel = document.getElementById("setPromptMode");
       if (promptSel) promptSel.value = settings.prompt_mode || "passthrough";
+      var tagSel = document.getElementById("setModelNameTag");
+      if (tagSel) tagSel.value = settings.model_name_tag || "off";
       renderTaskSchedules(settings);
       var scheduler = status.scheduler || {};
       var labels = {};
@@ -2717,6 +2729,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       auto_checkin_at: document.getElementById("setCheckinAt").value,
       auto_tasks: document.getElementById("setAutoTasks").checked,
       prompt_mode: promptSel ? promptSel.value : "passthrough",
+      model_name_tag: (document.getElementById("setModelNameTag") || {}).value || "off",
       task_schedules: {}
     };
     document.querySelectorAll("#taskSchedule input[data-task-kind]").forEach(function (input) {

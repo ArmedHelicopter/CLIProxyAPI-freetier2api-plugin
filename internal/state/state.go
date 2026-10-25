@@ -62,6 +62,9 @@ type State struct {
 	AutoTasks     *bool  `json:"auto_tasks,omitempty"`
 	// PromptMode 是页面上改过的提示词过滤模式；空表示沿用 YAML 配置。
 	PromptMode string `json:"prompt_mode,omitempty"`
+	// ModelNameTag 是页面上改过的模型名渠道标识模式（off/prefix/suffix）；
+	// 空表示沿用 YAML 配置。
+	ModelNameTag string `json:"model_name_tag,omitempty"`
 
 	// TaskSchedules 是按任务族保存的整点小时列表（0-23）。
 	// 新代码只读写这个字段；下面五个字段仅用于读取旧状态并迁移。

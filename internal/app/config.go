@@ -68,6 +68,7 @@ func (a *App) ApplyConfig(cfg pluginConfig) error {
 		ExtraModels:      cfg.ExtraModels,
 		DisabledModels:   cfg.DisabledModels,
 		ContextWindowFor: core.DefaultContextWindow,
+		ModelNameTag:     admin.EffectiveModelNameTag(cfg, a.SnapshotState().ModelNameTag),
 	})
 	a.models.RefreshFromState()
 	a.configureVendors(cfg)

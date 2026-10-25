@@ -15,6 +15,7 @@ type settingsUpdateRequest struct {
 	AutoCheckinAt string           `json:"auto_checkin_at"`
 	AutoTasks     *bool            `json:"auto_tasks"`
 	PromptMode    *string          `json:"prompt_mode"`
+	ModelNameTag  *string          `json:"model_name_tag"`
 	TaskSchedules map[string][]int `json:"task_schedules"`
 
 	// Deprecated: 兼容旧版页面/脚本的固定字段。
@@ -33,6 +34,10 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 	promptMode, errPrompt := normalizePromptMode(body.PromptMode)
 	if errPrompt != nil {
 		return ErrorResponse(errPrompt)
+	}
+	modelNameTag, errTag := normalizeModelNameTagPointer(body.ModelNameTag)
+	if errTag != nil {
+		return ErrorResponse(errTag)
 	}
 	changed := map[string]any{}
 	s.deps.MutateState(func(current *state.State) {
@@ -54,6 +59,16 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 			// 空串表示撤销页面覆盖，重新由 YAML 配置决定。
 			current.PromptMode = promptMode
 			changed["prompt_mode"] = promptMode
+		}
+		if body.ModelNameTag != nil {
+			if current.ModelNameTag != modelNameTag {
+				// 渠道标识改变对外模型 ID：宿主模型注册表未重建前 /v1/models
+				// 仍是旧名字。置 RestartPending 与手动别名/禁用同语义——
+				// 控制台据此提示「待生效」并触发 syncModelConfig 自愈。
+				current.RestartPending = true
+			}
+			current.ModelNameTag = modelNameTag
+			changed[ModelNameTagKey] = modelNameTag
 		}
 		if current.TaskSchedules == nil {
 			current.TaskSchedules = map[string][]int{}
@@ -106,10 +121,25 @@ func normalizePromptMode(input *string) (string, error) {
 	return mode, nil
 }
 
+// normalizeModelNameTagPointer 归一化页面提交的渠道标识模式。
+// 空串表示撤销页面覆盖，重新由 YAML 配置决定；其余必须落在合法取值内。
+func normalizeModelNameTagPointer(input *string) (string, error) {
+	if input == nil {
+		return "", nil
+	}
+	trimmed := strings.ToLower(strings.TrimSpace(*input))
+	if trimmed == "" {
+		// 空串表示撤销页面覆盖，重新由 YAML 配置决定。
+		return "", nil
+	}
+	return NormalizeModelNameTag(trimmed)
+}
+
 // settingsView 是 /status 的 settings 载荷：任务引擎的可读设置 + 提示词过滤现状。
 func (s *Service) settingsView() map[string]any {
 	settings := s.tasks.EffectiveSettings()
 	settings[PromptModeKey] = EffectivePromptMode(s.deps.Config(), s.deps.State().PromptMode)
+	settings[ModelNameTagKey] = EffectiveModelNameTag(s.deps.Config(), s.deps.State().ModelNameTag)
 	return settings
 }
 
