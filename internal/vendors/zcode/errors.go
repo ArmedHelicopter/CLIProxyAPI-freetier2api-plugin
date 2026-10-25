@@ -77,6 +77,17 @@ func Classify(status int, body string) *core.Failure {
 			Msg:    core.FirstNonEmpty(msg, "凭证失效"),
 		}
 
+	// 3.5) 模型桶耗尽：1005 + "exceed quota limit" 是 model_usage 桶的
+	//      **账号内单模型**额度耗尽（如活动礼包的 GLM-5.3 用完而 Flash 尚有
+	//      余量）。按（账号, 模型）避让而不是整个账号冷却——否则同一账号里
+	//      还有余量的模型会被连坐封掉。
+	case payload.Code == codeDailyQuota && strings.Contains(lower, "exceed quota limit"):
+		return &core.Failure{
+			Kind:   core.FailureKindModelBlocked,
+			Status: pickStatus(status, http.StatusBadRequest),
+			Msg:    core.FirstNonEmpty(msg, "该模型的额度已耗尽"),
+		}
+
 	// 4) 额度耗尽
 	case status == http.StatusPaymentRequired || promptExhausted(lower, payload.Code):
 		return &core.Failure{

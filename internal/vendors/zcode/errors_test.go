@@ -47,3 +47,37 @@ func TestClassify500WrappedPlanConcurrencyLimit(t *testing.T) {
 		t.Fatalf("kind = %v, want SoftRate", failure.Kind)
 	}
 }
+
+// TestClassifyModelBucketExhausted 验证 1005 + "exceed quota limit" 归入
+// 模型级避让（ModelBlocked）而不是账号级冷却（HardCredit）：活动礼包的
+// 单模型桶耗尽时，同账号的其他模型（如 Flash）应继续可用。
+func TestClassifyModelBucketExhausted(t *testing.T) {
+	body := `{"code":1005,"msg":"exceed quota limit","logid":"x"}`
+	failure := Classify(200, body)
+	if failure.Kind != core.FailureKindModelBlocked {
+		t.Fatalf("kind = %v, want ModelBlocked", failure.Kind)
+	}
+	if failure.HTTPStatus() != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", failure.HTTPStatus())
+	}
+}
+
+// TestClassifyAccountLevelQuotaStillHardCredit 验证账号级额度信号仍走
+// HardCredit：402、以及其他措辞的 1005（如领取名额用完）不按模型避让。
+func TestClassifyAccountLevelQuotaStillHardCredit(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		body   string
+	}{
+		{"payment_required", http.StatusPaymentRequired, `{"msg":"no credit"}`},
+		{"code1005_other_wording", 200, `{"code":1005,"msg":"daily claim quota used"}`},
+		{"insufficient_marker", 200, `{"code":7,"msg":"insufficient balance"}`},
+	}
+	for _, testCase := range cases {
+		failure := Classify(testCase.status, testCase.body)
+		if failure.Kind != core.FailureKindHardCredit {
+			t.Fatalf("%s: kind = %v, want HardCredit", testCase.name, failure.Kind)
+		}
+	}
+}
