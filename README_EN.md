@@ -42,8 +42,6 @@ If this project helps you, a Star would mean a lot.
 | `minimaxcodecn` | MiniMax Code CN | `cn` | OAuth Device Flow | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code Global | `global` | OAuth Device Flow | `minimaxcodeglobal-*.json` |
 
-> **New vendors**: `autoclawcn` / `autoclawglobal` (AutoClaw CN/Global) and `raccoon` (SenseTime Raccoon). AutoClaw CN supports console SMS-code login and Global supports Zai / Google OAuth web login (the Aliyun captcha runs in the console page, then paste the localhost callback link; or paste `accessToken`/`refreshToken` JSON directly); Raccoon supports web authorize login from the console (official authorize page + callback link paste). See [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md) for protocol details and configuration keys.
-
 ## Quick Start
 
 ### Option 1: Install via CPA Plugin Store (Recommended)
@@ -130,6 +128,31 @@ Configure under `plugins.configs.freetier2api` in `config.yaml` (runtime setting
 | `extra_models` | string | empty | Additional model IDs to register (comma-separated) |
 | `state_dir` | string | `~/.freetier2api-plugin` | State and cache directory |
 | `log_level` | string | `info` | Log level: `debug` / `info` / `error` |
+
+## Project Architecture
+
+```text
+package main / cgo        C ABI entry (main.go / cgo.go)
+  └─ internal/app         composition root and ABI adapter
+       ├─ internal/admin    management HTTP API + config + model catalog + console
+       ├─ internal/tasks    vendor-neutral task catalog/scheduler/queue/engine
+       ├─ internal/auth     account enumeration/batch/quota formatting + login sessions
+       ├─ internal/vendors/<name>   provider protocol and adapter layer (single package, closed filename whitelist)
+       │    ├─ adapter.go           [required] core.Vendor implementation + Instances/Configure/Match + ConfigFields
+       │    ├─ chat.go              [required] protocol endpoints, signing/headers, payload transforms, Chat/ChatStream, SSE
+       │    ├─ credential.go        [required] credential parsing/ownership/storage, device identity, helpers
+       │    ├─ models.go            [required] model catalog/probing + bundledModels() fallback
+       │    ├─ errors.go            [required] upstream error classification and retryability
+       │    ├─ login.go             [required] AuthMode + login flows + refresh (exactly one)
+       │    ├─ tasks.go             [optional] quota/check-in/plans/tasks/daily rewards/account profile
+       │    ├─ *_test.go            [as needed] beside the source; live tests use *_live_test.go
+       │    └─ assets/              [as needed] go:embed resources
+       └─ internal/core            vendor-neutral contracts
+```
+
+- Vendor packages may depend only on `core` + `hostbridge` + `logger`.
+- `internal/core` depends only on the standard library; only `internal/app/vendors.go` may import concrete vendors.
+- Every new internal package must declare its layer boundary (`layerRules` / `internalPackages`).
 
 ## Acknowledgments & Third-Party Notices
 

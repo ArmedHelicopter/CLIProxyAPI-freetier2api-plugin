@@ -2,15 +2,19 @@ package autoclaw
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 func TestNormalizePhone(t *testing.T) {
@@ -51,10 +55,10 @@ func TestNormalizeSMSCode(t *testing.T) {
 
 func TestDescribeSMSLoginError(t *testing.T) {
 	// 400001 是参数错误而不是「验证码不正确」——混为一谈会把排查方向带偏。
-	if got := describeSMSLoginError(400001, "请求数据有问题"); !strings.Contains(got, "参数") {
+	if got := describeLoginError(loginFlowSMS, 400001, "请求数据有问题"); !strings.Contains(got, "参数") {
 		t.Fatalf("400001 message = %q", got)
 	}
-	if got := describeSMSLoginError(630202, ""); !strings.Contains(got, "验证码不正确") {
+	if got := describeLoginError(loginFlowSMS, 630202, ""); !strings.Contains(got, "验证码不正确") {
 		t.Fatalf("630202 message = %q", got)
 	}
 }
@@ -353,3 +357,108 @@ func TestSubmitCallbackExchangesCodeWithSessionNavigateURI(t *testing.T) {
 		t.Fatalf("session should be consumed after success, state = %v", pollState)
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 登录测试辅助：loopback 宿主与会话表
+// ---------------------------------------------------------------------------
+
+// 本文件给登录链路的 HTTP 单测提供 loopback 桩：hostbridge.Client 默认经宿主
+// 出站，测试里换成直连 httptest 的转发器（与 codearts 包的 useLoopbackHost 同款）。
+//
+// 请求/响应都用 map 解析，避免在测试代码里再抄一份宿主的 JSON 字段名；
+// 字段口径见 internal/hostbridge/http.go 的 rpcHostHTTPRequest/Response。
+
+func useLoopbackHost(t *testing.T) {
+	t.Helper()
+	hostbridge.Configure(func(callbackID, method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return nil, nil
+		}
+		rawPayload, errMarshal := json.Marshal(payload)
+		if errMarshal != nil {
+			return nil, errMarshal
+		}
+		var req map[string]any
+		if errDecode := json.Unmarshal(rawPayload, &req); errDecode != nil {
+			return nil, errDecode
+		}
+		methodText, _ := req["method"].(string)
+		urlText, _ := req["url"].(string)
+		var bodyReader io.Reader
+		if encoded, okEncoded := req["body"].(string); okEncoded && encoded != "" {
+			body, errBody := base64.StdEncoding.DecodeString(encoded)
+			if errBody != nil {
+				return nil, errBody
+			}
+			bodyReader = strings.NewReader(string(body))
+		}
+		httpReq, errNew := http.NewRequest(methodText, urlText, bodyReader)
+		if errNew != nil {
+			return nil, errNew
+		}
+		if rawHeaders, okHeaders := req["headers"].(map[string]any); okHeaders {
+			for key, rawValues := range rawHeaders {
+				values, _ := rawValues.([]any)
+				for _, rawValue := range values {
+					if value, okValue := rawValue.(string); okValue {
+						httpReq.Header.Add(key, value)
+					}
+				}
+			}
+		}
+		resp, errDo := http.DefaultClient.Do(httpReq)
+		if errDo != nil {
+			return nil, errDo
+		}
+		defer func() { _ = resp.Body.Close() }()
+		body, errRead := io.ReadAll(resp.Body)
+		if errRead != nil {
+			return nil, errRead
+		}
+		wrapped, errWrap := json.Marshal(map[string]any{
+			"status_code": resp.StatusCode,
+			"headers":     resp.Header,
+			"body":        body,
+		})
+		if errWrap != nil {
+			return nil, errWrap
+		}
+		return wrapped, nil
+	})
+}
+
+// stubLoginSessions 是 core.LoginSessions 的内存实现（单测用）。
+type stubLoginSessions struct {
+	sessions map[string]*core.LoginSession
+}
+
+func newStubLoginSessions() *stubLoginSessions {
+	return &stubLoginSessions{sessions: map[string]*core.LoginSession{}}
+}
+
+func (s *stubLoginSessions) Register(vendorID, sessionID string, ttl, interval time.Duration, data any) {
+	s.sessions[sessionID] = &core.LoginSession{VendorID: vendorID, Data: data}
+}
+
+func (s *stubLoginSessions) Poll(sessionID string) (*core.LoginSession, core.PollState) {
+	session, ok := s.sessions[sessionID]
+	if !ok {
+		return nil, core.PollMissing
+	}
+	return session, core.PollReady
+}
+
+func (s *stubLoginSessions) Owns(sessionID string) (string, bool) {
+	session, ok := s.sessions[sessionID]
+	if !ok {
+		return "", false
+	}
+	return session.VendorID, true
+}
+
+func (s *stubLoginSessions) Delete(sessionID string) { delete(s.sessions, sessionID) }
+
+// envWithLogins 返回带会话表的 Env（登录链路单测用）。
+func envWithLogins() core.Env { return core.Env{Logins: newStubLoginSessions()} }
+
+var _ = testing.Short

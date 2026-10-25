@@ -42,8 +42,6 @@
 | `minimaxcodecn` | MiniMax Code 国内版 | `cn` | OAuth 设备授权 | `minimaxcodecn-*.json` |
 | `minimaxcodeglobal` | MiniMax Code 国际版 | `global` | OAuth 设备授权 | `minimaxcodeglobal-*.json` |
 
-> **新供应商**：`autoclawcn` / `autoclawglobal`（AutoClaw 国内版/国际版）与 `raccoon`（小浣熊）。AutoClaw 国内版支持控制台手机验证码登录、国际版支持 Zai / Google OAuth 网页登录（控制台页面内完成阿里云人机验证，登录后粘贴 localhost 回调链接；也可直接粘贴 `accessToken`/`refreshToken` JSON）；小浣熊支持控制台网页授权登录（官方授权页 + 回调链接粘贴）。协议细节与配置项见 [docs/vendor-autoclaw-raccoon.md](docs/vendor-autoclaw-raccoon.md)。
-
 ## 快速开始
 
 ### 方式一：通过 CPA 插件商店安装（推荐）
@@ -130,6 +128,31 @@ curl http://localhost:8317/v1/messages \
 | `extra_models` | string | 空 | 额外补充注册的模型名（逗号分隔） |
 | `state_dir` | string | `~/.freetier2api-plugin` | 状态与缓存目录（若存在 `~/.cli-proxy-api` 则默认使用其下 `freetier2api` 子目录） |
 | `log_level` | string | `info` | 日志级别：`debug` / `info` / `error` |
+
+## 项目架构
+
+```text
+package main / cgo        C ABI 入口（main.go / cgo.go）
+  └─ internal/app         组合根与 ABI 适配（生命周期、RPC 分发、五类能力）
+       ├─ internal/admin    管理接口：HTTP 路由/响应 + 全局配置 + 模型目录 + 控制台页
+       ├─ internal/tasks    供应商无关的任务目录、排程、队列与执行引擎
+       ├─ internal/auth     账号枚举/去重/批量执行/额度格式化 + 登录会话登记
+       ├─ internal/vendors/<name>   供应商协议与适配层（单包，文件名封闭白名单）
+       │    ├─ adapter.go           [必备] core.Vendor 实现 + Instances/Configure/Match + ConfigFields
+       │    ├─ chat.go              [必备] 协议端点/签名/请求头/载荷加工/传输/Chat/ChatStream/SSE
+       │    ├─ credential.go        [必备] 凭证解析/归属判定/存储写回/设备身份/凭证辅助
+       │    ├─ models.go            [必备] 模型目录/探测 + bundledModels() 兜底
+       │    ├─ errors.go            [必备] 上游错误分类与可重试判定
+       │    ├─ login.go             [必备] AuthMode + 登录流程 + 续期（只能有一个）
+       │    ├─ tasks.go             [可选] 额度/签到/套餐领取/任务/每日奖励/账号资料
+       │    ├─ *_test.go            [按需] 与源码同目录；实况测试用 *_live_test.go
+       │    └─ assets/              [按需] go:embed 的内嵌资源
+       └─ internal/core            供应商无关契约（Vendor、能力接口、注册表、凭证、错误分类）
+```
+
+- 供应商包只允许依赖 `core`（契约）+ `hostbridge`（宿主通信）+ `logger`（日志），多一个都不行。
+- `internal/core` 只依赖标准库；`internal/app` 是最上层，且只有 `internal/app/vendors.go` 可以 import 具体供应商。
+- 新增内部包必须显式声明分层边界（`layerRules` / `internalPackages`）。
 
 ## 致谢与第三方说明
 

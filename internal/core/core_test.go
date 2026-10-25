@@ -151,6 +151,40 @@ func (v *noFileIDVendor) ExecuteStream(context.Context, *Credential, *ExecuteReq
 	return nil
 }
 
+func TestMaskToken(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"short", "*****"},
+		{"12345678", "********"},
+		{"1234567890abcdef", "1234********cdef"},
+	}
+	for _, tc := range cases {
+		if got := MaskToken(tc.in); got != tc.want {
+			t.Fatalf("MaskToken(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestJWTHelpers(t *testing.T) {
+	// eyJ… payload = {"exp":1791529021,"user_id":"7591340"}
+	token := "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3OTE1MjkwMjEsInVzZXJfaWQiOiI3NTkxMzQwIn0.sig"
+	if got := JWTExpiry(token); got != 1791529021 {
+		t.Fatalf("JWTExpiry = %d", got)
+	}
+	if got := JWTUserID(token); got != "7591340" {
+		t.Fatalf("JWTUserID = %q", got)
+	}
+	if got := JWTExpiry("not-a-jwt"); got != 0 {
+		t.Fatalf("JWTExpiry(garbage) = %d", got)
+	}
+	if got := JWTUserID("not-a-jwt"); got != "" {
+		t.Fatalf("JWTUserID(garbage) = %q", got)
+	}
+}
+
 func TestJSONHelpers(t *testing.T) {
 	payload := map[string]any{
 		"a":          "  x  ",

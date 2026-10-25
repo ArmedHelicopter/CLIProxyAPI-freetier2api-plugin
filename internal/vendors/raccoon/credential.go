@@ -1,6 +1,6 @@
 package raccoon
 
-// 本文件实现小浣熊凭证的解析与归属判定。
+// 本文件实现小浣熊凭证的解析、归属判定、脱敏与写回合并。
 //
 // 凭证形态（与 Agent2API / Agent2API 的账号文件对齐）：
 //
@@ -17,7 +17,6 @@ package raccoon
 // 新票必须写回。expires_at 是毫秒时间戳（0 = 未知，靠 401 触发续期）。
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,48 +78,12 @@ func ParseCredential(raw []byte) (*Credential, error) {
 	cred.UID = getStr("uid", "user_id", "userId")
 	if cred.ExpiresAt = core.GetUnixSeconds(payload, "expires_at", "expiresAt"); cred.ExpiresAt == 0 {
 		// 响应里可能只有 JWT：从 claims 读 exp 兜底。
-		cred.ExpiresAt = jwtExpiry(cred.AccessToken)
+		cred.ExpiresAt = core.JWTExpiry(cred.AccessToken)
 	}
 	if strings.TrimSpace(cred.AccessToken) == "" && strings.TrimSpace(cred.RefreshToken) == "" {
 		return nil, ErrMissingToken
 	}
 	return cred, nil
-}
-
-// jwtExpiry 解码 JWT payload 的 exp（秒），解不出返回 0。不验签，只读 exp。
-func jwtExpiry(token string) int64 {
-	parts := strings.Split(strings.TrimSpace(token), ".")
-	if len(parts) < 2 {
-		return 0
-	}
-	payload, errDecode := base64.RawURLEncoding.DecodeString(parts[1])
-	if errDecode != nil {
-		return 0
-	}
-	var claims struct {
-		Exp int64 `json:"exp"`
-	}
-	if errUnmarshal := json.Unmarshal(payload, &claims); errUnmarshal != nil || claims.Exp <= 0 {
-		return 0
-	}
-	return claims.Exp
-}
-
-// jwtUserID 解码 JWT payload 里的用户 id（依次尝试常见键），解不出返回空。
-func jwtUserID(token string) string {
-	parts := strings.Split(strings.TrimSpace(token), ".")
-	if len(parts) < 2 {
-		return ""
-	}
-	payload, errDecode := base64.RawURLEncoding.DecodeString(parts[1])
-	if errDecode != nil {
-		return ""
-	}
-	var claims map[string]any
-	if errUnmarshal := json.Unmarshal(payload, &claims); errUnmarshal != nil {
-		return ""
-	}
-	return core.GetString(claims, "user_id", "userId", "uid", "userID")
 }
 
 // LooksLikeCredential 判断一份 JSON 是否属于小浣熊。
@@ -273,7 +236,7 @@ func (c *Credential) UIDOrTokenID() string {
 	if uid := c.UIDValue(); uid != "" {
 		return uid
 	}
-	return jwtUserID(c.AccessTokenValue())
+	return core.JWTUserID(c.AccessTokenValue())
 }
 
 // StorageJSON 把凭证序列化成落盘 JSON（vendor 字段冗余声明归属）。
@@ -296,4 +259,20 @@ func (c *Credential) StorageJSON() ([]byte, error) {
 		payload["nickname"] = c.Nickname
 	}
 	return json.MarshalIndent(payload, "", "  ")
+}
+
+// ---------------------------------------------------------------------------
+// 凭证写回合并
+// ---------------------------------------------------------------------------
+
+// 复用 core.MergeCredentialJSON 骨架：只覆盖 token 相关字段，
+// 用户手工维护的 note / disabled 等字段原样保留。
+
+// MergeCredentialJSON 把续期后的令牌合并回原凭证 JSON。
+func MergeCredentialJSON(original []byte, cred *Credential) ([]byte, error) {
+	return core.MergeCredentialJSON(original, cred.StorageJSON, func(target map[string]any) {
+		target["access_token"] = cred.AccessTokenValue()
+		target["refresh_token"] = cred.RefreshTokenValue()
+		target["expires_at"] = cred.ExpiresAtValue() * 1000
+	})
 }

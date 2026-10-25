@@ -81,7 +81,7 @@ func newInstance(env core.Env, region Region) core.Vendor {
 			}
 			return core.CredentialSeed{
 				VendorID: VendorIDFor(region), Region: string(region),
-				Label:  core.FirstNonEmpty(native.UserNameValue(), native.UIDValue(), MaskedKey(native.AccessTokenValue())),
+				Label:  core.FirstNonEmpty(native.UserNameValue(), native.UIDValue(), core.MaskToken(native.AccessTokenValue())),
 				FileID: core.FileIDFromFileName(fileName), UID: native.UIDValue(),
 				Token: native.AccessTokenValue(), RefreshToken: native.RefreshTokenValue(),
 				ExpiresAt: native.ExpiresAtValue(), AuthMode: "oauth",

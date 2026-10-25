@@ -13,6 +13,7 @@ package raccoon
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -72,18 +73,22 @@ func Classify(status int, body string) *core.Failure {
 	}
 }
 
-// ClassifyBusiness 按 HTTP 2xx 包体里的业务码分类（code != 0）。
+// ClassifyBusiness 按 HTTP 2xx/4xx 包体里的业务码分类（code != 0）。
 func ClassifyBusiness(status int, code int64, message string) *core.Failure {
 	kind := core.FailureKindClient
 	switch {
 	case code == quotaBusinessCode:
 		kind = core.FailureKindHardCredit
-	case strings.Contains(message, "失效") || strings.Contains(message, "重新登录"):
+	case strings.Contains(message, "失效") || strings.Contains(message, "重新登录") || strings.Contains(message, "not_found"):
 		kind = core.FailureKindSessionDead
+	}
+	msg := strings.TrimSpace(message)
+	if msg == "" {
+		msg = fmt.Sprintf("上游业务错误（code=%d）", code)
 	}
 	return &core.Failure{
 		Status: status,
-		Msg:    core.Truncate(message, 300),
+		Msg:    core.Truncate(msg, 300),
 		Kind:   kind,
 	}
 }

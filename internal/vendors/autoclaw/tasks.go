@@ -1,6 +1,6 @@
 package autoclaw
 
-// 本文件实现 AutoClaw 的每日签到（POST {base}/autoclaw-proxy/proxy/autoclaw-task-complete）。
+// 本文件实现 AutoClaw 的账号运营能力（当前为每日签到；POST {base}/autoclaw-proxy/proxy/autoclaw-task-complete）。
 //
 // 协议依据 Agent2API check.py：body {"task_id":"daily_signin"}，业务信封
 // code=0 成功；data.already_completed=true 表示今日已签（幂等），

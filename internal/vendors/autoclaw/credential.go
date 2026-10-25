@@ -1,6 +1,6 @@
 package autoclaw
 
-// 本文件实现 AutoClaw 凭证的解析与归属判定。
+// 本文件实现 AutoClaw 凭证的解析、归属判定、脱敏与写回合并。
 //
 // 凭证形态（与 Agent2API 的 auths/autoclaw-*.json 对齐）：
 //
@@ -14,8 +14,7 @@ package autoclaw
 //	  "region": "cn"
 //	}
 //
-// 登录是手机验证码 / OAuth（国内短信、海外 OAuth），本插件不实现登录流程，
-// 凭证由用户从 Agent2API 或抓包获取后手工添加；refresh_token 支持自动续期。
+// 登录凭证由 login.go 的短信 / OAuth 链路生成；refresh_token 支持自动续期。
 
 import (
 	"encoding/json"
@@ -361,4 +360,20 @@ func (c *Credential) StorageJSON() ([]byte, error) {
 		payload["sandboxEndpoint"] = c.SandboxEndpoint
 	}
 	return json.MarshalIndent(payload, "", "  ")
+}
+
+// ---------------------------------------------------------------------------
+// 凭证写回合并
+// ---------------------------------------------------------------------------
+
+// 复用 core.MergeCredentialJSON 骨架：只覆盖 token 相关字段，
+// 用户手工维护的 note / disabled 等字段原样保留。
+
+// MergeCredentialJSON 把刷新后的令牌合并回原凭证 JSON。
+func MergeCredentialJSON(original []byte, cred *Credential) ([]byte, error) {
+	return core.MergeCredentialJSON(original, cred.StorageJSON, func(target map[string]any) {
+		target["accessToken"] = cred.AccessTokenValue()
+		target["refreshToken"] = cred.RefreshTokenValue()
+		target["expiresAt"] = cred.ExpiresAtValue()
+	})
 }

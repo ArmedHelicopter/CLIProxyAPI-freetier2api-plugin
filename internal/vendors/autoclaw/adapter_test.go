@@ -1,6 +1,7 @@
 package autoclaw
 
 import (
+	"encoding/json"
 	"net/http"
 	"strings"
 	"testing"
@@ -98,7 +99,7 @@ func TestLooksLikeCredentialStrict(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var payload map[string]any
-			_ = jsonUnmarshalHelper(tc.raw, &payload)
+			_ = json.Unmarshal([]byte(tc.raw), &payload)
 			if got := LooksLikeCredential(payload, tc.fileName, ""); got != tc.want {
 				t.Fatalf("LooksLikeCredential(%q, %q) = %v, want %v", tc.fileName, tc.raw, got, tc.want)
 			}
@@ -178,14 +179,4 @@ func TestClassifyByCodeAndText(t *testing.T) {
 		t.Fatalf("401 kind = %q", f.Kind)
 	}
 	var _ = http.StatusOK
-}
-
-func TestMaskedKey(t *testing.T) {
-	got := MaskedKey("tok-abcdefghijk")
-	if !strings.HasPrefix(got, "tok-") || !strings.HasSuffix(got, "hijk") || strings.Contains(got, "abcdefg") {
-		t.Fatalf("MaskedKey = %q", got)
-	}
-	if got := MaskedKey("short"); got != "*****" {
-		t.Fatalf("MaskedKey short = %q", got)
-	}
 }

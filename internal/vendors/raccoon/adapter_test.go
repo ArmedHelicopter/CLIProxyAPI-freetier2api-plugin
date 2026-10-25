@@ -1,6 +1,7 @@
 package raccoon
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -39,20 +40,6 @@ func TestParseCredential(t *testing.T) {
 	}
 }
 
-func TestJWTExpiry(t *testing.T) {
-	// eyJ… payload = {"exp":1791529021,"user_id":"7591340"}
-	token := "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3OTE1MjkwMjEsInVzZXJfaWQiOiI3NTkxMzQwIn0.sig"
-	if got := jwtExpiry(token); got != 1791529021 {
-		t.Fatalf("jwtExpiry = %d", got)
-	}
-	if got := jwtUserID(token); got != "7591340" {
-		t.Fatalf("jwtUserID = %q", got)
-	}
-	if got := jwtExpiry("not-a-jwt"); got != 0 {
-		t.Fatalf("jwtExpiry(garbage) = %d", got)
-	}
-}
-
 func TestLooksLikeCredentialStrict(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -74,7 +61,7 @@ func TestLooksLikeCredentialStrict(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			var payload map[string]any
-			_ = jsonUnmarshalHelper(tc.raw, &payload)
+			_ = json.Unmarshal([]byte(tc.raw), &payload)
 			if got := LooksLikeCredential(payload, tc.fileName, ""); got != tc.want {
 				t.Fatalf("LooksLikeCredential(%q, %q) = %v, want %v", tc.fileName, tc.raw, got, tc.want)
 			}
@@ -154,9 +141,9 @@ func TestParseCallbackCode(t *testing.T) {
 }
 
 func TestAuthorizeURL(t *testing.T) {
-	got := AuthorizeURL("https://x.test", "办公小浣熊客户端", "st")
+	got := AuthorizeURLWith("https://x.test", "办公小浣熊客户端", "st")
 	if !strings.HasPrefix(got, "https://x.test/code/authorize?") || !strings.Contains(got, "state=st") {
-		t.Fatalf("AuthorizeURL = %q", got)
+		t.Fatalf("AuthorizeURLWith = %q", got)
 	}
 }
 
@@ -176,12 +163,5 @@ func TestClassifyByStatusAndText(t *testing.T) {
 	}
 	if f := ClassifyBusiness(200, 14018, "额度不足"); f.Kind != core.FailureKindHardCredit {
 		t.Fatalf("14018 kind = %q", f.Kind)
-	}
-}
-
-func TestMaskedKey(t *testing.T) {
-	got := MaskedKey("eyJ-abcdefghijk")
-	if !strings.HasPrefix(got, "eyJ-") || !strings.HasSuffix(got, "hijk") {
-		t.Fatalf("MaskedKey = %q", got)
 	}
 }

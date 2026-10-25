@@ -55,7 +55,7 @@ func Instances(env core.Env) []core.Vendor {
 			uid := native.UIDOrTokenID()
 			return core.CredentialSeed{
 				VendorID: VendorID,
-				Label:    core.FirstNonEmpty(native.NicknameValue(), uid, MaskedKey(native.AccessTokenValue())),
+				Label:    core.FirstNonEmpty(native.NicknameValue(), uid, core.MaskToken(native.AccessTokenValue())),
 				FileID:   core.FileIDFromFileName(fileName), UID: uid,
 				Token: native.AccessTokenValue(), RefreshToken: native.RefreshTokenValue(),
 				ExpiresAt: native.ExpiresAtValue(), AuthMode: "oauth",
@@ -68,7 +68,7 @@ func Instances(env core.Env) []core.Vendor {
 				return core.NativeRefresh[*Credential]{}, errRefresh
 			}
 			if expiresAt == 0 {
-				expiresAt = jwtExpiry(access)
+				expiresAt = core.JWTExpiry(access)
 			}
 			native.ApplyTokens(access, refresh, expiresAt)
 			native.ApplyIdentity(uid, "")
@@ -312,7 +312,7 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	}
 	credential := &Credential{AccessToken: access, RefreshToken: refresh, ExpiresAt: expiresAt}
 	if expiresAt == 0 {
-		credential.ExpiresAt = jwtExpiry(access)
+		credential.ExpiresAt = core.JWTExpiry(access)
 	}
 	if uid != "" {
 		credential.ApplyIdentity(uid, "")
@@ -340,7 +340,7 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 	}, nil
 }
 
-// MergeCredentialJSON 实现存储合并（见 merge.go）。
+// MergeCredentialJSON 实现存储合并（见 credential.go）。
 
 // ---- 内部工具 ----
 

@@ -1,6 +1,6 @@
 package raccoon
 
-// 本文件实现小浣熊的凭证续期、额度查询、每日签到与登录换票。
+// 本文件实现小浣熊的凭证续期、额度查询、每日签到与账号资料。
 //
 // 端点口径（Agent2API 抓包实测）：
 //   - 续期：POST {auth_base}/refresh body {"refresh_token":…}，响应可能
@@ -8,9 +8,7 @@ package raccoon
 //   - 积分：GET {points_base}/balance（available_points 及各来源分类）；
 //   - 签到：每日发放由服务端 00:00 自动入账；客户端侧的登录领取走
 //     POST {origin}/api/web/desktop/v1/login/points/grant（幂等，已领回
-//     granted:false）；
-//   - 登录：授权码换票 POST {auth_base}/login_with_authorization_code
-//     body {"authorization_code":…}；业务码 200035 = 授权码已失效。
+//     granted:false）。
 
 import (
 	"context"
@@ -19,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -30,12 +27,34 @@ import (
 // apiHTTPTimeout 是 JSON API 请求的上限。
 const apiHTTPTimeout = 30 * time.Second
 
-// ErrCodeExpired 是「授权码已失效」的上游业务码（200035）：不是登录服务
-// 坏了，是用户把回调链接放太久或重复点击，文案必须提示重新发起。
-const ErrCodeExpired = 200035
-
 // ErrCheckinNotGranted 表示登录领取时上游返回 granted:false（今日已发放）。
 var ErrCheckinNotGranted = errors.New("今日积分已发放（幂等命中）")
+
+// decodeAPIData 解析小浣熊统一的 {code,message,data} 信封，并把业务码映射成 core.Failure。
+func decodeAPIData[T any](status int, raw []byte, what string) (T, error) {
+	var zero T
+	var envelope struct {
+		Code    *int64          `json:"code"`
+		Message string          `json:"message"`
+		Msg     string          `json:"msg"`
+		Details string          `json:"details"`
+		Data    json.RawMessage `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		return zero, Classify(status, string(raw))
+	}
+	errMsg := core.FirstNonEmpty(envelope.Message, envelope.Msg, envelope.Details)
+	if envelope.Code != nil && *envelope.Code != 0 {
+		return zero, ClassifyBusiness(status, *envelope.Code, errMsg)
+	}
+	if len(envelope.Data) == 0 || string(envelope.Data) == "null" {
+		return zero, nil
+	}
+	if errUnmarshal := json.Unmarshal(envelope.Data, &zero); errUnmarshal != nil {
+		return zero, fmt.Errorf("parse %s data: %w", what, errUnmarshal)
+	}
+	return zero, nil
+}
 
 // RefreshToken 用 refresh token 换新票（POST {auth_base}/refresh）。
 //
@@ -75,28 +94,15 @@ func RefreshToken(ctx context.Context, authBase string, cred *Credential) (acces
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", "", 0, "", Classify(resp.StatusCode, string(raw))
 	}
-	var envelope struct {
-		Code    *int64          `json:"code"`
-		Message string          `json:"message"`
-		Data    json.RawMessage `json:"data"`
-	}
-	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
-		return "", "", 0, "", Classify(resp.StatusCode, string(raw))
-	}
-	if envelope.Code != nil && *envelope.Code != 0 {
-		return "", "", 0, "", ClassifyBusiness(resp.StatusCode, *envelope.Code, envelope.Message)
-	}
-	var data struct {
+	data, errDecode := decodeAPIData[struct {
 		AccessToken  string `json:"access_token"`
 		RefreshToken string `json:"refresh_token"`
 		ExpiresAt    any    `json:"expires_at"`
 		UserID       string `json:"user_id"`
 		UID          string `json:"uid"`
-	}
-	if len(envelope.Data) > 0 && string(envelope.Data) != "null" {
-		if errUnmarshal := json.Unmarshal(envelope.Data, &data); errUnmarshal != nil {
-			return "", "", 0, "", fmt.Errorf("parse refresh data: %w", errUnmarshal)
-		}
+	}](resp.StatusCode, raw, "refresh")
+	if errDecode != nil {
+		return "", "", 0, "", errDecode
 	}
 	if strings.TrimSpace(data.AccessToken) == "" {
 		return "", "", 0, "", &core.Failure{Status: resp.StatusCode, Msg: "小浣熊续期响应缺少令牌，旧凭证未被覆盖", Kind: core.FailureKindServer}
@@ -134,20 +140,13 @@ func FetchBalance(ctx context.Context, pointsBase string, cred *Credential) (ava
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return 0, Classify(resp.StatusCode, string(raw))
 	}
-	var envelope struct {
-		Code    *int64 `json:"code"`
-		Message string `json:"message"`
-		Data    struct {
-			AvailablePoints any `json:"available_points"`
-		} `json:"data"`
+	data, errDecode := decodeAPIData[struct {
+		AvailablePoints any `json:"available_points"`
+	}](resp.StatusCode, raw, "balance")
+	if errDecode != nil {
+		return 0, errDecode
 	}
-	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
-		return 0, Classify(resp.StatusCode, string(raw))
-	}
-	if envelope.Code != nil && *envelope.Code != 0 {
-		return 0, ClassifyBusiness(resp.StatusCode, *envelope.Code, envelope.Message)
-	}
-	return int64(core.IntFromAny(envelope.Data.AvailablePoints)), nil
+	return int64(core.IntFromAny(data.AvailablePoints)), nil
 }
 
 // ClaimDailyGrant 触发登录领取积分（POST {origin}/api/web/desktop/v1/login/points/grant）。
@@ -179,92 +178,16 @@ func ClaimDailyGrant(ctx context.Context, origin string, cred *Credential) (gran
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return false, Classify(resp.StatusCode, string(raw))
 	}
-	var envelope struct {
-		Code    *int64 `json:"code"`
-		Message string `json:"message"`
-		Data    struct {
-			Granted bool `json:"granted"`
-		} `json:"data"`
+	data, errDecode := decodeAPIData[struct {
+		Granted bool `json:"granted"`
+	}](resp.StatusCode, raw, "grant")
+	if errDecode != nil {
+		return false, errDecode
 	}
-	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
-		return false, Classify(resp.StatusCode, string(raw))
-	}
-	if envelope.Code != nil && *envelope.Code != 0 {
-		return false, ClassifyBusiness(resp.StatusCode, *envelope.Code, envelope.Message)
-	}
-	if !envelope.Data.Granted {
+	if !data.Granted {
 		return false, ErrCheckinNotGranted
 	}
 	return true, nil
-}
-
-// ExchangeAuthorizationCode 用一次性授权码换凭证
-// （POST {auth_base}/login_with_authorization_code）。
-func ExchangeAuthorizationCode(ctx context.Context, authBase, code string) (access, refresh string, expiresAt int64, uid string, err error) {
-	if strings.TrimSpace(authBase) == "" {
-		return "", "", 0, "", fmt.Errorf("upstream auth base URL is not configured")
-	}
-	body, errMarshal := json.Marshal(map[string]string{"authorization_code": code})
-	if errMarshal != nil {
-		return "", "", 0, "", fmt.Errorf("marshal exchange request: %w", errMarshal)
-	}
-	req, errReq := http.NewRequestWithContext(ctx, http.MethodPost, authBase+LoginCodePath, strings.NewReader(string(body)))
-	if errReq != nil {
-		return "", "", 0, "", fmt.Errorf("build exchange request: %w", errReq)
-	}
-	ApplyAPIHeaders(req, "")
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, errDo := hostbridge.Client(ctx, apiHTTPTimeout).Do(req)
-	if errDo != nil {
-		return "", "", 0, "", &core.Failure{Msg: "exchange: " + errDo.Error(), Kind: core.FailureKindTransient}
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
-	if errRead != nil {
-		return "", "", 0, "", &core.Failure{Status: resp.StatusCode, Msg: "read exchange response: " + errRead.Error(), Kind: core.FailureKindTransient}
-	}
-	var envelope struct {
-		Code    *int64          `json:"code"`
-		Message string          `json:"message"`
-		Data    json.RawMessage `json:"data"`
-	}
-	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
-		return "", "", 0, "", Classify(resp.StatusCode, string(raw))
-	}
-	if envelope.Code != nil {
-		if *envelope.Code == ErrCodeExpired {
-			return "", "", 0, "", &core.Failure{Msg: "授权码已失效，请重新发起登录", Kind: core.FailureKindClient}
-		}
-		if *envelope.Code != 0 {
-			return "", "", 0, "", ClassifyBusiness(resp.StatusCode, *envelope.Code, envelope.Message)
-		}
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return "", "", 0, "", Classify(resp.StatusCode, string(raw))
-	}
-	var data struct {
-		AccessToken  string `json:"access_token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresAt    any    `json:"expires_at"`
-		UserID       string `json:"user_id"`
-	}
-	if len(envelope.Data) > 0 && string(envelope.Data) != "null" {
-		if errUnmarshal := json.Unmarshal(envelope.Data, &data); errUnmarshal != nil {
-			return "", "", 0, "", fmt.Errorf("parse exchange data: %w", errUnmarshal)
-		}
-	}
-	access = strings.TrimSpace(data.AccessToken)
-	refresh = strings.TrimSpace(data.RefreshToken)
-	if access == "" || refresh == "" {
-		return "", "", 0, "", &core.Failure{Status: resp.StatusCode, Msg: "小浣熊未返回完整凭证（access_token/refresh_token）", Kind: core.FailureKindServer}
-	}
-	if ms := core.GetUnixSeconds(map[string]any{"expires_at": data.ExpiresAt}, "expires_at"); ms > 0 {
-		expiresAt = ms
-	}
-	uid = strings.TrimSpace(data.UserID)
-	return access, refresh, expiresAt, uid, nil
 }
 
 // FetchUserInfo 查询账号资料（GET {auth_base}/user_info），补 uid / 昵称。
@@ -291,57 +214,12 @@ func FetchUserInfo(ctx context.Context, authBase string, cred *Credential) (uid,
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", "", Classify(resp.StatusCode, string(raw))
 	}
-	var envelope struct {
-		Code    *int64 `json:"code"`
-		Message string `json:"message"`
-		Data    struct {
-			ID   string `json:"id"`
-			Name string `json:"name"`
-		} `json:"data"`
+	data, errDecode := decodeAPIData[struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	}](resp.StatusCode, raw, "user info")
+	if errDecode != nil {
+		return "", "", errDecode
 	}
-	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
-		return "", "", Classify(resp.StatusCode, string(raw))
-	}
-	if envelope.Code != nil && *envelope.Code != 0 {
-		return "", "", ClassifyBusiness(resp.StatusCode, *envelope.Code, envelope.Message)
-	}
-	return strings.TrimSpace(envelope.Data.ID), strings.TrimSpace(envelope.Data.Name), nil
-}
-
-// AuthorizeURL 构造网页授权页（登录入口展示给用户打开）。
-func AuthorizeURL(origin, appName, state string) string {
-	query := url.Values{}
-	query.Set("login_source", "desktop")
-	query.Set("appname", appName)
-	query.Set("state", state)
-	return AuthorizeURLWith(origin, appName, state)
-}
-
-// ParseCallbackCode 从回调链接里取授权码与 state。
-//
-// 只认官方客户端回调的固定形态 office-raccoon://auth/callback?code=…&state=…
-// （Agent2API oauth.rs 同口径）：scheme/host/path 逐项比对，不用前缀匹配——
-// office-raccoon://auth/callback@evil.com 这类形态用 startsWith 会全部放行。
-// 回调落在自定义协议上，任何本机程序都能构造一条丢进登录窗口，不校验 state
-// 就等于把「用别人的 code 换来的凭证写进你的账号库」敞开。
-func ParseCallbackCode(raw string) (code, state string, ok bool) {
-	raw = strings.TrimSpace(raw)
-	if index := strings.IndexAny(raw, "\r\n"); index >= 0 {
-		raw = raw[:index]
-	}
-	parsed, errParse := url.Parse(raw)
-	if errParse != nil {
-		return "", "", false
-	}
-	if !strings.EqualFold(parsed.Scheme, loginCallbackScheme) ||
-		!strings.EqualFold(parsed.Host, loginCallbackHost) ||
-		parsed.Path != loginCallbackPath {
-		return "", "", false
-	}
-	query := parsed.Query()
-	code = strings.TrimSpace(query.Get("code"))
-	if code == "" {
-		code = strings.TrimSpace(query.Get("authorization_code"))
-	}
-	return code, query.Get("state"), code != ""
+	return strings.TrimSpace(data.ID), strings.TrimSpace(data.Name), nil
 }

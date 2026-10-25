@@ -81,7 +81,9 @@ main { padding: 14px 20px 48px; }
                    background: var(--grad); flex: none; box-shadow: 0 0 8px rgba(22,104,220,.45); }
 .card h2 .muted { font-weight: 400; font-size: 12.5px; }
 
+[hidden], [hidden="true"], [hidden=""] { display: none !important; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+.row[hidden] { display: none !important; }
 button.act { padding: 6.5px 13px; border: 1px solid var(--border-strong); border-radius: 9px;
              background: var(--card); color: var(--fg); cursor: pointer; font-size: 13px; font-weight: 550;
              transition: background .12s ease, border-color .12s ease, color .12s ease,
@@ -320,7 +322,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
 
       <div class="card" id="loginBox" hidden>
         <h2 id="loginTitle">完成授权</h2>
-        <div class="row" id="loginVariantRow" hidden></div>
+        <div class="row" id="loginVariantRow" hidden style="display:none"></div>
         <div class="login-captcha" id="loginCaptcha" hidden></div>
         <div class="row">
           <input type="text" id="loginUrl" readonly style="flex:1;min-width:320px">
@@ -1941,8 +1943,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   function startCredentialPaste(vendor) {
     stopLoginPolling();
     resetLoginCaptcha();
-    var variantRow = document.getElementById("loginVariantRow");
-    if (variantRow) variantRow.hidden = true;
+    clearLoginVariants();
     currentApiKeyVendor = vendor;
     var login = document.getElementById("loginBox");
     var sms = document.getElementById("smsBox");
@@ -1997,6 +1998,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     var row = document.getElementById("loginVariantRow");
     row.textContent = "";
     row.hidden = false;
+    row.style.display = "flex";
     loginVariantButtons = [];
     var variants = (vendor && vendor.login_variants) || [{ id: "google", label: "Google" }];
     variants.forEach(function (variant) {
@@ -2181,6 +2183,16 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   }
 
   // resetLoginCaptcha 作废当前一轮验证并清掉容器（可重复调用）。
+  // clearLoginVariants 彻底清空并隐藏变体登录按钮（防止污染其他供应商面板）。
+  function clearLoginVariants() {
+    var row = document.getElementById("loginVariantRow");
+    if (row) {
+      row.textContent = "";
+      row.hidden = true;
+      row.style.display = "none";
+    }
+    loginVariantButtons = [];
+  }
   function resetLoginCaptcha() {
     var flow = loginCaptchaFlow;
     loginCaptchaFlow = null;
@@ -2198,6 +2210,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       holder.textContent = "";
       holder.hidden = true;
     }
+    clearLoginVariants();
   }
 
   // captchaParamText 归一化 SDK 回调参数（不同版本给字符串或对象）。
@@ -2214,8 +2227,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   function startSmsLogin(vendor) {
     stopLoginPolling();
     resetLoginCaptcha();
-    var variantRow = document.getElementById("loginVariantRow");
-    if (variantRow) variantRow.hidden = true;
+    clearLoginVariants();
     currentSmsVendor = vendor;
     smsSessionKey = "";
     var box = document.getElementById("smsBox");
@@ -2235,8 +2247,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   function startLogin(vendor) {
     if (vendor && vendor.sms_login) { startSmsLogin(vendor); return; }
     resetLoginCaptcha();
-    var variantRow = document.getElementById("loginVariantRow");
-    if (variantRow) variantRow.hidden = true;
+    clearLoginVariants();
     // 三个添加入口（授权链接 / 短信验证码 / API Key）互斥：打开任一个前先收起另外两个。
     var smsBox = document.getElementById("smsBox");
     if (smsBox) { smsBox.hidden = true; }
@@ -2349,10 +2360,10 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
   document.getElementById("btnLoginCancel").addEventListener("click", function () {
     stopLoginPolling();
     resetLoginCaptcha();
+    clearLoginVariants();
     setLoginVariantBusy(false);
     currentLoginState = "";
     document.getElementById("loginBox").hidden = true;
-    document.getElementById("loginVariantRow").hidden = true;
   });
 
   // submitLoginCallback 提交用户粘贴的 localhost 回调链接。
@@ -2373,27 +2384,35 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       pasteStatus.textContent = "请先粘贴浏览器地址栏里的整条链接。";
       return;
     }
+    // 立即停止后台设备授权轮询：用户已经拿到并提交了回调，不再需要并发轮询，
+    // 防止换票完成、会话销毁后，未退出的轮询请求误报「会话不存在或已过期」。
+    stopLoginPolling();
     btn.disabled = true;
     btn.textContent = "提交中…";
     redirect.hidden = true;
-    api("POST", "/login/callback", { state: currentLoginState, url: raw }).then(function (data) {
+    var submittedState = currentLoginState;
+    api("POST", "/login/callback", { state: submittedState, url: raw }).then(function (data) {
       btn.disabled = false;
       btn.textContent = "提交回调链接";
       var value = (data && data.status) || "";
-      var message = (data && data.message) || "";
+      var message = (data && data.message) || (data && data.error) || "";
       if (value === "success") {
         stopLoginPolling();
-        // 回调链接里有授权票据，成功后立刻从页面里清掉，不留在 DOM 与剪贴板历史里。
         document.getElementById("loginPasteUrl").value = "";
         currentLoginState = "";
         resetLoginCaptcha();
+        clearLoginVariants();
         pasteStatus.textContent = message || "解析成功，正在写入账号…";
         document.getElementById("loginStatus").textContent = "授权成功，账号已写入 CPA。";
         banner("ok", "账号添加成功，正在查询该账号额度…");
         loadQuotas(true);
+        setTimeout(function () {
+          var box = document.getElementById("loginBox");
+          if (box) { box.hidden = true; box.style.display = "none"; }
+        }, 1500);
         return;
       }
-      pasteStatus.textContent = message || "回调链接暂时无法完成登录，请稍后重试。";
+      pasteStatus.textContent = message || "回调链接暂时无法完成登录，请重新发起登录后重试。";
       // CodeArts：票据尚未换到凭证，需要在能联网的浏览器里打开门户登录页。
       if (data && data.redirect_url) {
         redirect.href = data.redirect_url;
@@ -2402,7 +2421,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     }).catch(function (err) {
       btn.disabled = false;
       btn.textContent = "提交回调链接";
-      pasteStatus.textContent = "提交失败：" + err.message;
+      pasteStatus.textContent = "提交失败：" + (err.message || err);
     });
   }
 
