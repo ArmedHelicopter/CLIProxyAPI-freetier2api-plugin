@@ -140,6 +140,9 @@ var quotaKeyRoles = map[string]struct {
 	"addon_quota_remaining": {"addon_quota", roleRemaining},
 	"addon_quota_total":     {"addon_quota", roleTotal},
 	"addon_quota_used":      {"addon_quota", roleUsed},
+	// token_plan 族：MiniMax Token Plan 的 token 余量。点数（default 族）与
+	// token 计划并存时各自成族，Totals 按「有容量者优先」取族，互不覆盖。
+	"token_remaining": {"token_plan", roleRemaining},
 }
 
 // 额度键的角色：一个族里每个角色至多一个键。

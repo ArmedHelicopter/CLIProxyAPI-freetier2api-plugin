@@ -129,3 +129,24 @@ func TestTotalsIgnoresUnknownKeys(t *testing.T) {
 		t.Fatalf("未登记的键族不应被折算，得到 %+v", got)
 	}
 }
+
+// TestTokenPlanFamilyIndependentOfDefault 锁定 token_plan 族与 default 族
+// 并存时的取值行为：点数（default）有容量时优先，token 余量不覆盖点数；
+// 点数耗尽时回落 token_plan。MiniMax Token Plan 与 op 点数并存的账号
+// 依赖这一行为（见 minimax PR 审查 P1-1）。
+func TestTokenPlanFamilyIndependentOfDefault(t *testing.T) {
+	both := &pluginapi.QuotaFetchResponse{Summary: []pluginapi.QuotaMetric{
+		{Key: "remaining", Value: 500, Unit: "点"},
+		{Key: "token_remaining", Value: 14291681135, Unit: "tokens"},
+	}}
+	if got := Totals(both); got.Remaining != 500 {
+		t.Fatalf("default family must win when it has capacity, got %d", got.Remaining)
+	}
+	zeroPoints := &pluginapi.QuotaFetchResponse{Summary: []pluginapi.QuotaMetric{
+		{Key: "remaining", Value: 0, Unit: "点"},
+		{Key: "token_remaining", Value: 14291681135, Unit: "tokens"},
+	}}
+	if got := Totals(zeroPoints); got.Remaining != 14291681135 {
+		t.Fatalf("token_plan family must take over when default is empty, got %d", got.Remaining)
+	}
+}

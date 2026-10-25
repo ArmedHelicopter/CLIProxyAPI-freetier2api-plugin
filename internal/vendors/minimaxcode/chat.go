@@ -1123,7 +1123,11 @@ const (
 	// 国际版 (Global)
 	AccountHostGlobal = "https://account.minimax.io"
 	AgentHostGlobal   = "https://agent.minimax.io"
-	StreamHostGlobal  = "https://agent-stream.minimax.io"
+	// PlatformHost 是开放平台域：coding_plan/remains（Token Plan 窗口）挂在这里，
+	// 与签名的 account 域分离，纯 Bearer 即可访问。
+	PlatformHostCN     = "https://www.minimaxi.com"
+	PlatformHostGlobal = "https://platform.minimax.io"
+	StreamHostGlobal   = "https://agent-stream.minimax.io"
 
 	// OAuth2 设备码配置（与桌面客户端对齐）
 	ClientID         = "mcode-public"
@@ -1180,6 +1184,14 @@ func AccountHostFor(r Region) string {
 }
 
 // AgentHostFor 返回 Agent 业务基础地址。
+// PlatformHostFor 返回该区域的开放平台域。
+func PlatformHostFor(r Region) string {
+	if r == RegionCN {
+		return PlatformHostCN
+	}
+	return PlatformHostGlobal
+}
+
 func AgentHostFor(r Region, override string) string {
 	if trimmed := strings.TrimRight(strings.TrimSpace(override), "/"); trimmed != "" {
 		return trimmed

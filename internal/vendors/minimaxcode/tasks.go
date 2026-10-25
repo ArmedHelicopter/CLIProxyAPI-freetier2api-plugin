@@ -2,6 +2,9 @@ package minimaxcode
 
 import (
 	"io"
+
+	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/logger"
 )
 
 import (
@@ -182,6 +185,34 @@ func FetchQuota(ctx context.Context, cred *Credential, baseURLOverride string) (
 		})
 	}
 
+	// Token Plan（订阅制）走独立的窗口体系：5 小时窗口 + 7 天窗口，
+	// 由 coding_plan/remains 提供（纯 Bearer，不需要 account 签名）。
+	// op 点数与 token 计划并存：点数为 0 时不占摘要，让位给 token 指标。
+	if tokenPlan := extractTokenPlanHead(coreMap); tokenPlan != nil {
+		planName = tokenPlan.planName
+		// Token Plan 在场时，为 0 的 op 点数指标不进摘要（避免「总剩余额度 0」
+		// 抢在 token 余量前面误导）。
+		kept := summaryMetrics[:0]
+		for _, metric := range summaryMetrics {
+			if metric.Value > 0 {
+				kept = append(kept, metric)
+			}
+		}
+		summaryMetrics = kept
+		summaryMetrics = append(summaryMetrics, tokenPlan.metrics...)
+		if groups := tokenPlan.groups(ctx, cred); len(groups) > 0 {
+			return &pluginapi.QuotaFetchResponse{
+				Subscription: &pluginapi.QuotaSubscription{
+					Plan:     planName,
+					TierName: planName,
+					TierID:   "minimax-token-plan",
+				},
+				Summary: summaryMetrics,
+				Groups:  groups,
+			}, nil
+		}
+	}
+
 	return &pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{
 			Plan:     planName,
@@ -190,6 +221,206 @@ func FetchQuota(ctx context.Context, cred *Credential, baseURLOverride string) (
 		},
 		Summary: summaryMetrics,
 	}, nil
+}
+
+// tokenPlanHead 是 membership 响应里的 Token Plan 概要。
+type tokenPlanHead struct {
+	planName    string
+	groupID     string
+	expiresAtMS int64
+	metrics     []pluginapi.QuotaMetric
+}
+
+// extractTokenPlanHead 从 membership 响应提取 Token Plan 概要。
+//
+// 未订阅（has_token_plan=false）或余量为 0 且无到期时间时返回 nil，
+// 调用方回落到 op 点数展示。
+func extractTokenPlanHead(coreMap map[string]any) *tokenPlanHead {
+	if core.GetString(coreMap, "has_token_plan") != "true" && parseBool(coreMap["has_token_plan"]) != true {
+		return nil
+	}
+	tier := strings.TrimSpace(core.GetString(coreMap, "token_plan_tier"))
+	remains := parseFloat(coreMap["tp_remains"])
+	expiresAtMS := int64(parseFloat(coreMap["token_plan_expires_at"]))
+	if remains == 0 && expiresAtMS == 0 {
+		return nil
+	}
+	info := &tokenPlanHead{
+		planName:    "MiniMax Token Plan",
+		groupID:     core.GetString(coreMap, "op_group_id"),
+		expiresAtMS: expiresAtMS,
+	}
+	if tier != "" {
+		info.planName += " " + strings.ToUpper(tier[:1]) + tier[1:]
+	}
+	if remains > 0 {
+		// key 用独立的 token_plan 族（token_remaining）：与 op 点数的
+		// default 族 remaining 并存时不会互相覆盖（Totals 按族取值）。
+		info.metrics = append(info.metrics, pluginapi.QuotaMetric{
+			Key:   "token_remaining",
+			Label: "Token Plan 剩余",
+			Value: remains,
+			Unit:  "tokens",
+		})
+	}
+	return info
+}
+
+// groups 拉取 M Plan 的 5 小时 / 7 天窗口，并附套餐有效期。
+//
+// coding_plan/remains 失败不拖垮整个额度响应：窗口缺失只是卡片少两条进度条，
+// 余量指标仍然有效。
+func (t *tokenPlanHead) groups(ctx context.Context, cred *Credential) []pluginapi.QuotaGroup {
+	groups := fetchTokenPlanRemains(ctx, cred, t.groupID)
+	if t.expiresAtMS > 0 {
+		groups = append(groups, pluginapi.QuotaGroup{
+			DisplayName: "套餐有效期",
+			Buckets: []pluginapi.QuotaBucket{{
+				Window:            "有效期",
+				RemainingFraction: 1,
+				ResetTime:         time.UnixMilli(t.expiresAtMS).Format(time.RFC3339),
+			}},
+		})
+	}
+	return groups
+}
+
+// fetchTokenPlanRemains 查询 coding_plan/remains 并折成窗口组。
+//
+// 端点为纯 Bearer（平台域，非签名的 account 域），按模型行返回 5 小时与
+// 7 天两个窗口；status=2 表示「已耗尽且不再发布百分比」，按 0% 展示；
+// status=3 的窗口不展示——与官方客户端的呈现一致。
+func fetchTokenPlanRemains(ctx context.Context, cred *Credential, groupID string) []pluginapi.QuotaGroup {
+	platform := PlatformHostFor(cred.Region)
+	// 超时收紧到 10s：该探测挂在额度查询路径上，账号列表逐账号拉额度时
+	// 30s 超时会被放大成整轮刷新的长尾。
+	req, errNew := http.NewRequestWithContext(ctx, http.MethodGet, platform+"/v1/api/openplatform/coding_plan/remains", nil)
+	if errNew != nil {
+		return nil
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+	if groupID != "" {
+		req.Header.Set("X-Group-Id", groupID)
+	}
+	resp, errDo := hostbridge.Client(ctx, 10*time.Second).Do(req)
+	if errDo != nil {
+		logger.Debug("minimax token plan windows: request failed: %v", errDo)
+		return nil
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		logger.Debug("minimax token plan windows: endpoint returned %s", resp.Status)
+		return nil
+	}
+	var body struct {
+		ModelRemains []map[string]any `json:"model_remains"`
+	}
+	if errDecode := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&body); errDecode != nil {
+		logger.Debug("minimax token plan windows: decode failed: %v", errDecode)
+		return nil
+	}
+
+	interval := pluginapi.QuotaGroup{DisplayName: "5 小时窗口"}
+	weekly := pluginapi.QuotaGroup{DisplayName: "7 天窗口"}
+	for _, row := range body.ModelRemains {
+		name := strings.TrimSpace(core.GetString(row, "model_name"))
+		if name == "" {
+			continue
+		}
+		display := name
+		if strings.EqualFold(name, "general") {
+			display = "通用额度"
+		}
+		if bucket, ok := planWindowBucket(display, "5 小时",
+			row["current_interval_remaining_percent"], row["current_interval_status"],
+			row["start_time"], row["end_time"],
+			row["current_interval_usage_count"], row["current_interval_total_count"]); ok {
+			interval.Buckets = append(interval.Buckets, bucket)
+		}
+		if bucket, ok := planWindowBucket(display, "7 天",
+			row["current_weekly_remaining_percent"], row["current_weekly_status"],
+			row["weekly_start_time"], row["weekly_end_time"],
+			row["current_weekly_usage_count"], row["current_weekly_total_count"]); ok {
+			weekly.Buckets = append(weekly.Buckets, bucket)
+		}
+	}
+	groups := make([]pluginapi.QuotaGroup, 0, 2)
+	if len(interval.Buckets) > 0 {
+		groups = append(groups, interval)
+	}
+	if len(weekly.Buckets) > 0 {
+		groups = append(groups, weekly)
+	}
+	return groups
+}
+
+// planWindowBucket 把一行窗口折成展示桶。
+//
+// 返回 false 表示该窗口不值得展示：status=3（上游不展示），或字段缺失/
+// 改名导致没有百分比且未显式标记耗尽——后者渲染成 0% 会制造假的
+// 「已用尽」进度条，比不显示更误导。
+func planWindowBucket(display, window string, remaining, status, start, end, usage, total any) (pluginapi.QuotaBucket, bool) {
+	statusCode := parseFloat(status)
+	if statusCode == 3 {
+		return pluginapi.QuotaBucket{}, false
+	}
+	// status=2 是「耗尽且不再发布百分比」：按 0% 展示（账号真的没额度）。
+	// 其余情况缺百分比（nil/空串）一律不展示。
+	var percent float64
+	hasPercent := false
+	switch typed := remaining.(type) {
+	case float64:
+		percent, hasPercent = typed, true
+	case string:
+		if strings.TrimSpace(typed) != "" {
+			percent, hasPercent = parseFloat(typed), true
+		}
+	}
+	if !hasPercent {
+		if statusCode == 2 {
+			percent, hasPercent = 0, true
+		} else {
+			return pluginapi.QuotaBucket{}, false
+		}
+	}
+	fraction := 0.0
+	if statusCode != 2 {
+		if percent <= 1 && percent > 0 {
+			// 上游以 0..1 小数表达时按小数处理，其余按 0..100 百分比。
+			fraction = percent
+		} else {
+			fraction = percent / 100
+		}
+		if fraction < 0 {
+			fraction = 0
+		} else if fraction > 1 {
+			fraction = 1
+		}
+	}
+	bucket := pluginapi.QuotaBucket{
+		Window:            display + " · " + window,
+		RemainingFraction: fraction,
+	}
+	if endMS := int64(parseFloat(end)); endMS > 0 {
+		bucket.ResetTime = time.UnixMilli(endMS).Format(time.RFC3339)
+	}
+	if used, total := parseFloat(usage), parseFloat(total); used > 0 || total > 0 {
+		bucket.Description = fmt.Sprintf("窗口已用次数 %s / %s", strconv.FormatFloat(used, 'f', 0, 64), strconv.FormatFloat(total, 'f', 0, 64))
+	}
+	_ = start
+	return bucket, true
+}
+
+// parseBool 宽松解析布尔字段。
+func parseBool(val any) bool {
+	switch v := val.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(strings.TrimSpace(v), "true")
+	}
+	return false
 }
 
 func parseFloat(val any) float64 {
