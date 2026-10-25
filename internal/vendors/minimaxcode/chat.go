@@ -509,6 +509,12 @@ func doMessageRequest(ctx context.Context, cred *Credential, req *core.ExecuteRe
 		modelID = cp.Model
 	}
 	modelCfg, _ := findModel(modelID)
+	// 工作区解析：上游会改名/下线模型（内置目录是编译期固化的），
+	// 以账号工作区 /config 列出的 model_id 为准，未命中回落内置值。
+	if upstreamID, wsVariant, ok := resolveWorkspaceModel(ctx, cred, baseURLOverride, modelID, modelCfg); ok {
+		modelCfg.UpstreamModel = upstreamID
+		modelCfg.Variant = wsVariant
+	}
 
 	var turns []*Turn
 	for _, m := range cp.Messages {

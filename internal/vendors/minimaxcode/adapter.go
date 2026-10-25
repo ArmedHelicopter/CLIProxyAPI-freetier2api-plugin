@@ -90,6 +90,49 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 
 // ---- 模型 ----
 
+// ModelsForAuth 返回该账号工作区当前可用的模型清单。
+//
+// /config 是权威来源（上游会改名/下线模型，内置目录是编译期固化的兜底）：
+// 实测 2026-10-25 订阅工作区的 M3.1-Flash 已从 MiniMax-M3.1-Flash-Preview
+// 更名为 MiniMax-M3.1-Flash，沿用内置 ID 会被 Agent 会话以 1406010011
+// "explicit model is not registered" 拒绝。对外 ID 统一小写（与既有清单
+// 命名一致），工作区未声明 thinking 支持的模型不带推理档位。
+func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return nil, errNative
+	}
+	models, errFetch := fetchWorkspaceModels(ctx, native, v.baseURL)
+	if errFetch != nil || len(models) == 0 {
+		// 拉取失败回落静态清单：宁可给旧 ID 也不给空清单（空清单会让宿主
+		// 淘汰凭证，而旧 ID 至多在对话时报错）。
+		return v.StaticModels(ctx)
+	}
+	out := make([]pluginapi.ModelInfo, 0, len(models))
+	for _, item := range models {
+		external := strings.ToLower(item.ModelID)
+		info := pluginapi.ModelInfo{
+			ID:            external,
+			Name:          core.FirstNonEmpty(item.DisplayName, external),
+			DisplayName:   core.FirstNonEmpty(item.DisplayName, external),
+			ContextLength: item.ContextLimit,
+		}
+		if workspaceSupportsVariant(item, "thinking") && len(item.Efforts) > 0 {
+			levels := make([]string, 0, len(item.Efforts))
+			for _, effort := range item.Efforts {
+				if effort != "" && effort != "default" {
+					levels = append(levels, effort)
+				}
+			}
+			if len(levels) > 0 {
+				info.Thinking = &pluginapi.ThinkingSupport{Levels: levels}
+			}
+		}
+		out = append(out, info)
+	}
+	return out, nil
+}
+
 // StaticModels 返回本区域的模型清单。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
 	models, errModels := FetchModels(ctx, v.region)
