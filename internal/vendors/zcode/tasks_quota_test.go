@@ -53,6 +53,26 @@ func balanceFixture() map[string]any {
 	}
 }
 
+func TestValidateBillingBalanceRejectsSuccessfulEmptyEnvelope(t *testing.T) {
+	cases := []map[string]any{
+		{},
+		{"code": float64(0), "data": map[string]any{}},
+		{"code": float64(0), "data": map[string]any{"plans": []any{}}},
+		{"code": float64(0), "data": map[string]any{"balances": []any{}}},
+	}
+	for i, body := range cases {
+		if err := validateBillingBalance(body); err == nil {
+			t.Fatalf("case %d: successful empty balance must be rejected", i)
+		}
+	}
+	if err := validateBillingBalance(map[string]any{
+		"code": float64(0),
+		"data": map[string]any{"plans": []any{}, "balances": []any{}},
+	}); err != nil {
+		t.Fatalf("empty but structurally valid arrays must be accepted: %v", err)
+	}
+}
+
 // TestBalanceQuotaExposeTotalsFamily 验证 default 族汇总：账号表的
 // 「剩余 / 总额」列靠它们算比例，逐模型指标保持独立键。
 func TestBalanceQuotaExposeTotalsFamily(t *testing.T) {
