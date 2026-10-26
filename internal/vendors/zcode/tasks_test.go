@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 )
 
@@ -201,6 +202,20 @@ func TestClaimStatusCountsAndErrors(t *testing.T) {
 	})
 	if withPlans.Error != "" || withPlans.Claimable != 1 {
 		t.Fatalf("有可领套餐时不应带 error: %+v", withPlans)
+	}
+}
+
+func TestApplySubscriptionUsesBalancePlan(t *testing.T) {
+	response := &pluginapi.QuotaFetchResponse{Subscription: &pluginapi.QuotaSubscription{}}
+	applySubscription(planSnapshot{
+		plans: []map[string]any{
+			{"plan_id": "future", "name": "Future", "status": "active"},
+			{"plan_id": "current", "name": "Current", "status": "active"},
+		},
+		balances: []map[string]any{{"plan_id": "current", "remaining_units": float64(10)}},
+	}, response)
+	if response.Subscription.Plan != "Current" || response.Subscription.TierName != "current" {
+		t.Fatalf("subscription = %+v, want current balance plan", response.Subscription)
 	}
 }
 

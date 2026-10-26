@@ -191,23 +191,35 @@ func (v *adapter) fetchQuota(ctx context.Context, cred *Credential) (*pluginapi.
 //
 // 数据来自套餐快照里已经拿到的 billing/balance，不额外发请求。
 func applySubscription(snapshot planSnapshot, response *pluginapi.QuotaFetchResponse) {
+	balancePlanIDs := make(map[string]struct{})
+	for _, bucket := range snapshot.balances {
+		if planID := normalizePlanID(core.FirstNonEmpty(
+			core.RawStringField(bucket, "plan_id"),
+			core.RawStringField(bucket, "planId"),
+		)); planID != "" {
+			balancePlanIDs[planID] = struct{}{}
+		}
+	}
 	for _, plan := range snapshot.plans {
 		status := strings.ToLower(strings.TrimSpace(core.RawStringField(plan, "status")))
 		if status != "" && status != "active" {
 			continue
+		}
+		planID := normalizePlanID(core.FirstNonEmpty(
+			core.RawStringField(plan, "plan_id"),
+			core.RawStringField(plan, "planId"),
+		))
+		if len(balancePlanIDs) > 0 {
+			if _, matched := balancePlanIDs[planID]; !matched {
+				continue
+			}
 		}
 		name := core.RawStringField(plan, "name")
 		if name == "" {
 			continue
 		}
 		response.Subscription.Plan = name
-		response.Subscription.TierName = core.FirstNonEmpty(
-			normalizePlanID(core.FirstNonEmpty(
-				core.RawStringField(plan, "plan_id"),
-				core.RawStringField(plan, "planId"),
-			)),
-			"zcode",
-		)
+		response.Subscription.TierName = core.FirstNonEmpty(planID, "zcode")
 		return
 	}
 }
@@ -531,6 +543,8 @@ type planSnapshot struct {
 	held map[string]bool
 	// plans 是 balance 返回的原始套餐条目（订阅名与状态展示用）。
 	plans []map[string]any
+	// balances 是当前额度桶，用于把订阅名关联到实际生效的套餐。
+	balances []map[string]any
 	// serverTime 是 balance 返回的服务端时间，用于统一判断套餐是否仍有效。
 	serverTime int64
 	// metrics 是 balance 换算出的各模型余量。
@@ -573,13 +587,19 @@ func (v *adapter) fetchPlanSnapshot(ctx context.Context, cred *Credential) planS
 
 	code, body, errBalance := billingRequest(ctx, cred, http.MethodGet,
 		PathBillingBalance+"?app_version="+url.QueryEscape(ClientAppVersion), nil)
+	balanceShapeErr := validateBillingBalance(body)
 	switch {
 	case errBalance != nil:
 		snapshot.errBalance = errBalance
 	case code != codeSuccess:
 		snapshot.errBalance = Classify(0, classifyBillingOutcome(code, body))
+	case balanceShapeErr != nil:
+		// A successful envelope without the billing arrays is incomplete, not zero quota.
+		// Keep claims and quota unavailable instead of presenting false empty state.
+		snapshot.errBalance = balanceShapeErr
 	default:
 		snapshot.plans = planRows(body)
+		snapshot.balances = balanceRows(body)
 		snapshot.serverTime = serverSeconds(body)
 		snapshot.held = heldPlanIDs(snapshot.plans, snapshot.serverTime)
 		snapshot.metrics, snapshot.groups = balanceQuota(body)
@@ -599,6 +619,20 @@ func (v *adapter) fetchPlanSnapshot(ctx context.Context, cred *Credential) planS
 	}
 	snapshot.offered = offered
 	return snapshot
+}
+
+func validateBillingBalance(body map[string]any) error {
+	data := dataMap(body)
+	if data == nil {
+		return transientErr("ZCode billing balance 响应缺少 data")
+	}
+	if _, ok := data["plans"].([]any); !ok {
+		return transientErr("ZCode billing balance 响应缺少 plans")
+	}
+	if _, ok := data["balances"].([]any); !ok {
+		return transientErr("ZCode billing balance 响应缺少 balances")
+	}
+	return nil
 }
 
 // planRows 取 balance 响应里的 data.plans。
