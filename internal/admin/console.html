@@ -300,6 +300,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
           <div class="dropdown-menu" id="addVendorMenu" hidden></div>
         </div>
         <button class="act" id="btnRefresh">Token续期</button>
+        <button class="act" id="btnRefreshQuotaAuth">刷新额度凭证</button>
         <button class="act" id="btnLoadQuotas">查询额度</button>
         <button class="act" id="btnCheckin">一键签到</button>
         <button class="act primary" id="btnAutoAll">一键做任务</button>
@@ -2570,6 +2571,21 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     });
   });
   document.getElementById("btnLoadQuotas").addEventListener("click", function () { loadQuotas(false); });
+  document.getElementById("btnRefreshQuotaAuth").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true;
+    banner("ok", "正在刷新全部账号凭证并重新查询额度…", 0);
+    api("POST", "/keepalive", {}).then(function (res) {
+      if (res && res.failed > 0) {
+        banner(res.succeeded > 0 ? "warn" : "err", res.message || "凭证刷新失败", 8000);
+      } else if (res) {
+        banner("ok", res.message || "凭证刷新完成", 5000);
+      }
+      return loadQuotas(false);
+    }).catch(function (err) {
+      banner("err", "刷新额度凭证失败：" + err.message, 8000);
+    }).then(function () { btn.disabled = false; });
+  });
   document.getElementById("btnLoadModels").addEventListener("click", function () { refreshModels(false); });
 
   // ---- 模型表列展示 ----

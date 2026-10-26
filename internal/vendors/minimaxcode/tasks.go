@@ -36,7 +36,7 @@ func Checkin(ctx context.Context, cred *Credential, baseURLOverride string) (*co
 	base := AgentHostFor(cred.Region, baseURLOverride)
 
 	// 1. 签到前必须先调用 prepare 确保账号 record 在 agent 端建立
-	_ = prepare(ctx, cred, baseURLOverride)
+	_ = prepare(ctx, cred, baseURLOverride, nil)
 
 	// 2. 查询签到看板状态
 	statusTarget := buildSigninTarget(cred, base, EpCheckinStatus, http.MethodGet, "")
@@ -119,11 +119,22 @@ func FetchQuota(ctx context.Context, cred *Credential, baseURLOverride string) (
 	}
 
 	base := AgentHostFor(cred.Region, baseURLOverride)
-	target := buildSigninTarget(cred, base, EpMembership, http.MethodPost, "{}")
+	requestMembership := func() (*http.Response, error) {
+		target := buildSigninTarget(cred, base, EpMembership, http.MethodPost, "{}")
+		return doRequest(ctx, cred, target, base, 30*time.Second)
+	}
 
-	resp, errDo := doRequest(ctx, cred, target, base, 30*time.Second)
+	resp, errDo := requestMembership()
 	if errDo != nil {
 		return nil, core.ToPluginError(errDo)
+	}
+	// 额度页面常在 access token 被撤销后先于聊天暴露 401。强制刷新一次，
+	// 并用刷新后的 token 重建签名请求，避免“登录成功但额度永远失效”。
+	if resp.StatusCode == http.StatusUnauthorized {
+		resp, errDo = requestWithCredentialRefresh(ctx, cred, baseURLOverride, requestMembership)
+		if errDo != nil {
+			return nil, core.ToPluginError(errDo)
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 

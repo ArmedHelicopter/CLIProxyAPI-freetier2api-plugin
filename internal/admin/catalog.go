@@ -339,11 +339,28 @@ func (c *Catalog) CacheStatic(vendorID string, models []pluginapi.ModelInfo) {
 //
 // 返回是否写入了缓存。
 func (c *Catalog) CacheProbedModels(vendorID string, models []pluginapi.ModelInfo) bool {
+	if len(models) == 0 && isDynamicWorkspaceVendor(vendorID) {
+		// MiniMax CN 的模型目录按账号工作区动态变化。空结果表示本次
+		// 探测失败/失效，不得继续暴露 state.json 中已知过期的静态 ID。
+		c.clearCachedVendor(vendorID)
+		c.persistProbed()
+		return false
+	}
 	if !c.cacheProbed(vendorID, models) {
 		return false
 	}
 	c.persistProbed()
 	return true
+}
+
+func isDynamicWorkspaceVendor(vendorID string) bool {
+	return strings.EqualFold(strings.TrimSpace(vendorID), "minimaxcodecn")
+}
+
+func (c *Catalog) clearCachedVendor(vendorID string) {
+	c.mu.Lock()
+	delete(c.cached, vendorID)
+	c.mu.Unlock()
 }
 
 // cacheProbed 只更新内存缓存，由调用方决定何时落盘。
@@ -352,6 +369,12 @@ func (c *Catalog) CacheProbedModels(vendorID string, models []pluginapi.ModelInf
 // 出现「清单是新的、倍率还是上一批」的错配。
 func (c *Catalog) cacheProbed(vendorID string, models []pluginapi.ModelInfo) bool {
 	if len(models) == 0 {
+		if isDynamicWorkspaceVendor(vendorID) {
+			logger.Info("models: %s dynamic workspace probe returned 0 model(s); clearing stale cache",
+				vendorID)
+			c.clearCachedVendor(vendorID)
+			return false
+		}
 		logger.Info("models: %s probe returned 0 model(s); keeping %d cached",
 			vendorID, len(c.Registered(vendorID)))
 		return false

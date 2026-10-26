@@ -59,6 +59,23 @@ type Options struct {
 	IncludeDisabled bool
 }
 
+func targetMatchesEntry(target string, entry core.HostAuth) bool {
+	normalize := func(value string) string {
+		return strings.TrimSuffix(strings.ToLower(strings.TrimSpace(value)), ".json")
+	}
+	target = normalize(target)
+	if target == "" {
+		return false
+	}
+	for _, candidate := range []string{entry.ID, entry.Name, entry.AuthIndex} {
+		candidate = normalize(candidate)
+		if candidate != "" && candidate == target {
+			return true
+		}
+	}
+	return false
+}
+
 // Load 返回可用账号与失败条目；按 credential FileID 去重。
 func (p *Pool) Load(ctx context.Context, callbackID string, opts Options) ([]Account, []Failure) {
 	entries, errList := hostbridge.ListAuths(ctx, callbackID, p.Registry)
@@ -79,8 +96,17 @@ func (p *Pool) Load(ctx context.Context, callbackID string, opts Options) ([]Acc
 		if !opts.IncludeDisabled && !entry.Usable() {
 			continue
 		}
-		if len(wanted) > 0 && !wanted[entry.ID] && !wanted[entry.Name] && !wanted[entry.AuthIndex] {
-			continue
+		if len(wanted) > 0 {
+			matched := false
+			for target := range wanted {
+				if targetMatchesEntry(target, entry) {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				continue
+			}
 		}
 		raw, filePath, okRaw := hostbridge.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
 		if !okRaw && strings.TrimSpace(entry.Path) != "" {
