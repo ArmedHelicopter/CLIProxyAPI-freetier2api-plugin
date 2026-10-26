@@ -218,80 +218,54 @@ func applySubscription(snapshot planSnapshot, response *pluginapi.QuotaFetchResp
 // 分两趟各自解析同一响应曾让口径漂移（P1 审查意见）。
 // 同名桶按出现顺序去重计入汇总（上游同模型多条时只计首条，避免重复加总）。
 func balanceQuota(body map[string]any) ([]pluginapi.QuotaMetric, []pluginapi.QuotaGroup) {
-	balances, _ := dataMap(body)["balances"].([]any)
+	balances := balanceRows(body)
 	if len(balances) == 0 {
 		return nil, nil
 	}
-
 	var totalRemaining, totalTotal, totalUsed float64
 	seen := map[string]bool{}
 	parsed := 0
 	metrics := make([]pluginapi.QuotaMetric, 0, len(balances))
 	group := pluginapi.QuotaGroup{DisplayName: "模型额度"}
-	for _, item := range balances {
-		entry, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		name := core.FirstNonEmpty(core.RawStringField(entry, "show_name"), core.RawStringField(entry, "model"))
+	for _, entry := range balances {
+		name := core.FirstNonEmpty(core.RawStringField(entry, "show_name"), core.RawStringField(entry, "showName"), core.RawStringField(entry, "model"))
 		if name == "" {
 			continue
 		}
 		parsed++
-		remaining := floatField(entry, "remaining_units")
-		used := floatField(entry, "used_units")
-		total := floatField(entry, "total_units")
+		remaining := firstFloat(entry, "remaining_units", "remainingUnits", "available_units", "availableUnits")
+		used := firstFloat(entry, "used_units", "usedUnits")
+		total := firstFloat(entry, "total_units", "totalUnits", "grant_units", "grantUnits")
 		if !seen[name] {
 			seen[name] = true
 			totalRemaining += remaining
 			totalTotal += total
 			totalUsed += used
 		}
-		metrics = append(metrics, pluginapi.QuotaMetric{
-			Key:   "remaining_" + sanitizeMetricKey(name),
-			Label: name + " 剩余",
-			Value: remaining,
-			Unit:  "tokens",
-		})
+		metrics = append(metrics, pluginapi.QuotaMetric{Key: "remaining_" + sanitizeMetricKey(name), Label: name + " 剩余", Value: remaining, Unit: "tokens"})
 		if used > 0 {
-			metrics = append(metrics, pluginapi.QuotaMetric{
-				Key:   "used_" + sanitizeMetricKey(name),
-				Label: name + " 已用",
-				Value: used,
-				Unit:  "tokens",
-			})
+			metrics = append(metrics, pluginapi.QuotaMetric{Key: "used_" + sanitizeMetricKey(name), Label: name + " 已用", Value: used, Unit: "tokens"})
 		}
-
 		fraction := 0.0
 		if total > 0 {
 			fraction = remaining / total
 			if fraction < 0 {
 				fraction = 0
-			} else if fraction > 1 {
+			}
+			if fraction > 1 {
 				fraction = 1
 			}
 		}
-		bucket := pluginapi.QuotaBucket{
-			Window:            name,
-			RemainingFraction: fraction,
-			Description:       fmt.Sprintf("已用 %s / 共 %s tokens", formatTokens(used), formatTokens(total)),
-		}
-		if expires := int64(floatField(entry, "expires_at")); expires > 0 {
-			// ResetTime 的既定语义是「重置时间」，而 one_time 礼包不重置、
-			// 到期即失效——这里按桶粒度放 expires_at 供「失效」参考，
-			// 套餐级的到期展示见 planExpiryGroup（走 Description）。
+		bucket := pluginapi.QuotaBucket{Window: name, RemainingFraction: fraction, Description: fmt.Sprintf("已用 %s / 共 %s tokens", formatTokens(used), formatTokens(total))}
+		if expires := int64(firstFloat(entry, "expires_at", "expiresAt", "period_end", "periodEnd")); expires > 0 {
 			bucket.ResetTime = time.Unix(expires, 0).UTC().Format(time.RFC3339)
 		}
 		group.Buckets = append(group.Buckets, bucket)
 	}
 	if parsed == 0 {
-		// 全部条目解析失败：不给「剩余 0」的假汇总，交回空指标。
 		return nil, nil
 	}
-	// default 族汇总放最前：账号表的「剩余 / 总额」靠这两个键算比例。
-	summary := []pluginapi.QuotaMetric{
-		{Key: "remaining", Label: "剩余", Value: totalRemaining, Unit: "tokens"},
-	}
+	summary := []pluginapi.QuotaMetric{{Key: "remaining", Label: "剩余", Value: totalRemaining, Unit: "tokens"}}
 	if totalTotal > 0 {
 		summary = append(summary, pluginapi.QuotaMetric{Key: "total", Label: "总量", Value: totalTotal, Unit: "tokens"})
 	}
@@ -299,6 +273,28 @@ func balanceQuota(body map[string]any) ([]pluginapi.QuotaMetric, []pluginapi.Quo
 		summary = append(summary, pluginapi.QuotaMetric{Key: "used", Label: "已用", Value: totalUsed, Unit: "tokens"})
 	}
 	return append(summary, metrics...), []pluginapi.QuotaGroup{group}
+}
+
+func balanceRows(body map[string]any) []map[string]any {
+	data := dataMap(body)
+	if data == nil {
+		return nil
+	}
+	for _, key := range []string{"balances", "balance", "quotas", "entitlements"} {
+		if rows := objectRows(data[key]); len(rows) > 0 {
+			return rows
+		}
+	}
+	return nil
+}
+
+func firstFloat(raw map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		if value := floatField(raw, key); value != 0 {
+			return value
+		}
+	}
+	return 0
 }
 
 // planExpiryGroup 从仍生效的套餐里取**最近一个到期时刻**作为套餐有效期提示。
@@ -334,6 +330,9 @@ func activePlans(plans []map[string]any, serverTime int64) []map[string]any {
 	for _, entry := range plans {
 		status := strings.ToLower(strings.TrimSpace(core.RawStringField(entry, "status")))
 		if status != "" && status != "active" {
+			continue
+		}
+		if startsAt := floatField(entry, "starts_at"); startsAt > 0 && serverTime > 0 && startsAt > float64(serverTime) {
 			continue
 		}
 		if endsAt := floatField(entry, "ends_at"); endsAt > 0 && serverTime > 0 && endsAt <= float64(serverTime) {
@@ -532,6 +531,8 @@ type planSnapshot struct {
 	held map[string]bool
 	// plans 是 balance 返回的原始套餐条目（订阅名与状态展示用）。
 	plans []map[string]any
+	// serverTime 是 balance 返回的服务端时间，用于统一判断套餐是否仍有效。
+	serverTime int64
 	// metrics 是 balance 换算出的各模型余量。
 	metrics []pluginapi.QuotaMetric
 	// groups 是 balance 换算出的窗口组（宿主卡片渲染进度条与到期时间）。
@@ -579,9 +580,10 @@ func (v *adapter) fetchPlanSnapshot(ctx context.Context, cred *Credential) planS
 		snapshot.errBalance = Classify(0, classifyBillingOutcome(code, body))
 	default:
 		snapshot.plans = planRows(body)
-		snapshot.held = heldPlanIDs(snapshot.plans, serverSeconds(body))
+		snapshot.serverTime = serverSeconds(body)
+		snapshot.held = heldPlanIDs(snapshot.plans, snapshot.serverTime)
 		snapshot.metrics, snapshot.groups = balanceQuota(body)
-		if expiry := planExpiryGroup(snapshot.plans, serverSeconds(body)); expiry != nil {
+		if expiry := planExpiryGroup(snapshot.plans, snapshot.serverTime); expiry != nil {
 			snapshot.groups = append(snapshot.groups, *expiry)
 		}
 	}
