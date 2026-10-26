@@ -191,37 +191,54 @@ func (v *adapter) fetchQuota(ctx context.Context, cred *Credential) (*pluginapi.
 //
 // 数据来自套餐快照里已经拿到的 billing/balance，不额外发请求。
 func applySubscription(snapshot planSnapshot, response *pluginapi.QuotaFetchResponse) {
-	balancePlanIDs := make(map[string]struct{})
-	for _, bucket := range snapshot.balances {
-		if planID := normalizePlanID(core.FirstNonEmpty(
-			core.RawStringField(bucket, "plan_id"),
-			core.RawStringField(bucket, "planId"),
-		)); planID != "" {
-			balancePlanIDs[planID] = struct{}{}
-		}
-	}
-	for _, plan := range snapshot.plans {
-		status := strings.ToLower(strings.TrimSpace(core.RawStringField(plan, "status")))
-		if status != "" && status != "active" {
-			continue
-		}
-		planID := normalizePlanID(core.FirstNonEmpty(
-			core.RawStringField(plan, "plan_id"),
-			core.RawStringField(plan, "planId"),
-		))
-		if len(balancePlanIDs) > 0 {
-			if _, matched := balancePlanIDs[planID]; !matched {
-				continue
-			}
-		}
-		name := core.RawStringField(plan, "name")
-		if name == "" {
-			continue
-		}
-		response.Subscription.Plan = name
-		response.Subscription.TierName = core.FirstNonEmpty(planID, "zcode")
+	active := activePlans(snapshot.plans, snapshot.serverTime)
+	if len(active) == 0 {
 		return
 	}
+	best, bestScore := active[0], 0
+	for _, plan := range active {
+		score := 0
+		for _, bucket := range snapshot.balances {
+			if planIdentityOverlap(plan, bucket) {
+				score++
+			}
+		}
+		if score > bestScore {
+			best, bestScore = plan, score
+		}
+	}
+	if bestScore == 0 && len(snapshot.balances) > 0 {
+		// Do not report an arbitrary promotional plan when balances cannot be
+		// associated; the default subscription is more truthful than a mismatch.
+		return
+	}
+	name := core.RawStringField(best, "name")
+	if name == "" {
+		return
+	}
+	planID := normalizePlanID(core.FirstNonEmpty(
+		core.RawStringField(best, "plan_id"),
+		core.RawStringField(best, "planId"),
+	))
+	response.Subscription.Plan = name
+	response.Subscription.TierName = core.FirstNonEmpty(planID, "zcode")
+}
+
+func planIdentityOverlap(plan, bucket map[string]any) bool {
+	planIDs := map[string]struct{}{}
+	for _, key := range []string{"plan_id", "planId", "user_plan_id", "userPlanId", "entitlement_id", "entitlementId"} {
+		if value := normalizePlanID(core.RawStringField(plan, key)); value != "" {
+			planIDs[value] = struct{}{}
+		}
+	}
+	for _, key := range []string{"plan_id", "planId", "user_plan_id", "userPlanId", "entitlement_id", "entitlementId"} {
+		if value := normalizePlanID(core.RawStringField(bucket, key)); value != "" {
+			if _, ok := planIDs[value]; ok {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // balanceQuota 把 billing/balance 的额度桶一次遍历折成（指标, 窗口组）。
