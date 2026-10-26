@@ -166,6 +166,16 @@ func TestClaimStatusCountsAndErrors(t *testing.T) {
 	if all.Claimable != 0 {
 		t.Fatalf("全部领取后 claimable = %d, want 0", all.Claimable)
 	}
+	// balance 失败时不可把 preview 投放误报成可领取，也不能显示已领取。
+	balanceFailed := claimStatusOf(planSnapshot{
+		offered:    []core.PlanInfo{{PlanID: "a"}},
+		held:       map[string]bool{},
+		errBalance: core.NewPluginError("x", "balance 失败", 502),
+	})
+	if balanceFailed.Error == "" || balanceFailed.Claimable != 0 {
+		t.Fatalf("balance 失败不应暴露可领取套餐: %+v", balanceFailed)
+	}
+
 	// preview 失败时必须带 error：页面据此保持按钮可点，而不是误显示「已领取」。
 	failed := claimStatusOf(planSnapshot{
 		held:       map[string]bool{},

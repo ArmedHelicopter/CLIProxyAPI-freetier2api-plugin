@@ -546,6 +546,9 @@ type planSnapshot struct {
 
 // claimable 返回尚未领取的投放套餐。
 func (s planSnapshot) claimable() []core.PlanInfo {
+	if s.errBalance != nil {
+		return nil
+	}
 	out := make([]core.PlanInfo, 0, len(s.offered))
 	for _, plan := range s.offered {
 		if !s.held[plan.PlanID] {
@@ -734,6 +737,8 @@ func claimStatusOf(snapshot planSnapshot) *pluginapi.ClaimStatus {
 		Claimable: len(snapshot.claimable()),
 	}
 	switch {
+	case snapshot.errBalance != nil:
+		status.Error = "额度/套餐状态查询失败：" + snapshot.errBalance.Error()
 	case snapshot.errPreview != nil:
 		status.Error = snapshot.errPreview.Error()
 	case len(snapshot.offered) == 0 && snapshot.errActivation != "":
