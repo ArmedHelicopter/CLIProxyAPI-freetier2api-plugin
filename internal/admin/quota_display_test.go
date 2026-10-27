@@ -62,6 +62,22 @@ func TestSupportsQuotaComesFromCapability(t *testing.T) {
 //
 // 键里必须同时含供应商与账号身份：过去把 Name / Label / AuthIndex 也当键，
 // 跨供应商同名就会互相串值（OpenCode ZEN 显示 WorkBuddy 额度的事故）。
+func TestQuotaFailureTypeIncludesCredentialClassification(t *testing.T) {
+	if got := quotaFailureType(core.NewPluginError("upstream_credential", "invalid access token", http.StatusUnauthorized)); got != string(core.FailureKindCredential) {
+		t.Fatalf("credential failure type = %q", got)
+	}
+	if got := quotaFailureType(core.NewPluginError("upstream_request_failed", "temporary", http.StatusBadGateway)); got != "upstream_request_failed" {
+		t.Fatalf("plugin failure type = %q", got)
+	}
+}
+
+func TestQuotaResultCarriesAccountAndVendorIdentityOnFailure(t *testing.T) {
+	result := quotaResult{AuthID: "account-1", Label: "Alice", VendorID: "minimaxcodecn", VendorName: "MiniMax Code 国内版", FailureType: string(core.FailureKindCredential), Message: "invalid access token", RefreshAttempted: true}
+	if result.AuthID == "" || result.Label == "" || result.VendorName == "" || result.FailureType != "credential" || !result.RefreshAttempted {
+		t.Fatalf("incomplete failure result: %+v", result)
+	}
+}
+
 func TestQuotaCacheKeyIsolatedByVendorAndAccount(t *testing.T) {
 	if quotaCacheKey("workbuddycn", "a", "") == quotaCacheKey("opencodezen", "a", "") {
 		t.Fatal("cache key must include vendor: same account id across vendors must not collide")
