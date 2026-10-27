@@ -46,9 +46,13 @@ type quotaResult struct {
 	Realm      string `json:"realm"`
 	OK         bool   `json:"ok"`
 	Message    string `json:"message,omitempty"`
-	Summary    string `json:"summary,omitempty"`
-	Remain     int64  `json:"remain"`
-	Total      int64  `json:"total"`
+	// FailureType is a stable, UI-friendly classification (credential, quota, transient, etc.).
+	FailureType string `json:"failure_type,omitempty"`
+	// RefreshAttempted reports that an expired credential was refreshed before retrying.
+	RefreshAttempted bool   `json:"refresh_attempted,omitempty"`
+	Summary          string `json:"summary,omitempty"`
+	Remain           int64  `json:"remain"`
+	Total            int64  `json:"total"`
 	// Unlimited 报告剩余额度无上限，展示层据此显示「无限」。
 	Unlimited bool                    `json:"unlimited,omitempty"`
 	Metrics   []pluginapi.QuotaMetric `json:"metrics,omitempty"`
@@ -173,9 +177,11 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 			result := outcome.result
 			s.cacheQuotaResult(result)
 		}()
-		quota, errQuota := s.queryQuota(ctx, current)
+		quota, refreshed, errQuota := s.queryQuota(ctx, current)
+		outcome.result.RefreshAttempted = refreshed
 		if errQuota != nil {
 			outcome.result.Message = errQuota.Error()
+			outcome.result.FailureType = quotaFailureType(errQuota)
 			return outcome
 		}
 		result := &outcome.result
@@ -213,21 +219,38 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 // queryQuota 查询单个账号的额度（含一次过期凭证的保活重试）。
 //
 // 只负责取数；缓存、领取状态落盘由 runQuotaBatch 统一负责。
-func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.QuotaFetchResponse, error) {
+func quotaFailureType(err error) string {
+	var failure *core.Failure
+	if errors.As(err, &failure) {
+		return failure.UpstreamKind()
+	}
+	var pluginErr *core.PluginError
+	if errors.As(err, &pluginErr) {
+		if pluginErr.HTTPStatus == http.StatusUnauthorized {
+			return string(core.FailureKindCredential)
+		}
+		return pluginErr.Code
+	}
+	return string(core.FailureKindTransient)
+}
+
+func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.QuotaFetchResponse, bool, error) {
 	quotaProvider, okQuota := core.As[core.QuotaProvider](job.vendor)
 	if !okQuota {
-		return nil, core.QuotaUnsupported(job.vendor)
+		return nil, false, core.QuotaUnsupported(job.vendor)
 	}
 	quota, errQuota := quotaProvider.Quota(ctx, job.credential)
+	refreshed := false
 	if errQuota != nil && isAuthExpired(errQuota) {
 		// 凭证过期类错误：先保活刷新一次再重试。MiniMax 的 access token 只有
 		// 1 小时有效期，不刷新的话额度列会一直挂着 401，用户只能自己想到去点
 		// 「一键保活」——那条路还要求他先认出这是凭证问题。
-		if refreshed := s.refreshedCredential(ctx, "", job); refreshed != nil {
-			quota, errQuota = quotaProvider.Quota(ctx, refreshed)
+		if refreshedCredential := s.refreshedCredential(ctx, "", job); refreshedCredential != nil {
+			refreshed = true
+			quota, errQuota = quotaProvider.Quota(ctx, refreshedCredential)
 		}
 	}
-	return quota, errQuota
+	return quota, refreshed, errQuota
 }
 
 // isAuthExpired 判断错误是否属于「凭证已过期/失效」类（401）。
