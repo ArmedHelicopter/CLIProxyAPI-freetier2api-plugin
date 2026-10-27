@@ -154,6 +154,9 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 	}
 
 	accountHost := AccountHostFor(session.Region)
+	if override := strings.TrimRight(strings.TrimSpace(baseURLOverride), "/"); override != "" {
+		accountHost = override
+	}
 	tokenURL := accountHost + EpToken
 
 	data := url.Values{}
@@ -296,6 +299,9 @@ func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride st
 	}
 
 	accountHost := AccountHostFor(cred.Region)
+	if override := strings.TrimRight(strings.TrimSpace(baseURLOverride), "/"); override != "" {
+		accountHost = override
+	}
 	tokenURL := accountHost + EpToken
 
 	data := url.Values{}
