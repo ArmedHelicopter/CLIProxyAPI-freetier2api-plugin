@@ -128,14 +128,10 @@ func FetchQuota(ctx context.Context, cred *Credential, baseURLOverride string) (
 	if errDo != nil {
 		return nil, core.ToPluginError(errDo)
 	}
-	// 额度页面常在 access token 被撤销后先于聊天暴露 401。强制刷新一次，
-	// 并用刷新后的 token 重建签名请求，避免“登录成功但额度永远失效”。
-	if resp.StatusCode == http.StatusUnauthorized {
-		resp, errDo = requestWithCredentialRefresh(ctx, cred, baseURLOverride, requestMembership)
-		if errDo != nil {
-			return nil, core.ToPluginError(errDo)
-		}
-	}
+	// 凭证刷新由 admin quota 编排统一负责：它会调用 Keepalive、持久化
+	// access/refresh token、重新加载账号后再重试。这里不能自行刷新，因为
+	// vendor 层拿不到原始 JSON/file path，刷新后只改内存会导致旧 token 留在磁盘，
+	// 下一次请求再次使用旧凭证并消耗/吊销 refresh_token。
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode >= 400 {
