@@ -923,8 +923,18 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       var rt = account.refreshed_at ? new Date(account.refreshed_at).toLocaleString() : "-";
       row.appendChild(el("td", rt, "muted"));
 
-      // 操作列（仅保留删除）
+      // 操作列：凭证失效时提供重新授权；旧凭证不会在授权成功前删除。
       var actionCell = el("td");
+      if (account.quota && account.quota.failure_type === "credential") {
+        var reauthBtn = el("button", "重新授权", "act primary");
+        reauthBtn.type = "button";
+        reauthBtn.title = "打开 OAuth 重新授权；授权成功后才替换旧凭证";
+        reauthBtn.addEventListener("click", function () {
+          var vendorInfo = vendorsById[account.vendor_id] || { id: account.vendor_id, name: account.vendor_name };
+          startLogin(vendorInfo);
+        });
+        actionCell.appendChild(reauthBtn);
+      }
       var deleteBtn = el("button", "删除", "act danger");
       deleteBtn.type = "button";
       deleteBtn.addEventListener("click", function () {

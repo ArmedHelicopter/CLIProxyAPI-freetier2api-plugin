@@ -278,7 +278,7 @@ func classifyRefreshFailure(status int, payload map[string]any) error {
 	errCode := strings.ToLower(strings.TrimSpace(core.GetString(payload, "error")))
 	errDesc := core.FirstNonEmpty(core.GetString(payload, "error_description"), errCode, fmt.Sprintf("HTTP %d", status))
 	if errCode == "invalid_grant" || strings.Contains(strings.ToLower(errDesc), "can no longer be used") || strings.Contains(strings.ToLower(errDesc), "revoked") {
-		return core.NewPluginError("minimax_refresh_token_revoked", "MiniMax refresh token 已失效或被撤销，请重新授权登录", http.StatusUnauthorized)
+		return core.NewPluginError("minimax_reauthorization_required", "MiniMax refresh token 已失效或被撤销，请重新授权登录", http.StatusUnauthorized)
 	}
 	return fmt.Errorf("minimax refresh token rejected: %s", errDesc)
 }
