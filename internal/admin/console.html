@@ -925,7 +925,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
 
       // 操作列：凭证失效时提供重新授权；旧凭证不会在授权成功前删除。
       var actionCell = el("td");
-      if (account.quota && account.quota.failure_type === "credential") {
+      if (account.quota && (account.quota.failure_type === "credential" || account.quota.failure_type === "minimax_refresh_token_revoked")) {
         var reauthBtn = el("button", "重新授权", "act primary");
         reauthBtn.type = "button";
         reauthBtn.title = "打开 OAuth 重新授权；授权成功后才替换旧凭证";
