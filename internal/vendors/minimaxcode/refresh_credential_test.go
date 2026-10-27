@@ -3,38 +3,27 @@ package minimaxcode
 import (
 	"context"
 	"encoding/json"
+	"freetier2api-plugin/internal/hostbridge"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
-
-	"freetier2api-plugin/internal/hostbridge"
 )
 
 func TestRefreshCredentialUsesOverrideAndRotatesTokens(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != EpToken || r.Method != http.MethodPost {
-			t.Fatalf("request = %s %s", r.Method, r.URL.Path)
-		}
-		if err := r.ParseForm(); err != nil || r.Form.Get("grant_type") != RefreshGrantType || r.Form.Get("refresh_token") != "old-refresh" {
-			t.Fatalf("unexpected form: %v", r.Form)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"access_token": "new-access", "refresh_token": "new-refresh", "expires_in": 7200})
-	}))
-	defer server.Close()
-	hostbridge.Configure(func(_, method string, payload any) (json.RawMessage, error) {
+	called := false
+	hostbridge.Configure(func(_, method string, _ any) (json.RawMessage, error) {
 		if method != "host.http.do" {
-			return nil, nil
+			t.Fatalf("method = %s", method)
 		}
-		_ = payload
-		return json.RawMessage(`{"StatusCode":200,"Headers":{"Content-Type":["application/json"]},"Body":"eyJhY2Nlc3NfdG9rZW4iOiJuZXctYWNjZXNzIiwicmVmcmVzaF90b2tlbiI6Im5ldy1yZWZyZXNoIiwiZXhwaXJlc19pbiI6NzIwMH0="}`), nil
+		called = true
+		body := []byte(`{"access_token":"new-access","refresh_token":"new-refresh","expires_in":7200}`)
+		return json.Marshal(map[string]any{"status_code": 200, "headers": map[string][]string{"Content-Type": {"application/json"}}, "body": body})
 	})
 	defer hostbridge.Configure(nil)
 	cred := &Credential{Region: RegionCN, AuthMode: "oauth", AccessToken: "old-access", RefreshToken: "old-refresh"}
-	updated, changed, err := RefreshCredential(context.Background(), cred, server.URL)
-	if err != nil || !changed {
-		t.Fatalf("refresh = %v %t", err, changed)
+	updated, changed, err := RefreshCredential(context.Background(), cred, "http://test.local")
+	if err != nil || !changed || !called {
+		t.Fatalf("refresh = %v %t called=%v", err, changed, called)
 	}
 	if updated.AccessToken != "new-access" || updated.RefreshToken != "new-refresh" || updated.ExpiresAt <= 0 {
 		t.Fatalf("updated credential = %+v", updated)
