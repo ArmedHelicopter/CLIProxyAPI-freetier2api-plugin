@@ -572,7 +572,9 @@ func doMessageRequest(ctx context.Context, cred *Credential, req *core.ExecuteRe
 	request := func() (*http.Response, error) {
 		return doRequest(ctx, cred, target, streamBase, 120*time.Second)
 	}
-	resp, errDo := requestWithCredentialRefresh(ctx, cred, baseURLOverride, request)
+	// 认证刷新由上层凭证协调器负责：它持久化并 reload 后再重试，
+	// vendor 层不能只在内存修改 native token，否则会与其它请求竞争并继续使用旧磁盘凭证。
+	resp, errDo := request()
 	if errDo != nil {
 		return nil, "", 0, fmt.Errorf("send message request: %w", errDo)
 	}
