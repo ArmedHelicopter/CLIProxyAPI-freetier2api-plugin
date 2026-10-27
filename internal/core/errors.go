@@ -261,7 +261,8 @@ func (e *Failure) Retryable() bool {
 	}
 	switch e.Kind {
 	case FailureKindContentBlocked, FailureKindChannelRejected, FailureKindPromptTooLong,
-		FailureKindImageInvalid, FailureKindBadParams, FailureKindClient, FailureKindCredential:
+		FailureKindImageInvalid, FailureKindBadParams, FailureKindClient, FailureKindCredential,
+		FailureKindSessionDead:
 		return false
 	default:
 		return true
