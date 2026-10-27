@@ -226,7 +226,10 @@ func quotaFailureType(err error) string {
 	}
 	var pluginErr *core.PluginError
 	if errors.As(err, &pluginErr) {
-		if pluginErr.Code != "" {
+		if pluginErr.Code == "minimax_refresh_token_revoked" {
+			return pluginErr.Code
+		}
+		if pluginErr.Code != "" && pluginErr.Code != "upstream_credential" {
 			return pluginErr.Code
 		}
 		if pluginErr.HTTPStatus == http.StatusUnauthorized {
