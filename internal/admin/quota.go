@@ -251,7 +251,11 @@ func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.Quot
 		// 凭证过期类错误：先保活刷新一次再重试。MiniMax 的 access token 只有
 		// 1 小时有效期，不刷新的话额度列会一直挂着 401，用户只能自己想到去点
 		// 「一键保活」——那条路还要求他先认出这是凭证问题。
-		if refreshedCredential := s.refreshedCredential(ctx, "", job); refreshedCredential != nil {
+		refreshedCredential, refreshErr := s.refreshedCredential(ctx, "", job)
+		if refreshErr != nil {
+			return nil, true, refreshErr
+		}
+		if refreshedCredential != nil {
 			refreshed = true
 			quota, errQuota = quotaProvider.Quota(ctx, refreshedCredential)
 		}
@@ -279,12 +283,17 @@ func isAuthExpired(err error) bool {
 //
 // 复用保活那条既有通道（它负责刷新 + 写盘 + 热更新宿主），额度查询因此不需要
 // 自己再造一套刷新逻辑。保活失败或账号消失时返回 nil，由调用方按原错误上报。
-func (s *Service) refreshedCredential(ctx context.Context, callbackID string, target quotaJob) *core.Credential {
+func (s *Service) refreshedCredential(ctx context.Context, callbackID string, target quotaJob) (*core.Credential, error) {
 	authID := core.FirstNonEmpty(target.entry.ID, target.entry.Name)
 	if authID == "" {
-		return nil
+		return nil, errors.New("credential refresh failed: account identity is missing")
 	}
-	s.tasks.Keepalive(ctx, callbackID, []string{authID}, 1)
+	refreshResults := s.tasks.Keepalive(ctx, callbackID, []string{authID}, 1)
+	for _, result := range refreshResults {
+		if !result.OK {
+			return nil, errors.New(result.Message)
+		}
+	}
 
 	loaded, _ := s.pool.Load(ctx, callbackID, accountpkg.Options{
 		Targets:       []string{authID},
@@ -292,8 +301,8 @@ func (s *Service) refreshedCredential(ctx context.Context, callbackID string, ta
 	})
 	for _, account := range loaded {
 		if account.Vendor.ID() == target.vendor.ID() {
-			return account.Credential
+			return account.Credential, nil
 		}
 	}
-	return nil
+	return nil, errors.New("credential refresh failed: refreshed account was not reloaded")
 }
