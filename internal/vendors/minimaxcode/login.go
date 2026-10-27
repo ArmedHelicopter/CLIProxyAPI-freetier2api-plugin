@@ -228,9 +228,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 		}, nil
 	}
 
-	// 授权成功，清理会话并构建凭据
-	logins.Delete(cleanState)
-
+	// 构建凭证后再验证其可用性；token endpoint 返回成功不等于 Agent/额度 API 可用。
 	refreshToken := core.GetString(payload, "refresh_token", "refreshToken")
 	expiresIn := core.GetInt64(payload, "expires_in", "expiresIn")
 	if expiresIn <= 0 {
@@ -251,6 +249,9 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 	_, _, _, _ = fetchUserInfo(ctx, cred, baseURLOverride)
 	_ = prepare(ctx, cred, baseURLOverride, nil)
 
+	if _, _, _, errVerify := fetchUserInfo(ctx, cred, baseURLOverride); errVerify != nil {
+		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "新凭证验证失败，请重新授权：" + errVerify.Error()}, nil
+	}
 	storageJSON, errStorage := cred.StorageJSON()
 	if errStorage != nil {
 		return &pluginapi.AuthLoginPollResponse{
@@ -265,6 +266,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 		label = VendorNameFor(session.Region) + "-" + accountIdentifier
 	}
 
+	logins.Delete(cleanState)
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "登录成功",
