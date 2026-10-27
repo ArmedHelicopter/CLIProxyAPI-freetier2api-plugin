@@ -226,10 +226,13 @@ func quotaFailureType(err error) string {
 	}
 	var pluginErr *core.PluginError
 	if errors.As(err, &pluginErr) {
+		if pluginErr.Code != "" {
+			return pluginErr.Code
+		}
 		if pluginErr.HTTPStatus == http.StatusUnauthorized {
 			return string(core.FailureKindCredential)
 		}
-		return pluginErr.Code
+		return string(core.FailureKindTransient)
 	}
 	return string(core.FailureKindTransient)
 }
