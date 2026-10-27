@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -220,6 +221,9 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 //
 // 只负责取数；缓存、领取状态落盘由 runQuotaBatch 统一负责。
 func quotaFailureType(err error) string {
+	if strings.Contains(strings.ToLower(err.Error()), "refresh token") && (strings.Contains(err.Error(), "重新授权") || strings.Contains(strings.ToLower(err.Error()), "revoked")) {
+		return "minimax_refresh_token_revoked"
+	}
 	var failure *core.Failure
 	if errors.As(err, &failure) {
 		return failure.UpstreamKind()
