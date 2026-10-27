@@ -232,6 +232,7 @@ input.aliasinput:focus { outline: none; border-color: var(--accent); box-shadow:
 .banner.ok   { background: var(--ok-soft);   border-left: 3px solid var(--ok);   color: var(--ok); }
 .banner.warn { background: var(--warn-soft); border-left: 3px solid var(--warn); color: var(--warn); }
 .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.quota-failure { color: var(--err); font-size: 12px; white-space: normal; line-height: 1.35; display: inline-block; max-width: 260px; }
 .disclaimer { padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 12.5px; background: var(--warn-soft); border: 1px solid transparent; border-left: 3px solid var(--warn); color: var(--fg); line-height: 1.55; }
 
 /* ---- 套餐领取弹窗 ---- */
@@ -843,8 +844,21 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       vendorCell.appendChild(pill(vendor, vendorChipClass(account.vendor_id, vendor)));
       row.appendChild(vendorCell);
 
-      row.appendChild(el("td", accountDisplay(account)));
-      row.appendChild(cellWith(account.disabled ? pill("已禁用", "err") : pill("正常", "ok")));
+      var accountCell = el("td", accountDisplay(account));
+      if (account.auth_index) accountCell.title = "auth_index: " + account.auth_index;
+      row.appendChild(accountCell);
+      var quotaFailure = account.quota && !account.quota.ok;
+      var statusCell = el("td");
+      if (account.disabled) {
+        statusCell.appendChild(pill("已禁用", "err"));
+      } else if (quotaFailure) {
+        var failurePill = pill("额度失败", "err");
+        failurePill.title = account.quota.message || "额度查询失败";
+        statusCell.appendChild(failurePill);
+      } else {
+        statusCell.appendChild(pill("正常", "ok"));
+      }
+      row.appendChild(statusCell);
 
       // 签到 / 套餐领取列：支持领取的供应商（如 ZCode）展示套餐领取按钮；其余展示签到或「无签到活动」
       var claimSpec = claimButtonSpec(account);
@@ -890,8 +904,12 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
           row.appendChild(el("td", "--", "muted"));
         }
       } else if (!quota.ok) {
-        row.appendChild(el("td", "-- / --", "muted"));
-        row.appendChild(el("td", "--", "muted"));
+        var failureCell = el("td");
+        var failureText = quota.message || "查询失败";
+        failureCell.appendChild(el("span", failureText, "quota-failure"));
+        failureCell.title = failureText;
+        row.appendChild(failureCell);
+        row.appendChild(el("td", quota.failure_type || "失败", "err"));
       } else if (quota.unlimited) {
         row.appendChild(el("td", "无限"));
         row.appendChild(el("td", "—", "muted"));
