@@ -11,6 +11,15 @@ import (
 	"testing"
 )
 
+func TestConsolePageShowsQuotaFailureDetails(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+	for _, literal := range []string{"failedDetails", "vendor_name || r.vendor_id", "r.message || \"未知错误\"", "12000"} {
+		if !strings.Contains(page, literal) {
+			t.Fatalf("console page is missing quota failure detail rendering: %s", literal)
+		}
+	}
+}
+
 func TestConsolePageHidesMissingTotal(t *testing.T) {
 	page := Page("/plugins/freetier2api")
 

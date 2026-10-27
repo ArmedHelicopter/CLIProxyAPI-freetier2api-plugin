@@ -1056,8 +1056,18 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
       var results = (data && data.results) || [];
       var failed = results.filter(function (r) { return !r.ok; }).length;
       if (!quiet) {
-        banner(failed ? "warn" : "ok",
-          "额度查询完成：" + results.length + " 个账号" + (failed ? "，" + failed + " 个失败" : ""), 5000);
+        if (failed) {
+          var failedDetails = results.filter(function (r) { return !r.ok; }).map(function (r) {
+            var who = r.label || r.name || r.auth_id || r.auth_index || "未知账号";
+            var vendor = r.vendor_name || r.vendor_id || "未知供应商";
+            var reason = r.message || "未知错误";
+            return vendor + " / " + who + "：" + reason;
+          });
+          var detail = failedDetails.length ? "\n" + failedDetails.join("\n") : "";
+          banner("warn", "额度查询完成：" + results.length + " 个账号，" + failed + " 个失败" + detail, 12000);
+        } else {
+          banner("ok", "额度查询完成：" + results.length + " 个账号", 5000);
+        }
       }
       return loadStatus(true);
     }).catch(function (err) {
