@@ -274,6 +274,15 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 	}, nil
 }
 
+func classifyRefreshFailure(status int, payload map[string]any) error {
+	errCode := strings.ToLower(strings.TrimSpace(core.GetString(payload, "error")))
+	errDesc := core.FirstNonEmpty(core.GetString(payload, "error_description"), errCode, fmt.Sprintf("HTTP %d", status))
+	if errCode == "invalid_grant" || strings.Contains(strings.ToLower(errDesc), "can no longer be used") || strings.Contains(strings.ToLower(errDesc), "revoked") {
+		return core.NewPluginError("minimax_refresh_token_revoked", "MiniMax refresh token 已失效或被撤销，请重新授权登录", http.StatusUnauthorized)
+	}
+	return fmt.Errorf("minimax refresh token rejected: %s", errDesc)
+}
+
 // RefreshCredential 使用 refresh_token 刷新 MiniMax OAuth 访问令牌。
 func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride string) (*Credential, bool, error) {
 	if cred == nil {
@@ -299,6 +308,8 @@ func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride st
 		return nil, false, fmt.Errorf("build refresh request: %w", errReq)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", DesktopUA)
 
 	resp, errDo := hostbridge.Client(ctx, 20*time.Second).Do(req)
 	if errDo != nil {
@@ -312,12 +323,7 @@ func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride st
 	}
 
 	if resp.StatusCode >= 400 || core.GetString(payload, "error") != "" {
-		errDesc := core.FirstNonEmpty(
-			core.GetString(payload, "error_description"),
-			core.GetString(payload, "error"),
-			fmt.Sprintf("HTTP %d", resp.StatusCode),
-		)
-		return nil, false, fmt.Errorf("minimax refresh token rejected: %s", errDesc)
+		return nil, false, classifyRefreshFailure(resp.StatusCode, payload)
 	}
 
 	accessToken := core.GetString(payload, "access_token", "accessToken")
