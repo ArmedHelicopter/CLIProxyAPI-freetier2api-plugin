@@ -94,8 +94,16 @@ func parseConfigModels(body []byte) []Model {
 				ContextWindow       int    `json:"contextWindow"`
 				MaxCompletionTokens int    `json:"maxCompletionTokens"`
 				Capabilities        struct {
-					Vision bool `json:"vision"`
+					Vision          bool     `json:"vision"`
+					Image           bool     `json:"image"`
+					SupportsImages  bool     `json:"supportsImages"`
+					Input           []string `json:"input"`
+					InputModalities []string `json:"inputModalities"`
 				} `json:"capabilities"`
+				InputModalities []string `json:"inputModalities"`
+				Modalities      struct {
+					Input []string `json:"input"`
+				} `json:"modalities"`
 				Reasoning struct {
 					Levels map[string]any `json:"levels"`
 				} `json:"reasoning"`
@@ -112,6 +120,7 @@ func parseConfigModels(body []byte) []Model {
 		if id == "" {
 			continue
 		}
+		imageSupport := item.Capabilities.Vision || item.Capabilities.Image || item.Capabilities.SupportsImages || hasImageModality(item.Capabilities.Input) || hasImageModality(item.Capabilities.InputModalities) || hasImageModality(item.InputModalities) || hasImageModality(item.Modalities.Input)
 		models = append(models, Model{
 			ID:             id,
 			Name:           core.FirstNonEmpty(item.Name, id),
@@ -119,11 +128,21 @@ func parseConfigModels(body []byte) []Model {
 			ContextWindow:  item.ContextWindow,
 			MaxTokens:      item.MaxCompletionTokens,
 			SupportsTools:  true,
-			SupportsImages: item.Capabilities.Vision,
+			SupportsImages: imageSupport,
 			IsReasoning:    len(item.Reasoning.Levels) > 0,
 		})
 	}
 	return models
+}
+
+func hasImageModality(values []string) bool {
+	for _, value := range values {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "image", "image_url", "vision", "multimodal":
+			return true
+		}
+	}
+	return false
 }
 
 // NormalizeModelName 归一化模型名大小写（上游对模型名大小写敏感）。

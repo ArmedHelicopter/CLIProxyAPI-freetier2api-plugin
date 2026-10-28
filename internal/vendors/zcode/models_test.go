@@ -4,12 +4,21 @@ import (
 	"testing"
 )
 
+func TestHasImageModality(t *testing.T) {
+	if !hasImageModality([]string{"text", "IMAGE"}) {
+		t.Fatal("expected image modality to be detected case-insensitively")
+	}
+	if hasImageModality([]string{"text", "audio"}) {
+		t.Fatal("audio-only modality must not be treated as image support")
+	}
+}
+
 func TestParseConfigModels(t *testing.T) {
 	body := []byte(`{"code":0,"data":{"builtinModels":[
 		{"modelId":"GLM-5.3","name":"GLM-5.3","contextWindow":1000000,"maxCompletionTokens":128000,
 		 "reasoning":{"levels":{"low":{},"high":{}}}},
 		{"modelId":"GLM-5.3-Flash","name":"GLM-5.3-Flash","contextWindow":1000000,"maxCompletionTokens":128000,
-		 "capabilities":{"vision":true}}
+		 "capabilities":{"input":["text","image"]}}
 	]}}`)
 	models := parseConfigModels(body)
 	if len(models) != 2 {
