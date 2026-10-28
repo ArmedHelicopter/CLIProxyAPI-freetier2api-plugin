@@ -98,6 +98,12 @@ func TestAuthParseVendorOwnershipDiscrimination(t *testing.T) {
 		{"minimaxcodecn filename", "minimaxcodecn-user1.json", "", `{"token":"at_123"}`, true},
 		{"minimaxcodeglobal filename", "minimaxcodeglobal-user1.json", "", `{"token":"at_123","region":"global"}`, true},
 
+		// 新增供应商：AutoClaw 国内版/国际版、小浣熊。
+		{"autoclawcn filename", "autoclawcn-user1.json", "", `{"accessToken":"at","refreshToken":"rt","region":"cn"}`, true},
+		{"autoclawglobal filename", "autoclawglobal-user1.json", "", `{"accessToken":"at","refreshToken":"rt","region":"global"}`, true},
+		{"autoclaw vendor field", "acc.json", "", `{"vendor":"autoclawcn","accessToken":"at"}`, true},
+		{"raccoon filename", "raccoon-7591340.json", "", `{"access_token":"a","refresh_token":"r","uid":"7591340"}`, true},
+		{"raccoon pinyin filename", "xiaohuanxiong-u1.json", "", `{"access_token":"a","refresh_token":"r","uid":"1"}`, true},
 		// 跨供应商误吞防护：通用结构必须落在**正确**的供应商头上。
 		{"qoder pt token is qoder", "acc.json", "", `{"access_token":"pt-abc"}`, true},
 		{"cline camel is cline", "acc.json", "", `{"accessToken":"at","refreshToken":"rt"}`, true},
@@ -350,5 +356,31 @@ func TestSubmitLoginCallbackRejectsSessionlessVendor(t *testing.T) {
 	if _, errSubmit := testApp.SubmitLoginCallback(
 		context.Background(), started.State, "http://127.0.0.1/authorize?a=1"); errSubmit == nil {
 		t.Fatal("没有本地回调的供应商必须拒绝粘贴")
+	}
+}
+
+// TestVendorAccountLimitEnforced 验证单个供应商最多允许添加 10 个账号（core.MaxAccountsPerVendor）。
+func TestVendorAccountLimitEnforced(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+
+	for i := 1; i <= core.MaxAccountsPerVendor; i++ {
+		id := string(rune(96 + i))
+		host.AddAccount(id, "codearts-user-"+id+".json", `{"vendor":"codearts","access_key_id":"ak","secret_access_key":"sk"}`)
+	}
+
+	// 同供应商已满 10 个账号时，发起第 11 个登录必须被拒绝。
+	_, errStart := testApp.HandleMethod(pluginabi.MethodAuthLoginStart, mustMarshal(map[string]any{
+		"metadata": map[string]any{core.VendorKey: "codearts"},
+	}))
+	if errStart == nil || !strings.Contains(errStart.Error(), "最多添加 10 个账号") {
+		t.Fatalf("expected account limit error for codearts, got %v", errStart)
+	}
+
+	// 其它未满 10 个账号的供应商不受影响。
+	if _, errOther := testApp.HandleMethod(pluginabi.MethodAuthLoginStart, mustMarshal(map[string]any{
+		"metadata": map[string]any{core.VendorKey: "qodercn"},
+	})); errOther != nil {
+		t.Fatalf("other vendor should still be allowed, got %v", errOther)
 	}
 }

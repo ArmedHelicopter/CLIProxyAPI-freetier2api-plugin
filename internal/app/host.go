@@ -5,7 +5,6 @@ package app
 
 import (
 	"context"
-	"strings"
 	"sync"
 	"time"
 
@@ -43,15 +42,12 @@ func (h *hostBridge) Settings() core.Settings {
 // configureVendors 把全局设置与原始配置键推给每个供应商。
 func (a *App) configureVendors(cfg pluginConfig) {
 	settings := a.host.Settings()
-	raw := make(map[string]string, len(cfg.Raw)+len(a.SnapshotState().VendorSettings))
+	raw := make(map[string]string, len(cfg.Raw)+1)
 	for key, value := range cfg.Raw {
 		raw[key] = value
 	}
-	for key, value := range a.SnapshotState().VendorSettings {
-		if strings.TrimSpace(key) != "" {
-			raw[key] = value
-		}
-	}
+	// 提示词过滤是全局设置：页面覆盖 > YAML > 内置默认，供应商读同一个键。
+	raw[admin.PromptModeKey] = admin.EffectivePromptMode(cfg, a.SnapshotState().PromptMode)
 	for _, vendor := range a.registry.Vendors() {
 		if configurable, okConfigurable := vendor.(core.Configurable); okConfigurable {
 			configurable.Configure(settings, raw)
@@ -162,8 +158,7 @@ func (d adminDeps) State() state.State         { return d.app.SnapshotState() }
 func (d adminDeps) MutateState(fn func(*state.State)) {
 	d.app.MutateState(fn)
 }
-func (d adminDeps) Model() *admin.Catalog       { return d.app.models }
-func (d adminDeps) WorkbuddyPromptMode() string { return d.app.promptModeFor() }
+func (d adminDeps) Model() *admin.Catalog { return d.app.models }
 
 func (d adminDeps) RefreshModels(ctx context.Context) (int, error) {
 	return d.app.refreshModelsFromUpstream(ctx)
@@ -172,8 +167,24 @@ func (d adminDeps) RefreshModels(ctx context.Context) (int, error) {
 func (d adminDeps) Reconfigure() error { return d.app.ApplyConfig(d.app.Config()) }
 
 // SubmitLoginCallback 把页面粘回来的 localhost 回调链接交给对应供应商处理。
+func (d adminDeps) SendLoginSMS(ctx context.Context, vendorID, phone string) (string, error) {
+	return d.app.SendLoginSMS(ctx, vendorID, phone)
+}
+
+func (d adminDeps) VerifyLoginSMS(ctx context.Context, vendorID, sessionKey, phone, code string) (string, string, string, error) {
+	return d.app.VerifyLoginSMS(ctx, vendorID, sessionKey, phone, code)
+}
+
 func (d adminDeps) SubmitLoginCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
 	return d.app.SubmitLoginCallback(ctx, state, rawURL)
+}
+
+func (d adminDeps) StartLogin(ctx context.Context, vendorID string, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	return d.app.StartLogin(ctx, vendorID, metadata)
+}
+
+func (d adminDeps) LoginCaptchaConfig(ctx context.Context, vendorID string) (core.CaptchaConfig, error) {
+	return d.app.LoginCaptchaConfig(ctx, vendorID)
 }
 
 func (a *App) managementRegistration() pluginapi.ManagementRegistrationResponse {

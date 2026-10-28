@@ -1,9 +1,18 @@
 package workbuddy
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"math"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
+
+	"freetier2api-plugin/cpasdk/pluginabi"
+	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // 本文件锁定每日活跃奖励（国际版签到）的关键判据。
@@ -107,6 +116,50 @@ func TestParseGrowthHeatmapEmpty(t *testing.T) {
 	}
 }
 
+// TestParseClaimResultRejectsMalformedPayloads 领奖响应解析失败必须显式报错，
+// 不能把 malformed JSON/HTML 静默当成 0 奖励成功。
+func TestParseClaimResultRejectsMalformedPayloads(t *testing.T) {
+	for _, raw := range []string{
+		`{`,
+		`<html><body>upstream error</body></html>`,
+		`{"unexpected":true}`,
+		`null`,
+	} {
+		t.Run(raw, func(t *testing.T) {
+			credit, energy, errParse := parseClaimResult(json.RawMessage(raw))
+			if errParse == nil {
+				t.Fatalf("parseClaimResult(%q) returned nil error with %d/%d reward", raw, credit, energy)
+			}
+			if credit != 0 || energy != 0 {
+				t.Fatalf("malformed claim result returned reward %d/%d", credit, energy)
+			}
+		})
+	}
+}
+
+func TestParseClaimResult(t *testing.T) {
+	for _, testCase := range []struct {
+		name         string
+		raw          string
+		wantCredit   int64
+		wantEnergy   int64
+		wantNilError bool
+	}{
+		{"reward", `{"credit":12,"energy":3}`, 12, 3, true},
+		{"already claimed", `{"already_claimed":true}`, 0, 0, true},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			credit, energy, errParse := parseClaimResult(json.RawMessage(testCase.raw))
+			if (errParse == nil) != testCase.wantNilError {
+				t.Fatalf("error = %v, want nil=%v", errParse, testCase.wantNilError)
+			}
+			if credit != testCase.wantCredit || energy != testCase.wantEnergy {
+				t.Fatalf("reward = %d/%d, want %d/%d", credit, energy, testCase.wantCredit, testCase.wantEnergy)
+			}
+		})
+	}
+}
+
 // TestTaskSpecsForGlobalRegistersDailyBonus 国际版必须注册每日活跃奖励族。
 func TestTaskSpecsForGlobalRegistersDailyBonus(t *testing.T) {
 	specs := TaskSpecsFor(RegionGlobal)
@@ -117,8 +170,8 @@ func TestTaskSpecsForGlobalRegistersDailyBonus(t *testing.T) {
 	if spec.Kind != TaskKindDailyBonus || spec.Route != "/dailybonus" || !spec.Manual {
 		t.Fatalf("spec = %+v", spec)
 	}
-	if len(spec.DefaultHours) != len(GlobalDailyBonusHours) {
-		t.Fatalf("default hours = %v, want %v", spec.DefaultHours, GlobalDailyBonusHours)
+	if len(spec.DefaultHours) != len(globalDailyBonusHours) {
+		t.Fatalf("default hours = %v, want %v", spec.DefaultHours, globalDailyBonusHours)
 	}
 	// CN 不注册该族（CN 走 checkin 族）。
 	for _, cnSpec := range TaskSpecsFor(RegionCN) {
@@ -177,10 +230,10 @@ func TestParseBalanceMatchesUpstreamShape(t *testing.T) {
 
 	// Cycle 套餐：1000 总量、400 剩余；加油包：500/500。合计 1500 / 900。
 	if balance.Total != 1500 {
-		t.Fatalf("total = %d, want 1500", balance.Total)
+		t.Fatalf("total = %v, want 1500", balance.Total)
 	}
 	if balance.Remain != 900 {
-		t.Fatalf("remain = %d, want 900", balance.Remain)
+		t.Fatalf("remain = %v, want 900", balance.Remain)
 	}
 	if len(balance.Packages) != 2 {
 		t.Fatalf("packages = %d, want 2", len(balance.Packages))
@@ -212,5 +265,301 @@ func TestPackageRemainUsedCycleWins(t *testing.T) {
 	})
 	if remain != 100 || size != 100 {
 		t.Fatalf("clamp: remain=%d size=%d, want 100/100", remain, size)
+	}
+}
+
+// claimHost 是只回一种上游响应的假宿主：任务列表 + 领奖。
+type claimHost struct {
+	taskBody  string
+	claimBody string
+}
+
+// installHostHTTP 用 responder 应答所有 host.http.do 调用，并在用例结束时复位。
+func installHostHTTP(t *testing.T, responder func(method, rawURL string) (status int, body string)) {
+	t.Helper()
+	hostbridge.Configure(func(_ string, method string, payload any) (json.RawMessage, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return nil, fmt.Errorf("test host: unsupported method %s", method)
+		}
+		raw, errMarshal := json.Marshal(payload)
+		if errMarshal != nil {
+			return nil, errMarshal
+		}
+		var req struct {
+			Method string `json:"method"`
+			URL    string `json:"url"`
+		}
+		if errDecode := json.Unmarshal(raw, &req); errDecode != nil {
+			return nil, errDecode
+		}
+		status, body := responder(req.Method, req.URL)
+		return json.Marshal(map[string]any{
+			"StatusCode": status,
+			"Headers":    map[string][]string{"Content-Type": {"application/json"}},
+			"Body":       []byte(body),
+		})
+	})
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+}
+
+func installClaimHost(t *testing.T, host claimHost) {
+	t.Helper()
+	installHostHTTP(t, func(_, rawURL string) (int, string) {
+		if strings.Contains(rawURL, "/claim") {
+			return http.StatusOK, host.claimBody
+		}
+		return http.StatusOK, host.taskBody
+	})
+}
+
+// TestRunGrowthTaskSurfacesClaimFailure 锁定领奖解析失败必须变成任务的错误结果。
+func TestRunGrowthTaskSurfacesClaimFailure(t *testing.T) {
+	// 任务已达标 → runGrowthTask 直接走领奖分支，不执行自动动作。
+	installClaimHost(t, claimHost{
+		taskBody:  `{"code":0,"data":[{"task_code":"chat_5","progress":{"current":5,"target":5}}]}`,
+		claimBody: `<html><body>upstream error</body></html>`,
+	})
+	client := NewClient(newRuntime(core.Env{}), Options{Context: context.Background()})
+	cred := testGlobalCredential("uid-claim")
+	cred.SetRealm(RegionCN)
+
+	_, _, _, errRun := runGrowthTask(context.Background(), client, cred, "chat_5")
+	if errRun == nil {
+		t.Fatal("领奖响应不可解析时必须报错，不能报成「任务已达标」")
+	}
+	if !strings.Contains(errRun.Error(), "领奖失败") {
+		t.Fatalf("error = %v, want 领奖失败", errRun)
+	}
+}
+
+// TestRunGrowthTaskReportsClaimedReward 锁定正常路径不受影响。
+func TestRunGrowthTaskReportsClaimedReward(t *testing.T) {
+	installClaimHost(t, claimHost{
+		taskBody:  `{"code":0,"data":[{"task_code":"chat_5","progress":{"current":5,"target":5}}]}`,
+		claimBody: `{"code":0,"data":{"credit":12,"energy":3}}`,
+	})
+	client := NewClient(newRuntime(core.Env{}), Options{Context: context.Background()})
+	cred := testGlobalCredential("uid-claim")
+	cred.SetRealm(RegionCN)
+
+	message, credit, energy, errRun := runGrowthTask(context.Background(), client, cred, "chat_5")
+	if errRun != nil {
+		t.Fatalf("正常领奖不应报错: %v", errRun)
+	}
+	if credit != 12 || energy != 3 {
+		t.Fatalf("reward = %d/%d, want 12/3", credit, energy)
+	}
+	if !strings.Contains(message, "已领奖") {
+		t.Fatalf("message = %q, want 已领奖", message)
+	}
+}
+
+// balanceHost 按 URL 回不同的额度响应，并记录被请求过的地址。
+type balanceHost struct {
+	personalBody   string
+	enterpriseBody string
+	paths          []string
+}
+
+func installBalanceHost(t *testing.T, host *balanceHost) {
+	t.Helper()
+	installHostHTTP(t, func(_, rawURL string) (int, string) {
+		host.paths = append(host.paths, rawURL)
+		if strings.Contains(rawURL, "enterprise-user-usage") {
+			return http.StatusOK, host.enterpriseBody
+		}
+		return http.StatusOK, host.personalBody
+	})
+}
+
+func (h *balanceHost) called(substr string) bool {
+	for _, path := range h.paths {
+		if strings.Contains(path, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFetchBalanceFallsBackToEnterpriseUsage 企业账号在个人接口上拿到
+// 200 + 空 Accounts，必须回退到企业用量接口，否则面板恒为 0 / 0。
+func TestFetchBalanceFallsBackToEnterpriseUsage(t *testing.T) {
+	host := &balanceHost{
+		personalBody:   `{"code":0,"msg":"OK","data":{"Response":{"Data":{"TotalCount":0,"TotalDosage":0,"Accounts":null}}}}`,
+		enterpriseBody: `{"code":0,"msg":"OK","data":{"credit":4.11,"limitNum":2000,"cycleStartTime":"2026-10-01 00:00:00","cycleEndTime":"2026-10-31 23:59:59","cycleResetTime":"2026-11-01 00:00:00"}}`,
+	}
+	installBalanceHost(t, host)
+	client := NewClient(newRuntime(core.Env{}), Options{Context: context.Background()})
+	cred := testTaskCredential("uid-enterprise-balance")
+	cred.EnterpriseID = "fysxmvfpz6dc"
+
+	balance, errFetch := client.FetchBalance(cred)
+	if errFetch != nil {
+		t.Fatalf("fetch balance: %v", errFetch)
+	}
+	if !balance.Enterprise {
+		t.Fatal("企业账号的余额必须标记为 enterprise")
+	}
+	if balance.Total != 2000 || math.Abs(balance.Remain-1995.89) > 0.0001 {
+		t.Fatalf("balance = %v/%v, want 1995.89/2000", balance.Remain, balance.Total)
+	}
+	if !host.called("/v2/billing/meter/get-user-resource") {
+		t.Fatal("个人接口必须先被尝试（企业接口只是回退）")
+	}
+	if !host.called("get-enterprise-user-usage") {
+		t.Fatal("企业账号必须回退到企业用量接口")
+	}
+}
+
+// TestFetchBalanceKeepsEmptyForNonEnterpriseAccount 非企业账号的空额度是真
+// 空额度，不能去打企业接口。
+func TestFetchBalanceKeepsEmptyForNonEnterpriseAccount(t *testing.T) {
+	host := &balanceHost{
+		personalBody:   `{"code":0,"data":{"Response":{"Data":{"Accounts":null}}}}`,
+		enterpriseBody: `{"code":0,"data":{"credit":1,"limitNum":100}}`,
+	}
+	installBalanceHost(t, host)
+	client := NewClient(newRuntime(core.Env{}), Options{Context: context.Background()})
+	cred := testTaskCredential("uid-personal-balance")
+
+	balance, errFetch := client.FetchBalance(cred)
+	if errFetch != nil {
+		t.Fatalf("fetch balance: %v", errFetch)
+	}
+	if balance.Total != 0 || balance.Enterprise {
+		t.Fatalf("balance = %+v, want empty personal quota", balance)
+	}
+	if host.called("enterprise-user-usage") {
+		t.Fatal("非企业账号不应请求企业用量接口")
+	}
+}
+
+// TestFetchBalancePrefersPersonalPackages 企业账号若个人接口确实有额度，
+// 以个人资源包为准，不再叠加企业额度。
+func TestFetchBalancePrefersPersonalPackages(t *testing.T) {
+	host := &balanceHost{
+		personalBody:   `{"code":0,"data":{"Response":{"Data":{"Accounts":[{"PackageName":"加油包","CapacitySize":500,"CapacityRemain":500}]}}}}`,
+		enterpriseBody: `{"code":0,"data":{"credit":1,"limitNum":100}}`,
+	}
+	installBalanceHost(t, host)
+	client := NewClient(newRuntime(core.Env{}), Options{Context: context.Background()})
+	cred := testTaskCredential("uid-enterprise-personal")
+	cred.EnterpriseID = "ent-1"
+
+	balance, errFetch := client.FetchBalance(cred)
+	if errFetch != nil {
+		t.Fatalf("fetch balance: %v", errFetch)
+	}
+	if balance.Enterprise || balance.Total != 500 || balance.Remain != 500 {
+		t.Fatalf("balance = %+v, want personal 500/500", balance)
+	}
+	if host.called("enterprise-user-usage") {
+		t.Fatal("个人额度非空时不应请求企业接口")
+	}
+}
+
+// TestParseEnterpriseBalanceKeepsFractionalCredit 企业已用量是小数，
+// 截断成整数会让「消耗 0.9 积分」在面板上完全不可见。
+func TestParseEnterpriseBalanceKeepsFractionalCredit(t *testing.T) {
+	balance, errParse := parseEnterpriseBalance(json.RawMessage(`{
+	  "credit":4.11,"limitNum":2000,
+	  "cycleStartTime":"2026-10-01 00:00:00",
+	  "cycleEndTime":"2026-10-31 23:59:59",
+	  "cycleResetTime":"2026-11-01 00:00:00"}`))
+	if errParse != nil {
+		t.Fatalf("parse: %v", errParse)
+	}
+	if !balance.Enterprise || balance.Total != 2000 {
+		t.Fatalf("balance = %+v", balance)
+	}
+	if math.Abs(balance.Remain-1995.89) > 0.0001 {
+		t.Fatalf("remain = %v, want 1995.89", balance.Remain)
+	}
+	if len(balance.Packages) != 1 {
+		t.Fatalf("packages = %d, want 1", len(balance.Packages))
+	}
+	pkg := balance.Packages[0]
+	if pkg.Name != "企业额度" {
+		t.Fatalf("package name = %q", pkg.Name)
+	}
+	if pkg.ExpireAt != 0 {
+		t.Fatal("企业额度到点回满，不能设 ExpireAt（会被显示成即将过期）")
+	}
+	if pkg.ResetAt == 0 {
+		t.Fatal("企业额度必须带周期回满时刻")
+	}
+	if !strings.Contains(pkg.Period, "2026-10-01") || !strings.Contains(pkg.Period, "2026-10-31") {
+		t.Fatalf("period = %q", pkg.Period)
+	}
+}
+
+// TestParseEnterpriseBalanceRejectsMissingLimit 缺 limitNum 的响应不能当成
+// 0 / 0 展示：那正是本 issue 要消除的假象。
+func TestParseEnterpriseBalanceRejectsMissingLimit(t *testing.T) {
+	for _, raw := range []string{`{}`, `{"credit":1}`, `null`, `<html>error</html>`} {
+		if _, errParse := parseEnterpriseBalance(json.RawMessage(raw)); errParse == nil {
+			t.Fatalf("parseEnterpriseBalance(%s) 必须报错", raw)
+		}
+	}
+}
+
+// TestBuildQuotaResponseEnterprisePlan 企业额度不能显示成个人 CN 套餐。
+func TestBuildQuotaResponseEnterprisePlan(t *testing.T) {
+	cred := testTaskCredential("uid-enterprise-quota")
+	cred.EnterpriseID = "ent-1"
+	balance, errParse := parseEnterpriseBalance(json.RawMessage(`{
+	  "credit":4.11,"limitNum":2000,
+	  "cycleStartTime":"2026-10-01 00:00:00",
+	  "cycleEndTime":"2026-10-31 23:59:59",
+	  "cycleResetTime":"2026-11-01 00:00:00"}`))
+	if errParse != nil {
+		t.Fatalf("parse: %v", errParse)
+	}
+	response := BuildQuotaResponse(cred, balance)
+	if response.Subscription == nil || response.Subscription.Plan != "enterprise" {
+		t.Fatalf("subscription = %+v, want plan=enterprise", response.Subscription)
+	}
+	if response.Subscription.TierName != "企业额度" {
+		t.Fatalf("tier = %q", response.Subscription.TierName)
+	}
+	metrics := map[string]float64{}
+	for _, metric := range response.Summary {
+		metrics[metric.Key] = metric.Value
+	}
+	if math.Abs(metrics["credit_used"]-4.11) > 0.0001 {
+		t.Fatalf("credit_used = %v, want 4.11", metrics["credit_used"])
+	}
+	if math.Abs(metrics["credit_remain"]-1995.89) > 0.0001 {
+		t.Fatalf("credit_remain = %v, want 1995.89", metrics["credit_remain"])
+	}
+	if len(response.Groups) != 1 || len(response.Groups[0].Buckets) != 1 {
+		t.Fatalf("groups = %+v, want 1 bucket", response.Groups)
+	}
+	bucket := response.Groups[0].Buckets[0]
+	if bucket.Window != "企业额度" {
+		t.Fatalf("window = %q", bucket.Window)
+	}
+	if !strings.Contains(bucket.Description, "1995.89 / 2000") || !strings.Contains(bucket.Description, "2026-10-01") {
+		t.Fatalf("description = %q", bucket.Description)
+	}
+	if bucket.ResetTime == "" {
+		t.Fatal("企业额度应展示周期回满时刻")
+	}
+}
+
+// TestBuildQuotaResponsePersonalDescription 个人额度是整数，不能显示成
+// 400.00 / 1000.00 这种形态。
+func TestBuildQuotaResponsePersonalDescription(t *testing.T) {
+	var payload billingResourceResponse
+	raw := `{"Response":{"Data":{"Accounts":[{"PackageName":"基础套餐","CycleCapacitySize":1000,"CycleCapacityRemain":400}]}}}`
+	if errUnmarshal := json.Unmarshal([]byte(raw), &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal: %v", errUnmarshal)
+	}
+	response := BuildQuotaResponse(testTaskCredential("uid-plain-quota"), parseBalance(payload))
+	if len(response.Groups) != 1 || len(response.Groups[0].Buckets) != 1 {
+		t.Fatalf("groups = %+v", response.Groups)
+	}
+	if got := response.Groups[0].Buckets[0].Description; got != "400 / 1000" {
+		t.Fatalf("description = %q, want 400 / 1000", got)
 	}
 }

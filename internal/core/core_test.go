@@ -151,6 +151,40 @@ func (v *noFileIDVendor) ExecuteStream(context.Context, *Credential, *ExecuteReq
 	return nil
 }
 
+func TestMaskToken(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"", ""},
+		{"short", "*****"},
+		{"12345678", "********"},
+		{"1234567890abcdef", "1234********cdef"},
+	}
+	for _, tc := range cases {
+		if got := MaskToken(tc.in); got != tc.want {
+			t.Fatalf("MaskToken(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestJWTHelpers(t *testing.T) {
+	// eyJ… payload = {"exp":1791529021,"user_id":"7591340"}
+	token := "eyJhbGciOiJIUzI1NiJ9.eyJleHAiOjE3OTE1MjkwMjEsInVzZXJfaWQiOiI3NTkxMzQwIn0.sig"
+	if got := JWTExpiry(token); got != 1791529021 {
+		t.Fatalf("JWTExpiry = %d", got)
+	}
+	if got := JWTUserID(token); got != "7591340" {
+		t.Fatalf("JWTUserID = %q", got)
+	}
+	if got := JWTExpiry("not-a-jwt"); got != 0 {
+		t.Fatalf("JWTExpiry(garbage) = %d", got)
+	}
+	if got := JWTUserID("not-a-jwt"); got != "" {
+		t.Fatalf("JWTUserID(garbage) = %q", got)
+	}
+}
+
 func TestJSONHelpers(t *testing.T) {
 	payload := map[string]any{
 		"a":          "  x  ",
@@ -249,6 +283,53 @@ func TestCapabilityAssertions(t *testing.T) {
 	withQuota := &quotaVendor{fakeVendor{Meta: Meta{VendorID: "withquota"}}}
 	if _, okQuota := As[QuotaProvider](withQuota); !okQuota {
 		t.Fatal("quota vendor must implement quota")
+	}
+}
+
+// accountCheckinVendor 模拟「供应商支持签到，但某类账号不支持」。
+type accountCheckinVendor struct {
+	fakeVendor
+	blocked bool
+}
+
+func (v *accountCheckinVendor) SupportsCheckin() bool { return true }
+
+func (v *accountCheckinVendor) Checkin(context.Context, *Credential) (*CheckinResult, error) {
+	return &CheckinResult{}, nil
+}
+
+func (v *accountCheckinVendor) SupportsCheckinFor(*Credential) bool { return !v.blocked }
+
+func (v *accountCheckinVendor) CheckinUnsupportedReason(*Credential) string {
+	if v.blocked {
+		return "企业账号不支持签到"
+	}
+	return ""
+}
+
+// TestSupportsCheckinFor 验证「供应商级能力 + 账号级能力」的两级判定。
+func TestSupportsCheckinFor(t *testing.T) {
+	plain := &fakeVendor{Meta: Meta{VendorID: "plain"}}
+	if SupportsCheckinFor(plain, &Credential{}) {
+		t.Fatal("没有签到能力的供应商必须判为不支持")
+	}
+
+	vendor := &accountCheckinVendor{fakeVendor: fakeVendor{Meta: Meta{VendorID: "acct"}}}
+	if !SupportsCheckinFor(vendor, &Credential{}) {
+		t.Fatal("未实现分账号判定的供应商应回落到供应商级能力")
+	}
+	vendor.blocked = true
+	if SupportsCheckinFor(vendor, &Credential{}) {
+		t.Fatal("账号级判定为假时必须判为不支持")
+	}
+	if !SupportsCheckin(vendor) {
+		t.Fatal("供应商级能力不因账号级判定而改变")
+	}
+	if reason := CheckinUnsupportedReason(vendor, &Credential{}); reason != "企业账号不支持签到" {
+		t.Fatalf("reason = %q", reason)
+	}
+	if reason := CheckinUnsupportedReason(plain, &Credential{}); reason != "" {
+		t.Fatalf("reason for plain vendor = %q, want empty", reason)
 	}
 }
 

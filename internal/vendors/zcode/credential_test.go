@@ -167,12 +167,12 @@ func TestParseCredentialRequiresSomeToken(t *testing.T) {
 }
 
 func TestOutboundTokenPrefersAPIKey(t *testing.T) {
-	// 对话只走 API Key 通道（Plan 通道需人机验证码），因此出站凭证必须优先它。
+	// OutboundToken 用于账号标签脱敏：有 API Key 时优先展示 API Key，否则回退 JWT。
 	cred := &Credential{APIKey: "key.s", JWTToken: "a.b.c"}
 	if got := cred.OutboundToken(); got != "key.s" {
 		t.Fatalf("OutboundToken = %q, want the API key", got)
 	}
-	// 只有 JWT 时回退（此时候选路径本身会拒绝，见 resolveTargetURL）。
+	// 只有 JWT 时回退 JWT。
 	if got := (&Credential{JWTToken: "a.b.c"}).OutboundToken(); got != "a.b.c" {
 		t.Fatalf("OutboundToken = %q, want the JWT", got)
 	}
@@ -227,5 +227,30 @@ func TestMergeStorageJSONPreservesUserKeys(t *testing.T) {
 	// 用户手工维护的字段必须保留，否则刷新一次就把配置抹了。
 	if out["disabled"] != true || out["note"] != "mine" {
 		t.Fatalf("用户字段丢失: %v", out)
+	}
+}
+
+// TestAccountKeyPrioritizesIdentity 验证闸门键优先用 user_id，回退 email，
+// 两者都缺时用出站凭证指纹，避免互不相关的账号共用同一把闸门。
+func TestAccountKeyPrioritizesIdentity(t *testing.T) {
+	cases := []struct {
+		cred Credential
+		want string
+	}{
+		{Credential{UserID: "u1", Email: "a@b.c", APIKey: "k1"}, "uid:u1"},
+		{Credential{Email: "a@b.c", APIKey: "k1"}, "email:a@b.c"},
+	}
+	for _, tc := range cases {
+		if got := tc.cred.AccountKey(); got != tc.want {
+			t.Fatalf("AccountKey() = %q, want %q", got, tc.want)
+		}
+	}
+	first := (&Credential{APIKey: "k1"}).AccountKey()
+	second := (&Credential{APIKey: "k2"}).AccountKey()
+	if first == "" || first == second {
+		t.Fatalf("token fingerprint must be non-empty and distinct: %q vs %q", first, second)
+	}
+	if (&Credential{}).AccountKey() != "" {
+		t.Fatal("credential without any identity must yield empty key")
 	}
 }

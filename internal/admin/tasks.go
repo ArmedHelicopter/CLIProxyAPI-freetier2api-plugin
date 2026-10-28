@@ -3,12 +3,12 @@ package admin
 // 本文件是任务引擎的管理接口适配层：解析请求、调用 tasks.Service、封装响应。
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/tasks"
 )
 
 func (s *Service) handleTasksScan(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
@@ -18,23 +18,31 @@ func (s *Service) handleTasksScan(req pluginapi.ManagementRequest) pluginapi.Man
 }
 
 func (s *Service) handleTasksRun(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	body, status := s.tasks.StartQueue(req.Body, hostbridge.RequestCallbackID(req))
-	return JSONResponse(status, body)
+	// 缺省值与旧行为一致：growth + school 全开、并发 1；请求体只覆盖它给出的字段。
+	body, errDecode := decodeRequestInto(req.Body, tasks.DefaultQueueRequest())
+	if errDecode != nil {
+		return BadJSONRequestResponse()
+	}
+	payload, status := s.tasks.StartQueue(body, hostbridge.RequestCallbackID(req))
+	return JSONResponse(status, payload)
 }
 
 func (s *Service) handleTasksQueue(_ pluginapi.ManagementRequest) pluginapi.ManagementResponse {
 	return JSONResponse(http.StatusOK, s.tasks.QueueSnapshot())
 }
 
+// taskAutoRequest 是「对单个账号执行单个任务」的请求体。
+type taskAutoRequest struct {
+	AuthID    string `json:"auth_id"`
+	UID       string `json:"uid"`
+	AccountID string `json:"account_id"`
+	TaskCode  string `json:"task_code"`
+}
+
 func (s *Service) handleTasksAuto(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body struct {
-		AuthID    string `json:"auth_id"`
-		UID       string `json:"uid"`
-		AccountID string `json:"account_id"`
-		TaskCode  string `json:"task_code"`
-	}
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[taskAutoRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()

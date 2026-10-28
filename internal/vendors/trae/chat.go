@@ -215,6 +215,8 @@ type ChatRequest struct {
 	Profile    Config
 	Body       []byte
 	Stream     bool
+	// catalog 是实例级模型目录缓存；nil 表示不缓存（测试与一次性调用）。
+	catalog *catalogCache
 }
 
 type StreamChunkHandler func(chunk []byte) error
@@ -280,7 +282,7 @@ func requestModelName(src []byte, cfg Config) string {
 //
 // 关键差异（相对旧版 llm_utils_chat 路径）：
 //   - model_name 必须是上游 wire id（目录 model_detail_list 里的精确值），
-//     config_name 是目录里的配置名，两者都由 resolveModelWithCatalog 解析；
+//     config_name 是目录里的配置名，两者都由 catalogCache.resolve 解析；
 //   - raw_chat_function 同时进请求体与请求头；
 //   - conversation_id / session_id 每次请求新生成。
 func PrepareBody(src []byte, cfg Config, resolved ResolvedModel) ([]byte, string, error) {
@@ -535,7 +537,7 @@ func doTraeRequest(ctx context.Context, baseURL string, req ChatRequest) (io.Rea
 		cfg = configForCredential(req.Credential)
 	}
 
-	resolved, errResolve := resolveModelWithCatalog(ctx, requestModelName(req.Body, cfg), cfg, req.Credential)
+	resolved, errResolve := req.catalog.resolve(ctx, requestModelName(req.Body, cfg), cfg, req.Credential)
 	if errResolve != nil {
 		return nil, "", errResolve
 	}

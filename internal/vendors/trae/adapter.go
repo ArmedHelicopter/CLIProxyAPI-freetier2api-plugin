@@ -25,6 +25,8 @@ type adapter struct {
 	ideVersion     string
 	ideVersionCode string
 	sessions       *SessionStore
+	// catalog 是模型目录缓存（按账号），随实例隔离。
+	catalog catalogCache
 }
 
 // profile 返回当前 profile 快照（编译期 profile + 运行期版本覆盖）。
@@ -141,7 +143,7 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	if !okCred || cred == nil {
 		return nil, fmt.Errorf("trae: 无可用凭证，无法拉取模型目录")
 	}
-	models, errModels := FetchModels(ctx, cred, v.profile())
+	models, errModels := v.catalog.fetchModels(ctx, cred, v.profile())
 	if errModels != nil {
 		return nil, errModels
 	}
@@ -177,6 +179,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 		Profile:    v.profile(),
 		Body:       req.Payload,
 		Stream:     false,
+		catalog:    &v.catalog,
 	})
 	if errChat != nil {
 		return nil, core.ToPluginError(errChat)
@@ -197,6 +200,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		Profile:    v.profile(),
 		Body:       req.Payload,
 		Stream:     true,
+		catalog:    &v.catalog,
 	}, sink.Emit)
 }
 
@@ -257,3 +261,14 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 }
 
 func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.profile()) }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor            = (*adapter)(nil)
+	_ core.CallbackSubmitter = (*adapter)(nil)
+	_ core.CheckinProvider   = (*adapter)(nil)
+	_ core.Configurable      = (*adapter)(nil)
+	_ core.LoginProvider     = (*adapter)(nil)
+	_ core.LoginSessionOwner = (*adapter)(nil)
+	_ core.QuotaProvider     = (*adapter)(nil)
+)

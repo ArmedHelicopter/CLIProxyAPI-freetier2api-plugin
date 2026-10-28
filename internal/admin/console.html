@@ -7,188 +7,266 @@
 <style>
 :root {
   color-scheme: light dark;
-  --bg: #f6f7f9; --fg: #1f2328; --muted: #656d76; --card: #ffffff;
-  --border: #d8dee4; --accent: #0969da; --ok: #1a7f37; --warn: #9a6700; --err: #cf222e;
+  --bg: #eef2f7; --fg: #171e28; --muted: #5d6b7d; --card: #ffffff;
+  --border: #e3e9f1; --border-strong: #cdd6e2;
+  --accent: #1668dc;
+  --accent-soft: rgba(22,104,220,.08); --grad: linear-gradient(135deg,#1d4ed8 0%,#1668dc 45%,#0ea5e9 100%);
+  --ok: #15803d; --ok-soft: rgba(34,197,94,.12);
+  --warn: #b45309; --warn-soft: rgba(245,158,11,.14);
+  --err: #b91c1c; --err-soft: rgba(239,68,68,.11);
+  --row-hover: rgba(22,104,220,.05);
+  --shadow-card: 0 1px 2px rgba(16,24,40,.05), 0 10px 28px -14px rgba(16,24,40,.14);
+  --shadow-pop: 0 12px 32px -8px rgba(16,24,40,.22);
+  --radius: 14px;
+  /* 供应商彩色芯片：vendorChipClass() 按 vendor_id 哈希取 v0..v5，两套主题各自覆盖 */
+  --chip-0-bg: rgba(124,58,237,.1);  --chip-0-fg: #6d28d9;
+  --chip-1-bg: rgba(8,145,178,.12);  --chip-1-fg: #155e75;
+  --chip-2-bg: rgba(180,83,9,.12);   --chip-2-fg: #92400e;
+  --chip-3-bg: rgba(225,29,72,.1);   --chip-3-fg: #be123c;
+  --chip-4-bg: rgba(22,101,52,.12);  --chip-4-fg: #166534;
+  --chip-5-bg: rgba(30,64,175,.1);   --chip-5-fg: #1e40af;
 }
 @media (prefers-color-scheme: dark) {
-  :root { --bg: #0d1117; --fg: #e6edf3; --muted: #8b949e; --card: #161b22;
-          --border: #30363d; --accent: #4493f8; --ok: #3fb950; --warn: #d29922; --err: #f85149; }
+  :root { --bg: #0a0f16; --fg: #e6ecf4; --muted: #8fa0b3; --card: #121a24;
+          --border: #212d3d; --border-strong: #324154;
+          --accent: #5290f5;
+          --accent-soft: rgba(82,144,245,.16); --grad: linear-gradient(135deg,#1e3a8a 0%,#1d4ed8 45%,#0284c7 100%);
+          --ok: #4ade80; --ok-soft: rgba(74,222,128,.13);
+          --warn: #fbbf24; --warn-soft: rgba(251,191,36,.13);
+          --err: #f87171; --err-soft: rgba(248,113,113,.13);
+          --row-hover: rgba(82,144,245,.08);
+          --shadow-card: 0 1px 2px rgba(0,0,0,.4), 0 12px 32px -16px rgba(0,0,0,.5);
+          --shadow-pop: 0 16px 40px -8px rgba(0,0,0,.6);
+          --chip-0-bg: rgba(167,139,250,.16); --chip-0-fg: #c4b5fd;
+          --chip-1-bg: rgba(34,211,238,.14);  --chip-1-fg: #67e8f9;
+          --chip-2-bg: rgba(251,191,36,.14);  --chip-2-fg: #fcd34d;
+          --chip-3-bg: rgba(251,113,133,.14); --chip-3-fg: #fda4af;
+          --chip-4-bg: rgba(134,239,172,.13); --chip-4-fg: #86efac;
+          --chip-5-bg: rgba(147,197,253,.14); --chip-5-fg: #93c5fd; }
 }
 * { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--fg);
-       font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif; }
-header { padding: 20px 24px 0; }
-h1 { margin: 0 0 4px; font-size: 20px; }
-.sub { color: var(--muted); font-size: 13px; }
-nav { display: flex; gap: 4px; padding: 16px 24px 0; flex-wrap: wrap; }
-nav button { padding: 7px 14px; border: 1px solid transparent; border-radius: 6px;
-             background: transparent; color: var(--fg); cursor: pointer; font-size: 14px; }
-nav button:hover { background: var(--card); }
-nav button.active { background: var(--card); border-color: var(--border); font-weight: 600; }
-main { padding: 16px 24px 48px; }
-.card { background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-        padding: 16px; margin-bottom: 16px; }
-.card h2 { margin: 0 0 12px; font-size: 15px; }
-/* 折叠块：默认收起，标题行常显。用于任务排程、扫描结果等长列表。 */
-details.fold { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 8px; }
-details.fold > summary { cursor: pointer; font-size: 13px; color: var(--muted);
-                       list-style: none; display: flex; align-items: center; gap: 6px; }
-details.fold > summary::-webkit-details-marker { display: none; }
-details.fold > summary::before { content: "\25B8"; font-size: 22px; line-height: 0.7;
-                                display: inline-block; vertical-align: -2px; }
-details.fold[open] > summary::before { content: "\25BE"; }
-details.fold > summary:hover { color: var(--accent); }
+body {
+  margin: 0; color: var(--fg);
+  font: 13.5px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif;
+  background: var(--bg);
+  background-image: radial-gradient(rgba(28,42,60,.07) 1px, transparent 1px);
+  background-size: 22px 22px;
+}
+@media (prefers-color-scheme: dark) {
+  body { background-image: radial-gradient(rgba(148,163,184,.08) 1px, transparent 1px); }
+}
+::selection { background: var(--accent-soft); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 5px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* ---- 头部：slim 渐变头带（宿主外壳悬浮按钮压在右上，保持低调不打架） ---- */
+header { margin: 14px 20px 0; border-radius: 14px; padding: 15px 22px;
+         background: var(--grad); color: #fff; position: relative; overflow: hidden;
+         box-shadow: 0 10px 26px -12px rgba(22,104,220,.55); }
+header::before { content: ""; position: absolute; width: 300px; height: 300px; border-radius: 50%;
+                 right: -70px; top: -160px;
+                 background: radial-gradient(circle, rgba(255,255,255,.26), transparent 65%); }
+header h1 { margin: 0; font-size: 19px; font-weight: 750; letter-spacing: -.01em; }
+.sub { color: var(--muted); font-size: 12.5px; }
+header .sub { color: rgba(255,255,255,.92); margin-top: 2px; }
+main { padding: 14px 20px 48px; }
+
+.card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius);
+        padding: 16px 18px; margin-bottom: 14px; box-shadow: var(--shadow-card); }
+.card h2 { margin: 0 0 12px; font-size: 14.5px; font-weight: 700;
+           display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.card h2::before { content: ""; width: 9px; height: 9px; border-radius: 3px;
+                   background: var(--grad); flex: none; box-shadow: 0 0 8px rgba(22,104,220,.45); }
+.card h2 .muted { font-weight: 400; font-size: 12.5px; }
+
+[hidden], [hidden="true"], [hidden=""] { display: none !important; }
 .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
-button.act { padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px;
-             background: var(--card); color: var(--fg); cursor: pointer; font-size: 13px; }
-button.act:hover { border-color: var(--accent); color: var(--accent); }
+.row[hidden] { display: none !important; }
+button.act { padding: 6.5px 13px; border: 1px solid var(--border-strong); border-radius: 9px;
+             background: var(--card); color: var(--fg); cursor: pointer; font-size: 13px; font-weight: 550;
+             transition: background .12s ease, border-color .12s ease, color .12s ease,
+                         transform .08s ease, box-shadow .12s ease, filter .12s ease; }
+button.act:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+button.act:active { transform: scale(.98); }
 button.act:disabled { opacity: .5; cursor: not-allowed; }
-button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
-table { width: 100%; border-collapse: collapse; font-size: 13px; }
-/* 单元格一律不换行：表头（如「输出上限」）与别名等内容保持单行；
-   内容总宽超出容器时由外层 #models 横向滚动兜底。 */
-th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
-th { color: var(--muted); font-weight: 500; }
+button.primary { background: var(--grad); border: 1px solid transparent; color: #fff;
+                 box-shadow: 0 4px 14px -4px rgba(22,104,220,.55); }
+button.primary:hover { background: var(--grad); filter: brightness(1.08); color: #fff;
+                       transform: translateY(-1px); box-shadow: 0 6px 18px -6px rgba(22,104,220,.65); }
+button.primary:active { transform: scale(.98); }
+/* 一键做任务：强调描边，主操作让位给「添加账号」 */
+#btnAutoAll { background: transparent; border: 1px solid var(--accent); color: var(--accent); box-shadow: none; }
+#btnAutoAll:hover { background: var(--accent-soft); transform: none; }
+/* 删除等危险操作：默认与普通按钮一致，悬停才转红（对应 JS 里的 "act danger"）。 */
+button.act.danger:hover:not(:disabled) { color: var(--err); border-color: var(--err); background: var(--err-soft); }
+
+table { width: 100%; border-collapse: separate; border-spacing: 0; font-size: 12.5px;
+        font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: 7.5px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+/* 表头吸顶只对随页面滚动的表格生效。#models 是 overflow-x 滚动容器，
+   纵向也被计算为 auto，吸顶落不到视口上，故模型表不吸顶（预期，非缺陷）。 */
+thead th { position: sticky; top: -1px; z-index: 1;
+           background: rgba(255,255,255,.86); backdrop-filter: blur(8px);
+           color: var(--muted); font-size: 11.5px; font-weight: 650; letter-spacing: .05em;
+           border-bottom: 1px solid var(--border-strong); }
+@media (prefers-color-scheme: dark) { thead th { background: rgba(18,26,36,.86); } }
+tbody tr { transition: background .12s ease; }
+tbody tr:hover td { background: var(--row-hover); }
+tbody tr:hover td:first-child { box-shadow: inset 3px 0 0 var(--accent); }
+tbody tr:last-child td { border-bottom: none; }
 th.sortable { cursor: pointer; user-select: none; }
 th.sortable:hover { color: var(--accent); }
-th.sortable .th-sort-wrap {
-  display: inline-flex;
-  align-items: center;
-  gap: 3px;
-  line-height: 1;
-  vertical-align: middle;
+th.sortable .th-sort-wrap { display: inline-flex; align-items: center; gap: 3px; line-height: 1; vertical-align: middle; }
+.sort-arrows { display: inline-flex; flex-direction: column; justify-content: center; align-items: center;
+               position: relative; top: -1px; }
+.sort-arrow { display: block; width: 0; height: 0; border-left: 3px solid transparent;
+              border-right: 3px solid transparent; transition: border-color .15s ease; }
+.sort-arrow.asc { border-bottom: 4px solid var(--muted); margin-bottom: 2px; }
+.sort-arrow.desc { border-top: 4px solid var(--muted); }
+.sort-arrows.order-asc .sort-arrow.asc { border-bottom-color: var(--accent); }
+.sort-arrows.order-desc .sort-arrow.desc { border-top-color: var(--accent); }
+
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px;
+        border-radius: 999px; font-size: 11.5px; font-weight: 550;
+        background: var(--bg); border: 1px solid var(--border); color: var(--fg); }
+.pill.v0 { background: var(--chip-0-bg); color: var(--chip-0-fg); border-color: transparent; }
+.pill.v1 { background: var(--chip-1-bg); color: var(--chip-1-fg); border-color: transparent; }
+.pill.v2 { background: var(--chip-2-bg); color: var(--chip-2-fg); border-color: transparent; }
+.pill.v3 { background: var(--chip-3-bg); color: var(--chip-3-fg); border-color: transparent; }
+.pill.v4 { background: var(--chip-4-bg); color: var(--chip-4-fg); border-color: transparent; }
+.pill.v5 { background: var(--chip-5-bg); color: var(--chip-5-fg); border-color: transparent; }
+.pill.ok   { color: var(--ok);   background: var(--ok-soft);   border-color: transparent; }
+.pill.warn { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+.pill.err  { color: var(--err);  background: var(--err-soft);  border-color: transparent; }
+.pill.ok::before, .pill.warn::before, .pill.err::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
+
+/* 阈值仪表：渐变填充，剩余比例高=绿 / 中=琥珀 / 低=红 */
+.bar { position: relative; display: inline-block; width: 72px; height: 6px;
+       border-radius: 4px; background: var(--border); vertical-align: middle; overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 4px;
+         background: linear-gradient(90deg, #34d399, #059669);
+         transition: width .3s ease; }
+.bar.warn i { background: linear-gradient(90deg, #fbbf24, #d97706); }
+.bar.err  i { background: linear-gradient(90deg, #f87171, #dc2626); }
+@media (prefers-color-scheme: dark) {
+  .bar i { background: linear-gradient(90deg, #34d399, #10b981); }
+  .bar.warn i { background: linear-gradient(90deg, #fcd34d, #f59e0b); }
+  .bar.err i { background: linear-gradient(90deg, #fca5a5, #ef4444); }
 }
-.sort-arrows {
-  display: inline-flex;
-  flex-direction: column;
-  justify-content: center;
-  align-items: center;
-  position: relative;
-  top: -1px;
-}
-.sort-arrow {
-  display: block;
-  width: 0;
-  height: 0;
-  border-left: 3px solid transparent;
-  border-right: 3px solid transparent;
-  transition: border-color .15s ease;
-}
-.sort-arrow.asc {
-  border-bottom: 4px solid var(--muted);
-  margin-bottom: 2px;
-}
-.sort-arrow.desc {
-  border-top: 4px solid var(--muted);
-}
-.sort-arrows.order-asc .sort-arrow.asc {
-  border-bottom-color: var(--accent);
-}
-.sort-arrows.order-desc .sort-arrow.desc {
-  border-top-color: var(--accent);
-}
-tr:last-child td { border-bottom: none; }
-.pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px;
-        border: 1px solid var(--border); }
-.pill.ok { color: var(--ok); border-color: var(--ok); }
-.pill.err { color: var(--err); border-color: var(--err); }
-.pill.warn { color: var(--warn); border-color: var(--warn); }
+
 .muted { color: var(--muted); }
 .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-.logbox { max-height: 420px; overflow: auto; font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-          background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px; }
+/* 终端日志：双主题恒定暗色内嵌面板 */
+.logbox { max-height: 420px; overflow: auto; font: 11.5px/1.7 ui-monospace, SFMono-Regular, Menlo, monospace;
+          background: #0b1220; color: #cbd5e1; border: 1px solid rgba(148,163,184,.18);
+          border-radius: 10px; padding: 12px 14px; box-shadow: inset 0 1px 6px rgba(0,0,0,.35); }
 .logbox div { white-space: pre-wrap; word-break: break-all; }
-.logbox .ERROR { color: var(--err); }
-.logbox .DEBUG { color: var(--muted); }
+.logbox .ERROR { color: #f87171; }
+.logbox .DEBUG { color: #7c8ca3; }
+.logbox .WARN { color: #fbbf24; }
+.logbox .INFO { color: #7dd3fc; }
+
 label { display: inline-flex; align-items: center; gap: 6px; }
-input[type=text], input[type=number] { padding: 6px 8px; border: 1px solid var(--border);
-        border-radius: 6px; background: var(--bg); color: var(--fg); font-size: 13px; }
+input[type=text], input[type=number], input[type=password], select {
+  padding: 6.5px 10px; border: 1px solid var(--border-strong);
+  border-radius: 9px; background: var(--card); color: var(--fg); font-size: 13px;
+  transition: border-color .12s ease, box-shadow .12s ease; }
+select { cursor: pointer; }
+input[type=text]:hover, input[type=number]:hover, input[type=password]:hover, select:hover { border-color: var(--muted); }
+input[type=text]:focus, input[type=number]:focus, input[type=password]:focus, select:focus { outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft); }
+input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; cursor: pointer; }
 /* 回调链接很长，用等宽字体 + 手动换行才看得出参数有没有粘全。 */
-textarea { padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px;
-        background: var(--bg); color: var(--fg); font-size: 13px; width: 100%;
+textarea { padding: 7px 11px; border: 1px solid var(--border-strong); border-radius: 10px;
+        background: var(--card); color: var(--fg); font-size: 13px; width: 100%;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; resize: vertical; }
 /* 表格内联输入：点击别名后出现，贴合表格行高。 */
-input.aliasinput { padding: 3px 6px; width: 100%; min-width: 96px; font-size: 13px;
+input.aliasinput { padding: 3px 7px; width: 100%; min-width: 96px; font-size: 12.5px;
         font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-input.aliasinput:focus { outline: none; border-color: var(--accent); }
-/* 模型表容器与自适应列宽：超宽时外层横向滚动；
-   固定信息列紧凑收拢，模型ID与名称通过弹性最大宽度自适应，
-   为费用倍率、上下文、能力等业务列留出充裕呼吸感 */
-#models { overflow-x: auto; }
-#models table { width: 100%; min-width: 680px; }
-#models th, #models td { padding: 9px 14px; text-align: left; }
-#models .col-check { width: 1%; text-align: center; padding-left: 10px; padding-right: 6px; }
-#models .col-status,
-#models .col-vendor { width: 1%; white-space: nowrap; }
-#models .modelidname {
-  display: inline-block;
-  max-width: 180px;
-  max-width: clamp(120px, 14vw, 200px);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  vertical-align: middle;
-}
-#models .name-text {
-  display: inline-block;
-  max-width: 140px;
-  max-width: clamp(80px, 10vw, 150px);
-  overflow: hidden;
-  text-overflow: ellipsis;
-  vertical-align: middle;
-}
-#models .col-credits { min-width: 96px; white-space: nowrap; }
-#models .col-context { min-width: 85px; white-space: nowrap; }
-#models .col-caps { min-width: 105px; white-space: nowrap; }
-#models .col-output { min-width: 85px; white-space: nowrap; }
-#models .col-efforts { min-width: 110px; white-space: nowrap; }
+input.aliasinput:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
 /* 模型 ID / 别名合并列：文字可点击进入编辑，右侧 ✎ 给出可编辑暗示。 */
 .modelid { display: inline-flex; align-items: center; gap: 6px; cursor: pointer;
-           border-bottom: 1px dashed var(--border); padding: 1px 2px; }
+           border-bottom: 1px dashed var(--border-strong); padding: 1px 2px; }
 .modelid:hover { color: var(--accent); border-bottom-color: var(--accent); }
 .modelid:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
-.modelidedit { color: var(--muted); font-size: 12px; }
+.modelidedit { color: var(--muted); font-size: 11.5px; }
 .modelid:hover .modelidedit { color: var(--accent); }
+
+#models { overflow-x: auto; }
+#models table { min-width: 980px; }
+#models .col-check { width: 1%; text-align: center; padding-left: 8px; padding-right: 4px; }
+#models .col-status, #models .col-vendor { width: 1%; white-space: nowrap; }
+#models .modelidname { display: inline-block; max-width: clamp(120px, 14vw, 200px);
+  overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+#models .name-text { display: inline-block; max-width: clamp(80px, 10vw, 150px);
+  overflow: hidden; text-overflow: ellipsis; vertical-align: middle; }
+#models .col-credits { min-width: 90px; white-space: nowrap; }
+#models .col-context, #models .col-output { min-width: 76px; white-space: nowrap; }
+#models .col-caps { min-width: 105px; white-space: nowrap; }
+#models .col-efforts { min-width: 150px; white-space: nowrap; }
+
 /* 列展示：贴按钮行最右侧；菜单靠右展开，避免超出视口。 */
 .cols-setter { margin-left: auto; }
+.dropdown { position: relative; display: inline-block; }
+.dropdown-menu { position: absolute; top: calc(100% + 6px); left: 0; z-index: 20;
+                 min-width: 180px; background: var(--card); border: 1px solid var(--border);
+                 border-radius: 12px; box-shadow: var(--shadow-pop); overflow: hidden; padding: 4px; }
 .dropdown-menu.right { left: auto; right: 0; }
+.dropdown-menu button { display: block; width: 100%; padding: 7.5px 12px; border: 0; border-radius: 8px;
+                        background: transparent; color: var(--fg); text-align: left;
+                        cursor: pointer; font-size: 13px; transition: background .1s ease; }
+.dropdown-menu button:hover { background: var(--accent-soft); color: var(--accent); }
 .dropdown-menu label { display: flex; align-items: center; gap: 8px;
-                       padding: 9px 14px; cursor: pointer; font-size: 13px; }
+                       padding: 8px 12px; cursor: pointer; font-size: 13px; border-radius: 8px; }
 .dropdown-menu label:hover { background: var(--bg); }
 .dropdown-menu label.disabled { cursor: not-allowed; opacity: .7; }
-.banner { padding: 10px 14px; border-radius: 6px; margin-bottom: 12px; font-size: 13px; display: none; transition: opacity .2s ease; }
+
+.banner { padding: 10px 14px; border-radius: 10px; margin-bottom: 12px; font-size: 13px;
+          display: none; transition: opacity .2s ease; border: 1px solid transparent;
+          border-left-width: 3px; backdrop-filter: blur(6px); }
 .banner.show { display: block; }
-.banner.err { background: rgba(207,34,46,.1); border: 1px solid var(--err); color: var(--err); }
-.banner.ok { background: rgba(26,127,55,.1); border: 1px solid var(--ok); color: var(--ok); }
-.banner.warn { background: rgba(154,103,0,.1); border: 1px solid var(--warn); color: var(--warn); }
+.banner.err  { background: var(--err-soft);  border-left: 3px solid var(--err);  color: var(--err); }
+.banner.ok   { background: var(--ok-soft);   border-left: 3px solid var(--ok);   color: var(--ok); }
+.banner.warn { background: var(--warn-soft); border-left: 3px solid var(--warn); color: var(--warn); }
 .hint { font-size: 12px; color: var(--muted); margin-top: 6px; }
-progress { width: 160px; height: 8px; }
-.dropdown { position: relative; display: inline-block; }
-.dropdown-menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 20;
-                 min-width: 180px; background: var(--card); border: 1px solid var(--border);
-                 border-radius: 6px; box-shadow: 0 6px 20px rgba(0,0,0,.12); overflow: hidden; }
-.dropdown-menu button { display: block; width: 100%; padding: 9px 14px; border: 0;
-                        background: transparent; color: var(--fg); text-align: left;
-                        cursor: pointer; font-size: 13px; }
-.dropdown-menu button:hover { background: var(--bg); color: var(--accent); }
+.quota-failure { color: var(--err); font-size: 12px; white-space: normal; line-height: 1.35; display: inline-block; max-width: 260px; }
+.disclaimer { padding: 10px 14px; border-radius: 10px; margin-bottom: 14px; font-size: 12.5px; background: var(--warn-soft); border: 1px solid transparent; border-left: 3px solid var(--warn); color: var(--fg); line-height: 1.55; }
 
 /* ---- 套餐领取弹窗 ---- */
 .modal { position: fixed; inset: 0; z-index: 60; display: none; align-items: center;
-         justify-content: center; padding: 20px; background: rgba(0,0,0,.45); }
+         justify-content: center; padding: 20px; background: rgba(9,13,18,.55); backdrop-filter: blur(3px); }
 .modal[hidden] { display: none !important; }
 .modal-box { width: 100%; max-width: 620px; max-height: 86vh; overflow: auto;
              padding: 20px; background: var(--card); border: 1px solid var(--border);
-             border-radius: 8px; box-shadow: 0 12px 40px rgba(0,0,0,.25); }
+             border-radius: 16px; box-shadow: var(--shadow-pop); }
 .modal-box h2 { margin-top: 0; }
-.plan { padding: 12px; margin: 10px 0; border: 1px solid var(--border);
-        border-radius: 6px; cursor: pointer; }
+.plan { padding: 12px; margin: 10px 0; border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
 .plan:hover { border-color: var(--accent); }
 .plan.selected { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); }
-.plan-title { font-weight: 600; }
+.plan-title { font-weight: 650; }
 .plan-grants { margin-top: 6px; font-size: 13px; color: var(--muted); }
 .claim-captcha { min-height: 68px; margin: 12px 0; display: flex;
                  align-items: center; justify-content: center; }
+/* 登录面板的人机验证落点：与领取弹窗同款，但高度只在滑块出现时占位。 */
+.login-captcha { min-height: 0; margin: 10px 0 0; display: flex;
+                 align-items: center; justify-content: flex-start; }
+.login-captcha[hidden] { display: none !important; }
 .claim-row { display: flex; gap: 8px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
-details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+
+/* 折叠块：默认收起，标题行常显。用于任务排程、扫描结果等长列表。 */
+details.fold { border-top: 1px solid var(--border); margin-top: 12px; padding-top: 10px; }
+details.fold > summary { cursor: pointer; font-size: 12.5px; color: var(--muted);
+                        list-style: none; display: flex; align-items: center; gap: 6px; }
+details.fold > summary::-webkit-details-marker { display: none; }
+details.fold > summary::before { content: "\25B8"; font-size: 22px; line-height: .7;
+                                display: inline-block; vertical-align: -2px; }
+details.fold[open] > summary::before { content: "\25BE"; }
+details.fold > summary:hover { color: var(--accent); }
+details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
+@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
 </style>
 </head>
 <body>
@@ -197,6 +275,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   <div class="sub">WorkBuddy / Qoder 账号、额度、模型与任务管理 · 本地零凭证存储</div>
 </header>
 <main>
+  <div class="disclaimer">
+    ⚠️ <b>合规与免责声明：</b>本项目仅供个人学习与技术研究使用（单供应商最多添加 10 个账号），严禁用于任何商业售卖、API 转售、代刷代充或违反各上游平台服务条款及法律法规的非法用途。使用本插件产生的一切风险（含账号封禁、权益清零等）均由使用者自行承担。
+  </div>
   <div class="card" id="keyBox" hidden>
     <h2>管理密钥</h2>
     <div class="row">
@@ -220,17 +301,36 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
           <div class="dropdown-menu" id="addVendorMenu" hidden></div>
         </div>
         <button class="act" id="btnRefresh">Token续期</button>
+        <button class="act" id="btnRefreshQuotaAuth">刷新额度凭证</button>
         <button class="act" id="btnLoadQuotas">查询额度</button>
         <button class="act" id="btnCheckin">一键签到</button>
         <button class="act primary" id="btnAutoAll">一键做任务</button>
       </div>
 
+      <div class="card" id="smsBox" hidden>
+        <h2 id="smsTitle">手机验证码登录</h2>
+        <div class="row" style="margin-bottom:8px">
+          <input type="tel" id="inputSmsPhone" placeholder="手机号（11 位）" style="flex:2;min-width:240px">
+          <button class="act" id="btnSmsSend">发送验证码</button>
+        </div>
+        <div class="row" style="margin-bottom:8px">
+          <input type="text" id="inputSmsCode" placeholder="6 位短信验证码" style="flex:1;min-width:160px" maxlength="6">
+          <input type="text" id="inputSmsLabel" placeholder="备注名称（可选）" style="flex:1;min-width:140px">
+          <button class="act primary" id="btnSmsVerify">登录并添加</button>
+          <button class="act" id="btnSmsCancel">取消</button>
+        </div>
+        <div class="hint" id="smsStatus">输入手机号获取验证码。</div>
+      </div>
+
       <div class="card" id="loginBox" hidden>
-        <h2>完成授权</h2>
+        <h2 id="loginTitle">完成授权</h2>
+        <div class="row" id="loginVariantRow" hidden style="display:none"></div>
+        <div class="login-captcha" id="loginCaptcha" hidden></div>
         <div class="row">
           <input type="text" id="loginUrl" readonly style="flex:1;min-width:320px">
           <button class="act" id="btnOpenUrl">打开链接</button>
           <button class="act" id="btnCopyUrl">复制</button>
+          <button class="act" id="btnLoginCancel">取消</button>
         </div>
         <div class="hint" id="loginStatus">等待授权…</div>
         <details id="loginPasteBox" hidden>
@@ -323,11 +423,11 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     <div class="card">
       <h2>运行期设置</h2>
       <div class="row">
-        <label><input type="checkbox" id="setAutoCheckin"> 每日自动任务</label>
+        <label><input type="checkbox" id="setAutoCheckin"> 每日自动签到</label>
         <label>执行时间 <input type="text" id="setCheckinAt" placeholder="10:00" style="width:80px"></label>
       </div>
       <div class="row" style="margin-top:8px">
-        <label><input type="checkbox" id="setAutoTasks"> 自动每日任务</label>
+        <label><input type="checkbox" id="setAutoTasks"> 每日自动任务</label>
       </div>
       <div class="row" style="margin-top:8px">
         <label>提示词防御模式
@@ -337,6 +437,16 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
             <option value="append">追加（文末追加安全指引）</option>
           </select>
         </label>
+      </div>
+      <div class="row" style="margin-top:8px">
+        <label>模型名渠道标识
+          <select id="setModelNameTag" style="margin-left:8px;padding:3px 6px">
+            <option value="off">关闭（模型名保持原样）</option>
+            <option value="prefix">前缀（如 zcode-GLM-5.3）</option>
+            <option value="suffix">后缀（如 GLM-5.3-zcode）</option>
+          </select>
+        </label>
+        <span class="hint">给各供应商的模型名自动加渠道标识，改后需等模型清单刷新（或重启宿主）生效</span>
       </div>
       <details class="fold" id="scheduleFold">
         <summary>任务排程</summary>
@@ -585,6 +695,15 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     return el("span", text, "pill" + (kind ? " " + kind : ""));
   }
 
+  // vendorChipClass 把供应商标识哈希到 v0..v5，交给 CSS 上彩色芯片底色。
+  // 优先用 vendor_id：展示名可以改，用名字哈希会让芯片颜色跟着变。
+  function vendorChipClass(vendorID, label) {
+    var key = String(vendorID || label || "");
+    var h = 0;
+    for (var i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+    return "v" + (h % 6);
+  }
+
   // cellWith 把节点包进一个 td（表格里 appendChild 更顺手）。
   function cellWith(node) {
     var td = el("td");
@@ -722,11 +841,24 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       var row = el("tr");
       var vendor = vendorLabel(account.vendor_id, account.realm);
       var vendorCell = el("td");
-      vendorCell.appendChild(pill(vendor, ""));
+      vendorCell.appendChild(pill(vendor, vendorChipClass(account.vendor_id, vendor)));
       row.appendChild(vendorCell);
 
-      row.appendChild(el("td", accountDisplay(account)));
-      row.appendChild(cellWith(account.disabled ? pill("已禁用", "err") : pill("正常", "ok")));
+      var accountCell = el("td", accountDisplay(account));
+      if (account.auth_index) accountCell.title = "auth_index: " + account.auth_index;
+      row.appendChild(accountCell);
+      var quotaFailure = account.quota && !account.quota.ok;
+      var statusCell = el("td");
+      if (account.disabled) {
+        statusCell.appendChild(pill("已禁用", "err"));
+      } else if (quotaFailure) {
+        var failurePill = pill("额度失败", "err");
+        failurePill.title = account.quota.message || "额度查询失败";
+        statusCell.appendChild(failurePill);
+      } else {
+        statusCell.appendChild(pill("正常", "ok"));
+      }
+      row.appendChild(statusCell);
 
       // 签到 / 套餐领取列：支持领取的供应商（如 ZCode）展示套餐领取按钮；其余展示签到或「无签到活动」
       var claimSpec = claimButtonSpec(account);
@@ -772,22 +904,36 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
           row.appendChild(el("td", "--", "muted"));
         }
       } else if (!quota.ok) {
-        row.appendChild(el("td", "-- / --", "muted"));
-        row.appendChild(el("td", "--", "muted"));
+        var failureCell = el("td");
+        var failureText = quota.message || "查询失败";
+        failureCell.appendChild(el("span", failureText, "quota-failure"));
+        failureCell.title = failureText;
+        row.appendChild(failureCell);
+        row.appendChild(el("td", quota.failure_type || "失败", "err"));
       } else if (quota.unlimited) {
         row.appendChild(el("td", "无限"));
         row.appendChild(el("td", "—", "muted"));
       } else {
-        row.appendChild(el("td", quota.remain + " / " + quota.total));
-        var ratio = quota.total > 0 ? (quota.remain / quota.total) : 0;
+        // total=0 不等于「额度用尽」：有的上游只报可用余额（AutoClaw 的积分
+        // 钱包只有 balance，没有总额/已用）。把 0 当总额会拼出「10000 / 0」
+        // 再配一条红色 0% 空槽，既错又误导；此时按「余额 / —」展示，比例留空。
+        var hasTotal = quota.total > 0;
+        var remainCell = el("td", quota.remain + " / " + (hasTotal ? quota.total : "—"));
+        if (!hasTotal) {
+          remainCell.title = "上游只提供可用余额，没有总额 / 已用概念";
+        }
+        row.appendChild(remainCell);
+        var ratio = hasTotal ? (quota.remain / quota.total) : 0;
         var barCell = el("td");
-        var bar = el("span", null, "bar");
-        var fill = el("i");
-        fill.style.width = Math.round(ratio * 100) + "%";
-        bar.appendChild(fill);
-        barCell.appendChild(bar);
-        barCell.appendChild(el("span", quota.total > 0
-          ? Math.round(ratio * 100) + "%" : "—", "muted"));
+        if (hasTotal) {
+          // 阈值着色：剩余 >=50% 绿 / 20~50% 琥珀 / <20% 红（该列显示的即剩余比例）。
+          var bar = el("span", null, ratio >= 0.5 ? "bar" : (ratio >= 0.2 ? "bar warn" : "bar err"));
+          var fill = el("i");
+          fill.style.width = Math.round(ratio * 100) + "%";
+          bar.appendChild(fill);
+          barCell.appendChild(bar);
+        }
+        barCell.appendChild(el("span", hasTotal ? Math.round(ratio * 100) + "%" : "—", "muted"));
         row.appendChild(barCell);
       }
 
@@ -795,8 +941,18 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       var rt = account.refreshed_at ? new Date(account.refreshed_at).toLocaleString() : "-";
       row.appendChild(el("td", rt, "muted"));
 
-      // 操作列（仅保留删除）
+      // 操作列：凭证失效时提供重新授权；旧凭证不会在授权成功前删除。
       var actionCell = el("td");
+      if (account.quota && (account.quota.failure_type === "credential" || account.quota.failure_type === "minimax_refresh_token_revoked")) {
+        var reauthBtn = el("button", "重新授权", "act primary");
+        reauthBtn.type = "button";
+        reauthBtn.title = "打开 OAuth 重新授权；授权成功后才替换旧凭证";
+        reauthBtn.addEventListener("click", function () {
+          var vendorInfo = vendorsById[account.vendor_id] || { id: account.vendor_id, name: account.vendor_name };
+          startLogin(vendorInfo);
+        });
+        actionCell.appendChild(reauthBtn);
+      }
       var deleteBtn = el("button", "删除", "act danger");
       deleteBtn.type = "button";
       deleteBtn.addEventListener("click", function () {
@@ -810,7 +966,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     host.appendChild(table);
 
     var summary = el("div", "共 " + accounts.length + " 个账号 · 插件版本 " + (status.version || "-")
-      + " · 提示词 " + (status.workbuddy_prompt_mode || "-"), "hint");
+      + " · 提示词 " + ((status.settings || {}).prompt_mode || "-"), "hint");
     host.appendChild(summary);
   }
 
@@ -829,14 +985,9 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       document.getElementById("setCheckinAt").value = settings.auto_checkin_at || "10:00";
       document.getElementById("setAutoTasks").checked = !!settings.auto_tasks;
       var promptSel = document.getElementById("setPromptMode");
-      if (promptSel) {
-        // 键名必须与后端一致：/status 返回 workbuddy_prompt_mode，
-        // 运行期覆盖值在 settings.vendor_settings.workbuddy_prompt_mode。
-        // 两处都取不到才回落 passthrough（后端的默认值）。
-        promptSel.value = status.workbuddy_prompt_mode
-          || (settings.vendor_settings || {}).workbuddy_prompt_mode
-          || "passthrough";
-      }
+      if (promptSel) promptSel.value = settings.prompt_mode || "passthrough";
+      var tagSel = document.getElementById("setModelNameTag");
+      if (tagSel) tagSel.value = settings.model_name_tag || "off";
       renderTaskSchedules(settings);
       var scheduler = status.scheduler || {};
       var labels = {};
@@ -933,8 +1084,18 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       var results = (data && data.results) || [];
       var failed = results.filter(function (r) { return !r.ok; }).length;
       if (!quiet) {
-        banner(failed ? "warn" : "ok",
-          "额度查询完成：" + results.length + " 个账号" + (failed ? "，" + failed + " 个失败" : ""), 5000);
+        if (failed) {
+          var failedDetails = results.filter(function (r) { return !r.ok; }).map(function (r) {
+            var who = r.label || r.name || r.auth_id || r.auth_index || "未知账号";
+            var vendor = r.vendor_name || r.vendor_id || "未知供应商";
+            var reason = r.message || "未知错误";
+            return vendor + " / " + who + "：" + reason;
+          });
+          var detail = failedDetails.length ? "\n" + failedDetails.join("\n") : "";
+          banner("warn", "额度查询完成：" + results.length + " 个账号，" + failed + " 个失败" + detail, 12000);
+        } else {
+          banner("ok", "额度查询完成：" + results.length + " 个账号", 5000);
+        }
       }
       return loadStatus(true);
     }).catch(function (err) {
@@ -1068,7 +1229,7 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       hint.textContent = "上游未下发人机验证参数，无法在页面内完成领取";
       return;
     }
-    loadClaimSdk().then(function () {
+    loadAliyunSdk().then(function () {
       window.AliyunCaptchaConfig = { region: config.region, prefix: config.prefix };
       window.initAliyunCaptcha({
         SceneId: config.scene_id,
@@ -1104,16 +1265,26 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     });
   }
 
-  // loadClaimSdk 懒加载阿里云验证码脚本，只在真的要领时才拉。
-  function loadClaimSdk() {
+  // loadAliyunSdk 懒加载阿里云验证码脚本（套餐领取与登录共用）。
+  var aliyunSdkPromise = null;
+  function loadAliyunSdk() {
     if (typeof window.initAliyunCaptcha === "function") return Promise.resolve();
-    return new Promise(function (resolve, reject) {
+    if (aliyunSdkPromise) return aliyunSdkPromise;
+    aliyunSdkPromise = new Promise(function (resolve, reject) {
       var s = document.createElement("script");
       s.src = "https://o.alicdn.com/captcha-frontend/aliyunCaptcha/AliyunCaptcha.js";
-      s.onload = resolve;
-      s.onerror = function () { reject(new Error("验证码脚本加载失败")); };
+      s.onload = function () {
+        if (typeof window.initAliyunCaptcha === "function") { resolve(); return; }
+        aliyunSdkPromise = null;
+        reject(new Error("验证码组件加载异常，请重试"));
+      };
+      s.onerror = function () {
+        aliyunSdkPromise = null;
+        reject(new Error("验证码脚本加载失败"));
+      };
       document.head.appendChild(s);
     });
+    return aliyunSdkPromise;
   }
 
   // submitClaim 提交领取。
@@ -1356,12 +1527,12 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   }
 
   function modelStatusCell(model) {
-    return cellWith(model.disabled ? pill("已禁用", "err") : pill("正常", "ok"));
+    return cellWith(model.disabled ? pill("禁用", "err") : pill("正常", "ok"));
   }
 
   function modelVendorCell(model) {
-    // 国内版用 warn 色区分（海外版用默认色），与账号表保持一致的视觉约定。
-    return cellWith(pill(vendorLabel(model.vendor_id, model.realm), ""));
+    var vendor = vendorLabel(model.vendor_id, model.realm);
+    return cellWith(pill(vendor, vendorChipClass(model.vendor_id, vendor)));
   }
 
   // formatCredits 归一化倍率样式为始终保留两位小数的 "0.50X"；剥除多余的 "credits" 字符，汉字（如 "免费" / "订阅"）保留。
@@ -1774,10 +1945,28 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
   //
   // 支持登录的供应商（Cline / WorkBuddy / Qoder）→ 发起设备授权；
   // 纯 API key 的供应商（OpenCode ZEN）→ 展开 API Key 输入框，保存后直写凭证文件。
+  var MAX_ACCOUNTS_PER_VENDOR = 10;
+
   function startVendorAdd(vendor) {
     var loginBox = document.getElementById("loginBox");
     var apiKeyBox = document.getElementById("apiKeyBox");
     stopLoginPolling();
+    var existingCount = ((lastStatus && lastStatus.accounts) || []).filter(function (a) {
+      return a.vendor_id === vendor.id;
+    }).length;
+    if (existingCount >= MAX_ACCOUNTS_PER_VENDOR) {
+      if (loginBox) loginBox.hidden = true;
+      if (apiKeyBox) apiKeyBox.hidden = true;
+      banner("err", "每个供应商最多添加 " + MAX_ACCOUNTS_PER_VENDOR + " 个账号（" + vendor.name + " 已达上限）");
+      return;
+    }
+
+    // 登录前要求人机验证的供应商（AutoClaw 国际版）：先渲染 Zai/Google 入口，
+    // 拖完滑块拿到令牌后才去换授权链接。凭证粘贴仍作为兜底保留在面板里。
+    if (vendor && vendor.login_captcha) {
+      startCaptchaLogin(vendor);
+      return;
+    }
 
     if (vendor.supports_login !== false && vendor.auth_mode !== "apikey") {
       if (apiKeyBox) apiKeyBox.hidden = true;
@@ -1787,6 +1976,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
 
     // API Key 型供应商：直接在页面展示输入框添加
     if (loginBox) loginBox.hidden = true;
+    var smsBox = document.getElementById("smsBox");
+    if (smsBox) smsBox.hidden = true;
     currentApiKeyVendor = vendor;
     if (apiKeyBox) {
       apiKeyBox.hidden = false;
@@ -1798,10 +1989,326 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     }
   }
 
+  // startCredentialPaste 打开通用凭证粘贴框（autoclawglobal 用）。
+  // 复用 apiKeyBox：单输入框贴 JSON，插件侧 ParseCredential 兼容。
+  function startCredentialPaste(vendor) {
+    stopLoginPolling();
+    resetLoginCaptcha();
+    clearLoginVariants();
+    currentApiKeyVendor = vendor;
+    var login = document.getElementById("loginBox");
+    var sms = document.getElementById("smsBox");
+    if (login) login.hidden = true;
+    if (sms) sms.hidden = true;
+    var apiKeyBox = document.getElementById("apiKeyBox");
+    if (!apiKeyBox) return;
+    apiKeyBox.hidden = false;
+    document.getElementById("apiKeyTitle").textContent = "粘贴 " + vendor.name + " 凭证";
+    document.getElementById("apiKeyHint").textContent =
+      "粘贴 AutoClaw 国际版凭证 JSON（含访问令牌与刷新令牌，可从 AutoClaw 桌面端登录态文件或 Agent2API 获取）。" +
+      "保存后插件会自动续期。";
+    document.getElementById("inputApiKey").value = "";
+    document.getElementById("inputApiLabel").value = "";
+    document.getElementById("inputApiKey").focus();
+  }
+
+  // ---- 页面内人机验证登录（AutoClaw 国际版等）----
+  //
+  // 上游换授权地址的接口强制要求阿里云风控令牌（浏览器端 SDK 生成，网关侧
+  // 没有等价实现）。流程与 Agent2API 一致：
+  //   取控件参数 → 拖滑块 → captchaVerifyParam → /login/start 换授权链接
+  //   → 新标签页登录 → 把停在 localhost 的整条回调链接粘回来换码。
+  //
+  // 与「套餐领取」的控件不共用固定容器：SDK 实例销毁后在同一容器上重新初始化
+  // 会卡住（实测），因此每次登录都建一套新的 element/button，用完一起删。
+  var loginVariantButtons = [];
+  var loginCaptchaFlow = null;
+  var loginCaptchaGeneration = 0;
+
+  function startCaptchaLogin(vendor) {
+    stopLoginPolling();
+    resetLoginCaptcha();
+    currentSmsVendor = null;
+    currentApiKeyVendor = null;
+    currentLoginState = "";
+    var login = document.getElementById("loginBox");
+    var sms = document.getElementById("smsBox");
+    var apiKey = document.getElementById("apiKeyBox");
+    if (sms) sms.hidden = true;
+    if (apiKey) apiKey.hidden = true;
+    if (!login) return;
+    login.hidden = false;
+    document.getElementById("loginTitle").textContent = "添加 " + vendor.name + " 账号（网页登录）";
+    document.getElementById("loginUrl").value = "";
+    var pasteBox = document.getElementById("loginPasteBox");
+    if (pasteBox) pasteBox.hidden = true;
+
+    var status = document.getElementById("loginStatus");
+    status.textContent = "先选择登录方式；点按钮后会弹出阿里云人机验证（官方要求的风控步骤）。";
+
+    var row = document.getElementById("loginVariantRow");
+    row.textContent = "";
+    row.hidden = false;
+    row.style.display = "flex";
+    loginVariantButtons = [];
+    var variants = (vendor && vendor.login_variants) || [{ id: "google", label: "Google" }];
+    variants.forEach(function (variant) {
+      var btn = el("button", "使用 " + variant.label + " 登录", "act primary");
+      btn.type = "button";
+      btn.addEventListener("click", function () { beginCaptchaLogin(vendor, variant); });
+      row.appendChild(btn);
+      loginVariantButtons.push(btn);
+    });
+    // 凭证粘贴兜底：卡片本身也会自动续期，用户可以随时改走这条路。
+    var pasteBtn = el("button", "粘贴凭证", "act");
+    pasteBtn.type = "button";
+    pasteBtn.addEventListener("click", function () { startCredentialPaste(vendor); });
+    row.appendChild(pasteBtn);
+  }
+
+  function setLoginVariantBusy(busy) {
+    loginVariantButtons.forEach(function (btn) { btn.disabled = busy; });
+  }
+
+  // beginCaptchaLogin 取控件参数并起一轮验证 → 换授权链接。
+  function beginCaptchaLogin(vendor, variant) {
+    var status = document.getElementById("loginStatus");
+    setLoginVariantBusy(true);
+    status.textContent = "正在准备人机验证…";
+    resetLoginCaptcha();
+    api("GET", "/login/captcha-config?vendor=" + encodeURIComponent(vendor.id)).then(function (data) {
+      if (!data || !data.ok) throw new Error((data && data.message) || "获取风控验证配置失败");
+      var config = data.captcha || {};
+      if (!config.enabled) throw new Error("上游没有开启网页登录，请改用「粘贴凭证」");
+      if (!config.scene_id || !config.prefix) throw new Error("上游返回的风控配置不完整，请稍后重试");
+      status.textContent = "请在弹出的滑块中完成验证（官方要求的风控步骤）。";
+      return runLoginCaptcha(config, function (verifyParam) {
+        return requestLoginURL(vendor, variant, verifyParam);
+      });
+    }).catch(function (err) {
+      status.textContent = "登录失败：" + ((err && err.message) || err);
+      resetLoginCaptcha();
+      setLoginVariantBusy(false);
+    });
+  }
+
+  // requestLoginURL 用验证令牌换授权地址，并把粘贴回调的入口展开。
+  function requestLoginURL(vendor, variant, verifyParam) {
+    var status = document.getElementById("loginStatus");
+    status.textContent = "人机验证通过，正在获取授权链接…";
+    return api("POST", "/login/start", {
+      vendor_id: vendor.id,
+      metadata: {
+        oauth_variant: variant.id,
+        ali_captcha_verify_param: verifyParam
+      }
+    }).then(function (data) {
+      if (!data || !data.ok) throw new Error((data && data.message) || "获取授权链接失败");
+      if (!data.url) throw new Error("上游没有返回授权链接，请重试");
+      currentLoginState = data.state || "";
+      document.getElementById("loginUrl").value = data.url;
+      var hint = data.callback_hint || variant.callback_hint || "";
+      var pasteBox = document.getElementById("loginPasteBox");
+      if (pasteBox) pasteBox.hidden = false;
+      document.getElementById("loginPasteHint").textContent =
+        "登录完成后浏览器会停在 " + (hint || "http://localhost/ 的回调地址") +
+        "。远程 / Docker 部署下这个地址打不开是正常的，把地址栏里的整条链接复制后粘贴到下面提交。";
+      document.getElementById("loginPasteUrl").value = "";
+      document.getElementById("loginPasteStatus").textContent = "";
+      document.getElementById("btnSubmitCallback").disabled = false;
+      status.textContent = "请打开下面的链接完成 " + variant.label + " 登录。";
+      // 授权地址已经拿到，滑块流程到此结束（凭证等下一条粘贴请求）。
+      // 这里**不立刻 destroy**：当前还在 SDK 的 captchaVerifyCallback 里，
+      // 先让它收到 bizResult=true 自己收起滑块；实例留到下一次发起/取消时清。
+      setLoginVariantBusy(false);
+      return true;
+    }).catch(function (err) {
+      // 不收起滑块：验证令牌是一次性的，换地址失败（多为 630014 已过期）
+      // 让用户直接再拖一次比重新点入口更快。错误原因写在同一行。
+      status.textContent = "获取授权链接失败：" + ((err && err.message) || err);
+      throw err;
+    });
+  }
+
+  // runLoginCaptcha 渲染阿里云控件并在预热后主动点开滑块。
+  //
+  // resolve 表示「控件已就绪、滑块已弹出」；验证结果走 onVerify（由 SDK 的
+  // captchaVerifyCallback 调用），onVerify 返回 true 时 SDK 才收起滑块。
+  function runLoginCaptcha(config, onVerify) {
+    resetLoginCaptcha();
+    var generation = ++loginCaptchaGeneration;
+    var holder = document.getElementById("loginCaptcha");
+    holder.textContent = "";
+    holder.hidden = false;
+
+    var element = document.createElement("div");
+    element.id = "login-captcha-element-" + generation;
+    holder.appendChild(element);
+
+    var trigger = document.createElement("button");
+    trigger.id = "login-captcha-trigger-" + generation;
+    trigger.type = "button";
+    trigger.setAttribute("aria-hidden", "true");
+    trigger.style.position = "fixed";
+    trigger.style.width = "1px";
+    trigger.style.height = "1px";
+    trigger.style.opacity = "0";
+    trigger.style.pointerEvents = "none";
+    holder.appendChild(trigger);
+
+    var flow = { generation: generation, instance: null, element: element, button: trigger, timer: 0, verified: false };
+    loginCaptchaFlow = flow;
+
+    // region/prefix 必须在脚本加载前设好，否则 SDK 会打默认站点一直转圈。
+    window.AliyunCaptchaConfig = { region: config.region || "ga", prefix: config.prefix };
+    return loadAliyunSdk().then(function () {
+      if (generation !== loginCaptchaGeneration) return null;
+      return new Promise(function (resolve, reject) {
+        var settled = false;
+        function settle(fn) {
+          if (settled) return false;
+          settled = true;
+          if (flow.timer) { clearTimeout(flow.timer); flow.timer = 0; }
+          fn();
+          return true;
+        }
+        flow.timer = setTimeout(function () {
+          settle(function () { reject(new Error("验证码组件初始化超时，请重试")); });
+        }, 40000);
+        try {
+          window.initAliyunCaptcha({
+            SceneId: config.scene_id,
+            mode: "popup",
+            language: "zh-CN",
+            element: "#" + element.id,
+            button: "#" + trigger.id,
+            slideStyle: { width: 360, height: 40 },
+            getInstance: function (inst) {
+              if (generation !== loginCaptchaGeneration) {
+                try { if (inst && inst.destroy) inst.destroy(); } catch (e) { /* 已不可用 */ }
+                return;
+              }
+              flow.instance = inst;
+              settle(resolve);
+            },
+            captchaVerifyCallback: function (param) {
+              if (generation !== loginCaptchaGeneration) {
+                return { captchaResult: false, bizResult: false };
+              }
+              var value = captchaParamText(param);
+              if (!value) return { captchaResult: false, bizResult: false };
+              return Promise.resolve(onVerify(value)).then(function (ok) {
+                if (ok) flow.verified = true;
+                return { captchaResult: !!ok, bizResult: !!ok };
+              }).catch(function () {
+                return { captchaResult: false, bizResult: false };
+              });
+            },
+            onError: function (err) {
+              // 只有初始化阶段可以靠这个 reject；验证阶段的失败已经由
+              // onVerify 的 catch 报在页面上，SDK 会让用户重试。
+              if (!flow.instance) {
+                settle(function () { reject(new Error((err && err.message) || "验证码组件不可用，请重试")); });
+              }
+            }
+          });
+        } catch (err) {
+          settle(function () { reject(err); });
+        }
+      });
+    }).then(function (ready) {
+      if (ready === null || generation !== loginCaptchaGeneration) return;
+      // 客户端实测：SDK 预热没完成时点按钮弹不出滑块。
+      return new Promise(function (resolve) { setTimeout(resolve, 2100); });
+    }).then(function () {
+      if (generation !== loginCaptchaGeneration) return;
+      trigger.click();
+      // SDK 面板右上角的关闭不回调，没人拖动时这里就是唯一能复原界面的地方。
+      setTimeout(function () {
+        if (generation !== loginCaptchaGeneration || flow.verified) return;
+        document.getElementById("loginStatus").textContent = "验证码等待超时，请重新点击登录再试一次";
+        resetLoginCaptcha();
+        setLoginVariantBusy(false);
+      }, 120000);
+    });
+  }
+
+  // resetLoginCaptcha 作废当前一轮验证并清掉容器（可重复调用）。
+  // clearLoginVariants 彻底清空并隐藏变体登录按钮（防止污染其他供应商面板）。
+  function clearLoginVariants() {
+    var row = document.getElementById("loginVariantRow");
+    if (row) {
+      row.textContent = "";
+      row.hidden = true;
+      row.style.display = "none";
+    }
+    loginVariantButtons = [];
+  }
+  function resetLoginCaptcha() {
+    var flow = loginCaptchaFlow;
+    loginCaptchaFlow = null;
+    loginCaptchaGeneration++;
+    if (flow) {
+      if (flow.timer) clearTimeout(flow.timer);
+      if (flow.instance && typeof flow.instance.destroy === "function") {
+        try { flow.instance.destroy(); } catch (e) { /* 实例可能已不可用 */ }
+      }
+      if (flow.element && flow.element.parentNode) flow.element.parentNode.removeChild(flow.element);
+      if (flow.button && flow.button.parentNode) flow.button.parentNode.removeChild(flow.button);
+    }
+    var holder = document.getElementById("loginCaptcha");
+    if (holder) {
+      holder.textContent = "";
+      holder.hidden = true;
+    }
+    clearLoginVariants();
+  }
+
+  // captchaParamText 归一化 SDK 回调参数（不同版本给字符串或对象）。
+  function captchaParamText(param) {
+    if (typeof param === "string") return param;
+    if (param && typeof param.captchaVerifyParam === "string") return param.captchaVerifyParam;
+    if (param && typeof param.verifyParam === "string") return param.verifyParam;
+    return "";
+  }
+
+  var currentSmsVendor = null;
+  var smsSessionKey = "";
+
+  function startSmsLogin(vendor) {
+    stopLoginPolling();
+    resetLoginCaptcha();
+    clearLoginVariants();
+    currentSmsVendor = vendor;
+    smsSessionKey = "";
+    var box = document.getElementById("smsBox");
+    var login = document.getElementById("loginBox");
+    var apiKey = document.getElementById("apiKeyBox");
+    if (login) login.hidden = true;
+    if (apiKey) apiKey.hidden = true;
+    box.hidden = false;
+    document.getElementById("smsTitle").textContent = "添加 " + vendor.name + " 账号（手机验证码登录）";
+    document.getElementById("inputSmsPhone").value = "";
+    document.getElementById("inputSmsCode").value = "";
+    document.getElementById("inputSmsLabel").value = "";
+    document.getElementById("smsStatus").textContent = "输入手机号获取验证码。";
+    document.getElementById("inputSmsPhone").focus();
+  }
+
   function startLogin(vendor) {
+    if (vendor && vendor.sms_login) { startSmsLogin(vendor); return; }
+    resetLoginCaptcha();
+    clearLoginVariants();
+    // 三个添加入口（授权链接 / 短信验证码 / API Key）互斥：打开任一个前先收起另外两个。
+    var smsBox = document.getElementById("smsBox");
+    if (smsBox) { smsBox.hidden = true; }
+    var apiKey = document.getElementById("apiKeyBox");
+    if (apiKey) { apiKey.hidden = true; }
+    currentSmsVendor = null;
     stopLoginPolling();
     currentLoginState = "";
     var box = document.getElementById("loginBox");
+    document.getElementById("loginTitle").textContent = "完成授权";
     var urlField = document.getElementById("loginUrl");
     var status = document.getElementById("loginStatus");
     var pasteBox = document.getElementById("loginPasteBox");
@@ -1901,6 +2408,14 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       document.getElementById("loginStatus").textContent = "复制失败，请手动选中复制。";
     }
   });
+  document.getElementById("btnLoginCancel").addEventListener("click", function () {
+    stopLoginPolling();
+    resetLoginCaptcha();
+    clearLoginVariants();
+    setLoginVariantBusy(false);
+    currentLoginState = "";
+    document.getElementById("loginBox").hidden = true;
+  });
 
   // submitLoginCallback 提交用户粘贴的 localhost 回调链接。
   //
@@ -1920,25 +2435,35 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       pasteStatus.textContent = "请先粘贴浏览器地址栏里的整条链接。";
       return;
     }
+    // 立即停止后台设备授权轮询：用户已经拿到并提交了回调，不再需要并发轮询，
+    // 防止换票完成、会话销毁后，未退出的轮询请求误报「会话不存在或已过期」。
+    stopLoginPolling();
     btn.disabled = true;
     btn.textContent = "提交中…";
     redirect.hidden = true;
-    api("POST", "/login/callback", { state: currentLoginState, url: raw }).then(function (data) {
+    var submittedState = currentLoginState;
+    api("POST", "/login/callback", { state: submittedState, url: raw }).then(function (data) {
       btn.disabled = false;
       btn.textContent = "提交回调链接";
       var value = (data && data.status) || "";
-      var message = (data && data.message) || "";
+      var message = (data && data.message) || (data && data.error) || "";
       if (value === "success") {
         stopLoginPolling();
-        // 回调链接里有授权票据，成功后立刻从页面里清掉，不留在 DOM 与剪贴板历史里。
         document.getElementById("loginPasteUrl").value = "";
+        currentLoginState = "";
+        resetLoginCaptcha();
+        clearLoginVariants();
         pasteStatus.textContent = message || "解析成功，正在写入账号…";
         document.getElementById("loginStatus").textContent = "授权成功，账号已写入 CPA。";
         banner("ok", "账号添加成功，正在查询该账号额度…");
         loadQuotas(true);
+        setTimeout(function () {
+          var box = document.getElementById("loginBox");
+          if (box) { box.hidden = true; box.style.display = "none"; }
+        }, 1500);
         return;
       }
-      pasteStatus.textContent = message || "回调链接暂时无法完成登录，请稍后重试。";
+      pasteStatus.textContent = message || "回调链接暂时无法完成登录，请重新发起登录后重试。";
       // CodeArts：票据尚未换到凭证，需要在能联网的浏览器里打开门户登录页。
       if (data && data.redirect_url) {
         redirect.href = data.redirect_url;
@@ -1947,11 +2472,66 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     }).catch(function (err) {
       btn.disabled = false;
       btn.textContent = "提交回调链接";
-      pasteStatus.textContent = "提交失败：" + err.message;
+      pasteStatus.textContent = "提交失败：" + (err.message || err);
     });
   }
 
   document.getElementById("btnSubmitCallback").addEventListener("click", submitLoginCallback);
+
+  // ---- 手机验证码登录（sms_login 供应商）----
+  document.getElementById("btnSmsSend").addEventListener("click", function () {
+    var status = document.getElementById("smsStatus");
+    var phone = document.getElementById("inputSmsPhone").value.trim();
+    var btn = document.getElementById("btnSmsSend");
+    if (!currentSmsVendor) { status.textContent = "请先重新打开添加面板。"; return; }
+    if (!phone) { status.textContent = "请先填写手机号。"; return; }
+    btn.disabled = true; btn.textContent = "发送中…";
+    status.textContent = "正在发送验证码…";
+    api("POST", "/login/sms/send", { vendor_id: currentSmsVendor.id, phone: phone }).then(function (data) {
+      btn.disabled = false; btn.textContent = "发送验证码";
+      if (data && data.ok) {
+        smsSessionKey = (data.session_key || "");
+        status.textContent = data.message || "验证码已发送。";
+        document.getElementById("inputSmsCode").focus();
+      } else {
+        status.textContent = (data && data.message) || "发送失败，请稍后重试。";
+      }
+    }).catch(function (err) {
+      btn.disabled = false; btn.textContent = "发送验证码";
+      status.textContent = "发送失败：" + err.message;
+    });
+  });
+
+  document.getElementById("btnSmsVerify").addEventListener("click", function () {
+    var status = document.getElementById("smsStatus");
+    var phone = document.getElementById("inputSmsPhone").value.trim();
+    var code = document.getElementById("inputSmsCode").value.trim();
+    var label = document.getElementById("inputSmsLabel").value.trim();
+    var btn = document.getElementById("btnSmsVerify");
+    if (!currentSmsVendor) { status.textContent = "请先重新打开添加面板。"; return; }
+    if (!phone || !code) { status.textContent = "请填写手机号与短信验证码。"; return; }
+    btn.disabled = true; btn.textContent = "登录中…";
+    status.textContent = "正在验证并添加账号…";
+    api("POST", "/login/sms/verify", { vendor_id: currentSmsVendor.id, session_key: smsSessionKey, phone: phone, code: code, label: label }).then(function (data) {
+      btn.disabled = false; btn.textContent = "登录并添加";
+      if (data && data.ok) {
+        document.getElementById("smsBox").hidden = true;
+        currentSmsVendor = null;
+        banner("ok", (data.message || "账号添加成功") + "：" + (data.auth_id || ""));
+        loadQuotas(true);
+      } else {
+        status.textContent = (data && data.message) || "登录失败，请检查验证码后重试。";
+      }
+    }).catch(function (err) {
+      btn.disabled = false; btn.textContent = "登录并添加";
+      status.textContent = "登录失败：" + err.message;
+    });
+  });
+
+  document.getElementById("btnSmsCancel").addEventListener("click", function () {
+    document.getElementById("smsBox").hidden = true;
+    currentSmsVendor = null;
+  });
 
   document.getElementById("btnCancelApiKey").addEventListener("click", function () {
     document.getElementById("apiKeyBox").hidden = true;
@@ -1969,11 +2549,14 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     var btn = document.getElementById("btnSubmitApiKey");
     btn.disabled = true;
     btn.textContent = "保存中…";
-    api("POST", "/accounts/add", {
-      vendor: currentApiKeyVendor.id,
-      api_key: apiKey,
-      label: label
-    }).then(function (res) {
+    var payload = { vendor: currentApiKeyVendor.id, label: label };
+    if (currentApiKeyVendor.id === "autoclawglobal") {
+      // AutoClaw 国际版：输入框里是凭证 JSON（访问令牌/刷新令牌）。
+      payload.credential_json = apiKey;
+    } else {
+      payload.api_key = apiKey;
+    }
+    api("POST", "/accounts/add", payload).then(function (res) {
       btn.disabled = false;
       btn.textContent = "保存账号";
       if (!res || !res.ok) {
@@ -2026,6 +2609,24 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
     });
   });
   document.getElementById("btnLoadQuotas").addEventListener("click", function () { loadQuotas(false); });
+  document.getElementById("btnRefreshQuotaAuth").addEventListener("click", function () {
+    var btn = this;
+    btn.disabled = true;
+    banner("ok", "正在刷新全部账号凭证并重新查询额度…", 0);
+    api("POST", "/quotas", { refresh_credentials: true }).then(function (res) {
+      var results = (res && res.results) || [];
+      var failed = results.filter(function (item) { return !item.ok; }).length;
+      var succeeded = results.length - failed;
+      if (failed > 0) {
+        banner(succeeded > 0 ? "warn" : "err", "凭证刷新完成：" + succeeded + " 成功，" + failed + " 失败", 8000);
+      } else if (res) {
+        banner("ok", "凭证刷新并查询完成：" + succeeded + " 个账号", 5000);
+      }
+      return loadStatus(true);
+    }).catch(function (err) {
+      banner("err", "刷新额度凭证失败：" + err.message, 8000);
+    }).then(function () { btn.disabled = false; });
+  });
   document.getElementById("btnLoadModels").addEventListener("click", function () { refreshModels(false); });
 
   // ---- 模型表列展示 ----
@@ -2184,7 +2785,8 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 13px; }
       auto_checkin: document.getElementById("setAutoCheckin").checked,
       auto_checkin_at: document.getElementById("setCheckinAt").value,
       auto_tasks: document.getElementById("setAutoTasks").checked,
-      workbuddy_prompt_mode: promptSel ? promptSel.value : "passthrough",
+      prompt_mode: promptSel ? promptSel.value : "passthrough",
+      model_name_tag: (document.getElementById("setModelNameTag") || {}).value || "off",
       task_schedules: {}
     };
     document.querySelectorAll("#taskSchedule input[data-task-kind]").forEach(function (input) {

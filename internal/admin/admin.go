@@ -44,10 +44,17 @@ type Deps interface {
 	State() state.State
 	MutateState(func(*state.State))
 	Model() *Catalog
-	WorkbuddyPromptMode() string
 	RefreshModels(ctx context.Context) (int, error)
+	// SendLoginSMS 发送短信验证码（vendorID 定位实现 SMSLoginProvider 的实例）。
+	SendLoginSMS(ctx context.Context, vendorID, phone string) (sessionKey string, err error)
+	// VerifyLoginSMS 用短信验证码完成登录并返回落盘凭证。
+	VerifyLoginSMS(ctx context.Context, vendorID, sessionKey, phone, code string) (fileName, label, storageJSON string, err error)
 	// SubmitLoginCallback 处理用户粘贴回来的 localhost 授权回调链接。
 	SubmitLoginCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error)
+	// StartLogin 发起一次供应商登录（控制台在页面内完成人机验证后调用）。
+	StartLogin(ctx context.Context, vendorID string, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error)
+	// LoginCaptchaConfig 取登录前的人机验证控件参数。
+	LoginCaptchaConfig(ctx context.Context, vendorID string) (core.CaptchaConfig, error)
 	Reconfigure() error
 }
 
@@ -111,8 +118,13 @@ func (s *Service) managementRoutes(prefix string) []pluginapi.ManagementRoute {
 		{Method: "GET", Path: prefix + "/school/status", Description: "开学季活动状态。"},
 		{Method: "POST", Path: prefix + "/keepalive", Description: "手动执行 token 保活。"},
 		{Method: "POST", Path: prefix + "/plans/preview", Description: "查询账号当前可领套餐与人机验证控件参数。"},
+		{Method: "POST", Path: prefix + "/activities/preview", Description: "只读探测账号当前活动资格，不执行领取。"},
 		{Method: "POST", Path: prefix + "/plans/claim", Description: "提交人机验证令牌并领取套餐。"},
 		{Method: "POST", Path: prefix + "/login/callback", Description: "提交用户粘贴的 localhost 授权回调链接（远程部署下的登录兜底）。"},
+		{Method: "POST", Path: prefix + "/login/start", Description: "发起一次供应商登录（可携带页面内人机验证令牌）。"},
+		{Method: "GET", Path: prefix + "/login/captcha-config", Description: "读取登录前的人机验证控件参数（阿里云场景 ID/region/prefix）。"},
+		{Method: "POST", Path: prefix + "/login/sms/send", Description: "发送短信验证码（支持手机验证码登录的供应商）。"},
+		{Method: "POST", Path: prefix + "/login/sms/verify", Description: "用短信验证码完成登录并保存账号。"},
 	}
 	for _, spec := range s.tasks.Catalog().ManualSpecs() {
 		if spec.Route == "" {
@@ -204,10 +216,20 @@ func (s *Service) Handle(request []byte) ([]byte, error) {
 
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/plans/preview"):
 		return core.OKEnvelope(s.handlePlansPreview(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/activities/preview"):
+		return core.OKEnvelope(s.handleActivitiesPreview(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/plans/claim"):
 		return core.OKEnvelope(s.handlePlansClaim(rpc))
 	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/callback"):
 		return core.OKEnvelope(s.handleLoginCallbackRequest(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/start"):
+		return core.OKEnvelope(s.handleLoginStartRequest(rpc))
+	case method == http.MethodGet && matchesManagementPath(rpc.Path, id.ID, "/login/captcha-config"):
+		return core.OKEnvelope(s.handleLoginCaptchaConfigRequest(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/sms/send"):
+		return core.OKEnvelope(s.handleLoginSMSSend(rpc))
+	case method == http.MethodPost && matchesManagementPath(rpc.Path, id.ID, "/login/sms/verify"):
+		return core.OKEnvelope(s.handleLoginSMSVerify(rpc))
 	}
 	if method == http.MethodPost {
 		if suffix, okSuffix := managementSuffix(rpc.Path, id.ID); okSuffix {
@@ -265,9 +287,44 @@ func normalizeRequestPath(path string) string {
 func HTMLResponse(status int, body []byte) pluginapi.ManagementResponse {
 	return pluginapi.ManagementResponse{
 		StatusCode: status,
-		Headers:    http.Header{"Content-Type": []string{"text/html; charset=utf-8"}},
-		Body:       body,
+		Headers: http.Header{
+			"Content-Type": []string{"text/html; charset=utf-8"},
+			// 页面与后端字段名一起演进：不允许浏览器拿旧页面去提交已改名的键。
+			"Cache-Control": []string{"no-store"},
+		},
+		Body: body,
 	}
+}
+
+// decodeRequest 解码管理请求体。空请求体保持兼容并视为未提供参数（返回零值）；
+// 非空请求体只要不是合法 JSON 就返回错误，由调用方统一回 400，
+// 避免畸形请求继续按默认值执行。
+func decodeRequest[T any](raw []byte) (T, error) {
+	var body T
+	return decodeRequestInto(raw, body)
+}
+
+// decodeRequestInto 与 decodeRequest 相同，但以一个非零默认值起步：
+// 只出现在请求体里的字段才覆盖默认值，缺省字段保留 base。
+func decodeRequestInto[T any](raw []byte, base T) (T, error) {
+	if len(raw) == 0 {
+		return base, nil
+	}
+	if errUnmarshal := json.Unmarshal(raw, &base); errUnmarshal != nil {
+		var zero T
+		return zero, errUnmarshal
+	}
+	return base, nil
+}
+
+// BadJSONRequestResponse 构造统一的畸形 JSON 请求响应。
+//
+// login/callback 是唯一例外：页面按 AuthLoginStatus 契约读 status / message，
+// 那边自己构造同样形状的 400，不套用这里。
+func BadJSONRequestResponse() pluginapi.ManagementResponse {
+	return JSONResponse(http.StatusBadRequest, map[string]any{
+		"ok": false, "error": "请求体解析失败，请检查 JSON 格式",
+	})
 }
 
 // JSONResponse 构造 JSON 管理响应。
@@ -298,6 +355,19 @@ func ErrorResponse(err error) pluginapi.ManagementResponse {
 		}
 	}
 	return JSONResponse(status, map[string]any{"error": message, "ok": false})
+}
+
+// queryString 取第一个非空查询参数（缺失返回空串）。
+func queryString(query map[string][]string, key string) string {
+	if query == nil {
+		return ""
+	}
+	for _, value := range query[key] {
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 func queryInt64(query map[string][]string, key string, fallback int64) int64 {

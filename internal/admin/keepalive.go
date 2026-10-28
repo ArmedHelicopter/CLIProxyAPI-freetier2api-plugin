@@ -16,11 +16,21 @@ import (
 )
 
 func (s *Service) handleKeepaliveRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	var body accountBatchRequest
+	if len(req.Body) > 0 {
+		decoded, errDecode := decodeRequest[accountBatchRequest](req.Body)
+		if errDecode != nil {
+			return BadJSONRequestResponse()
+		}
+		body = decoded
+	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
 
-	// targets 传 nil：端点语义一直是「全部账号」，请求体不参与筛选。
-	results := s.tasks.Keepalive(ctx, hostbridge.RequestCallbackID(req), nil, batchConcurrency)
+	// An explicit account_ids list refreshes only the credential that failed;
+	// an absent/empty list preserves the existing all-accounts endpoint behavior.
+	targets := body.AccountIDs
+	results := s.tasks.Keepalive(ctx, hostbridge.RequestCallbackID(req), targets, batchConcurrency)
 	if len(results) == 0 {
 		return JSONResponse(http.StatusOK, map[string]any{
 			"ok": true, "message": "没有需要续期的可用账号", "succeeded": 0, "failed": 0, "results": []any{},

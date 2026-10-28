@@ -47,17 +47,6 @@ func (a *App) decodeConfig(raw []byte) (pluginConfig, error) {
 	return cfg, nil
 }
 
-// promptModeFor 返回当前生效的提示词模式（WorkBuddy 运行时设置）。
-func (a *App) promptModeFor() string {
-	if mode := strings.TrimSpace(a.SnapshotState().VendorSettings["workbuddy_prompt_mode"]); mode != "" {
-		return mode
-	}
-	if mode := strings.TrimSpace(a.Config().Raw["workbuddy_prompt_mode"]); mode != "" {
-		return mode
-	}
-	return "passthrough"
-}
-
 // ApplyConfig 应用配置：初始化日志与状态目录、设置指纹盐、下发供应商配置。
 func (a *App) ApplyConfig(cfg pluginConfig) error {
 	if errDir := ensureStateDir(cfg); errDir != nil {
@@ -79,6 +68,7 @@ func (a *App) ApplyConfig(cfg pluginConfig) error {
 		ExtraModels:      cfg.ExtraModels,
 		DisabledModels:   cfg.DisabledModels,
 		ContextWindowFor: core.DefaultContextWindow,
+		ModelNameTag:     admin.EffectiveModelNameTag(cfg, a.SnapshotState().ModelNameTag),
 	})
 	a.models.RefreshFromState()
 	a.configureVendors(cfg)

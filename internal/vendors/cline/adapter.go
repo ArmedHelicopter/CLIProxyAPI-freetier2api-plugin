@@ -318,3 +318,13 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{{Name: "cline_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"}}
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.AuthModeReporter     = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+)

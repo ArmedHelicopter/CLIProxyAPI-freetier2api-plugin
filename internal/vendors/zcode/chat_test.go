@@ -1,9 +1,13 @@
 package zcode
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // 对话转换测试：请求侧（tools / tool_calls / tool role / 多模态）与
@@ -346,19 +350,34 @@ func TestClassifyEmbeddedError(t *testing.T) {
 	}
 }
 
-func TestResolveTargetURLRequiresAPIKey(t *testing.T) {
-	// 有 API Key 时打到 api.z.ai 的回退端点。
-	target, errResolve := resolveTargetURL("", &Credential{APIKey: "k.s"})
+func TestResolveTargetURLPrefersStartPlanAndUltraGateway(t *testing.T) {
+	// 具备 JWT 时优先走 Start Plan 通道。
+	target, errResolve := resolveTargetURL("", &Credential{JWTToken: "a.b.c", APIKey: "k.s"})
 	if errResolve != nil {
 		t.Fatalf("unexpected error: %v", errResolve)
 	}
-	if target != ZAIOrigin+PathAPIMessages {
-		t.Fatalf("target = %q", target)
+	if target != ZCodeOrigin+PathPlanMessages {
+		t.Fatalf("target = %q, want %q", target, ZCodeOrigin+PathPlanMessages)
 	}
 
-	// 只有 JWT 时必须明确拒绝，而不是发出必然 3007 的请求。
-	if _, errResolve := resolveTargetURL("", &Credential{JWTToken: "a.b.c"}); errResolve == nil {
-		t.Fatal("缺少 API Key 时必须拒绝，而不是走需要验证码的 Plan 通道")
+	// 仅持 API Key 时默认走 ZCode Ultra 网关（避免国内直连 api.z.ai DNS 失败）。
+	target, errResolve = resolveTargetURL("", &Credential{APIKey: "k.s"})
+	if errResolve != nil {
+		t.Fatalf("unexpected error: %v", errResolve)
+	}
+	if target != ZCodeOrigin+PathUltraZAIMessages {
+		t.Fatalf("target = %q, want %q", target, ZCodeOrigin+PathUltraZAIMessages)
+	}
+
+	// 显式指定 baseURL 时走自定义基地址。
+	target, errResolve = resolveTargetURL("https://custom.zcode.test/", &Credential{APIKey: "k.s"})
+	if errResolve != nil || target != "https://custom.zcode.test"+PathAPIMessages {
+		t.Fatalf("custom target = %q, err = %v", target, errResolve)
+	}
+
+	// 两者都缺失时报错。
+	if _, errResolve := resolveTargetURL("", &Credential{}); errResolve == nil {
+		t.Fatal("缺少 JWT 与 API Key 时必须拒绝")
 	}
 }
 
@@ -369,25 +388,56 @@ func TestApplyStartPlanSystemIsIdempotent(t *testing.T) {
 	}
 	applyStartPlanSystem(body, "GLM-5.3")
 	first, _ := body["system"].([]any)
-	if len(first) == 0 {
-		t.Fatal("身份块未注入")
+	if len(first) != 3 {
+		t.Fatalf("system 块数 = %d, want 3（cli_prefix / stable / dynamic）", len(first))
 	}
 
-	// 重复调用不得重复拼接（上游按内容审查，重复块会被判异常）。
+	// 重复调用不得重复拼接（上游按内容审查，超过 3 块会被判 3012 异常）。
 	applyStartPlanSystem(body, "GLM-5.3")
 	second, _ := body["system"].([]any)
 	if len(second) != len(first) {
 		t.Fatalf("重复注入改变了块数: %d != %d", len(second), len(first))
 	}
 
-	// 官方块在最前，用户原有 system 保留在后。
+	// 首块为 CLI prefix（无 cache_control），末块内嵌模型名与用户 system（Output Style 槽位）。
 	head, _ := second[0].(map[string]any)
 	if !strings.Contains(head["text"].(string), "ZCode") {
 		t.Fatalf("首块应为官方身份块: %v", head)
 	}
+	if head["cache_control"] != nil {
+		t.Fatalf("首块 CLI prefix 不应携带 cache_control: %v", head)
+	}
 	tail, _ := second[len(second)-1].(map[string]any)
-	if tail["text"] != "user instructions" {
-		t.Fatalf("用户 system 应保留: %v", tail)
+	tailText, _ := tail["text"].(string)
+	if !strings.Contains(tailText, "account:zai-start-plan/GLM-5.3") {
+		t.Fatalf("动态块应包含当前模型标识: %s", tailText)
+	}
+	if !strings.Contains(tailText, "# Output Style: custom\nuser instructions") {
+		t.Fatalf("用户 system 应内嵌在动态块的 Output Style 槽位: %s", tailText)
+	}
+}
+
+func TestConvertMessagesMergesConsecutiveToolResults(t *testing.T) {
+	body := anthropicBody(t, `{
+		"model": "GLM-5.3",
+		"messages": [
+			{"role": "user", "content": "check two files"},
+			{"role": "assistant", "content": null, "tool_calls": [
+				{"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{}"}},
+				{"id": "call_2", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+			]},
+			{"role": "tool", "tool_call_id": "call_1", "content": "file_a"},
+			{"role": "tool", "tool_call_id": "call_2", "content": "file_b"}
+		]
+	}`, nil)
+	messages, _ := body["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("连续 tool 消息应合并为单条 user 消息, got %d messages: %v", len(messages), messages)
+	}
+	toolUser, _ := messages[2].(map[string]any)
+	blocks, _ := toolUser["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("合并后应含 2 个 tool_result 块, got %d: %v", len(blocks), blocks)
 	}
 }
 
@@ -413,5 +463,91 @@ func TestApplyCacheControl(t *testing.T) {
 	first := messages[0].(map[string]any)
 	if _, isString := first["content"].(string); !isString {
 		t.Fatalf("非末条消息不应被改写: %v", first["content"])
+	}
+}
+
+// ---- Start Plan 出站闸门 ----
+
+// TestChatGateSerializesPerAccount 验证同账号闸门串行：持有者未释放时后来者
+// 排队，释放后可再次获取；不同账号互不阻塞。
+func TestChatGateSerializesPerAccount(t *testing.T) {
+	gate := newChatGate()
+
+	release, errAcquire := gate.acquire(context.Background(), "uid:user-a")
+	if errAcquire != nil {
+		t.Fatalf("first acquire: %v", errAcquire)
+	}
+
+	ctxQuick, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, errSecond := gate.acquire(ctxQuick, "uid:user-a"); errSecond == nil {
+		t.Fatal("second acquire must block while the slot is held")
+	}
+
+	release()
+	releaseAgain, errThird := gate.acquire(context.Background(), "uid:user-a")
+	if errThird != nil {
+		t.Fatalf("acquire after release: %v", errThird)
+	}
+	releaseAgain()
+
+	releaseOther, errOther := gate.acquire(context.Background(), "uid:user-b")
+	if errOther != nil {
+		t.Fatalf("other account must not be blocked: %v", errOther)
+	}
+	releaseOther()
+}
+
+// TestChatGateRespectsCancelledContext 验证宿主取消请求时排队者立即退出。
+func TestChatGateRespectsCancelledContext(t *testing.T) {
+	gate := newChatGate()
+	release, errAcquire := gate.acquire(context.Background(), "uid:cancel")
+	if errAcquire != nil {
+		t.Fatalf("first acquire: %v", errAcquire)
+	}
+	defer release()
+
+	ctxCancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, errSecond := gate.acquire(ctxCancelled, "uid:cancel"); errSecond == nil {
+		t.Fatal("cancelled context must not acquire a held slot")
+	}
+}
+
+// TestHoldStartPlanSlotSkipsAPIKeyChannel 验证纯 API Key 通道不进闸门：该通道
+// 没有 3008/3009/3010 并发上限，不能被同账号的在途对话挡在队列里。
+func TestHoldStartPlanSlotSkipsAPIKeyChannel(t *testing.T) {
+	v := &adapter{gate: newChatGate()}
+	cred := &Credential{APIKey: "k.s"} // 无 JWT，走网关通道
+
+	release, errHold := v.holdStartPlanSlot(context.Background(), cred)
+	if errHold != nil {
+		t.Fatalf("api-key channel must not queue: %v", errHold)
+	}
+	release()
+
+	if _, errNil := v.holdStartPlanSlot(context.Background(), nil); errNil != nil {
+		t.Fatalf("nil credential must fall through: %v", errNil)
+	}
+}
+
+// TestHoldStartPlanSlotCancelWhileQueuedIsClientFault 验证排队中宿主断开时按
+// 客户端取消处理（不重试、不计上游故障），而不是当成上游 5xx。
+func TestHoldStartPlanSlotCancelWhileQueuedIsClientFault(t *testing.T) {
+	v := &adapter{gate: newChatGate()}
+	native := &Credential{JWTToken: "jwt", UserID: "u-queued"}
+
+	held, errHeld := v.gate.acquire(context.Background(), native.AccountKey())
+	if errHeld != nil {
+		t.Fatalf("hold slot: %v", errHeld)
+	}
+	defer held()
+
+	ctxCancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, errHold := v.holdStartPlanSlot(ctxCancelled, native)
+	failure, ok := errHold.(*core.Failure)
+	if !ok || failure.Kind != core.FailureKindClient {
+		t.Fatalf("cancel while queued = %v, want client failure", errHold)
 	}
 }

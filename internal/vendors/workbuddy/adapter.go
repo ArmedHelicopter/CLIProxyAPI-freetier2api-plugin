@@ -10,7 +10,6 @@ import (
 	"context"
 	_ "embed"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -206,7 +205,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 		Body:       req.Payload,
 		Model:      req.Model,
 		ClientIP:   req.ClientIP,
-		Meta:       ChatMetaFromBody(req.Payload, http.Header(req.Headers)),
+		Meta:       ChatMetaFromBody(req.Payload),
 	})
 	if errChat != nil {
 		return nil, errChat
@@ -229,7 +228,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		Body:       req.Payload,
 		Model:      req.Model,
 		ClientIP:   req.ClientIP,
-		Meta:       ChatMetaFromBody(req.Payload, http.Header(req.Headers)),
+		Meta:       ChatMetaFromBody(req.Payload),
 	})
 	if errStream != nil {
 		return errStream
@@ -273,6 +272,11 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	native, errNative := v.Native(cred)
 	if errNative != nil {
 		return nil, errNative
+	}
+	if reason := checkinUnsupportedReason(native); reason != "" {
+		// 企业账号的签到端点恒返回 400 code 10001（「企业账号不支持该操作」）。
+		// 这不是故障，也不该记成「今日已签到」：如实跳过并给出原因。
+		return &core.CheckinResult{NotRecorded: true, Message: reason}, nil
 	}
 	client := v.client(ctx)
 	if v.region.IsGlobal() {
@@ -421,6 +425,36 @@ func (v *adapter) client(ctx context.Context) *Client {
 // 两个域都有每日收入路径，因此恒为 true。
 func (v *adapter) SupportsCheckin() bool { return true }
 
+// SupportsCheckinFor 实现 core.CheckinCapability：按账号判定签到是否可用。
+func (v *adapter) SupportsCheckinFor(cred *core.Credential) bool {
+	return v.CheckinUnsupportedReason(cred) == ""
+}
+
+// CheckinUnsupportedReason 实现 core.CheckinCapability：返回不可签到的可读原因。
+func (v *adapter) CheckinUnsupportedReason(cred *core.Credential) string {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return ""
+	}
+	return checkinUnsupportedReason(native)
+}
+
+// checkinUnsupportedReason 判定该凭证是否没有签到活动。
+//
+// 企业账号请求 daily-checkin 恒得到 400 code 10001「企业账号不支持该操作」；
+// 企业额度按月度周期自动回满，本来就没有签到这条收入路径。
+// 只看国内版：国际版的每日活跃奖励是另一套链路（信标 + 次日发放），
+// 与国内版签到端点无关。
+func checkinUnsupportedReason(cred *Credential) string {
+	if cred == nil || cred.Realm().IsGlobal() {
+		return ""
+	}
+	if strings.TrimSpace(cred.EnterpriseIDValue()) != "" {
+		return "企业账号不支持签到：企业额度按月度周期自动回满"
+	}
+	return ""
+}
+
 // LoadModelCache 实现 core.ModelCacheLoader：只加载本实例的缓存。
 func (v *adapter) LoadModelCache(cached []core.CachedModel) {
 	filtered := make([]core.CachedModel, 0, len(cached))
@@ -529,10 +563,11 @@ func (r *runtime) configure(settings core.Settings, raw map[string]string) {
 	cfg.deviceToken = strings.TrimSpace(raw["workbuddy_device_token"])
 	cfg.deviceTokenFile = strings.TrimSpace(raw["workbuddy_device_token_file"])
 
-	if value := strings.ToLower(strings.TrimSpace(raw["workbuddy_prompt_mode"])); value != "" {
+	// 提示词过滤是全局设置（prompt_mode / prompt_file），WorkBuddy 只是实现方。
+	if value := strings.ToLower(strings.TrimSpace(raw["prompt_mode"])); value != "" {
 		cfg.promptMode = value
 	}
-	if path := strings.TrimSpace(raw["workbuddy_prompt_file"]); path != "" {
+	if path := strings.TrimSpace(raw["prompt_file"]); path != "" {
 		text, errRead := readPromptFile(path)
 		if errRead != nil {
 			logger.Error("load prompt file failed, falling back to built-in prompt: %v", errRead)
@@ -586,8 +621,6 @@ func (r *runtime) options(ctx context.Context) Options {
 // ConfigFields 声明 WorkBuddy 专属 YAML 配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{Name: "workbuddy_prompt_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"passthrough", "custom", "append"}, Description: "系统提示词处理模式。"},
-		{Name: "workbuddy_prompt_file", Type: pluginapi.ConfigFieldTypeString, Description: "自定义提示词文件路径。"},
 		{Name: "workbuddy_sanitize_fingerprints", Type: pluginapi.ConfigFieldTypeBoolean, Description: "出站请求体指纹脱敏，默认开启。"},
 		{Name: "workbuddy_passthrough_ip", Type: pluginapi.ConfigFieldTypeBoolean, Description: "是否透传客户端 IP，默认关闭。"},
 		{Name: "workbuddy_user_agent", Type: pluginapi.ConfigFieldTypeString, Description: "出站 User-Agent 覆盖。"},
@@ -596,13 +629,6 @@ func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 		{Name: "workbuddy_client_name", Type: pluginapi.ConfigFieldTypeString, Description: "归属头客户端名。"},
 		{Name: "workbuddy_device_token", Type: pluginapi.ConfigFieldTypeString, Description: "X-Device-Token 全局兜底。"},
 		{Name: "workbuddy_device_token_file", Type: pluginapi.ConfigFieldTypeString, Description: "设备令牌文件路径。"},
-	}
-}
-
-// RuntimeFields 声明管理页可改字段。
-func (v *adapter) RuntimeFields() []pluginapi.ConfigField {
-	return []pluginapi.ConfigField{
-		{Name: "workbuddy_prompt_mode", Type: pluginapi.ConfigFieldTypeEnum, EnumValues: []string{"passthrough", "custom", "append"}, Description: "系统提示词处理模式（页面覆盖 YAML）。"},
 	}
 }
 
@@ -783,3 +809,25 @@ func (r *runtime) hostProbeCredential(region Region) *Credential {
 	}
 	return nil
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.CheckinProvider      = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.ConsoleModelProvider = (*adapter)(nil)
+	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+	_ core.ModelCacheLoader     = (*adapter)(nil)
+	_ core.ModelsProvider       = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+	_ core.Refresher            = (*adapter)(nil)
+	_ core.StorageMerger        = (*adapter)(nil)
+	_ core.TaskCatalogProvider  = (*adapter)(nil)
+	_ core.TaskInspector        = (*adapter)(nil)
+	_ core.TaskPreparer         = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
+	_ core.TaskStatusProvider   = (*adapter)(nil)
+	_ core.ScheduledRunner      = (*adapter)(nil)
+)

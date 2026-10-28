@@ -12,10 +12,13 @@ package tests
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginabi"
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/app"
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/vendors/workbuddy"
@@ -136,12 +139,28 @@ func registerRequest(t *testing.T, cfg app.Config) []byte {
 
 // sampleCredentialJSON 构造一份凭证 JSON（嵌套形态）。
 func sampleCredentialJSON(realm, uid string) string {
+	return credentialJSON(realm, uid, "ent-1")
+}
+
+// personalCredentialJSON 构造一份不带企业租户的普通账号凭证。
+//
+// 企业账号与个人账号的关键差别就在 enterpriseId 上：企业账号没有签到活动、
+// 额度走企业用量接口，所以「个人账号」用例必须显式不带这个字段。
+func personalCredentialJSON(realm, uid string) string {
+	return credentialJSON(realm, uid, "")
+}
+
+func credentialJSON(realm, uid, enterpriseID string) string {
 	region := workbuddy.NormalizeRegion(realm)
+	enterprise := ""
+	if enterpriseID != "" {
+		enterprise = fmt.Sprintf(`"enterpriseId": %q, `, enterpriseID)
+	}
 	return fmt.Sprintf(`{
   "auth": {"accessToken": "at-%s", "refreshToken": "rt-%s", "expiresAt": %d, "domain": "%s", "realm": "%s"},
-  "account": {"uid": "%s", "enterpriseId": "ent-1", "nickname": "账号%s"},
+  "account": {%s"uid": "%s", "nickname": "账号%s"},
   "device_token": "dt-%s"
-}`, uid, uid, time.Now().Add(24*time.Hour).Unix(), workbuddy.DefaultDomainFor(region), region, uid, uid, uid)
+}`, uid, uid, time.Now().Add(24*time.Hour).Unix(), workbuddy.DefaultDomainFor(region), region, enterprise, uid, uid, uid)
 }
 
 // 小工具。
@@ -203,4 +222,32 @@ func waitFor(t *testing.T, timeout time.Duration, condition func() bool) bool {
 		time.Sleep(5 * time.Millisecond)
 	}
 	return condition()
+}
+
+// managementCall 调一次插件管理接口并返回响应体（body 可为 nil）。
+func managementCall(t *testing.T, method, path string) pluginapi.ManagementResponse {
+	t.Helper()
+	return managementCallWithBody(t, method, path, nil)
+}
+
+// managementCallWithBody 调一次带 JSON body 的插件管理接口。
+func managementCallWithBody(t *testing.T, method, path string, body any) pluginapi.ManagementResponse {
+	t.Helper()
+	request := pluginapi.ManagementRequest{
+		Method:  method,
+		Path:    "/v0/management/plugins/freetier2api" + path,
+		Headers: http.Header{"X-Host-Callback-Id": []string{testCallbackID}},
+	}
+	if body != nil {
+		request.Body = mustMarshal(body)
+	}
+	raw, errHandle := testApp.HandleMethod(pluginabi.MethodManagementHandle, mustMarshal(request))
+	if errHandle != nil {
+		t.Fatalf("%s %s: %v", method, path, errHandle)
+	}
+	var response pluginapi.ManagementResponse
+	if errUnmarshal := json.Unmarshal(decodeEnvelopeResultForTest(t, raw), &response); errUnmarshal != nil {
+		t.Fatalf("decode management response: %v", errUnmarshal)
+	}
+	return response
 }

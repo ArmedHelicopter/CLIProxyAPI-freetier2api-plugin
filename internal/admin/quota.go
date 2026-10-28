@@ -2,9 +2,9 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -47,9 +47,13 @@ type quotaResult struct {
 	Realm      string `json:"realm"`
 	OK         bool   `json:"ok"`
 	Message    string `json:"message,omitempty"`
-	Summary    string `json:"summary,omitempty"`
-	Remain     int64  `json:"remain"`
-	Total      int64  `json:"total"`
+	// FailureType is a stable, UI-friendly classification (credential, quota, transient, etc.).
+	FailureType string `json:"failure_type,omitempty"`
+	// RefreshAttempted reports that an expired credential was refreshed before retrying.
+	RefreshAttempted bool   `json:"refresh_attempted,omitempty"`
+	Summary          string `json:"summary,omitempty"`
+	Remain           int64  `json:"remain"`
+	Total            int64  `json:"total"`
 	// Unlimited 报告剩余额度无上限，展示层据此显示「无限」。
 	Unlimited bool                    `json:"unlimited,omitempty"`
 	Metrics   []pluginapi.QuotaMetric `json:"metrics,omitempty"`
@@ -65,9 +69,9 @@ type quotaBatchOutcome struct {
 }
 
 func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountBatchRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[accountBatchRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
@@ -96,11 +100,22 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	// 已有一轮在跑时不重复打上游：等它结束，再回读缓存。
 	jobs := make([]quotaJob, 0, len(loaded))
 	for _, account := range loaded {
-		jobs = append(jobs, quotaJob{entry: account.Entry, vendor: account.Vendor, credential: account.Credential})
+		job := quotaJob{entry: account.Entry, vendor: account.Vendor, credential: account.Credential}
+		// 不支持额度查询的供应商（如 OpenCode ZEN）不进查询轮次、不写缓存，
+		// 也不进 /quotas 结果——页面据 /status 的 supports_quota=false 直接显示
+		// 「-- / --」，不需要一条注定失败的结果。
+		if !supportsQuota(account.Vendor) {
+			continue
+		}
+		jobs = append(jobs, job)
+	}
+	if len(jobs) == 0 {
+		// 全是失败项或不支持额度的账号：没有要跑的一轮，直接回结果。
+		return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": results})
 	}
 	done, owner := s.acquireQuotaRun()
 	if owner {
-		go s.runQuotaBatch(done, jobs)
+		go s.runQuotaBatch(done, jobs, body.RefreshCredentials)
 	}
 	select {
 	case <-done:
@@ -110,7 +125,7 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 
 	for _, job := range jobs {
 		identity := job.identity()
-		if cached := s.getCachedQuota(identity.UID, identity.AuthID, identity.AuthIndex, identity.Name, identity.Label); cached != nil {
+		if cached := s.getCachedQuota(identity.VendorID, identity.UID, identity.AuthID); cached != nil {
 			results = append(results, *cached)
 			continue
 		}
@@ -148,7 +163,7 @@ func (s *Service) finishQuotaRun(done chan struct{}) {
 //
 // 每个账号完成即写缓存（成功与失败都写），因此页面在轮次中途刷新也能
 // 看到已完成的账号，而不是整批退回「查询中」。
-func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
+func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob, forceRefresh bool) {
 	defer s.finishQuotaRun(done)
 
 	ctx, cancel := context.WithTimeout(hostbridge.WithCallbackID(context.Background(), ""), requestTimeout)
@@ -161,11 +176,13 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 		// 而「上游没有额度接口」这类结论早已确定，不存在还会变。
 		defer func() {
 			result := outcome.result
-			s.cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
+			s.cacheQuotaResult(result)
 		}()
-		quota, errQuota := s.queryQuota(ctx, current)
+		quota, refreshed, errQuota := s.queryQuota(ctx, current, forceRefresh)
+		outcome.result.RefreshAttempted = refreshed
 		if errQuota != nil {
 			outcome.result.Message = errQuota.Error()
+			outcome.result.FailureType = quotaFailureType(errQuota)
 			return outcome
 		}
 		result := &outcome.result
@@ -203,21 +220,54 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 // queryQuota 查询单个账号的额度（含一次过期凭证的保活重试）。
 //
 // 只负责取数；缓存、领取状态落盘由 runQuotaBatch 统一负责。
-func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.QuotaFetchResponse, error) {
+func quotaFailureType(err error) string {
+	if strings.Contains(strings.ToLower(err.Error()), "refresh token") && (strings.Contains(err.Error(), "重新授权") || strings.Contains(strings.ToLower(err.Error()), "revoked")) {
+		return "minimax_refresh_token_revoked"
+	}
+	var failure *core.Failure
+	if errors.As(err, &failure) {
+		return failure.UpstreamKind()
+	}
+	var pluginErr *core.PluginError
+	if errors.As(err, &pluginErr) {
+		if pluginErr.Code == "minimax_refresh_token_revoked" {
+			return pluginErr.Code
+		}
+		if pluginErr.Code != "" && pluginErr.Code != "upstream_credential" {
+			return pluginErr.Code
+		}
+		if pluginErr.HTTPStatus == http.StatusUnauthorized {
+			return string(core.FailureKindCredential)
+		}
+		return string(core.FailureKindTransient)
+	}
+	return string(core.FailureKindTransient)
+}
+
+func (s *Service) queryQuota(ctx context.Context, job quotaJob, forceRefresh bool) (*pluginapi.QuotaFetchResponse, bool, error) {
 	quotaProvider, okQuota := core.As[core.QuotaProvider](job.vendor)
 	if !okQuota {
-		return nil, core.QuotaUnsupported(job.vendor)
+		return nil, false, core.QuotaUnsupported(job.vendor)
 	}
 	quota, errQuota := quotaProvider.Quota(ctx, job.credential)
-	if errQuota != nil && isAuthExpired(errQuota) {
+	refreshed := false
+	if forceRefresh || (errQuota != nil && isAuthExpired(errQuota)) {
 		// 凭证过期类错误：先保活刷新一次再重试。MiniMax 的 access token 只有
 		// 1 小时有效期，不刷新的话额度列会一直挂着 401，用户只能自己想到去点
 		// 「一键保活」——那条路还要求他先认出这是凭证问题。
-		if refreshed := s.refreshedCredential(ctx, "", job); refreshed != nil {
-			quota, errQuota = quotaProvider.Quota(ctx, refreshed)
+		refreshedCredential, refreshErr := s.refreshedCredential(ctx, "", job)
+		if refreshErr != nil {
+			if forceRefresh || isAuthExpired(errQuota) {
+				return nil, true, refreshErr
+			}
+			return quota, false, errQuota
+		}
+		if refreshedCredential != nil {
+			refreshed = true
+			quota, errQuota = quotaProvider.Quota(ctx, refreshedCredential)
 		}
 	}
-	return quota, errQuota
+	return quota, refreshed, errQuota
 }
 
 // isAuthExpired 判断错误是否属于「凭证已过期/失效」类（401）。
@@ -240,12 +290,17 @@ func isAuthExpired(err error) bool {
 //
 // 复用保活那条既有通道（它负责刷新 + 写盘 + 热更新宿主），额度查询因此不需要
 // 自己再造一套刷新逻辑。保活失败或账号消失时返回 nil，由调用方按原错误上报。
-func (s *Service) refreshedCredential(ctx context.Context, callbackID string, target quotaJob) *core.Credential {
+func (s *Service) refreshedCredential(ctx context.Context, callbackID string, target quotaJob) (*core.Credential, error) {
 	authID := core.FirstNonEmpty(target.entry.ID, target.entry.Name)
 	if authID == "" {
-		return nil
+		return nil, errors.New("credential refresh failed: account identity is missing")
 	}
-	s.tasks.Keepalive(ctx, callbackID, []string{authID}, 1)
+	refreshResults := s.tasks.Keepalive(ctx, callbackID, []string{authID}, 1)
+	for _, result := range refreshResults {
+		if !result.OK {
+			return nil, errors.New(result.Message)
+		}
+	}
 
 	loaded, _ := s.pool.Load(ctx, callbackID, accountpkg.Options{
 		Targets:       []string{authID},
@@ -253,8 +308,8 @@ func (s *Service) refreshedCredential(ctx context.Context, callbackID string, ta
 	})
 	for _, account := range loaded {
 		if account.Vendor.ID() == target.vendor.ID() {
-			return account.Credential
+			return account.Credential, nil
 		}
 	}
-	return nil
+	return nil, errors.New("credential refresh failed: refreshed account was not reloaded")
 }

@@ -421,6 +421,8 @@ func TestConsoleLoadModelsButtonRefreshesUpstream(t *testing.T) {
 	page := Page("/plugins/freetier2api")
 
 	for _, literal := range []string{
+		`api("POST", "/quotas", { refresh_credentials: true })`,
+		`btnRefreshQuotaAuth`,
 		`api("POST", "/models/refresh"`, // 真正触发上游拉取
 		`refreshModels(false);`,         // 按钮绑定到刷新入口
 		"从上游刷新失败：",                      // 上游错误原样呈现
@@ -523,5 +525,22 @@ func TestConsoleModelOptionalColumnsHiddenByDefault(t *testing.T) {
 	// 缺省/损坏/存储不可用时必须回到空对象。
 	if !regexp.MustCompile(`catch \(e\) \{\s*return \{\};`).MatchString(page) {
 		t.Fatal("column preferences must default to an empty object")
+	}
+}
+
+func TestConsolePageSettingsLabelsAndDisclaimer(t *testing.T) {
+	page := Page("/plugins/freetier2api")
+	for _, required := range []string{
+		"每日自动签到",
+		"每日自动任务",
+		"合规与免责声明",
+		"MAX_ACCOUNTS_PER_VENDOR = 10",
+	} {
+		if !strings.Contains(page, required) {
+			t.Fatalf("console page missing %q", required)
+		}
+	}
+	if strings.Contains(page, "自动每日任务") {
+		t.Fatal("console page must replace 自动每日任务 with 每日自动任务")
 	}
 }

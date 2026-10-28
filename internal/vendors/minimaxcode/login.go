@@ -154,6 +154,9 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 	}
 
 	accountHost := AccountHostFor(session.Region)
+	if override := strings.TrimRight(strings.TrimSpace(baseURLOverride), "/"); override != "" {
+		accountHost = override
+	}
 	tokenURL := accountHost + EpToken
 
 	data := url.Values{}
@@ -225,9 +228,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 		}, nil
 	}
 
-	// 授权成功，清理会话并构建凭据
-	logins.Delete(cleanState)
-
+	// 构建凭证后再验证其可用性；token endpoint 返回成功不等于 Agent/额度 API 可用。
 	refreshToken := core.GetString(payload, "refresh_token", "refreshToken")
 	expiresIn := core.GetInt64(payload, "expires_in", "expiresIn")
 	if expiresIn <= 0 {
@@ -246,8 +247,11 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 
 	// 探测用户真实 ID 与 Agent ID
 	_, _, _, _ = fetchUserInfo(ctx, cred, baseURLOverride)
-	_ = prepare(ctx, cred, baseURLOverride)
+	_ = prepare(ctx, cred, baseURLOverride, nil)
 
+	if _, _, _, errVerify := fetchUserInfo(ctx, cred, baseURLOverride); errVerify != nil {
+		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusError, Message: "新凭证验证失败，请重新授权：" + errVerify.Error()}, nil
+	}
 	storageJSON, errStorage := cred.StorageJSON()
 	if errStorage != nil {
 		return &pluginapi.AuthLoginPollResponse{
@@ -262,6 +266,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 		label = VendorNameFor(session.Region) + "-" + accountIdentifier
 	}
 
+	logins.Delete(cleanState)
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "登录成功",
@@ -272,6 +277,15 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, state string, bas
 			StorageJSON: storageJSON,
 		},
 	}, nil
+}
+
+func classifyRefreshFailure(status int, payload map[string]any) error {
+	errCode := strings.ToLower(strings.TrimSpace(core.GetString(payload, "error")))
+	errDesc := core.FirstNonEmpty(core.GetString(payload, "error_description"), errCode, fmt.Sprintf("HTTP %d", status))
+	if errCode == "invalid_grant" || strings.Contains(strings.ToLower(errDesc), "can no longer be used") || strings.Contains(strings.ToLower(errDesc), "revoked") {
+		return core.NewPluginError("minimax_reauthorization_required", "MiniMax refresh token 已失效或被撤销，请重新授权登录", http.StatusUnauthorized)
+	}
+	return fmt.Errorf("minimax refresh token rejected: %s", errDesc)
 }
 
 // RefreshCredential 使用 refresh_token 刷新 MiniMax OAuth 访问令牌。
@@ -287,6 +301,9 @@ func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride st
 	}
 
 	accountHost := AccountHostFor(cred.Region)
+	if override := strings.TrimRight(strings.TrimSpace(baseURLOverride), "/"); override != "" {
+		accountHost = override
+	}
 	tokenURL := accountHost + EpToken
 
 	data := url.Values{}
@@ -299,6 +316,8 @@ func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride st
 		return nil, false, fmt.Errorf("build refresh request: %w", errReq)
 	}
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", DesktopUA)
 
 	resp, errDo := hostbridge.Client(ctx, 20*time.Second).Do(req)
 	if errDo != nil {
@@ -312,12 +331,7 @@ func RefreshCredential(ctx context.Context, cred *Credential, baseURLOverride st
 	}
 
 	if resp.StatusCode >= 400 || core.GetString(payload, "error") != "" {
-		errDesc := core.FirstNonEmpty(
-			core.GetString(payload, "error_description"),
-			core.GetString(payload, "error"),
-			fmt.Sprintf("HTTP %d", resp.StatusCode),
-		)
-		return nil, false, fmt.Errorf("minimax refresh token rejected: %s", errDesc)
+		return nil, false, classifyRefreshFailure(resp.StatusCode, payload)
 	}
 
 	accessToken := core.GetString(payload, "access_token", "accessToken")

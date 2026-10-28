@@ -206,7 +206,7 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 		UserID:   UserIDFromJWT(jwt),
 	}
 
-	// 兑换 API Key：这是本插件唯一可用的对话通道（Plan 通道需人机验证码）。
+	// 兑换 API Key：作为备选凭证一并持久化。
 	// 兑换失败不阻断登录——JWT 仍可用于额度查询与套餐领取。
 	apiWarning := ""
 	// access_token 可能在 data 顶层或 data.zai 下，两处都收。
@@ -214,12 +214,12 @@ func LoginPoll(ctx context.Context, logins core.LoginSessions, sessionID string)
 	if accessToken != "" {
 		apiKey, errExchange := ExchangeAPIKey(ctx, accessToken)
 		if errExchange != nil {
-			apiWarning = fmt.Sprintf("（API Key 兑换失败：%v，该账号暂不能用于对话）", errExchange)
+			apiWarning = fmt.Sprintf("（API Key 兑换失败：%v，已使用 Start Plan JWT 凭证）", errExchange)
 		} else {
 			cred.APIKey = apiKey
 		}
 	} else {
-		apiWarning = "（上游未返回 access_token，未能兑换 API Key，该账号暂不能用于对话）"
+		apiWarning = "（上游未返回 access_token，已使用 Start Plan JWT 凭证）"
 	}
 
 	cred.Label = core.FirstNonEmpty(cred.Email, "ZCode-"+MaskedKey(core.FirstNonEmpty(cred.APIKey, cred.JWTToken)))

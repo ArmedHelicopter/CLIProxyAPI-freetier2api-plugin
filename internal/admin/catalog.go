@@ -7,6 +7,7 @@ package admin
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -29,6 +30,8 @@ type ModelSettings struct {
 	EnabledRealms  []string
 	ExtraModels    []string
 	DisabledModels []string
+	// ModelNameTag 是模型名渠道标识模式（off/prefix/suffix）。
+	ModelNameTag string
 	// ContextWindowFor 返回额外模型的上下文窗口兜底（缺省 0 表示不填）。
 	ContextWindowFor func(modelID string) int64
 }
@@ -337,11 +340,28 @@ func (c *Catalog) CacheStatic(vendorID string, models []pluginapi.ModelInfo) {
 //
 // 返回是否写入了缓存。
 func (c *Catalog) CacheProbedModels(vendorID string, models []pluginapi.ModelInfo) bool {
+	if len(models) == 0 && isDynamicWorkspaceVendor(vendorID) {
+		// MiniMax CN 的模型目录按账号工作区动态变化。空结果表示本次
+		// 探测失败/失效，不得继续暴露 state.json 中已知过期的静态 ID。
+		c.clearCachedVendor(vendorID)
+		c.persistProbed()
+		return false
+	}
 	if !c.cacheProbed(vendorID, models) {
 		return false
 	}
 	c.persistProbed()
 	return true
+}
+
+func isDynamicWorkspaceVendor(vendorID string) bool {
+	return strings.EqualFold(strings.TrimSpace(vendorID), "minimaxcodecn")
+}
+
+func (c *Catalog) clearCachedVendor(vendorID string) {
+	c.mu.Lock()
+	delete(c.cached, vendorID)
+	c.mu.Unlock()
 }
 
 // cacheProbed 只更新内存缓存，由调用方决定何时落盘。
@@ -350,6 +370,12 @@ func (c *Catalog) CacheProbedModels(vendorID string, models []pluginapi.ModelInf
 // 出现「清单是新的、倍率还是上一批」的错配。
 func (c *Catalog) cacheProbed(vendorID string, models []pluginapi.ModelInfo) bool {
 	if len(models) == 0 {
+		if isDynamicWorkspaceVendor(vendorID) {
+			logger.Info("models: %s dynamic workspace probe returned 0 model(s); clearing stale cache",
+				vendorID)
+			c.clearCachedVendor(vendorID)
+			return false
+		}
 		logger.Info("models: %s probe returned 0 model(s); keeping %d cached",
 			vendorID, len(c.Registered(vendorID)))
 		return false
@@ -426,7 +452,9 @@ func equalCachedModels(a, b []core.CachedModel) bool {
 	for _, item := range b {
 		prev, ok := index[key{item.VendorID, item.ID}]
 		if !ok || prev.Name != item.Name || prev.ContextLength != item.ContextLength ||
-			prev.MaxOutputTokens != item.MaxOutputTokens || prev.Credits != item.Credits {
+			prev.MaxOutputTokens != item.MaxOutputTokens || prev.Credits != item.Credits ||
+			prev.SupportsImages != item.SupportsImages || prev.SupportsTool != item.SupportsTool ||
+			!slices.Equal(prev.Efforts, item.Efforts) || prev.DefaultEffort != item.DefaultEffort {
 			return false
 		}
 	}
@@ -686,20 +714,51 @@ func (c *Catalog) AliasFor(vendorID, modelID string) string {
 func (c *Catalog) ApplyAliases(vendorID string, models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if len(models) == 0 || len(c.aliases) == 0 {
+	if len(models) == 0 || (c.settings.ModelNameTag == ModelNameTagOff && len(c.aliases) == 0) {
 		return models
 	}
 	prefix := strings.ToLower(strings.TrimSpace(vendorID)) + ":"
+	// 撞车判定用**本次入参清单**构造的 ID 集合：registeredLocked 对缓存为空
+	// 的供应商会把任何名字判成「已存在」，导致标识被整体放弃——同一份清单
+	// 里有的带标识、有的不带，恰好复活本特性要消除的歧义。
+	present := make(map[string]bool, len(models))
+	for _, model := range models {
+		present[strings.ToLower(strings.TrimSpace(model.ID))] = true
+	}
 	out := make([]pluginapi.ModelInfo, 0, len(models))
 	for _, model := range models {
-		if alias := c.aliases[prefix+strings.TrimSpace(model.ID)]; alias != "" {
-			model.ID = alias
-			model.Name = alias
-			model.DisplayName = alias
+		bare := strings.TrimSpace(model.ID)
+		manual := c.aliases[prefix+bare]
+		tagged := c.taggedModelID(vendorID, bare)
+		switch {
+		case manual != "":
+			model.ID = manual
+			model.Name = manual
+			model.DisplayName = manual
+		case tagged != "" && !present[strings.ToLower(tagged)]:
+			// 自动渠道标识不覆盖：手动别名优先；tag 后的名字撞上**同供应商
+			// 清单里的其他模型**时放弃标识（防路由歧义；跨供应商本就不合并）。
+			model.ID = tagged
+			model.Name = tagged
+			model.DisplayName = tagged
 		}
 		out = append(out, model)
 	}
 	return out
+}
+
+// taggedModelID 按当前模式给模型 ID 加渠道标识；off 或结果为空返回空串。
+//
+// 标识统一按**供应商**生成（不同账号之间不区分）：zcode 的 GLM-5.3 无论几个
+// 账号对外都是 zcode-GLM-5.3。
+func (c *Catalog) taggedModelID(vendorID, modelID string) string {
+	switch c.settings.ModelNameTag {
+	case ModelNameTagPrefix:
+		return vendorID + "-" + modelID
+	case ModelNameTagSuffix:
+		return modelID + "-" + vendorID
+	}
+	return ""
 }
 
 // ResolveOutboundModel 把客户端请求的模型名还原成上游的官方 ID。
@@ -728,7 +787,30 @@ func (c *Catalog) ResolveOutboundModel(vendorID, model string) string {
 		}
 		logger.Debug("models: ignoring alias %q -> %q (%s no longer registers it)", alias, bare, vendorID)
 	}
+	// 自动渠道标识的还原：prefix / suffix **两种形态都试**（不依赖当前模式）。
+	// 模式切换后（如 prefix→off/suffix）宿主注册表仍是旧名字，客户端手里的
+	// 旧标识请求必须仍能还原，否则带标识的名字会直通上游报 invalid model。
+	for _, bare := range c.untagModelID(vendorID, requested) {
+		if c.registeredLocked(vendorID, bare) {
+			return bare
+		}
+	}
 	return model
+}
+
+// untagModelID 尝试把带渠道标识的模型 ID 还原成官方 ID，返回全部候选
+// （prefix 剥离与 suffix 剥离各一个；都不匹配返回空）。
+func (c *Catalog) untagModelID(vendorID, requested string) []string {
+	vendorLower := strings.ToLower(strings.TrimSpace(vendorID))
+	requestedLower := strings.ToLower(requested)
+	var out []string
+	if lead := vendorLower + "-"; strings.HasPrefix(requestedLower, lead) && len(requested) > len(lead) {
+		out = append(out, requested[len(lead):])
+	}
+	if tail := "-" + vendorLower; strings.HasSuffix(requestedLower, tail) && len(requested) > len(tail) {
+		out = append(out, requested[:len(requested)-len(tail)])
+	}
+	return out
 }
 
 // SetAlias 设置或清除某模型的别名。

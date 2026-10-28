@@ -32,11 +32,16 @@ import (
 //
 // 只打印截断后的非敏感信息（轮次、状态、额度），不打印凭证内容。
 
-// resolveLiveIdentity 按实况探针所在账号派生设备身份。
+// resolveLiveIdentity 取探针账号自己提供的设备身份。
 //
-// 探针必须与插件走同一条身份来源，否则测的就不是线上行为。
-func resolveLiveIdentity(_ context.Context, _ Region) MachineIdentity {
-	return ResolveIdentity(FingerprintSeed("", os.Getenv("QODER_LIVE_CREDS")), nil)
+// 探针必须与插件走同一条身份来源，否则测的就不是线上行为：身份只来自凭证
+// 或 QODER_LIVE_MACHINE_TOKEN/TYPE（模拟全局配置），插件不派生。
+func resolveLiveIdentity(cred *Credential) MachineIdentity {
+	return ResolveIdentity(cred, map[string]string{
+		"qoder_machine_token": os.Getenv("QODER_LIVE_MACHINE_TOKEN"),
+		"qoder_machine_type":  os.Getenv("QODER_LIVE_MACHINE_TYPE"),
+		"qoder_machine_code":  os.Getenv("QODER_LIVE_MACHINE_CODE"),
+	})
 }
 
 // configureQoderProbeHost 装上把出站请求真发到上游的宿主。
@@ -129,7 +134,7 @@ func TestLiveCheckin(t *testing.T) {
 		t.Logf("读取额度基线失败（将只用 reward 回读判定）: %v", errQuota)
 	}
 
-	identity := resolveLiveIdentity(context.Background(), region)
+	identity := resolveLiveIdentity(cred)
 	t.Logf("设备身份: native=%v", identity.Native())
 
 	result, errCheckin := Checkin(context.Background(), cred, identity)

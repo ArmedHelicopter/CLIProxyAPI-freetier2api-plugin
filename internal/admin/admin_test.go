@@ -22,6 +22,11 @@ type stubDeps struct {
 
 	callbackResult *core.CallbackSubmitResult
 	callbackErr    error
+
+	loginStart    *pluginapi.AuthLoginStartResponse
+	loginStartErr error
+	captcha       core.CaptchaConfig
+	captchaErr    error
 }
 
 func (s stubDeps) Identity() Identity {
@@ -32,8 +37,7 @@ func (s stubDeps) State() state.State   { return s.store.Snapshot() }
 func (s stubDeps) MutateState(fn func(*state.State)) {
 	s.store.Mutate(fn)
 }
-func (s stubDeps) Model() *Catalog             { return s.manager }
-func (s stubDeps) WorkbuddyPromptMode() string { return "passthrough" }
+func (s stubDeps) Model() *Catalog { return s.manager }
 func (s stubDeps) ResolveCredential(context.Context, string, []byte, string, map[string]string) (*core.Credential, core.Vendor, error) {
 	return nil, nil, context.Canceled
 }
@@ -41,11 +45,34 @@ func (s stubDeps) RefreshModels(context.Context) (int, error) { return 0, nil }
 func (s stubDeps) Reconfigure() error                         { return nil }
 
 // callbackResult / callbackErr 让用例能驱动「粘贴回调链接」的返回分支。
+func (s stubDeps) SendLoginSMS(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (s stubDeps) VerifyLoginSMS(context.Context, string, string, string, string) (string, string, string, error) {
+	return "", "", "", nil
+}
+
 func (s stubDeps) SubmitLoginCallback(context.Context, string, string) (*core.CallbackSubmitResult, error) {
 	if s.callbackErr != nil {
 		return nil, s.callbackErr
 	}
 	return s.callbackResult, nil
+}
+
+// loginStart / loginCaptcha 让用例能驱动页面内登录的两个新入口。
+func (s stubDeps) StartLogin(context.Context, string, map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	if s.loginStartErr != nil {
+		return nil, s.loginStartErr
+	}
+	return s.loginStart, nil
+}
+
+func (s stubDeps) LoginCaptchaConfig(context.Context, string) (core.CaptchaConfig, error) {
+	if s.captchaErr != nil {
+		return core.CaptchaConfig{}, s.captchaErr
+	}
+	return s.captcha, nil
 }
 
 func newStubDeps(t *testing.T) stubDeps {
@@ -138,20 +165,16 @@ func (s stubTaskDeps) Config() tasks.Config {
 
 func (s stubTaskDeps) SaveRefreshedCredential(context.Context, string, core.Vendor, core.HostAuth, []byte, *core.Credential, string) {
 }
-func (s stubTaskDeps) State() state.State                     { return s.deps.State() }
-func (s stubTaskDeps) MutateState(fn func(*state.State))      { s.deps.MutateState(fn) }
-func (s stubTaskDeps) Now() time.Time                         { return time.Now() }
-func (s stubTaskDeps) RuntimeFields() []pluginapi.ConfigField { return nil }
+func (s stubTaskDeps) State() state.State                { return s.deps.State() }
+func (s stubTaskDeps) MutateState(fn func(*state.State)) { s.deps.MutateState(fn) }
+func (s stubTaskDeps) Now() time.Time                    { return time.Now() }
 
 // TestSettingsPayloadKeysMatchConsole 锁死「后端字段名 ↔ 页面字段名」的一致性。
 //
-// 真实事故：后端把 prompt_mode 改名为 workbuddy_prompt_mode（GET /status 的
-// 响应键与 POST /settings 的请求键都改了），页面没跟着改，于是——
-//   - 摘要行显示「提示词 -」；
-//   - 下拉框永远回落 passthrough，看不出真实配置；
-//   - 点「保存设置」发的是 prompt_mode，后端直接忽略，改动**根本存不进去**。
+// 真实事故：`/settings` 的字段名与页面提交的键曾经漂移过（后端改名、页面没跟），
+// 结果页面上的改动**根本存不进去**且没有任何报错。
 //
-// 编译期已经保证 Go 侧一致，但 HTML 是字符串，编译器看不见。这里用测试把
+// 编译期已经保证 Go 侧一致，但 HTML 是字符串，编译器看不见。这里把
 // settingsUpdateRequest 的每个 json tag 钉到页面上，防止再次漂移。
 func TestSettingsPayloadKeysMatchConsole(t *testing.T) {
 	page := Page("/plugins/freetier2api")
@@ -177,13 +200,9 @@ func TestSettingsPayloadKeysMatchConsole(t *testing.T) {
 	}
 
 	// 反向：页面读取的 /status 键必须在后端载荷里真实存在。
-	for _, key := range []string{"workbuddy_prompt_mode", "version", "settings"} {
+	for _, key := range []string{"version", "settings", "prompt_mode"} {
 		if !strings.Contains(page, key) {
 			t.Errorf("页面读取的 /status 键 %q 未出现在页面上", key)
 		}
-	}
-	// 旧键名不得复活：后端已不再返回 prompt_mode。
-	if strings.Contains(page, "status.prompt_mode") {
-		t.Error("页面仍在读 status.prompt_mode，但后端返回的是 workbuddy_prompt_mode")
 	}
 }

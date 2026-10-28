@@ -65,6 +65,15 @@ type Credential struct {
 	Label string
 	// Email 是账号邮箱（登录流程会填）。
 	Email string
+
+	// MachineToken / MachineType / MachineCode 是官方组件签发的设备身份。
+	//
+	// 上游对活动列表按设备身份做**精确校验**（见 identity.go），插件无法
+	// 伪造，只能由用户从自己登录过官方桌面的那台机器上取来填进凭证文件。
+	// 为空表示未提供，签到时不发机器头。
+	MachineToken string
+	MachineType  string
+	MachineCode  string
 }
 
 // ParseCredential 解析 Qoder 凭证 JSON。
@@ -113,7 +122,20 @@ func ParseCredential(raw []byte, fallbackRegion Region) (*Credential, error) {
 	if email, okEmail := payload["email"].(string); okEmail {
 		cred.Email = strings.TrimSpace(email)
 	}
+	cred.MachineToken = firstStringIn(payload, "machine_token", "machineToken")
+	cred.MachineType = firstStringIn(payload, "machine_type", "machineType")
+	cred.MachineCode = firstStringIn(payload, "machine_code", "machineCode")
 	return cred, nil
+}
+
+// firstStringIn 返回给定键里第一个非空字符串值。
+func firstStringIn(payload map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value, okValue := payload[key].(string); okValue && strings.TrimSpace(value) != "" {
+			return strings.TrimSpace(value)
+		}
+	}
+	return ""
 }
 
 // firstTokenIn 返回一层 JSON 里第一个非空的 token 字段。
@@ -185,4 +207,51 @@ func RegionForCredential(raw map[string]any) Region {
 		return NormalizeRegion(region)
 	}
 	return ""
+}
+
+// ---- 活动设备身份 ----
+//
+// 上游对 cosy-machinetoken + cosy-machinetype 做精确校验，只接受官方组件签发的
+// 原始配对。这里只读取用户自己提供的真实身份（凭证字段 → 全局配置），绝不自造。
+
+// MachineIdentity 是一次签到请求要带的设备身份。
+type MachineIdentity struct {
+	// Token / Type 是成对出现的机器身份，由官方组件签发，必须原样使用。
+	Token string
+	Type  string
+	// Code 是 cosy-machinecode，可选（实测不影响活动可见性）。
+	Code string
+	// Version 是 cosy-version（桌面端版本）。
+	Version string
+}
+
+// Native 报告身份是否可用（token 与 type 必须成对，缺一不可）。
+func (m MachineIdentity) Native() bool { return m.Token != "" && m.Type != "" }
+
+// DesktopVersion 是活动平台认的桌面端版本（cosy-version 头）。
+const DesktopVersion = "0.4.8"
+
+// ResolveIdentity 组装本次签到要用的设备身份。
+//
+// cred 提供账号自带的身份字段（凭证文件里手写的 machine_token / machine_type），
+// raw 是插件全局配置（qoder_machine_token / qoder_machine_type / …）。
+// 两者都没有时返回零值——调用方据此**不发**任何机器头。
+func ResolveIdentity(cred *Credential, raw map[string]string) MachineIdentity {
+	identity := MachineIdentity{
+		Version: core.FirstNonEmpty(strings.TrimSpace(raw["qoder_desktop_version"]), DesktopVersion),
+	}
+	if cred != nil {
+		identity.Token = strings.TrimSpace(cred.MachineToken)
+		identity.Type = strings.TrimSpace(cred.MachineType)
+		identity.Code = strings.TrimSpace(cred.MachineCode)
+	}
+	identity.Token = core.FirstNonEmpty(identity.Token, strings.TrimSpace(raw["qoder_machine_token"]))
+	identity.Type = core.FirstNonEmpty(identity.Type, strings.TrimSpace(raw["qoder_machine_type"]))
+	identity.Code = core.FirstNonEmpty(identity.Code, strings.TrimSpace(raw["qoder_machine_code"]))
+	if !identity.Native() {
+		// 只有一个头等于没有：上游要求成对，半套身份既解锁不了活动，还会
+		// 让请求形态偏离官方客户端。清空以免调用方误以为「有身份」。
+		return MachineIdentity{Version: identity.Version}
+	}
+	return identity
 }

@@ -2,6 +2,7 @@ package workbuddy
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -935,13 +936,37 @@ func tailOfString(text string, n int) string {
 
 // 本文件生成请求标识与从请求体里提取会话键。
 
-// NewHexID 生成 32 位十六进制随机 ID（与官方客户端的 messageId 形态一致）。
+// NewHexID 生成 32 位十六进制随机 ID。
 func NewHexID() string {
 	return core.RandomHex(16)
 }
 
 func newHexID() string {
 	return NewHexID()
+}
+
+// NewUUIDv7Hex 生成去横线的 UUIDv7（32 位十六进制）。
+//
+// 官方客户端的 conversationRequestId / messageId 都是 UUIDv7 去横线
+// （客户端断言正则 ^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$），
+// 纯随机 hex 不是合法 v7 形态。
+func NewUUIDv7Hex() string {
+	var buf [16]byte
+	if _, errRead := rand.Read(buf[:]); errRead != nil {
+		// 随机源失败：退回纯随机旧形态，ID 只要求唯一。
+		return NewHexID()
+	}
+	// 48bit 毫秒时间戳 + version 7 + 随机；variant 按 RFC 9562 置 10。
+	ms := time.Now().UnixMilli()
+	buf[0] = byte(ms >> 40)
+	buf[1] = byte(ms >> 32)
+	buf[2] = byte(ms >> 24)
+	buf[3] = byte(ms >> 16)
+	buf[4] = byte(ms >> 8)
+	buf[5] = byte(ms)
+	buf[6] = (buf[6] & 0x0F) | 0x70
+	buf[8] = (buf[8] & 0x3F) | 0x80
+	return hex.EncodeToString(buf[:])
 }
 
 // ConversationKey 从请求体里提取会话键，用于生成稳定的会话头族。
@@ -1038,55 +1063,6 @@ func contentSignature(content any) string {
 		return strings.Join(parts, "\x1f")
 	}
 	return ""
-}
-
-// TurnKey 返回当前轮次的键（最后一条 user 消息）。
-//
-// 序号入键是刻意的：连续两次内容相同的「继续」必须被识别为不同轮次，
-// 否则第二轮会复用第一轮的请求 ID，后台聚合会把它们合并成一次。
-func TurnKey(body []byte) string {
-	payload := decodeBodyMap(body)
-	if payload == nil {
-		return ""
-	}
-	messages, okMessages := payload["messages"].([]any)
-	if !okMessages {
-		return ""
-	}
-	for index := len(messages) - 1; index >= 0; index-- {
-		message, okMessage := messages[index].(map[string]any)
-		if !okMessage {
-			continue
-		}
-		role, _ := message["role"].(string)
-		if !strings.EqualFold(strings.TrimSpace(role), "user") {
-			continue
-		}
-		signature := contentSignature(message["content"])
-		if signature == "" {
-			continue
-		}
-		return fmt.Sprintf("u%d:%s", index, signature)
-	}
-	return ""
-}
-
-// RequestIDForKey 从会话键派生一个稳定的请求 ID。
-func RequestIDForKey(key string) string {
-	if strings.TrimSpace(key) == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte("req|" + key))
-	return hex.EncodeToString(sum[:16])
-}
-
-// TurnRequestID 从轮次键派生一个稳定的请求 ID。
-func TurnRequestID(key string) string {
-	if strings.TrimSpace(key) == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte("turn|" + key))
-	return hex.EncodeToString(sum[:16])
 }
 
 // RealmDisplayName 返回域的展示名。

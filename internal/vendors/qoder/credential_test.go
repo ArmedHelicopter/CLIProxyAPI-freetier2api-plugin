@@ -1,0 +1,176 @@
+package qoder
+
+import (
+	"testing"
+)
+
+// 本文件锁住设备身份的解析规则。
+//
+// 背景（issue #13 / #10）：上游对 cosy-machinetoken + cosy-machinetype 做
+// **精确校验**。2026-10-23 逐头隔离实测（同一国际号）：
+//
+//	不发机器头                      → 2 条 VIEW_DETAILS，无 CLAIM_BENEFIT
+//	官方组件（Windows 真机）的配对   → 出现 CLAIM_BENEFIT（可领）
+//	同一 token 改动 1 个字符        → 活动消失
+//	同一 token 截断 1 位 / 增补 1 位 → 活动消失
+//	A 设备 token + B 设备 type      → 活动消失
+//	随机/派生 88 字符 token + type  → 活动消失
+//	容器内官方组件（isVm=true）     → 活动消失
+//
+// 国内版更严格地反向：不发机器头可领，发了派生 token 反而被过滤。
+// 结论：插件不得自行派生身份，只能转发用户提供的真值。
+
+// TestResolveIdentityUsesProvidedValues 覆盖：用户提供的值原样透传，不改写。
+func TestResolveIdentityUsesProvidedValues(t *testing.T) {
+	const token = "P1gA-official-token-from-runtime-info"
+	const machineType = "001b505914466e907f"
+	cred := &Credential{MachineToken: token, MachineType: machineType, MachineCode: "c075415b76a3900977"}
+
+	identity := ResolveIdentity(cred, nil)
+	if identity.Token != token || identity.Type != machineType {
+		t.Errorf("应原样透传凭证里的身份: %+v", identity)
+	}
+	if identity.Code != "c075415b76a3900977" {
+		t.Errorf("code 应透传: %q", identity.Code)
+	}
+	if !identity.Native() {
+		t.Error("token+type 齐全时应可用")
+	}
+}
+
+// TestResolveIdentityFallsBackToConfig 覆盖：凭证没带身份时用全局配置。
+func TestResolveIdentityFallsBackToConfig(t *testing.T) {
+	identity := ResolveIdentity(nil, map[string]string{
+		"qoder_machine_token": "cfg-token",
+		"qoder_machine_type":  "cfg-type",
+		"qoder_machine_code":  "cfg-code",
+	})
+	if identity.Token != "cfg-token" || identity.Type != "cfg-type" || identity.Code != "cfg-code" {
+		t.Errorf("应从配置读身份: %+v", identity)
+	}
+}
+
+// TestResolveIdentityCredentialWinsOverConfig 覆盖：凭证级配置优先于全局配置。
+//
+// 凭证里的身份属于「这台设备登录的那个账号」，比全局配置更具体。
+func TestResolveIdentityCredentialWinsOverConfig(t *testing.T) {
+	identity := ResolveIdentity(
+		&Credential{MachineToken: "cred-token", MachineType: "cred-type"},
+		map[string]string{"qoder_machine_token": "cfg-token", "qoder_machine_type": "cfg-type"},
+	)
+	if identity.Token != "cred-token" || identity.Type != "cred-type" {
+		t.Errorf("凭证级身份应优先: %+v", identity)
+	}
+}
+
+// TestResolveIdentityRefusesHalfIdentity 覆盖：只有一半身份时整体作废。
+//
+// 上游要求 token 与 type 成对，半套身份解锁不了任何活动；保留它只会让
+// 调用方误以为「有身份」，从而在日志里给出错误结论。
+func TestResolveIdentityRefusesHalfIdentity(t *testing.T) {
+	cases := []struct {
+		name string
+		cred *Credential
+		raw  map[string]string
+	}{
+		{"token only", &Credential{MachineToken: "tok"}, nil},
+		{"type only", &Credential{MachineType: "ty"}, nil},
+		{"token in cred, type in config", &Credential{MachineToken: "tok"}, map[string]string{"qoder_machine_type": ""}},
+		{"empty", nil, nil},
+	}
+	for _, testCase := range cases {
+		identity := ResolveIdentity(testCase.cred, testCase.raw)
+		if identity.Native() {
+			t.Errorf("%s: 半套/空身份不应可用: %+v", testCase.name, identity)
+		}
+		if identity.Token != "" || identity.Type != "" {
+			t.Errorf("%s: 半套身份应被清空，避免误判: %+v", testCase.name, identity)
+		}
+	}
+}
+
+// TestResolveIdentityPairsAcrossSources 覆盖：token 来自凭证、type 来自配置
+// 时仍算成对——两者都真实存在，只是写在不同位置。
+func TestResolveIdentityPairsAcrossSources(t *testing.T) {
+	identity := ResolveIdentity(&Credential{MachineToken: "tok"}, map[string]string{"qoder_machine_type": "ty"})
+	if !identity.Native() {
+		t.Errorf("跨来源拼成的完整身份应可用: %+v", identity)
+	}
+}
+
+// TestResolveIdentityNeverDerives 覆盖：没有输入时绝不生成身份。
+//
+// 这条是本文件最重要的约束——派生值会让活动被上游整条过滤。
+func TestResolveIdentityNeverDerives(t *testing.T) {
+	identity := ResolveIdentity(&Credential{Token: "dt-some-account-token"}, map[string]string{})
+	if identity.Native() {
+		t.Errorf("没有用户提供的身份时不得自行生成: %+v", identity)
+	}
+	if identity.Version != DesktopVersion {
+		t.Errorf("version = %q, 期望默认 %q", identity.Version, DesktopVersion)
+	}
+}
+
+// TestIdentityDesktopVersionOverride 覆盖：cosy-version 可被配置覆盖。
+func TestIdentityDesktopVersionOverride(t *testing.T) {
+	identity := ResolveIdentity(nil, map[string]string{"qoder_desktop_version": "9.9.9"})
+	if identity.Version != "9.9.9" {
+		t.Errorf("version = %q, 期望 9.9.9", identity.Version)
+	}
+	if fallback := ResolveIdentity(nil, nil); fallback.Version != DesktopVersion {
+		t.Errorf("未配置时 version = %q, 期望 %q", fallback.Version, DesktopVersion)
+	}
+}
+
+// TestNativeRequiresTokenAndType 覆盖：身份可用的判据是两个头成对。
+func TestNativeRequiresTokenAndType(t *testing.T) {
+	cases := []struct {
+		name     string
+		identity MachineIdentity
+		want     bool
+	}{
+		{"both", MachineIdentity{Token: "tok", Type: "ty"}, true},
+		{"token only", MachineIdentity{Token: "tok"}, false},
+		{"type only", MachineIdentity{Type: "ty"}, false},
+		{"empty", MachineIdentity{}, false},
+	}
+	for _, testCase := range cases {
+		if got := testCase.identity.Native(); got != testCase.want {
+			t.Errorf("%s: Native() = %v, 期望 %v", testCase.name, got, testCase.want)
+		}
+	}
+}
+
+// TestCheckinHeadersOmitMachineWhenUnavailable 覆盖：没有真身份时一个机器头都不发。
+//
+// 这是国内版能正常领取的前提——发了派生 token 反而会把活动过滤掉。
+func TestCheckinHeadersOmitMachineWhenUnavailable(t *testing.T) {
+	headers := checkinHeaders("dt-token", ResolveIdentity(nil, nil))
+	for _, key := range []string{"cosy-machinetoken", "cosy-machinetype", "cosy-machinecode", "cosy-machineid"} {
+		if value, okValue := headers[key]; okValue {
+			t.Errorf("无真身份时不应发送 %s = %q", key, value)
+		}
+	}
+	// 桌面端标识仍必须带上：没有它连签到接口都不放行。
+	if headers["cosy-clienttype"] != "10" {
+		t.Errorf("cosy-clienttype = %q, 期望 10", headers["cosy-clienttype"])
+	}
+	if headers["cosy-version"] == "" {
+		t.Error("cosy-version 不应为空")
+	}
+}
+
+// TestCheckinHeadersSendProvidedMachineIdentity 覆盖：有真身份时原样发送。
+func TestCheckinHeadersSendProvidedMachineIdentity(t *testing.T) {
+	identity := MachineIdentity{Token: "tok", Type: "ty", Code: "cd", Version: DesktopVersion}
+	headers := checkinHeaders("dt-token", identity)
+	if headers["cosy-machinetoken"] != "tok" {
+		t.Errorf("cosy-machinetoken = %q", headers["cosy-machinetoken"])
+	}
+	if headers["cosy-machinetype"] != "ty" {
+		t.Errorf("cosy-machinetype = %q", headers["cosy-machinetype"])
+	}
+	if headers["cosy-machinecode"] != "cd" {
+		t.Errorf("cosy-machinecode = %q", headers["cosy-machinecode"])
+	}
+}

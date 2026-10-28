@@ -84,17 +84,22 @@ func campaignsBody(campaigns ...string) string {
 		strings.Join(campaigns, ","))
 }
 
-// testIdentity 返回一份插件派生的设备身份。
+// testIdentity 返回一份「用户提供的」设备身份。
 //
-// 值本身无所谓：上游只要求 token/type 成对，这里只驱动请求头组装与判定。
+// 值本身无所谓：这里只驱动请求头组装与判定。上游对真值做精确校验，但那
+// 属于服务端行为，单测只验证「有身份就发、没身份就不发」的契约。
 func testIdentity() MachineIdentity {
-	return ResolveIdentity("test-seed", nil)
+	return ResolveIdentity(nil, map[string]string{
+		"qoder_machine_token": "token-from-official-component",
+		"qoder_machine_type":  "type-from-official-component",
+		"qoder_machine_code":  "code-from-official-component",
+	})
 }
 
 // TestCheckinGlobalSendsNativeMachineHeaders 覆盖：拿到真身份后，活动查询、
 // 领取与发放回查都要带同一组机器头（上游在三条链路上都按身份过滤）。
 func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	const campaignID = "camp-global-identity"
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
@@ -132,10 +137,12 @@ func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
 	want := map[string]string{
 		"Cosy-Machinetoken": identity.Token,
 		"Cosy-Machinetype":  identity.Type,
-		"Cosy-Machineid":    identity.MachineID,
-		"Cosy-Machineos":    identity.MachineOS,
+		"Cosy-Machinecode":  identity.Code,
 		"Cosy-Version":      identity.Version,
 	}
+	// 派生机器头（machineid / machineos / hostname）一律不发：上游只认官方
+	// 组件签发的精确值，别的机器头既解锁不了活动，还会让请求形态偏离官方客户端。
+	forbidden := []string{"Cosy-Machineid", "Cosy-Machineos", "Cosy-Machinehostname"}
 	checked := 0
 	for _, request := range upstream.requests {
 		if !strings.Contains(request.url, "/sash/") {
@@ -145,6 +152,11 @@ func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
 		for key, value := range want {
 			if got := request.headers[key]; len(got) == 0 || got[0] != value {
 				t.Errorf("%s %s 的头 %s = %v, 期望 [%s]", request.method, request.url, key, got, value)
+			}
+		}
+		for _, key := range forbidden {
+			if got := request.headers[key]; len(got) != 0 {
+				t.Errorf("%s %s 不应发送 %s = %v", request.method, request.url, key, got)
 			}
 		}
 	}
@@ -168,6 +180,33 @@ func claimedCampaign(id, key string, startAt, endAt int64) string {
 		`"benefit":{"kind":"CREDITS","amount":100}}`, id, key, startAt, endAt)
 }
 
+// pinCheckinNow 把签到判定时钟固定到 at，并在用例结束时恢复。
+func pinCheckinNow(t *testing.T, at time.Time) time.Time {
+	t.Helper()
+	restore := checkinNow
+	checkinNow = func() time.Time { return at }
+	t.Cleanup(func() { checkinNow = restore })
+	return at
+}
+
+// checkinOpenNow 返回「当日窗口已开启」的固定时刻（UTC+8 15:00）。
+//
+// 这批用例按返回的 now 构造上游活动窗口，必须与签到判定共用同一个时钟。
+// 直接取真实时间时，本地 10:00 之前构造出来的是上一轮窗口，领取逻辑按
+// 设计返回 window_not_open，用例于是每天有 8 小时必然失败（CI 跑在 UTC，
+// 北京时间的凌晨正好落在窗口开启前）。签到正确性只取决于相对时刻，把时钟
+// 与窗口一起钉死即可稳定覆盖。
+func checkinOpenNow(t *testing.T) time.Time {
+	t.Helper()
+	return pinCheckinNow(t, time.Date(2026, 10, 22, 15, 0, 0, 0, campaignZone))
+}
+
+// checkinBeforeOpenNow 返回「当日窗口尚未开启」的固定时刻（UTC+8 09:00）。
+func checkinBeforeOpenNow(t *testing.T) time.Time {
+	t.Helper()
+	return pinCheckinNow(t, time.Date(2026, 10, 22, 9, 0, 0, 0, campaignZone))
+}
+
 // roundWindow 返回当前轮与上一轮的时间窗口（UTC+8 秒级时间戳）。
 //
 // 活动 startAt 落在当天 10:00、endAt 落在次日 10:00 之前，与上游实测一致。
@@ -184,7 +223,7 @@ func roundWindow(t *testing.T, now time.Time) (startAt, endAt int64, prevStart, 
 
 // TestCheckinClaimsCurrentRound 覆盖：当前轮可领取时应真正领取并确认到账。
 func TestCheckinClaimsCurrentRound(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	const campaignID = "camp-current"
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
@@ -247,7 +286,7 @@ func TestCheckinClaimsCurrentRound(t *testing.T) {
 // 上游每日 10:00（UTC+8）开启新一轮。9 点那一轮只能看到**上一轮**已领取
 // 的活动——把它当成「今日已领取」就是 issue 报告的假性成功。
 func TestCheckinBeforeWindowIsNotRecorded(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinBeforeOpenNow(t)
 	_, _, prevStart, prevEnd := roundWindow(t, now)
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
 	upstream.responses["GET https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"] = testhostResponse{
@@ -279,7 +318,7 @@ func TestCheckinBeforeWindowIsNotRecorded(t *testing.T) {
 
 // TestCheckinCurrentRoundAlreadyClaimed 覆盖：当前轮已领取才算「今日已领取」。
 func TestCheckinCurrentRoundAlreadyClaimed(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
 	upstream.responses["GET https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"] = testhostResponse{
@@ -306,7 +345,7 @@ func TestCheckinCurrentRoundAlreadyClaimed(t *testing.T) {
 
 // TestCheckinBlockedByUpstream 覆盖：上游风控去重不得当成成功。
 func TestCheckinBlockedByUpstream(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	const campaignID = "camp-blocked"
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
@@ -345,7 +384,7 @@ func TestCheckinBlockedByUpstream(t *testing.T) {
 
 // TestCheckinNotConfirmedWithoutGrant 覆盖：领取 200 但回读不到发放记录。
 func TestCheckinNotConfirmedWithoutGrant(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	const campaignID = "camp-unconfirmed"
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
@@ -387,7 +426,7 @@ func TestCheckinNotConfirmedWithoutGrant(t *testing.T) {
 
 // TestCheckinAchievementGate 覆盖：需先完成成就的活动不能当成已领。
 func TestCheckinAchievementGate(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	gated := fmt.Sprintf(`{"campaignId":"camp-gated","campaignKey":"act-milktea","actionType":"CLAIM_BENEFIT",`+
 		`"claimStatus":"ACHIEVEMENT_NOT_COMPLETED","startAt":%d,"endAt":%d,`+
@@ -424,7 +463,7 @@ func TestCheckinAchievementGate(t *testing.T) {
 // 国际版与国内版共用同一套 campaigns 活动（官方文档与官方活动页均确认），
 // 因此不能对国际版做静态跳过。
 func TestCheckinGlobalRegionUsesGlobalEndpoint(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
 	upstream.responses["GET https://openapi.qoder.sh/sash/api/v1/me/campaigns"] = testhostResponse{

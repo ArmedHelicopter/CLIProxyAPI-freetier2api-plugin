@@ -50,6 +50,20 @@ func TestDecodeValidation(t *testing.T) {
 	}
 }
 
+// TestDeprecatedPromptKeys 验证旧键名仍被解析成全局提示词配置。
+func TestDeprecatedPromptKeys(t *testing.T) {
+	cfg, err := DecodePluginConfig([]byte("workbuddy_prompt_mode: append\nworkbuddy_prompt_file: /tmp/p.md\n"), DefaultPluginConfig())
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if cfg.PromptMode != PromptModeAppend {
+		t.Fatalf("prompt mode = %q", cfg.PromptMode)
+	}
+	if cfg.Raw[PromptFileKey] != "/tmp/p.md" {
+		t.Fatalf("prompt file = %q", cfg.Raw[PromptFileKey])
+	}
+}
+
 func TestParseClock(t *testing.T) {
 	hour, minute, err := ParseClock("09:05")
 	if err != nil || hour != 9 || minute != 5 {

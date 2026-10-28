@@ -57,3 +57,50 @@ func TestSupportsQuotaComesFromCapability(t *testing.T) {
 		t.Fatal("vendor implementing QuotaProvider must report supports_quota=true")
 	}
 }
+
+// TestQuotaCacheKeyIsolatedByVendorAndAccount 锁定额度缓存键的唯一性。
+//
+// 键里必须同时含供应商与账号身份：过去把 Name / Label / AuthIndex 也当键，
+// 跨供应商同名就会互相串值（OpenCode ZEN 显示 WorkBuddy 额度的事故）。
+func TestQuotaFailureTypeIncludesCredentialClassification(t *testing.T) {
+	if got := quotaFailureType(core.NewPluginError("upstream_credential", "invalid access token", http.StatusUnauthorized)); got != string(core.FailureKindCredential) {
+		t.Fatalf("credential failure type = %q", got)
+	}
+	if got := quotaFailureType(core.NewPluginError("upstream_request_failed", "temporary", http.StatusBadGateway)); got != "upstream_request_failed" {
+		t.Fatalf("plugin failure type = %q", got)
+	}
+}
+
+func TestQuotaResultCarriesAccountAndVendorIdentityOnFailure(t *testing.T) {
+	result := quotaResult{AuthID: "account-1", Label: "Alice", VendorID: "minimaxcodecn", VendorName: "MiniMax Code 国内版", FailureType: string(core.FailureKindCredential), Message: "invalid access token", RefreshAttempted: true}
+	if result.AuthID == "" || result.Label == "" || result.VendorName == "" || result.FailureType != "credential" || !result.RefreshAttempted {
+		t.Fatalf("incomplete failure result: %+v", result)
+	}
+}
+
+func TestQuotaCacheKeyIsolatedByVendorAndAccount(t *testing.T) {
+	if quotaCacheKey("workbuddycn", "a", "") == quotaCacheKey("opencodezen", "a", "") {
+		t.Fatal("cache key must include vendor: same account id across vendors must not collide")
+	}
+	if quotaCacheKey("workbuddycn", "a", "") == quotaCacheKey("workbuddycn", "b", "") {
+		t.Fatal("cache key must include account identity")
+	}
+	if quotaCacheKey("", "a", "") != "" || quotaCacheKey("v", "", "") != "" {
+		t.Fatal("incomplete identity must produce no key")
+	}
+	if quotaCacheKey("v", "", "auth-1") == "" {
+		t.Fatal("AuthID must serve as a fallback identity when FileID is empty")
+	}
+}
+
+// TestQuotaCacheIsolatedByVendor 锁定读取侧：同名账号跨供应商不共享额度。
+func TestQuotaCacheIsolatedByVendor(t *testing.T) {
+	s := &Service{quotaCache: map[string]quotaResult{}}
+	s.cacheQuotaResult(quotaResult{VendorID: "workbuddycn", UID: "acc-1", Remain: 10, Total: 20})
+	if q := s.getCachedQuota("opencodezen", "acc-1", "auth-1"); q != nil {
+		t.Fatalf("must not read another vendor's quota: %+v", q)
+	}
+	if q := s.getCachedQuota("workbuddycn", "acc-1", "auth-1"); q == nil || q.Remain != 10 {
+		t.Fatalf("own quota must be readable, got %+v", q)
+	}
+}

@@ -2,10 +2,13 @@ package zcode
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
 
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 )
 
@@ -15,6 +18,14 @@ import (
 //   - 归一化：plan_id 大小写/空白、status 非 active 的过期套餐不该算「已持有」；
 //   - 集合运算：已投放 ∩ 已持有 = 按钮置灰的依据；
 //   - 业务码翻译：页面上的文案直接来自这里。
+
+func TestBillingHeadersFallBackToAPIKey(t *testing.T) {
+	cred := &Credential{APIKey: "sk-test", Profile: DeviceProfile{Platform: "win32", Arch: "x64"}}
+	headers := billingHeaders(cred)
+	if headers["x-api-key"] != "sk-test" || headers["Authorization"] != "" {
+		t.Fatalf("API key headers = %#v", headers)
+	}
+}
 
 func TestNormalizePlanIDIsCaseAndSpaceInsensitive(t *testing.T) {
 	// 上游的 plan_id 大小写不统一（「ZCode-V3-Start-Plan」与「zcode-v3-start-plan」
@@ -87,19 +98,40 @@ func TestParsePlanGrantsFallsBackToGrantsField(t *testing.T) {
 }
 
 func TestHeldPlanIDsExcludesInactivePlans(t *testing.T) {
-	body := map[string]any{"data": map[string]any{"plans": []any{
+	plans := planRows(map[string]any{"data": map[string]any{"plans": []any{
 		map[string]any{"plan_id": "active-plan", "status": "active"},
 		map[string]any{"plan_id": "expired-plan", "status": "expired"},
 		map[string]any{"plan_id": "implicit-active"},
 		map[string]any{"status": "active"}, // 无 ID：跳过
-	}}}
-	held := heldPlanIDs(body)
+	}}})
+	held := heldPlanIDs(plans, 0)
 	if !held["active-plan"] || !held["implicit-active"] {
 		t.Fatalf("生效套餐应计入持有: %+v", held)
 	}
 	// 过期套餐必须排除：否则活动下线后按钮会永远灰着。
 	if held["expired-plan"] {
 		t.Fatalf("过期套餐不应计入持有: %+v", held)
+	}
+}
+
+func TestHeldPlanIDsTreatsPastEndsAtAsExpired(t *testing.T) {
+	// 上游可能把已结束的活动仍标成 active（官方客户端按服务端时间归一成 expired）。
+	// 不归一的话活动下线后按钮会一直灰在「已领取」。
+	plans := planRows(map[string]any{"data": map[string]any{"plans": []any{
+		map[string]any{"plan_id": "ended", "status": "active", "ends_at": float64(1000)},
+		map[string]any{"plan_id": "running", "status": "active", "ends_at": float64(3000)},
+		map[string]any{"plan_id": "no-end", "status": "active"},
+	}}})
+	held := heldPlanIDs(plans, 2000)
+	if held["ended"] {
+		t.Fatalf("ends_at 已过的 active 套餐不应计入持有: %+v", held)
+	}
+	if !held["running"] || !held["no-end"] {
+		t.Fatalf("未到期/无到期时间的套餐应计入持有: %+v", held)
+	}
+	// 服务端时间缺失（0）时不做过期推断，保持保守。
+	if !heldPlanIDs(plans, 0)["ended"] {
+		t.Fatal("缺少服务端时间时不应按本机时钟推断过期")
 	}
 }
 
@@ -135,6 +167,16 @@ func TestClaimStatusCountsAndErrors(t *testing.T) {
 	if all.Claimable != 0 {
 		t.Fatalf("全部领取后 claimable = %d, want 0", all.Claimable)
 	}
+	// balance 失败时不可把 preview 投放误报成可领取，也不能显示已领取。
+	balanceFailed := claimStatusOf(planSnapshot{
+		offered:    []core.PlanInfo{{PlanID: "a"}},
+		held:       map[string]bool{},
+		errBalance: core.NewPluginError("x", "balance 失败", 502),
+	})
+	if balanceFailed.Error == "" || balanceFailed.Claimable != 0 {
+		t.Fatalf("balance 失败不应暴露可领取套餐: %+v", balanceFailed)
+	}
+
 	// preview 失败时必须带 error：页面据此保持按钮可点，而不是误显示「已领取」。
 	failed := claimStatusOf(planSnapshot{
 		held:       map[string]bool{},
@@ -142,6 +184,38 @@ func TestClaimStatusCountsAndErrors(t *testing.T) {
 	})
 	if failed.Error == "" || failed.Claimable != 0 {
 		t.Fatalf("preview 失败应带 error: %+v", failed)
+	}
+
+	// 活跃上报失败且活动列表为空：不能说成「已领取」——空列表本来就不代表领完。
+	activationFailed := claimStatusOf(planSnapshot{
+		held:          map[string]bool{},
+		errActivation: "激活上报 HTTP 500",
+	})
+	if activationFailed.Error == "" {
+		t.Fatalf("活跃上报失败时空列表必须带 error: %+v", activationFailed)
+	}
+	// 反过来：有投放时活跃上报的失败不影响按钮可用性，就不该打扰用户。
+	withPlans := claimStatusOf(planSnapshot{
+		offered:       []core.PlanInfo{{PlanID: "a"}},
+		held:          map[string]bool{},
+		errActivation: "激活上报 HTTP 500",
+	})
+	if withPlans.Error != "" || withPlans.Claimable != 1 {
+		t.Fatalf("有可领套餐时不应带 error: %+v", withPlans)
+	}
+}
+
+func TestApplySubscriptionUsesBalancePlan(t *testing.T) {
+	response := &pluginapi.QuotaFetchResponse{Subscription: &pluginapi.QuotaSubscription{}}
+	applySubscription(planSnapshot{
+		plans: []map[string]any{
+			{"plan_id": "future", "name": "Future", "status": "active"},
+			{"plan_id": "current", "name": "Current", "status": "active"},
+		},
+		balances: []map[string]any{{"plan_id": "current", "remaining_units": float64(10)}},
+	}, response)
+	if response.Subscription.Plan != "Current" || response.Subscription.TierName != "current" {
+		t.Fatalf("subscription = %+v, want current balance plan", response.Subscription)
 	}
 }
 
@@ -248,5 +322,224 @@ func TestClaimGateIsPerInstance(t *testing.T) {
 	}
 	if busy.wait(ctx) {
 		t.Fatal("本实例刚发过领取，应当节流")
+	}
+}
+
+// 活跃上报的纯函数测试（不触网）。
+//
+// 覆盖三件会静默出错、且出错表现都是「活动列表恒空」的事：
+//   - 事件体字段集必须与官方 sendReport 一致（少字段上游可能静默忽略）；
+//   - 每账号每日只报一次（重复上报没有收益，只会多打上游）；
+//   - 日期按账号档案时区算（官方 reportAppDailyActive 的 toLocalDateKey 同义）。
+
+func TestActivationEventBodyMatchesOfficialFields(t *testing.T) {
+	cred := &Credential{
+		JWTToken: "jwt",
+		Profile: DeviceProfile{
+			Platform: "win32", Arch: "x64", OSVersion: "10.0.22631",
+			Language: "zh-CN", Timezone: "Asia/Shanghai",
+			Screen: "1920x1080", DeviceMID: "mid-1",
+		},
+	}
+	body := activationEventBody("app_launch", cred, "user-1")
+
+	// 官方 sendReport 的 16 个键，一个都不能少（多一个不会被拒，少一个可能被忽略）。
+	want := []string{
+		"event_id", "client_timezone", "client_language", "element_name",
+		"event_region", "event_type", "event_text", "event_extra_detail",
+		"user_id", "screen_resolution", "app_version", "device_os_category",
+		"device_os_version", "device_mid", "mac_id", "marketing_params",
+	}
+	for _, key := range want {
+		if _, ok := body[key]; !ok {
+			t.Fatalf("事件体缺少字段 %q: %+v", key, body)
+		}
+	}
+	if len(body) != len(want) {
+		t.Fatalf("事件体字段数 = %d, want %d: %+v", len(body), len(want), body)
+	}
+
+	if body["element_name"] != "app_launch" || body["event_region"] != "app" || body["event_type"] != "view" {
+		t.Fatalf("事件语义字段错误: %+v", body)
+	}
+	// 设备字段必须取自账号档案，否则多账号会聚成同一台机器。
+	if body["device_mid"] != "mid-1" || body["device_os_category"] != "windows" ||
+		body["screen_resolution"] != "1920x1080" || body["client_timezone"] != "Asia/Shanghai" {
+		t.Fatalf("设备字段未取自账号档案: %+v", body)
+	}
+	if body["marketing_params"] != "{}" || body["mac_id"] != "" {
+		t.Fatalf("固定字段错误: %+v", body)
+	}
+	if body["event_id"] == "" || body["event_id"] == activationEventBody("app_launch", cred, "user-1")["event_id"] {
+		t.Fatal("event_id 每次必须新生成")
+	}
+}
+
+func TestActivationElementsAreOfficialPair(t *testing.T) {
+	// 两条缺一不可：app_launch 是启动，app_daily_active 是日活。
+	want := []string{"app_launch", "app_daily_active"}
+	if len(activationElements) != len(want) {
+		t.Fatalf("activationElements = %v", activationElements)
+	}
+	for index, element := range want {
+		if activationElements[index] != element {
+			t.Fatalf("activationElements[%d] = %q, want %q", index, activationElements[index], element)
+		}
+	}
+}
+
+func TestActivationStateDedupesPerUserPerDay(t *testing.T) {
+	state := newActivationState()
+	if !state.shouldReport("u1", "2026-10-23") {
+		t.Fatal("首次上报应放行")
+	}
+	if state.shouldReport("u1", "2026-10-23") {
+		t.Fatal("同一账号同一天不应重复上报")
+	}
+	// 账号之间互不影响。
+	if !state.shouldReport("u2", "2026-10-23") {
+		t.Fatal("不同账号应各自上报")
+	}
+	// 跨日重新放行。
+	if !state.shouldReport("u1", "2026-10-24") {
+		t.Fatal("跨日应重新上报")
+	}
+}
+
+func TestActivationStateForgetsOnFailure(t *testing.T) {
+	state := newActivationState()
+	state.shouldReport("u1", "2026-10-23")
+	// 上报失败必须撤销占位，否则整个自然日都拿不到活动。
+	state.forget("u1")
+	if !state.shouldReport("u1", "2026-10-23") {
+		t.Fatal("失败后应允许重试")
+	}
+}
+
+func TestLocalDateFollowsProfileTimezone(t *testing.T) {
+	// 2026-10-23T20:00:00Z：上海已是 10-24，纽约仍是 10-23。
+	at := time.Date(2026, 10, 23, 20, 0, 0, 0, time.UTC)
+	if got := localDate(DeviceProfile{Timezone: "Asia/Shanghai"}, at); got != "2026-10-24" {
+		t.Fatalf("上海日期 = %q, want 2026-10-24", got)
+	}
+	if got := localDate(DeviceProfile{Timezone: "America/New_York"}, at); got != "2026-10-23" {
+		t.Fatalf("纽约日期 = %q, want 2026-10-23", got)
+	}
+	// 时区缺失/非法时退回 UTC，而不是 panic 或空串。
+	if got := localDate(DeviceProfile{}, at); got != "2026-10-23" {
+		t.Fatalf("无时区日期 = %q, want 2026-10-23", got)
+	}
+	if got := localDate(DeviceProfile{Timezone: "Not/AZone"}, at); got != "2026-10-23" {
+		t.Fatalf("非法时区日期 = %q, want 2026-10-23", got)
+	}
+}
+
+func TestEnsureActivationExplainsMissingUserID(t *testing.T) {
+	// 无 user_id 时不上报，但必须给出原因：否则用户只会看到永远空的活动列表。
+	v := Instances(core.Env{})[0].(*adapter)
+	reason := v.ensureActivation(context.Background(), &Credential{JWTToken: "not-a-jwt"})
+	if reason == "" {
+		t.Fatal("缺少 user_id 时必须返回原因")
+	}
+	if reason := v.ensureActivation(context.Background(), nil); reason != "" {
+		t.Fatalf("nil 凭证应静默, got %q", reason)
+	}
+}
+
+func TestMarketingHeadersCarryCredential(t *testing.T) {
+	// JWT 优先：同一凭证同时有 JWT 与 API Key 时，只能带 JWT 的 Bearer。
+	h := marketingHeaders(&Credential{
+		JWTToken: "jwt-token",
+		APIKey:   "sk-test",
+		Profile:  DeviceProfile{Platform: "win32", Arch: "x64", Language: "en-US"},
+	})
+	if h["Authorization"] != "Bearer jwt-token" || h["x-api-key"] != "" {
+		t.Fatalf("JWT headers = %#v", h)
+	}
+	if h["Accept"] != "application/json" || h["x-request-id"] == "" {
+		t.Fatalf("missing request headers: %#v", h)
+	}
+	// 语言必须来自账号档案，而不是被硬编码的 zh-CN 覆盖。
+	if got := h["X-Client-Language"]; got != "en-US" {
+		t.Fatalf("X-Client-Language = %q, want en-US", got)
+	}
+
+	// 纯 API Key 凭证（控制台添加的形态）必须带 x-api-key，否则上游按匿名请求处理。
+	h = marketingHeaders(&Credential{APIKey: "sk-test", Profile: DeviceProfile{Platform: "win32", Arch: "x64"}})
+	if h["x-api-key"] != "sk-test" || h["Authorization"] != "" {
+		t.Fatalf("API key headers = %#v", h)
+	}
+}
+
+func TestParseMarketingTouchNormalizesPlans(t *testing.T) {
+	raw := []byte(`{"code":0,"data":{"deliveries":[
+		{"banner":{"background":{"args":{"zcode_plan":{"plan_id":"low","name":"Low","priority":1,"entitlements":[{"show_name":"GLM-5.3-Flash","grant_units":100,"period":"one_time"}]}}}}},
+		{"banner":{"background":{"args":{"zcode_plan":{"plan_id":"high","name":"High","priority":9}}}}},
+		{"banner":{"background":{"args":{"zcode_plan":{"plan_id":"HIGH","name":"High 重复","priority":9}}}}},
+		{"banner":{"background":{"args":{"button":{"text":"learn more"}}}}},
+		{"banner":{"background":{"args":{"zcode_plan":{"name":"没有 plan_id"}}}}}
+	]}}`)
+
+	plans, err := parseMarketingTouch(http.StatusOK, raw)
+	if err != nil {
+		t.Fatalf("parseMarketingTouch: %v", err)
+	}
+	// 没有 plan_id 的投递与重复 plan_id（大小写不同）都要被丢弃。
+	if len(plans) != 2 {
+		t.Fatalf("plans = %+v, want 2", plans)
+	}
+	// 优先级降序，同优先级按 plan_id 升序。
+	if plans[0].PlanID != "high" || plans[1].PlanID != "low" {
+		t.Fatalf("order = %q, %q", plans[0].PlanID, plans[1].PlanID)
+	}
+	if len(plans[1].Grants) != 1 || plans[1].Grants[0].Model != "GLM-5.3-Flash" {
+		t.Fatalf("grants = %+v", plans[1].Grants)
+	}
+}
+
+func TestParseMarketingTouchErrors(t *testing.T) {
+	tests := []struct {
+		name       string
+		status     int
+		body       string
+		wantCode   string
+		wantDetail string
+	}{
+		{
+			name:       "业务码非零",
+			status:     http.StatusOK,
+			body:       `{"code":4001,"msg":"today not active"}`,
+			wantCode:   "zcode_activity_business",
+			wantDetail: "today not active",
+		},
+		{
+			name:       "HTTP 非 2xx",
+			status:     http.StatusUnauthorized,
+			body:       `{"code":401,"msg":"unauthorized"}`,
+			wantCode:   "zcode_activity_http",
+			wantDetail: "HTTP 401",
+		},
+		{
+			name:       "响应不是 JSON",
+			status:     http.StatusOK,
+			body:       `<html>login</html>`,
+			wantCode:   "zcode_activity_response",
+			wantDetail: "login",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := parseMarketingTouch(test.status, []byte(test.body))
+			var pluginErr *core.PluginError
+			if !errors.As(err, &pluginErr) {
+				t.Fatalf("err = %v, want *core.PluginError", err)
+			}
+			if pluginErr.Code != test.wantCode || pluginErr.HTTPStatus != http.StatusBadGateway {
+				t.Fatalf("err = %+v", pluginErr)
+			}
+			if !strings.Contains(err.Error(), test.wantDetail) {
+				t.Fatalf("err = %q, want detail %q", err, test.wantDetail)
+			}
+		})
 	}
 }

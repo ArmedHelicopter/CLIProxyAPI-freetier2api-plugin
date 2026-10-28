@@ -1,21 +1,22 @@
 package admin
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/state"
 	"freetier2api-plugin/internal/tasks"
 )
 
 type settingsUpdateRequest struct {
-	AutoCheckin         *bool            `json:"auto_checkin"`
-	AutoCheckinAt       string           `json:"auto_checkin_at"`
-	AutoTasks           *bool            `json:"auto_tasks"`
-	WorkbuddyPromptMode string           `json:"workbuddy_prompt_mode"`
-	TaskSchedules       map[string][]int `json:"task_schedules"`
+	AutoCheckin   *bool            `json:"auto_checkin"`
+	AutoCheckinAt string           `json:"auto_checkin_at"`
+	AutoTasks     *bool            `json:"auto_tasks"`
+	PromptMode    *string          `json:"prompt_mode"`
+	ModelNameTag  *string          `json:"model_name_tag"`
+	TaskSchedules map[string][]int `json:"task_schedules"`
 
 	// Deprecated: 兼容旧版页面/脚本的固定字段。
 	CheckinHours   []int `json:"checkin_hours"`
@@ -26,9 +27,17 @@ type settingsUpdateRequest struct {
 }
 
 func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body settingsUpdateRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[settingsUpdateRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
+	}
+	promptMode, errPrompt := normalizePromptMode(body.PromptMode)
+	if errPrompt != nil {
+		return ErrorResponse(errPrompt)
+	}
+	modelNameTag, errTag := normalizeModelNameTagPointer(body.ModelNameTag)
+	if errTag != nil {
+		return ErrorResponse(errTag)
 	}
 	changed := map[string]any{}
 	s.deps.MutateState(func(current *state.State) {
@@ -46,15 +55,20 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 			current.AutoTasks = body.AutoTasks
 			changed["auto_tasks"] = *body.AutoTasks
 		}
-		if mode := strings.ToLower(strings.TrimSpace(body.WorkbuddyPromptMode)); mode != "" {
-			switch mode {
-			case "passthrough", "custom", "append":
-				if current.VendorSettings == nil {
-					current.VendorSettings = map[string]string{}
-				}
-				current.VendorSettings["workbuddy_prompt_mode"] = mode
-				changed["workbuddy_prompt_mode"] = mode
+		if body.PromptMode != nil {
+			// 空串表示撤销页面覆盖，重新由 YAML 配置决定。
+			current.PromptMode = promptMode
+			changed["prompt_mode"] = promptMode
+		}
+		if body.ModelNameTag != nil {
+			if current.ModelNameTag != modelNameTag {
+				// 渠道标识改变对外模型 ID：宿主模型注册表未重建前 /v1/models
+				// 仍是旧名字。置 RestartPending 与手动别名/禁用同语义——
+				// 控制台据此提示「待生效」并触发 syncModelConfig 自愈。
+				current.RestartPending = true
 			}
+			current.ModelNameTag = modelNameTag
+			changed[ModelNameTagKey] = modelNameTag
 		}
 		if current.TaskSchedules == nil {
 			current.TaskSchedules = map[string][]int{}
@@ -88,8 +102,45 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 	}
 	s.tasks.Poke()
 	return JSONResponse(http.StatusOK, map[string]any{
-		"ok": true, "changed": changed, "settings": s.tasks.EffectiveSettings(),
+		"ok": true, "changed": changed, "settings": s.settingsView(),
 	})
+}
+
+// normalizePromptMode 校验页面提交的提示词过滤模式。
+//
+// 提示词过滤是全局能力，只有一份模式：空串表示撤销页面覆盖、回到 YAML
+// 配置，其余写法必须落在 ParsePromptMode 认可的取值内。
+func normalizePromptMode(input *string) (string, error) {
+	if input == nil {
+		return "", nil
+	}
+	mode, errMode := ParsePromptMode(*input)
+	if errMode != nil {
+		return "", core.NewPluginError("prompt_mode_invalid", errMode.Error(), http.StatusBadRequest)
+	}
+	return mode, nil
+}
+
+// normalizeModelNameTagPointer 归一化页面提交的渠道标识模式。
+// 空串表示撤销页面覆盖，重新由 YAML 配置决定；其余必须落在合法取值内。
+func normalizeModelNameTagPointer(input *string) (string, error) {
+	if input == nil {
+		return "", nil
+	}
+	trimmed := strings.ToLower(strings.TrimSpace(*input))
+	if trimmed == "" {
+		// 空串表示撤销页面覆盖，重新由 YAML 配置决定。
+		return "", nil
+	}
+	return NormalizeModelNameTag(trimmed)
+}
+
+// settingsView 是 /status 的 settings 载荷：任务引擎的可读设置 + 提示词过滤现状。
+func (s *Service) settingsView() map[string]any {
+	settings := s.tasks.EffectiveSettings()
+	settings[PromptModeKey] = EffectivePromptMode(s.deps.Config(), s.deps.State().PromptMode)
+	settings[ModelNameTagKey] = EffectiveModelNameTag(s.deps.Config(), s.deps.State().ModelNameTag)
+	return settings
 }
 
 // handleScheduledRun 手动触发一个定时任务。

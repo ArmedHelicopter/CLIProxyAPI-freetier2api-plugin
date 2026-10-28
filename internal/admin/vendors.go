@@ -14,10 +14,16 @@ type vendorDescriptor struct {
 	SupportsCheckin bool   `json:"supports_checkin"`
 	AuthMode        string `json:"auth_mode"`
 	SupportsLogin   bool   `json:"supports_login"`
+	// SMSLogin 报告该供应商支持「手机号 + 短信验证码」两步登录表单。
+	SMSLogin bool `json:"sms_login"`
 	// PasteCallback 报告该供应商的登录是否需要（也支持）「粘贴 localhost 回调链接」兜底。
 	PasteCallback bool `json:"paste_callback"`
 	// CallbackHint 是页面要展示的本机回调地址（仅 PasteCallback 为真时有值）。
 	CallbackHint string `json:"callback_hint,omitempty"`
+	// LoginCaptcha 报告登录前是否需要页面内的人机验证控件。
+	LoginCaptcha bool `json:"login_captcha"`
+	// LoginVariants 是同一供应商可选的登录变体（如 AutoClaw 的 Zai / Google）。
+	LoginVariants []core.LoginVariant `json:"login_variants,omitempty"`
 }
 
 func (s *Service) buildVendorsPayload() map[string]any {
@@ -35,9 +41,18 @@ func (s *Service) buildVendorsPayload() map[string]any {
 			AuthMode:        vendorAuthMode(vendor),
 			SupportsLogin:   vendorSupportsLogin(vendor),
 		}
+		if _, okSMS := core.As[core.SMSLoginProvider](vendor); okSMS {
+			descriptor.SMSLogin = true
+		}
 		if submitter, okSubmit := core.As[core.CallbackSubmitter](vendor); okSubmit {
 			descriptor.PasteCallback = true
 			descriptor.CallbackHint = strings.TrimSpace(submitter.LocalCallbackHint())
+		}
+		if _, okCaptcha := core.As[core.LoginCaptchaProvider](vendor); okCaptcha {
+			descriptor.LoginCaptcha = true
+		}
+		if variants, okVariants := core.As[core.LoginVariantProvider](vendor); okVariants {
+			descriptor.LoginVariants = variants.LoginVariants()
 		}
 		vendors = append(vendors, descriptor)
 	}
@@ -54,6 +69,12 @@ func vendorAuthMode(vendor core.Vendor) string {
 }
 
 func vendorSupportsLogin(vendor core.Vendor) bool {
-	_, okLogin := core.As[core.LoginProvider](vendor)
-	return okLogin
+	if _, okLogin := core.As[core.LoginProvider](vendor); okLogin {
+		return true
+	}
+	// 短信验证码登录也是登录（控制台渲染两步表单而不是授权链接）。
+	if _, okSMS := core.As[core.SMSLoginProvider](vendor); okSMS {
+		return true
+	}
+	return false
 }

@@ -213,41 +213,47 @@ type modelsDevEntry struct {
 // modelsDevCatalog 是 provider 下的模型 ID → 条目表。
 type modelsDevCatalog map[string]modelsDevEntry
 
-// modelsDevCache 是目录的进程内缓存（成功与失败分开计时）。
-var modelsDevCache struct {
-	sync.Mutex
+// modelsDevCache 是目录缓存（成功与失败分开计时）。
+//
+// 属于 adapter 实例而不是包级变量：多个 App 实例各缓存各的，互不影响。
+// 零值可用；nil 接收者表示不缓存（一次性调用直接打上游）。
+type modelsDevCache struct {
+	mu         sync.Mutex
 	catalog    modelsDevCatalog
 	validUntil time.Time
 	failedNext time.Time
 }
 
-// fetchModelsDevCatalog 拉取（或命中缓存）models.dev 目录。
-func fetchModelsDevCatalog(ctx context.Context) (modelsDevCatalog, error) {
+// fetch 拉取（或命中缓存）models.dev 目录。
+func (c *modelsDevCache) fetch(ctx context.Context) (modelsDevCatalog, error) {
 	now := time.Now()
-	modelsDevCache.Lock()
-	if modelsDevCache.catalog != nil && now.Before(modelsDevCache.validUntil) {
-		catalog := modelsDevCache.catalog
-		modelsDevCache.Unlock()
-		return catalog, nil
-	}
-	failing := now.Before(modelsDevCache.failedNext)
-	modelsDevCache.Unlock()
-	if failing {
-		return nil, fmt.Errorf("models.dev catalog recently failed; negative cache")
+	if c != nil {
+		c.mu.Lock()
+		if c.catalog != nil && now.Before(c.validUntil) {
+			catalog := c.catalog
+			c.mu.Unlock()
+			return catalog, nil
+		}
+		failing := now.Before(c.failedNext)
+		c.mu.Unlock()
+		if failing {
+			return nil, fmt.Errorf("models.dev catalog recently failed; negative cache")
+		}
 	}
 
 	catalog, errFetch := loadModelsDevCatalog(ctx)
-	now = time.Now()
-	modelsDevCache.Lock()
-	if errFetch != nil {
-		modelsDevCache.failedNext = now.Add(modelsDevNegativeTTL)
-		modelsDevCache.Unlock()
-		return nil, errFetch
+	if c != nil {
+		now = time.Now()
+		c.mu.Lock()
+		if errFetch != nil {
+			c.failedNext = now.Add(modelsDevNegativeTTL)
+		} else {
+			c.catalog = catalog
+			c.validUntil = now.Add(modelsDevCacheTTL)
+		}
+		c.mu.Unlock()
 	}
-	modelsDevCache.catalog = catalog
-	modelsDevCache.validUntil = now.Add(modelsDevCacheTTL)
-	modelsDevCache.Unlock()
-	return catalog, nil
+	return catalog, errFetch
 }
 
 // loadModelsDevCatalog 发起一次目录请求并解析出 ZEN 对应的 provider。
@@ -292,12 +298,12 @@ func parseModelsDevCatalog(body []byte) (modelsDevCatalog, error) {
 	return provider.Models, nil
 }
 
-// enrichWithModelsDev 用 models.dev 目录补全模型元数据。
+// enrich 用 models.dev 目录补全模型元数据。
 //
 // 只在字段为空时填充（ZEN /v1/models 未来若返回元数据则优先）；目录不可
 // 用时只记一条 info，模型列表本身照常返回。
-func enrichWithModelsDev(ctx context.Context, models []Model) {
-	catalog, errCatalog := fetchModelsDevCatalog(ctx)
+func (c *modelsDevCache) enrich(ctx context.Context, models []Model) {
+	catalog, errCatalog := c.fetch(ctx)
 	if errCatalog != nil {
 		logger.Info("opencodezen: models.dev catalog unavailable, keep fallback metadata: %v", errCatalog)
 		return

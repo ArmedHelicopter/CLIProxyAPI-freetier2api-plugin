@@ -36,20 +36,19 @@ func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string
 		modelCounts[model.Realm]++
 	}
 	return map[string]any{
-		"ok":                    true,
-		"plugin":                s.deps.Identity().ID,
-		"version":               s.deps.Identity().Version,
-		"enabled_realms":        cfg.EnabledRealms,
-		"workbuddy_prompt_mode": s.deps.WorkbuddyPromptMode(),
-		"log_level":             logger.CurrentLevel(),
-		"state_dir":             cfg.StateDir,
-		"accounts":              accounts,
-		"account_count":         len(accounts),
-		"model_counts":          modelCounts,
-		"models_fetched_at":     current.ModelsFetchedAt,
-		"restart_pending":       current.RestartPending,
-		"settings":              s.tasks.EffectiveSettings(),
-		"scheduler":             s.tasks.Status(),
+		"ok":                true,
+		"plugin":            s.deps.Identity().ID,
+		"version":           s.deps.Identity().Version,
+		"enabled_realms":    cfg.EnabledRealms,
+		"log_level":         logger.CurrentLevel(),
+		"state_dir":         cfg.StateDir,
+		"accounts":          accounts,
+		"account_count":     len(accounts),
+		"model_counts":      modelCounts,
+		"models_fetched_at": current.ModelsFetchedAt,
+		"restart_pending":   current.RestartPending,
+		"settings":          s.settingsView(),
+		"scheduler":         s.tasks.Status(),
 	}
 }
 
@@ -75,28 +74,45 @@ type accountSummary struct {
 	SupportsClaim bool               `json:"supports_claim"`
 }
 
-func (s *Service) getCachedQuota(keys ...string) *quotaResult {
-	s.quotaMu.RLock()
-	defer s.quotaMu.RUnlock()
-	for _, key := range keys {
-		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			if q, ok := s.quotaCache[trimmed]; ok {
-				copyQ := q
-				return &copyQ
-			}
-		}
+// quotaCacheKey 返回额度缓存的唯一键：供应商 + 账号身份（FileID 优先，AuthID 兜底）。
+//
+// 键必须同时包含供应商与账号身份。额度结果曾按 Name / Label / AuthIndex 多键落库，
+// 这些字段跨供应商并不唯一（两个账号同昵称、或同一个 auth_index 都很常见），于是 A
+// 账号的额度会被 B 账号读到——OpenCode ZEN 显示 WorkBuddy 的「剩余 / 总额」正是
+// 这条路径。
+func quotaCacheKey(vendorID, fileID, authID string) string {
+	vendorID = strings.TrimSpace(vendorID)
+	accountID := core.FirstNonEmpty(fileID, authID)
+	if vendorID == "" || accountID == "" {
+		return ""
 	}
-	return nil
+	return vendorID + "\x00" + accountID
 }
 
-func (s *Service) cacheQuotaResult(q quotaResult, keys ...string) {
+// getCachedQuota 读取账号额度缓存；身份不完整时视为未命中。
+func (s *Service) getCachedQuota(vendorID, fileID, authID string) *quotaResult {
+	key := quotaCacheKey(vendorID, fileID, authID)
+	if key == "" {
+		return nil
+	}
+	s.quotaMu.RLock()
+	defer s.quotaMu.RUnlock()
+	q, ok := s.quotaCache[key]
+	if !ok {
+		return nil
+	}
+	return &q
+}
+
+// cacheQuotaResult 写入账号额度缓存；身份不完整时不写。
+func (s *Service) cacheQuotaResult(q quotaResult) {
+	key := quotaCacheKey(q.VendorID, q.UID, q.AuthID)
+	if key == "" {
+		return
+	}
 	s.quotaMu.Lock()
 	defer s.quotaMu.Unlock()
-	for _, key := range keys {
-		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			s.quotaCache[trimmed] = q
-		}
-	}
+	s.quotaCache[key] = q
 }
 
 func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
@@ -119,7 +135,7 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 			Realm:           credential.RegionValue(),
 			Status:          entry.Status,
 			Disabled:        entry.Disabled,
-			SupportsCheckin: core.SupportsCheckin(vendor),
+			SupportsCheckin: core.SupportsCheckinFor(vendor, credential),
 			SupportsQuota:   supportsQuota(vendor),
 			SupportsClaim:   supportsClaim(vendor),
 		}
@@ -144,12 +160,28 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 			claim := record
 			summary.Claim = &claim
 		}
-		if q := s.getCachedQuota(uid, summary.AuthID, summary.AuthIndex, entry.Name, summary.Label); q != nil {
-			summary.Quota = q
+		// 只有支持额度查询的供应商才读取额度缓存。不支持额度的账号（OpenCode
+		// ZEN、Cline 等）不该显示任何「剩余 / 总额」，即便缓存里存在同名字段。
+		if supportsQuota(vendor) {
+			if q := s.getCachedQuota(vendor.ID(), uid, summary.AuthID); q != nil {
+				summary.Quota = q
+				// A successful quota read proves the credential is usable even when
+				// the host retained a stale runtime error from an earlier request.
+				// Do not mutate host auth state; only avoid displaying a contradictory
+				// error in this plugin's account overview.
+				summary.Status = displayedAccountStatus(summary.Status, q.OK)
+			}
 		}
 		out = append(out, summary)
 	}
 	return out
+}
+
+func displayedAccountStatus(status string, quotaOK bool) string {
+	if strings.EqualFold(strings.TrimSpace(status), "error") && quotaOK {
+		return "active"
+	}
+	return status
 }
 
 // supportsQuota 报告该供应商是否提供额度查询。
@@ -185,13 +217,14 @@ func (s *Service) buildLogsPayload(req pluginapi.ManagementRequest) map[string]a
 }
 
 type accountBatchRequest struct {
-	AccountIDs []string `json:"account_ids"`
+	AccountIDs         []string `json:"account_ids"`
+	RefreshCredentials bool     `json:"refresh_credentials,omitempty"`
 }
 
 func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountBatchRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[accountBatchRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	if len(body.AccountIDs) == 0 {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "account_ids 不能为空"})
@@ -237,49 +270,14 @@ func (s *Service) deleteAuthFile(ctx context.Context, callbackID string, entry c
 	if !okRaw {
 		return fmt.Errorf("读取凭证失败，无法确认归属")
 	}
-	if _, okParse := s.registry.ParseCredential(raw, hostbridge.AccountIdentity(entry), nil); !okParse {
-		return fmt.Errorf("该凭证不属于本插件，拒绝删除")
-	}
-	targetPath := strings.TrimSpace(filePath)
-	if targetPath == "" {
-		targetPath = strings.TrimSpace(entry.Path)
-	}
-	if targetPath == "" {
-		return fmt.Errorf("该账号没有对应的凭证文件（运行时凭证），无法删除")
-	}
-	if errSafe := ensureAuthFilePathSafe(targetPath); errSafe != nil {
+	targetPath, errSafe := safeAuthFileForDelete(s.registry, entry, raw, core.FirstNonEmpty(filePath, entry.Path))
+	if errSafe != nil {
 		return errSafe
 	}
 	if errRemove := os.Remove(targetPath); errRemove != nil {
-		if os.IsNotExist(errRemove) {
-			return nil
-		}
 		return fmt.Errorf("删除文件失败：%w", errRemove)
 	}
 	logger.Info("deleted auth file %s (vendor=%s)", filepath.Base(targetPath), entry.Name)
-	return nil
-}
-
-func ensureAuthFilePathSafe(path string) error {
-	if !filepath.IsAbs(path) {
-		return fmt.Errorf("拒绝删除非绝对路径：%s", path)
-	}
-	if !strings.HasSuffix(strings.ToLower(path), ".json") {
-		return fmt.Errorf("拒绝删除非凭证文件：%s", filepath.Base(path))
-	}
-	info, errStat := os.Lstat(path)
-	if errStat != nil {
-		if os.IsNotExist(errStat) {
-			return nil
-		}
-		return fmt.Errorf("检查文件失败：%w", errStat)
-	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("拒绝删除符号链接：%s", filepath.Base(path))
-	}
-	if info.IsDir() {
-		return fmt.Errorf("拒绝删除目录：%s", filepath.Base(path))
-	}
 	return nil
 }
 
@@ -287,12 +285,15 @@ type accountAddRequest struct {
 	Vendor string `json:"vendor"`
 	APIKey string `json:"api_key"`
 	Label  string `json:"label"`
+	// CredentialJSON 是供应商原生凭证 JSON（token 对等复杂凭证）。
+	// 提供时优先于 api_key：原样交给供应商的 Parse 归一，不套 api_key 信封。
+	CredentialJSON string `json:"credential_json,omitempty"`
 }
 
 func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountAddRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[accountAddRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	vendorID := strings.TrimSpace(body.Vendor)
 	apiKey := strings.TrimSpace(body.APIKey)
@@ -300,34 +301,59 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 	if vendorID == "" {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "vendor 不能为空"})
 	}
-	if apiKey == "" {
+	credentialJSON := strings.TrimSpace(body.CredentialJSON)
+	if apiKey == "" && credentialJSON == "" {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "api_key 不能为空"})
 	}
 	vendor, okVendor := s.registry.ByID(vendorID)
 	if !okVendor {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": fmt.Sprintf("未知供应商 %q", vendorID)})
 	}
-	payload := map[string]any{
-		"type":         s.deps.Identity().ProviderKey,
-		core.VendorKey: vendor.ID(),
-		"api_key":      apiKey,
-	}
-	if label != "" {
-		payload["label"] = label
-	}
-	rawJSON, errMarshal := json.MarshalIndent(payload, "", "  ")
-	if errMarshal != nil {
-		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
-	}
+	var rawJSON []byte
 	seed := label
-	if seed == "" {
-		seed = maskedAPIKey(apiKey)
+	if credentialJSON != "" {
+		// 原生凭证 JSON：补 vendor 归属字段后原样落盘，交给供应商 Parse 归一。
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(credentialJSON), &doc); err != nil || doc == nil {
+			return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "credential_json 不是合法的 JSON 对象"})
+		}
+		doc[core.VendorKey] = vendor.ID()
+		encoded, errMarshal := json.MarshalIndent(doc, "", "  ")
+		if errMarshal != nil {
+			return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
+		}
+		rawJSON = encoded
+		if seed == "" {
+			seed = core.RandomHex(8)
+		}
+	} else {
+		payload := map[string]any{
+			"type":         s.deps.Identity().ProviderKey,
+			core.VendorKey: vendor.ID(),
+			"api_key":      apiKey,
+		}
+		if label != "" {
+			payload["label"] = label
+		}
+		encoded, errMarshal := json.MarshalIndent(payload, "", "  ")
+		if errMarshal != nil {
+			return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
+		}
+		rawJSON = encoded
+		if seed == "" {
+			seed = maskedAPIKey(apiKey)
+		}
 	}
 	if seed == "" {
 		seed = core.RandomHex(8)
 	}
 	fileName := core.FileNameFor(vendor.ID(), seed)
 	callbackID := hostbridge.RequestCallbackID(req)
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	if errLimit := s.pool.CheckVendorLimit(ctx, callbackID, vendor, fileName); errLimit != nil {
+		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": errLimit.Error()})
+	}
 
 	if errSave := saveAuthFile(callbackID, fileName, rawJSON); errSave != nil {
 		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errSave.Error()})
@@ -349,15 +375,21 @@ func maskedAPIKey(key string) string {
 }
 
 func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountBatchRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[accountBatchRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
 	results := s.runForAccounts(ctx, hostbridge.RequestCallbackID(req), body.AccountIDs,
 		func(vendor core.Vendor, _ *core.Credential) bool { return core.SupportsCheckin(vendor) },
 		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (accountActionOutcome, error) {
+			// 供应商级能力为真时仍要按账号复核：企业账号天生没有签到活动，
+			// 如实报「跳过 + 原因」，而不是让上游 400 变成一条失败记录。
+			if !core.SupportsCheckinFor(vendor, credential) {
+				reason := core.FirstNonEmpty(core.CheckinUnsupportedReason(vendor, credential), "本账号不支持签到")
+				return accountActionOutcome{Message: reason, Skipped: true}, nil
+			}
 			checkin, okCheckin := core.As[core.CheckinProvider](vendor)
 			if !okCheckin {
 				return accountActionOutcome{}, fmt.Errorf("本供应商不提供签到")

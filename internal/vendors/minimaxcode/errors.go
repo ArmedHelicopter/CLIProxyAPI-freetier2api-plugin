@@ -23,7 +23,8 @@ import (
 // 上游会把「登录过期」写成余额话术的变体，先判余额会误判成 402。
 var (
 	credentialMarkers = []string{
-		"token invalid", "invalid token", "token expired", "token is expired",
+		"token invalid", "invalid token", "invalid access token", "access token invalid",
+		"access_token_invalid", "token expired", "token is expired",
 		"unauthorized", "unauthenticated", "login required", "not logged in",
 		"凭证无效", "凭证已过期", "登录已过期", "请重新登录", "未登录",
 	}

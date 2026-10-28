@@ -22,7 +22,10 @@ const (
 	codeParameterError  = 3001 // 缺 X-Device-Mid 等必需参数
 	codeSessionExpired  = 3004 // OAuth 轮询会话过期
 	codeModelNotAllowed = 3006 // 该账号套餐不含此模型
-	codeCaptchaFailed   = 3007 // 验证码校验失败（Plan 通道）
+	codeCaptchaFailed   = 3007 // 安全/验证码校验失败
+	codeConcurrent3008  = 3008 // Start Plan 并发请求上限
+	codeConcurrent3009  = 3009 // Start Plan 模型并发上限
+	codeConcurrent3010  = 3010 // Start Plan 模型并发上限
 	codeDailyQuota      = 1005 // 每日额度用完（额度耗尽的判定依据之一）
 	codeMaxTokens       = 1210 // max_tokens 超出 [1,131072]
 	codeUnusualActivity = 3012 // 风控「unusual activity」
@@ -74,6 +77,17 @@ func Classify(status int, body string) *core.Failure {
 			Msg:    core.FirstNonEmpty(msg, "凭证失效"),
 		}
 
+	// 3.5) 模型桶耗尽：1005 + "exceed quota limit" 是 model_usage 桶的
+	//      **账号内单模型**额度耗尽（如活动礼包的 GLM-5.3 用完而 Flash 尚有
+	//      余量）。按（账号, 模型）避让而不是整个账号冷却——否则同一账号里
+	//      还有余量的模型会被连坐封掉。
+	case payload.Code == codeDailyQuota && strings.Contains(lower, "exceed quota limit"):
+		return &core.Failure{
+			Kind:   core.FailureKindModelBlocked,
+			Status: pickStatus(status, http.StatusBadRequest),
+			Msg:    core.FirstNonEmpty(msg, "该模型的额度已耗尽"),
+		}
+
 	// 4) 额度耗尽
 	case status == http.StatusPaymentRequired || promptExhausted(lower, payload.Code):
 		return &core.Failure{
@@ -82,11 +96,15 @@ func Classify(status int, body string) *core.Failure {
 			Msg:    core.FirstNonEmpty(msg, "额度已用完"),
 		}
 
-	// 5) 限流
-	case status == http.StatusTooManyRequests:
+	// 5) 限流 / 并发上限（3008/3009/3010）。上游偶发把并发超限包成 500 +
+	//    OpenAI 形态错误（"model concurrency limit exceeded"），按文案兜住，
+	//    避免落进 5xx 分支被当成上游故障计入熔断。只认完整短语，避免无关
+	//    正文里出现「concurrency limit」时被误判成软限流。
+	case status == http.StatusTooManyRequests || payload.Code == codeConcurrent3008 || payload.Code == codeConcurrent3009 || payload.Code == codeConcurrent3010 ||
+		strings.Contains(lower, "concurrency limit exceeded"):
 		return &core.Failure{
 			Kind:   core.FailureKindSoftRate,
-			Status: status,
+			Status: pickStatus(status, http.StatusTooManyRequests),
 			Msg:    core.FirstNonEmpty(msg, "上游限流"),
 		}
 

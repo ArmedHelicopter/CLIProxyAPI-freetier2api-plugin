@@ -5,7 +5,6 @@ import (
 	"testing"
 	"time"
 
-	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/state"
@@ -32,8 +31,6 @@ func (f *fakeDeps) Now() time.Time           { return f.now }
 func (f *fakeDeps) MutateState(mutate func(*state.State)) {
 	mutate(&f.state)
 }
-
-func (f *fakeDeps) RuntimeFields() []pluginapi.ConfigField { return nil }
 
 func (f *fakeDeps) SaveRefreshedCredential(
 	ctx context.Context, callbackID string, vendor core.Vendor,

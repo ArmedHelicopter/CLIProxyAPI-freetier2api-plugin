@@ -43,6 +43,9 @@ const VendorKey = "vendor"
 // 产生不一致的分帧行为，且两套代码都要跟着上游协议变化维护。
 const FormatChatCompletions = "chat-completions"
 
+// MaxAccountsPerVendor 是单个供应商允许添加的最大账号数。
+const MaxAccountsPerVendor = 10
+
 // Vendor 是供应商实例的**必需**契约（= 供应商协议 × 区域）。
 //
 // 只放每家都必然具备的能力：身份、凭证归属/解析、模型清单、对话执行。

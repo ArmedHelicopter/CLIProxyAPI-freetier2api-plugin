@@ -16,34 +16,9 @@ import (
 	"encoding/json"
 	"net/http"
 	"testing"
-
-	"freetier2api-plugin/cpasdk/pluginabi"
-	"freetier2api-plugin/cpasdk/pluginapi"
 )
 
-// managementCall 调一次插件管理接口并返回响应体。
-func managementCall(t *testing.T, method, path string) pluginapi.ManagementResponse {
-	t.Helper()
-	raw, errHandle := testApp.HandleMethod(pluginabi.MethodManagementHandle, mustMarshal(pluginapi.ManagementRequest{
-		Method: method,
-		Path:   "/v0/management/plugins/freetier2api" + path,
-		Headers: http.Header{
-			"X-Host-Callback-Id": []string{testCallbackID},
-		},
-	}))
-	if errHandle != nil {
-		t.Fatalf("%s %s: %v", method, path, errHandle)
-	}
-	var env abiEnvelope
-	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
-		t.Fatalf("decode envelope: %v", errUnmarshal)
-	}
-	var resp pluginapi.ManagementResponse
-	if errUnmarshal := json.Unmarshal(env.Result, &resp); errUnmarshal != nil {
-		t.Fatalf("decode management response: %v (raw=%s)", errUnmarshal, env.Result)
-	}
-	return resp
-}
+// managementCall 与 managementCallWithBody 见 testutil_test.go。
 
 // statusAccounts 拉一次 /status 并取出账号列表。
 func statusAccounts(t *testing.T) []struct {
@@ -77,12 +52,12 @@ func statusAccounts(t *testing.T) []struct {
 	return payload.Accounts
 }
 
-// TestQuotaUnsupportedAccountNeverStaysQuerying 覆盖事故本身。
+// TestQuotaUnsupportedAccountNeverStaysQuerying 覆盖不支持额度账号的展示契约。
 //
 // OpenCode ZEN 实现不了 QuotaProvider，因此：
 //   - /status 的 supports_quota 必须是 false（页面据此显示「-- / --」）；
-//   - 查过一次额度后，结果（ok=false）必须被缓存下来——否则下次 /status
-//     又回到「没有结果」，页面就重新退化成「查询中…」。
+//   - /quotas 结果不得包含该账号，避免它出现在额度查询窗口；
+//   - /status 仍然保留账号本身，供账号表展示。
 func TestQuotaUnsupportedAccountNeverStaysQuerying(t *testing.T) {
 	host := installFakeHost(t)
 	setupTestPlugin(t)
@@ -114,15 +89,20 @@ func TestQuotaUnsupportedAccountNeverStaysQuerying(t *testing.T) {
 	if len(accounts) != 1 {
 		t.Fatalf("want 1 account after quota query, got %d", len(accounts))
 	}
-	if accounts[0].Quota == nil {
-		t.Fatal("the unsupported-quota result must be cached: without it the console " +
-			"falls back to「查询中…」on every status refresh")
+	var quotaResponse struct {
+		Results []struct {
+			AuthID string `json:"auth_id"`
+		} `json:"results"`
 	}
-	if accounts[0].Quota.OK {
-		t.Fatalf("unsupported quota must report ok=false, got %+v", accounts[0].Quota)
+	if errDecode := json.Unmarshal([]byte(resp.Body), &quotaResponse); errDecode != nil {
+		t.Fatalf("decode /quotas response: %v", errDecode)
 	}
-	if accounts[0].Quota.Message == "" {
-		t.Fatal("unsupported quota must carry an explanatory message")
+	if len(quotaResponse.Results) != 0 {
+		t.Fatalf("unsupported account must not enter quota results: %+v", quotaResponse.Results)
+	}
+	accounts = statusAccounts(t)
+	if len(accounts) != 1 || accounts[0].Quota != nil {
+		t.Fatalf("unsupported account should remain visible without quota result: %+v", accounts)
 	}
 }
 

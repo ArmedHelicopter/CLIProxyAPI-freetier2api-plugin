@@ -1,7 +1,6 @@
 package admin
 
 import (
-	"encoding/json"
 	"net/http"
 	"sort"
 	"strconv"
@@ -196,18 +195,17 @@ func (s *Service) ModelAlias(req pluginapi.ManagementRequest) pluginapi.Manageme
 	return s.modelAliasHandler(req)
 }
 
+// modelToggleRequest 是批量禁用/启用模型的请求体。
+type modelToggleRequest struct {
+	Models   []string `json:"models"`
+	Disabled bool     `json:"disabled"`
+}
+
 // modelToggleHandler 批量禁用/启用模型。
 func (s *Service) modelToggleHandler(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body struct {
-		Models   []string `json:"models"`
-		Disabled bool     `json:"disabled"`
-	}
-	if len(req.Body) > 0 {
-		if errUnmarshal := json.Unmarshal(req.Body, &body); errUnmarshal != nil {
-			return JSONResponse(http.StatusBadRequest, map[string]any{
-				"ok": false, "error": "请求体解析失败：" + errUnmarshal.Error(),
-			})
-		}
+	body, errDecode := decodeRequest[modelToggleRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	targets := make([]string, 0, len(body.Models))
 	for _, item := range body.Models {
@@ -231,18 +229,17 @@ func (s *Service) modelToggleHandler(req pluginapi.ManagementRequest) pluginapi.
 	})
 }
 
+// modelAliasRequest 是设置/清除模型别名的请求体。
+type modelAliasRequest struct {
+	Model string `json:"model"`
+	Alias string `json:"alias"`
+}
+
 // modelAliasHandler 设置或清除某个模型的别名。
 func (s *Service) modelAliasHandler(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body struct {
-		Model string `json:"model"`
-		Alias string `json:"alias"`
-	}
-	if len(req.Body) > 0 {
-		if errUnmarshal := json.Unmarshal(req.Body, &body); errUnmarshal != nil {
-			return JSONResponse(http.StatusBadRequest, map[string]any{
-				"ok": false, "error": "请求体解析失败：" + errUnmarshal.Error(),
-			})
-		}
+	body, errDecode := decodeRequest[modelAliasRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	vendorID, bare := s.deps.Model().VendorForAliasScope(body.Model)
 	if vendorID == "" || strings.TrimSpace(bare) == "" {

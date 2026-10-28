@@ -54,6 +54,49 @@ func TestTotalsRecognizesEveryVendorKeyFamily(t *testing.T) {
 			want: QuotaTotals{Remaining: 80, Total: 100},
 		},
 		{
+			name: "合法零额度不被后续额度族覆盖",
+			summary: []pluginapi.QuotaMetric{
+				{Key: "user_quota_remaining", Value: 0},
+				{Key: "addon_quota_remaining", Value: 50},
+				{Key: "user_quota_total", Value: 100},
+				{Key: "addon_quota_total", Value: 200},
+			},
+			want: QuotaTotals{Remaining: 0, Total: 100},
+		},
+		{
+			// Qoder Free 计划：套餐额度是合法的 {used:0,total:0,remaining:0}，
+			// 真正有数的是拓展包。按出现顺序取会把账号永久锁死在 0/0。
+			name: "首个族为 0/0 时让位给有容量的族（Qoder Free + 拓展包）",
+			summary: []pluginapi.QuotaMetric{
+				{Key: "user_quota_remaining", Value: 0},
+				{Key: "user_quota_total", Value: 0},
+				{Key: "user_quota_used", Value: 0},
+				{Key: "addon_quota_remaining", Value: 50},
+				{Key: "addon_quota_total", Value: 200},
+				{Key: "addon_quota_used", Value: 150},
+			},
+			want: QuotaTotals{Remaining: 50, Total: 200},
+		},
+		{
+			name: "所有族都是 0/0 时保留第一个族（额度已用尽 / 未开通）",
+			summary: []pluginapi.QuotaMetric{
+				{Key: "user_quota_remaining", Value: 0},
+				{Key: "user_quota_total", Value: 0},
+				{Key: "addon_quota_remaining", Value: 0},
+				{Key: "addon_quota_total", Value: 0},
+			},
+			want: QuotaTotals{Remaining: 0, Total: 0},
+		},
+		{
+			name: "只给了 total=0 时不从 used 反推（presence 决定，非数值）",
+			summary: []pluginapi.QuotaMetric{
+				{Key: "credit_remain", Value: 0},
+				{Key: "credit_total", Value: 0},
+				{Key: "credit_used", Value: 20},
+			},
+			want: QuotaTotals{Remaining: 0, Total: 0},
+		},
+		{
 			name: "无限额度（Trae 用 -1 / unlimited 表达）",
 			summary: []pluginapi.QuotaMetric{
 				{Key: "credit_remain", Value: -1, Unit: "unlimited"},
@@ -84,5 +127,26 @@ func TestTotalsIgnoresUnknownKeys(t *testing.T) {
 	}})
 	if got != (QuotaTotals{}) {
 		t.Fatalf("未登记的键族不应被折算，得到 %+v", got)
+	}
+}
+
+// TestTokenPlanFamilyIndependentOfDefault 锁定 token_plan 族与 default 族
+// 并存时的取值行为：点数（default）有容量时优先，token 余量不覆盖点数；
+// 点数耗尽时回落 token_plan。MiniMax Token Plan 与 op 点数并存的账号
+// 依赖这一行为（见 minimax PR 审查 P1-1）。
+func TestTokenPlanFamilyIndependentOfDefault(t *testing.T) {
+	both := &pluginapi.QuotaFetchResponse{Summary: []pluginapi.QuotaMetric{
+		{Key: "remaining", Value: 500, Unit: "点"},
+		{Key: "token_remaining", Value: 14291681135, Unit: "tokens"},
+	}}
+	if got := Totals(both); got.Remaining != 500 {
+		t.Fatalf("default family must win when it has capacity, got %d", got.Remaining)
+	}
+	zeroPoints := &pluginapi.QuotaFetchResponse{Summary: []pluginapi.QuotaMetric{
+		{Key: "remaining", Value: 0, Unit: "点"},
+		{Key: "token_remaining", Value: 14291681135, Unit: "tokens"},
+	}}
+	if got := Totals(zeroPoints); got.Remaining != 14291681135 {
+		t.Fatalf("token_plan family must take over when default is empty, got %d", got.Remaining)
 	}
 }

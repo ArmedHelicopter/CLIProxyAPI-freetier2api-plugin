@@ -100,7 +100,7 @@ func httpGetBearerJSON(ctx context.Context, endpoint, token string) (map[string]
 		return nil, NewError("qoder_upstream_transient", errDo.Error(), http.StatusBadGateway)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := readQoderResponseBody(resp.Body)
 	if errRead != nil {
 		return nil, NewError("qoder_upstream_error", errRead.Error(), http.StatusBadGateway)
 	}
@@ -375,8 +375,9 @@ type dailyCheckinStatus struct {
 
 // Checkin 执行一次签到。
 //
-// identity 是本次要携带的官方客户端设备身份；国际版缺它时活动列表会被
-// 上游静默过滤，因此这里在查活动**之前**就如实报告「缺少设备身份」。
+// identity 是用户提供的官方组件设备身份；没有时它为零值，请求里不发机器头
+// （见 checkinHeaders）。国内版不需要身份；国际版没有身份就看不到活动，
+// 此时结果会说明原因而不是笼统报「无可用签到活动」。
 func Checkin(ctx context.Context, cred *Credential, identity MachineIdentity) (*CheckinResult, error) {
 	result := &CheckinResult{Status: CheckinError}
 	bearer := checkinBearer(cred.Token)
@@ -533,8 +534,20 @@ func campaignsCheckin(ctx context.Context, region Region, bearer string, identit
 	}
 	result.Status = CheckinNoCampaign
 	result.NotRecorded = true
-	result.Message = "无可用签到活动"
+	result.Message = noCampaignMessage(region, identity)
 	return result
+}
+
+// noCampaignMessage 说明「没有可领取活动」的真实原因。
+//
+// 国际版的活动只下发给登录过官方客户端的那台真机（上游按 machinetoken 精确
+// 校验，2026-10-23 实测：派生值、容器内官方组件、改一位的值全部无效）。没带
+// 身份时不能笼统地说「无可用签到活动」——那会让用户以为今天本来就没活动。
+func noCampaignMessage(region Region, identity MachineIdentity) string {
+	if region == RegionGlobal && !identity.Native() {
+		return "国际版活动只下发给登录过官方客户端的设备；请在该机器上运行 runtime-info，把输出的 machineToken/machineType 填入凭证或插件配置"
+	}
+	return "无可用签到活动"
 }
 
 // claimCampaign 领取一次活动，并在领取后回读上游确认发放。
@@ -813,29 +826,26 @@ func parseCampaigns(raw any) []campaignInfo {
 // cosy-clienttype: 10 是桌面端标识；上游按它放行签到接口，
 // 不需要 cosy 签名（这是签到与对话接口最大的差异）。
 //
-// 机器头只在拿到**官方组件给的真身份**时才发（见 identity.go）：国际版
-// 缺了它们，可领取活动会被上游静默过滤；而发派生假身份同样会被过滤，
-// 所以拿不到就一个都不发。
-// checkinHeaders 是桌面端签到所需的请求头（抓包确认）。
-//
-// cosy-clienttype: 10 是桌面端标识；上游按它放行签到接口，
-// 不需要 cosy 签名（这是签到与对话接口最大的差异）。
-//
-// 机器头必须**成对**出现（token + type）：实测缺任一个，国际版可领取活动
-// 会被上游静默过滤。身份由 identity.go 按账号种子派生。
+// 机器头**只在用户提供了官方组件签发的真身份时才发**（见 identity.go）：
+// 上游对 machinetoken/machinetype 做精确校验，任何派生、随机或拼接的值都会
+// 让可领取活动被整条过滤——国内版本来看得见，发假头反而看不见。没有真身份
+// 时一个都不发，这是唯一不会自我破坏的选择。
 func checkinHeaders(bearer string, identity MachineIdentity) map[string]string {
 	headers := map[string]string{
-		"authorization":        "Bearer " + bearer,
-		"accept":               "application/json",
-		"accept-language":      "zh-CN",
-		"user-agent":           "Qoder",
-		"cosy-clienttype":      "10",
-		"cosy-version":         identity.Version,
-		"cosy-machineid":       identity.MachineID,
-		"cosy-machinetoken":    identity.Token,
-		"cosy-machinetype":     identity.Type,
-		"cosy-machineos":       identity.MachineOS,
-		"cosy-machinehostname": identity.Hostname,
+		"authorization":   "Bearer " + bearer,
+		"accept":          "application/json",
+		"accept-language": "zh-CN",
+		"user-agent":      "Qoder",
+		"cosy-clienttype": "10",
+		"cosy-version":    identity.Version,
+	}
+	if !identity.Native() {
+		return headers
+	}
+	headers["cosy-machinetoken"] = identity.Token
+	headers["cosy-machinetype"] = identity.Type
+	if identity.Code != "" {
+		headers["cosy-machinecode"] = identity.Code
 	}
 	return headers
 }
@@ -879,7 +889,10 @@ func doCheckinRequest(ctx context.Context, region Region, method, path, bearer s
 		return 0, nil, fmt.Sprintf("do request: %v", errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, errRead := readQoderResponseBody(resp.Body)
+	if errRead != nil {
+		return resp.StatusCode, nil, "read response: " + errRead.Error()
+	}
 	var parsed any
 	if len(data) > 0 {
 		_ = json.Unmarshal(data, &parsed)

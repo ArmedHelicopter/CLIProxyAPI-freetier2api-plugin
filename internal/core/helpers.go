@@ -237,6 +237,67 @@ func RandomHex(n int) string {
 	return hex.EncodeToString(buf)
 }
 
+// jwtPayload 解码 JWT 的第二段 payload（不验签）；解不出返回 nil。
+func jwtPayload(token string) []byte {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	payload, errDecode := base64.RawURLEncoding.DecodeString(parts[1])
+	if errDecode == nil {
+		return payload
+	}
+	seg := parts[1]
+	if rem := len(seg) % 4; rem > 0 {
+		seg += strings.Repeat("=", 4-rem)
+	}
+	if payload, errDecode = base64.URLEncoding.DecodeString(seg); errDecode == nil {
+		return payload
+	}
+	return nil
+}
+
+// MaskToken 返回脱敏后的 token（展示用）：保留前 4 后 4 位，中间用 * 填充。
+// 不超过 8 位时全部遮挡；空值返回空串。
+func MaskToken(token string) string {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) <= 8 {
+		return strings.Repeat("*", len(trimmed))
+	}
+	return trimmed[:4] + strings.Repeat("*", len(trimmed)-8) + trimmed[len(trimmed)-4:]
+}
+
+// JWTExpiry 解码 JWT payload 的 exp（秒），解不出返回 0。不验签，只读 exp。
+func JWTExpiry(token string) int64 {
+	payload := jwtPayload(token)
+	if len(payload) == 0 {
+		return 0
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if errUnmarshal := json.Unmarshal(payload, &claims); errUnmarshal != nil || claims.Exp <= 0 {
+		return 0
+	}
+	return claims.Exp
+}
+
+// JWTUserID 解码 JWT payload 里的用户 id（依次尝试常见键），解不出返回空。
+func JWTUserID(token string) string {
+	payload := jwtPayload(token)
+	if len(payload) == 0 {
+		return ""
+	}
+	var claims map[string]any
+	if errUnmarshal := json.Unmarshal(payload, &claims); errUnmarshal != nil {
+		return ""
+	}
+	return GetString(claims, "user_id", "userId", "uid", "userID")
+}
+
 // NewPKCEPair 生成 PKCE 的 verifier 与 S256 challenge。
 func NewPKCEPair() (verifier, challenge string, err error) {
 	buffer := make([]byte, 32)

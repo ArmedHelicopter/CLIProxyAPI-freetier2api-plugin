@@ -433,10 +433,14 @@ func (a *App) handleQuotaReset(request []byte) ([]byte, error) {
 	if errResolve != nil {
 		return nil, errResolve
 	}
-	if !core.SupportsCheckin(vendor) {
+	if !core.SupportsCheckinFor(vendor, credential) {
+		// 供应商级能力为真但账号级为假时（WorkBuddy 企业账号），
+		// 用供应商给出的原因说明，避免把「不支持签到」显示成失败。
+		message := core.FirstNonEmpty(core.CheckinUnsupportedReason(vendor, credential),
+			"本供应商不提供签到；额度按上游周期自动重置")
 		return core.OKEnvelope(pluginapi.QuotaResetResponse{
 			Success: false,
-			Message: "本供应商不提供签到；额度按上游周期自动重置",
+			Message: message,
 		})
 	}
 	checkin, okCheckin := core.As[core.CheckinProvider](vendor)

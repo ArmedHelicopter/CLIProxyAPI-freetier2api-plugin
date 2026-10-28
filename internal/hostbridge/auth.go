@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
@@ -50,6 +51,29 @@ func ListAuths(ctx context.Context, callbackID string, registry *core.Registry) 
 	// 按文件名将 Files 的文件属性（如 ModTime、Path）合入 Auths，避免将同一凭证重复展示。
 	entries = mergeAuthsAndFiles(wrapper.Auths, wrapper.Files)
 	return filterPluginAuths(entries, registry), nil
+}
+
+// ResolveAuthPath 把宿主给出的凭证文件路径归一化成绝对路径。
+//
+// 宿主不一定给绝对路径：EasyCLIProxyAPI 把内核的 oauth.auth-dir 配成相对路径
+// （默认 ../oauth，相对内核工作目录），CLIProxyAPI 扫盘时把相对路径写进 auth
+// 属性，host.auth.list / host.auth.get 又原样返回。插件与宿主是同进程、同工作
+// 目录，所以 filepath.Abs 解析出来的就是宿主实际读写的那个文件；这也是宿主自己
+// 管理接口 DELETE /v0/management/auth-files 的做法。
+//
+// 归一化只放在**宿主边界**：Path 是本插件所有路径消费方（删除、stat 取修改时间、
+// 读文件兜底、续期写回）的共同输入，各自再换算一次就会出现「有的路径是绝对、
+// 有的是相对」的分歧。空值原样返回，交给调用方按「没有文件」处理。
+func ResolveAuthPath(path string) string {
+	trimmed := strings.TrimSpace(path)
+	if trimmed == "" {
+		return ""
+	}
+	abs, errAbs := filepath.Abs(trimmed)
+	if errAbs != nil {
+		return trimmed
+	}
+	return abs
 }
 
 // mergeAuthsAndFiles 合并宿主 Auths 与 Files，避免同一凭证出现重复条目。
@@ -105,6 +129,7 @@ func filterPluginAuths(entries []core.HostAuth, registry *core.Registry) []core.
 		if !belongs {
 			continue
 		}
+		entry.Path = ResolveAuthPath(entry.Path)
 
 		// 归一化去重键：优先用去掉 .json 的 Name，其次用 ID
 		key := normalizeAuthKey(entry.Name)
@@ -277,7 +302,7 @@ func AuthJSONAndPath(ctx context.Context, callbackID, authIndex string) ([]byte,
 	if len(response.JSON) == 0 {
 		return nil, "", false
 	}
-	return response.JSON, response.Path, true
+	return response.JSON, ResolveAuthPath(response.Path), true
 }
 
 // getAuthJSONByIndex 按 auth_index 取凭证 JSON。

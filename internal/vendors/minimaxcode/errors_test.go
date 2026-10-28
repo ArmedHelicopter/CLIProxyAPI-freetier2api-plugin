@@ -7,6 +7,19 @@ import (
 	"freetier2api-plugin/internal/core"
 )
 
+func TestClassifyInvalidAccessTokenAsCredential(t *testing.T) {
+	got := Classify(http.StatusInternalServerError, `{"error":"invalid access token"}`)
+	if got.Kind != core.FailureKindCredential {
+		t.Fatalf("kind = %s, want credential", got.Kind)
+	}
+	if got.HTTPStatus() != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", got.HTTPStatus())
+	}
+	if got.Retryable() {
+		t.Fatal("invalid access token must not be retryable as a transient 5xx")
+	}
+}
+
 func TestClassifyCredentialBeatsBalanceWording(t *testing.T) {
 	// 上游会把登录过期写成余额话术的变体；凭证判定必须排在余额之前。
 	got := Classify(http.StatusBadRequest, "token invalid, balance unchanged")

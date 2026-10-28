@@ -6,6 +6,7 @@ import (
 	"context"
 	_ "embed"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -102,6 +103,90 @@ func ChatStream(ctx context.Context, baseURL string, req ChatRequest, onChunk fu
 	return parseAnthropicSSE(resp.Body, converter, onChunk)
 }
 
+// ---- Start Plan 出站闸门 ----
+
+// planQueueWaitTimeout 是排队等待同账号在途对话出清的上限。覆盖常见流式
+// 回答长度；超过后按 SoftRate 交还宿主换路，不把请求挂死。
+const planQueueWaitTimeout = 90 * time.Second
+
+// errPlanQueueTimeout 表示排队超过上限，未取得出站资格。
+var errPlanQueueTimeout = errors.New("zcode start plan queue timeout")
+
+// chatGate 按账号串行化 Start Plan 通道的对话出站。
+//
+// 为什么需要它：Start Plan 是单用户交互套餐，上游以 3008/3009/3010 明确
+// 声明了并发上限，高频并发还会触发 3012「unusual activity」；官方客户端天然
+// 串行（一个用户在打字）。本插件把宿主转发来的并发 agent 请求直灌上游，
+// 等价于把几十个会话塞进一个交互套餐——上游按设计拒绝。同一账号同一时刻
+// 只放行一个在途对话，排队者等前一个出清后再出站，与官方客户端行为一致。
+//
+// 这不是绕过风控：上游以业务错误码声明了并发上限，客户端遵守自己收到的
+// 限制并排队是标准做法；排队等不到时按 SoftRate 交还宿主换路。
+//
+// 状态属于 vendor 实例（与 claimGate 同一约定）：多 App 并存时各自独立。
+type chatGate struct {
+	mu    sync.Mutex
+	slots map[string]chan struct{}
+}
+
+// newChatGate 构造实例级闸门。
+func newChatGate() *chatGate {
+	return &chatGate{slots: map[string]chan struct{}{}}
+}
+
+// acquire 取得该账号的出站资格并返回交还函数：无在途对话立即返回；否则
+// 有界排队，请求 context 取消（宿主断开客户端）时提前退出、不占队列。
+func (g *chatGate) acquire(ctx context.Context, accountKey string) (func(), error) {
+	slot := g.slot(accountKey)
+	timer := time.NewTimer(planQueueWaitTimeout)
+	defer timer.Stop()
+	select {
+	case slot <- struct{}{}:
+		return func() { <-slot }, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-timer.C:
+		return nil, errPlanQueueTimeout
+	}
+}
+
+// slot 返回账号对应的闸门。账号数受 core.MaxAccountsPerVendor 约束，无需回收。
+func (g *chatGate) slot(accountKey string) chan struct{} {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	slot, ok := g.slots[accountKey]
+	if !ok {
+		slot = make(chan struct{}, 1)
+		g.slots[accountKey] = slot
+	}
+	return slot
+}
+
+// holdStartPlanSlot 为一次对话取得 Start Plan 出站资格，返回值在成功时必为
+// 可调用函数，便于 defer。纯 API Key 通道不受该并发上限约束，直接放行。
+func (v *adapter) holdStartPlanSlot(ctx context.Context, cred *Credential) (func(), error) {
+	if cred == nil || !cred.UsesPlanChannel() {
+		return func() {}, nil
+	}
+	release, errAcquire := v.gate.acquire(ctx, cred.AccountKey())
+	if errAcquire == nil {
+		return release, nil
+	}
+	if errors.Is(errAcquire, errPlanQueueTimeout) {
+		return nil, &core.Failure{
+			Kind:   core.FailureKindSoftRate,
+			Status: 0,
+			Msg:    "zcode Start Plan 通道并发排队超时（同账号在途对话未出清），已交还宿主换路",
+		}
+	}
+	// 宿主已断开：不重试，也不计入上游故障。
+	return nil, &core.Failure{
+		Kind:   core.FailureKindClient,
+		Status: 0,
+		Msg:    "zcode chat cancelled while queued: " + errAcquire.Error(),
+	}
+}
+
 // emitCollapsedCompletion 把一次非流式响应折成 OpenAI chunk 序列。
 //
 // 上游忽略 stream 参数时的兜底路径：客户端发的是流式请求，必须仍然收到
@@ -122,6 +207,11 @@ func emitCollapsedCompletion(completion []byte, model string, onChunk func([]byt
 		return errStart
 	}
 	message := resp.Choices[0].Message
+	if reasoning, ok := message["reasoning_content"].(string); ok && reasoning != "" {
+		if errEmit := onChunk(converter.chunk(map[string]any{"reasoning_content": reasoning}, nil)); errEmit != nil {
+			return errEmit
+		}
+	}
 	if content, ok := message["content"].(string); ok && content != "" {
 		chunk := converter.chunk(map[string]any{"content": content}, nil)
 		if errEmit := onChunk(chunk); errEmit != nil {
@@ -176,18 +266,27 @@ func buildHTTPRequest(ctx context.Context, baseURL string, req ChatRequest) (*ht
 
 // resolveTargetURL 决定本次对话走哪条通道。
 //
-// 上游 Plan 通道强制校验 X-Aliyun-Captcha-Verify-Param；本插件不内置浏览器
-// 验证码求解（成本与依赖都过高），因此**只走 API Key 通道**。JWT 仍保留在
-// 凭证里供 billing 族使用，但不用它发对话请求。
+// 优先走 Start Plan 通道（zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages，Bearer JWT）；
+// 仅持 API Key 的账号走 ZCode 官方网关转发通道（zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages，
+// 对齐官方客户端 official-coding-plan-gateway.ts，避免直连 api.z.ai 在国内网络下 DNS 解析失败）。
 func resolveTargetURL(baseURL string, cred *Credential) (string, error) {
-	base := strings.TrimRight(baseURL, "/")
-	if base == "" {
-		base = ZAIOrigin
+	if cred == nil {
+		return "", fmt.Errorf("zcode credential is nil")
 	}
-	if strings.TrimSpace(cred.APIKey) == "" {
-		return "", fmt.Errorf("zcode: 该账号没有 API Key，无法走对话通道（Plan 通道需要人机验证码，本插件未启用求解）")
+	base := strings.TrimRight(strings.TrimSpace(baseURL), "/")
+	if cred.UsesPlanChannel() {
+		if base == "" {
+			base = ZCodeOrigin
+		}
+		return base + PathPlanMessages, nil
 	}
-	return base + PathAPIMessages, nil
+	if strings.TrimSpace(cred.APIKey) != "" {
+		if base == "" {
+			return ZCodeOrigin + PathUltraZAIMessages, nil
+		}
+		return base + PathAPIMessages, nil
+	}
+	return "", fmt.Errorf("zcode: credential missing both jwt_token and api_key")
 }
 
 // applyChatHeaders 组装出站请求头：鉴权 + 身份头 + 追踪头。
@@ -196,8 +295,13 @@ func applyChatHeaders(req *http.Request, cred *Credential) {
 		"Content-Type":      "application/json",
 		"Accept":            "text/event-stream, application/json",
 		"anthropic-version": AnthropicVersion,
-		// API Key 通道用 x-api-key（免验证码）；不发送 Plan 通道的验证码头。
-		"x-api-key": cred.APIKey,
+	}
+	if cred.UsesPlanChannel() {
+		headers["Authorization"] = "Bearer " + cred.JWTToken
+		headers["x-api-key"] = cred.JWTToken
+	} else if strings.TrimSpace(cred.APIKey) != "" {
+		headers["x-api-key"] = cred.APIKey
+		headers["Authorization"] = "Bearer " + cred.APIKey
 	}
 	BuildIdentityHeaders(cred.Profile).Apply(headers)
 	for key, value := range BuildTraceHeaders() {
@@ -295,30 +399,39 @@ func convertMessages(messages []any) ([]string, []map[string]any) {
 			}
 
 		case "tool":
-			// 工具结果在 Anthropic 协议里是 user 消息下的 tool_result 块。
-			outMessages = append(outMessages, map[string]any{
-				"role": "user",
-				"content": []any{map[string]any{
-					"type":        "tool_result",
-					"tool_use_id": strings.TrimSpace(core.RawStringField(msg, "tool_call_id")),
-					"content":     textFromContent(content),
-				}},
-			})
+			// 工具结果在 Anthropic 协议里是 user 消息下的 tool_result 块；连续的 tool/user 消息合并。
+			outMessages = appendAnthropicMessage(outMessages, "user", []any{map[string]any{
+				"type":        "tool_result",
+				"tool_use_id": strings.TrimSpace(core.RawStringField(msg, "tool_call_id")),
+				"content":     textFromContent(content),
+			}})
 
 		case "assistant":
-			outMessages = append(outMessages, map[string]any{
-				"role":    "assistant",
-				"content": assistantBlocks(content, msg["tool_calls"]),
-			})
+			outMessages = appendAnthropicMessage(outMessages, "assistant", assistantBlocks(content, msg["tool_calls"]))
 
 		default:
-			outMessages = append(outMessages, map[string]any{
-				"role":    "user",
-				"content": userBlocks(content),
-			})
+			outMessages = appendAnthropicMessage(outMessages, "user", userBlocks(content))
 		}
 	}
 	return systemParts, outMessages
+}
+
+// appendAnthropicMessage 追加一条 Anthropic 消息；若与上一条同 role 则合并其 content 块，
+// 满足 Anthropic Messages 协议对 user / assistant 严格交替的要求（例如并发工具返回多条 tool 结果）。
+func appendAnthropicMessage(out []map[string]any, role string, blocks []any) []map[string]any {
+	if len(blocks) == 0 {
+		return out
+	}
+	if n := len(out); n > 0 && core.RawStringField(out[n-1], "role") == role {
+		if prev, ok := out[n-1]["content"].([]any); ok {
+			out[n-1]["content"] = append(prev, blocks...)
+			return out
+		}
+	}
+	return append(out, map[string]any{
+		"role":    role,
+		"content": blocks,
+	})
 }
 
 // assistantBlocks 组装 assistant 的 content 块（文本 + tool_use）。
@@ -498,11 +611,12 @@ func anthropicToOpenAICompletion(raw []byte, model string) ([]byte, error) {
 		Model      string `json:"model"`
 		StopReason string `json:"stop_reason"`
 		Content    []struct {
-			Type  string          `json:"type"`
-			Text  string          `json:"text"`
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
+			Type     string          `json:"type"`
+			Text     string          `json:"text"`
+			Thinking string          `json:"thinking"`
+			ID       string          `json:"id"`
+			Name     string          `json:"name"`
+			Input    json.RawMessage `json:"input"`
 		} `json:"content"`
 		Usage struct {
 			InputTokens  int `json:"input_tokens"`
@@ -514,9 +628,12 @@ func anthropicToOpenAICompletion(raw []byte, model string) ([]byte, error) {
 	}
 
 	var text strings.Builder
+	var reasoning strings.Builder
 	var toolCalls []any
 	for _, block := range resp.Content {
 		switch block.Type {
+		case "thinking":
+			reasoning.WriteString(block.Thinking)
 		case "text":
 			text.WriteString(block.Text)
 		case "tool_use":
@@ -529,6 +646,9 @@ func anthropicToOpenAICompletion(raw []byte, model string) ([]byte, error) {
 		message["content"] = text.String()
 	} else {
 		message["content"] = nil
+	}
+	if reasoning.Len() > 0 {
+		message["reasoning_content"] = reasoning.String()
 	}
 	if len(toolCalls) > 0 {
 		message["tool_calls"] = toolCalls
@@ -646,6 +766,10 @@ func (c *streamConverter) feed(event map[string]any, onChunk func([]byte) error)
 			return nil
 		}
 		switch core.RawStringField(delta, "type") {
+		case "thinking_delta":
+			if thinking := core.RawStringField(delta, "thinking"); thinking != "" {
+				return onChunk(c.chunk(map[string]any{"reasoning_content": thinking}, nil))
+			}
 		case "text_delta":
 			if text := core.RawStringField(delta, "text"); text != "" {
 				return onChunk(c.chunk(map[string]any{"content": text}, nil))
@@ -845,15 +969,21 @@ func transientErr(msg string) *core.Failure {
 //go:embed assets/zcode_system.json
 var zcodeSystemJSON []byte
 
+type systemBlockTemplate struct {
+	Type         string         `json:"type"`
+	Text         string         `json:"text"`
+	CacheControl map[string]any `json:"cache_control,omitempty"`
+}
+
 var (
 	zcodeSystemOnce   sync.Once
-	zcodeSystemBlocks []any
+	zcodeSystemBlocks []systemBlockTemplate
 )
 
-// systemBlocks 返回官方身份块（解析失败时为空，此时跳过注入）。
-func systemBlocks() []any {
+// systemBlocks 返回官方身份块模板（解析失败时为空，此时跳过注入）。
+func systemBlocks() []systemBlockTemplate {
 	zcodeSystemOnce.Do(func() {
-		var blocks []any
+		var blocks []systemBlockTemplate
 		if errUnmarshal := json.Unmarshal(zcodeSystemJSON, &blocks); errUnmarshal != nil {
 			blocks = nil
 		}
@@ -862,8 +992,10 @@ func systemBlocks() []any {
 	return zcodeSystemBlocks
 }
 
-// applyStartPlanSystem 前置官方身份块与当前模型块，保留客户端原有 system。
+// applyStartPlanSystem 按 ZCode ContextBuilder 规范组装三段式 system（cli_prefix / stable / dynamic）。
 //
+// 上游网关严格校验这三段结构：追加第 4 个 system 块会触发 HTTP 405 code=3012 拦截。
+// 因此客户端传入的 system 提示词按官方 Output Style 槽位内嵌到第 3 段动态块中。
 // 幂等：首块已是官方标识时直接返回，重复调用不会重复拼接。
 func applyStartPlanSystem(body map[string]any, model string) {
 	blocks := systemBlocks()
@@ -874,61 +1006,67 @@ func applyStartPlanSystem(body map[string]any, model string) {
 	existing := body["system"]
 	if list, ok := existing.([]any); ok && len(list) > 0 {
 		if first, ok := list[0].(map[string]any); ok {
-			if core.RawStringField(first, "text") == core.RawStringField(blocks[0].(map[string]any), "text") {
+			if core.RawStringField(first, "text") == blocks[0].Text {
 				return
 			}
 		}
 	}
 
-	official := make([]any, 0, len(blocks)+2)
-	for _, block := range blocks {
-		official = append(official, cloneBlock(block))
-	}
+	modelLine := ""
 	if trimmed := strings.TrimSpace(model); trimmed != "" {
-		official = append(official, map[string]any{
-			"type":          "text",
-			"text":          "- You are powered by the model named " + trimmed + ".",
-			"cache_control": map[string]any{"type": "ephemeral"},
-		})
+		modelLine = "\n- You are powered by the model named account:zai-start-plan/" + trimmed + "."
 	}
-	body["system"] = append(official, normalizeUserSystem(existing)...)
+	outputStyle := ""
+	if userSys := extractUserSystemText(existing); userSys != "" {
+		outputStyle = "\n\n# Output Style: custom\n" + userSys
+	}
+
+	official := make([]any, 0, len(blocks))
+	for _, tmpl := range blocks {
+		text := strings.ReplaceAll(tmpl.Text, "{{MODEL_LINE}}", modelLine)
+		text = strings.ReplaceAll(text, "{{OUTPUT_STYLE}}", outputStyle)
+		entry := map[string]any{
+			"type": tmpl.Type,
+			"text": text,
+		}
+		if len(tmpl.CacheControl) > 0 {
+			cc := make(map[string]any, len(tmpl.CacheControl))
+			for k, v := range tmpl.CacheControl {
+				cc[k] = v
+			}
+			entry["cache_control"] = cc
+		}
+		official = append(official, entry)
+	}
+	body["system"] = official
 }
 
-// normalizeUserSystem 把客户端原有 system 归一成 text 块列表。
-//
-// Anthropic 要求 system 是 block 数组（或字符串），官方客户端注入后也是数组，
-// 因此这里统一成数组形态，避免出现「数组 + 字符串」混合。
-func normalizeUserSystem(system any) []any {
+// extractUserSystemText 提取客户端原有 system 文本。
+func extractUserSystemText(system any) string {
 	switch v := system.(type) {
 	case nil:
-		return nil
+		return ""
 	case string:
-		if strings.TrimSpace(v) == "" {
-			return nil
-		}
-		return []any{map[string]any{"type": "text", "text": v}}
+		return strings.TrimSpace(v)
 	case []any:
-		out := make([]any, 0, len(v))
+		parts := make([]string, 0, len(v))
 		for _, item := range v {
 			switch block := item.(type) {
 			case string:
-				if strings.TrimSpace(block) != "" {
-					out = append(out, map[string]any{"type": "text", "text": block})
+				if s := strings.TrimSpace(block); s != "" {
+					parts = append(parts, s)
 				}
 			case map[string]any:
-				if core.RawStringField(block, "type") != "text" || strings.TrimSpace(core.RawStringField(block, "text")) == "" {
-					continue
+				if core.RawStringField(block, "type") == "text" {
+					if s := strings.TrimSpace(core.RawStringField(block, "text")); s != "" {
+						parts = append(parts, s)
+					}
 				}
-				entry := map[string]any{"type": "text", "text": core.RawStringField(block, "text")}
-				if cc, ok := block["cache_control"]; ok {
-					entry["cache_control"] = cc
-				}
-				out = append(out, entry)
 			}
 		}
-		return out
+		return strings.Join(parts, "\n\n")
 	}
-	return nil
+	return ""
 }
 
 // applyCacheControl 给最后一条非 system 消息的末块加 ephemeral 缓存标记。
@@ -965,23 +1103,9 @@ func applyCacheControl(body map[string]any) {
 	}
 }
 
-// cloneBlock 深拷贝一个 system 块，避免调用方改动污染缓存的原型。
-func cloneBlock(block any) any {
-	raw, errMarshal := json.Marshal(block)
-	if errMarshal != nil {
-		return block
-	}
-	var cloned any
-	if errUnmarshal := json.Unmarshal(raw, &cloned); errUnmarshal != nil {
-		return block
-	}
-	return cloned
-}
-
 // 上游常量收口：URL、端点、客户端指纹与模型名。
 //
 // 约定与其它供应商一致：**禁止在别处硬编码上游常量**，一律引用本文件。
-// 参考 zcode2api/app/constants.py（其自身又标注「值均来自源码实证」）。
 
 const (
 	// VendorID 是本供应商在 freetier2api 插件内的唯一标识。
@@ -991,18 +1115,18 @@ const (
 
 	// ── 上游 origin ─────────────────────────────────────────────────────────
 
-	// ZCodeOrigin 承载 Plan 通道、计费族与 OAuth CLI。
+	// ZCodeOrigin 承载 Start Plan 对话通道、Ultra 网关、计费族与 OAuth CLI。
 	ZCodeOrigin = "https://zcode.z.ai"
-	// ZAIOrigin 承载 API Key 通道与 API Key 兑换链。
+	// ZAIOrigin 承载 API Key 兑换链。
 	ZAIOrigin = "https://api.z.ai"
 
 	// ── 对话端点 ────────────────────────────────────────────────────────────
 
-	// PathPlanMessages 是 Plan 通道（Bearer JWT）。上游**强制**校验
-	// X-Aliyun-Captcha-Verify-Param：没有真实浏览器求解器时该通道不可用，
-	// 因此本插件默认走 PathAPIMessages。
+	// PathPlanMessages 是 Start Plan 通道（Bearer JWT）。
 	PathPlanMessages = "/api/v1/zcode-plan/anthropic/v1/messages"
-	// PathAPIMessages 是 API Key 回退通道，免验证码。
+	// PathUltraZAIMessages 是 ZCode 官方网关对 api.z.ai 的代理路径（对齐 official-coding-plan-gateway.ts）。
+	PathUltraZAIMessages = "/api/v1/ultra-zai/anthropic/v1/messages"
+	// PathAPIMessages 是自定义 baseURL 时的直连 Anthropic Messages 路径。
 	PathAPIMessages = "/api/anthropic/v1/messages"
 
 	// ── OAuth CLI（headless，服务端中转）─────────────────────────────────────
@@ -1019,10 +1143,14 @@ const (
 
 	// ── 计费 / 额度（zcode.z.ai）────────────────────────────────────────────
 
-	// BillingBase 是计费族基准（current/balance/preview/claim）。
+	// BillingBase 是计费族基准（balance/preview/claim）。
+	//
+	// billing/current 已废弃（官方源码 codingPlanProviderAvailability.ts 与
+	// bigmodelUsageQuotaProvider.ts 均标注），持有套餐改由 billing/balance 的
+	// data.plans 判定，见 tasks.go 的 fetchPlanSnapshot。
 	BillingBase = ZCodeOrigin + "/api/v1/zcode-plan"
 
-	PathBillingCurrent = "/billing/current"
+	// PathBillingBalance 同时返回 data.plans（持有套餐）与 data.balances（余量）。
 	PathBillingBalance = "/billing/balance"
 	// PathBillingPreview 列出上游当前投放的套餐（未过滤已持有）。
 	PathBillingPreview = "/billing/preview"
@@ -1031,13 +1159,20 @@ const (
 	PathUsage         = "/usage"
 	PathClientConfigs = "/api/v1/client/configs"
 
+	// PathEventReport 是客户端埋点上报端点。
+	//
+	// **不在 zcode-plan 之下**（拼 BillingBase 会 404），也不带 Authorization。
+	// 上游把它当作活动套餐的投放资格信号：官方桌面端每次启动发 app_launch、
+	// 每天发一次 app_daily_active，缺了这两条 billing/preview 就恒空。
+	PathEventReport = "/api/v1/event/report"
+
 	// ── 客户端指纹 ──────────────────────────────────────────────────────────
 
 	// ClientAppVersion 是官方桌面端现行版本。
 	//
 	// 上游按客户端版本判定兼容性（版本过旧会被拒），因此跟进官方升版时要
 	// 同步改这里。
-	ClientAppVersion = "3.14.3"
+	ClientAppVersion = "3.16.2"
 
 	// UserAgent 与 ClientAppVersion 同源，避免两者漂移。
 	UserAgent = "ZCode/" + ClientAppVersion

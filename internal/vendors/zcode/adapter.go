@@ -15,9 +15,8 @@ import (
 // JWT 与兑换出的 API Key）。之所以声明为 oauth 而不是 apikey，是因为页面按
 // auth_mode 决定「添加账号」的动作——apikey 会直接弹输入框、不发起登录。
 //
-// 通道选择：对话只走 API Key 通道（api.z.ai，免人机验证码）。Plan 通道
-// （Bearer JWT）被上游强制要求 X-Aliyun-Captcha-Verify-Param，而本插件不内置
-// 浏览器验证码求解。JWT 仍保留，供额度查询与套餐领取使用。
+// 通道选择：具备 JWT 时优先走 Start Plan 通道（zcode.z.ai/api/v1/zcode-plan/anthropic/v1/messages）；
+// 纯 API Key 账号走 ZCode 官方网关转发通道（zcode.z.ai/api/v1/ultra-zai/anthropic/v1/messages）。
 
 // adapter 是 core.Vendor 在 ZCode 上的实现。
 type adapter struct {
@@ -25,11 +24,15 @@ type adapter struct {
 	baseURL string
 	// claims 是本实例的领取节流器；不共享，多 App 并存时互不影响。
 	claims *claimGate
+	// activations 是本实例的活跃上报去重表（每账号每日一次）。
+	activations *activationState
+	// gate 是本实例的 Start Plan 出站闸门；不共享，多 App 并存时互不影响。
+	gate *chatGate
 }
 
 // Instances 构造 ZCode 实例。
 func Instances(env core.Env) []core.Vendor {
-	return []core.Vendor{&adapter{claims: newClaimGate(), NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
+	return []core.Vendor{&adapter{claims: newClaimGate(), activations: newActivationState(), gate: newChatGate(), NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
 		Meta: core.Meta{VendorID: VendorID, VendorName: VendorName, VendorRegion: "global"},
 		Env:  env,
 		Extract: func(c *core.Credential) (*Credential, bool) {
@@ -109,6 +112,12 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	if errNative != nil {
 		return nil, errNative
 	}
+	release, errGate := v.holdStartPlanSlot(ctx, native)
+	if errGate != nil {
+		return nil, errGate
+	}
+	defer release()
+
 	payload, errChat := Chat(ctx, v.baseURL, ChatRequest{
 		Credential: native,
 		Body:       req.Payload,
@@ -129,6 +138,12 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errNative != nil {
 		return errNative
 	}
+	release, errGate := v.holdStartPlanSlot(ctx, native)
+	if errGate != nil {
+		return errGate
+	}
+	defer release()
+
 	return ChatStream(ctx, v.baseURL, ChatRequest{
 		Credential: native,
 		Body:       req.Payload,
@@ -146,7 +161,7 @@ func (v *adapter) Quota(ctx context.Context, cred *core.Credential) (*pluginapi.
 	if errNative != nil {
 		return nil, errNative
 	}
-	return FetchQuota(ctx, native)
+	return v.fetchQuota(ctx, native)
 }
 
 // ---- 登录与续期 ----
@@ -168,3 +183,16 @@ func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 		{Name: "zcode_claim_min_interval", Type: pluginapi.ConfigFieldTypeString, Description: "两次套餐领取之间的最小间隔（Go 时长，如 15s；0 表示不节流）。"},
 	}
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.AuthModeReporter     = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+	_ core.Refresher            = (*adapter)(nil)
+	_ core.ActivityProbe        = (*adapter)(nil)
+	_ core.PlanClaimer          = (*adapter)(nil)
+)

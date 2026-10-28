@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -189,5 +190,167 @@ func TestHandleLoginCallbackReportsPersistFailure(t *testing.T) {
 	message, _ := payload["message"].(string)
 	if !strings.Contains(message, "保存凭证失败") {
 		t.Fatalf("message = %q, want 说明保存失败", message)
+	}
+}
+
+// loginRoutePayload 调用一个登录相关管理路由并解出响应体。
+func loginRoutePayload(t *testing.T, service *Service, request pluginapi.ManagementRequest) map[string]any {
+	t.Helper()
+	raw, errMarshal := json.Marshal(request)
+	if errMarshal != nil {
+		t.Fatalf("marshal request: %v", errMarshal)
+	}
+	raw, errHandle := service.Handle(raw)
+	if errHandle != nil {
+		t.Fatalf("handle %s: %v", request.Path, errHandle)
+	}
+	var envelope struct {
+		Result struct {
+			StatusCode int
+			Body       []byte
+		}
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		t.Fatalf("decode envelope: %v (raw=%s)", errUnmarshal, raw)
+	}
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(envelope.Result.Body, &payload); errUnmarshal != nil {
+		t.Fatalf("decode payload: %v (body=%s)", errUnmarshal, envelope.Result.Body)
+	}
+	return payload
+}
+
+// TestRegistrationDeclaresLoginStartRoutes 锁定页面内登录的两个入口：宿主按
+// 路由声明放行插件子路径，漏登记就是 404（页面只能看到「获取授权链接失败」）。
+func TestRegistrationDeclaresLoginStartRoutes(t *testing.T) {
+	found := map[string]bool{}
+	for _, route := range newService(t).Registration().Routes {
+		found[route.Method+" "+route.Path] = true
+	}
+	for _, want := range []string{
+		"POST /plugins/freetier2api/login/start",
+		"GET /plugins/freetier2api/login/captcha-config",
+	} {
+		if !found[want] {
+			t.Fatalf("route %q missing: %#v", want, found)
+		}
+	}
+}
+
+func TestHandleLoginStartReturnsAuthorizationURL(t *testing.T) {
+	deps := newStubDeps(t)
+	deps.loginStart = &pluginapi.AuthLoginStartResponse{
+		URL:      "https://accounts.example/oauth",
+		State:    "autoclawglobal_oauth_abc",
+		Metadata: map[string]any{"callback_hint": "http://localhost:46952/auth/callback-google"},
+	}
+	payload := loginRoutePayload(t, newServiceWithDeps(t, deps), pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/freetier2api/login/start",
+		Body:   []byte(`{"vendor_id":"autoclawglobal","metadata":{"oauth_variant":"google","ali_captcha_verify_param":"p"}}`),
+	})
+	if payload["ok"] != true || payload["url"] != "https://accounts.example/oauth" {
+		t.Fatalf("payload = %#v", payload)
+	}
+	if payload["callback_hint"] != "http://localhost:46952/auth/callback-google" {
+		t.Fatalf("callback_hint = %#v", payload["callback_hint"])
+	}
+}
+
+// TestHandleLoginStartSurfacesVendorError 锁定上游错误必须原样回到页面上：
+// 滑块过期（630014）时用户需要看到「重拖一次」，而不是一句 HTTP 500。
+func TestHandleLoginStartSurfacesVendorError(t *testing.T) {
+	deps := newStubDeps(t)
+	deps.loginStartErr = core.NewPluginError("login_failed", "风控验证未通过，请重新点击登录再试一次", http.StatusBadRequest)
+	payload := loginRoutePayload(t, newServiceWithDeps(t, deps), pluginapi.ManagementRequest{
+		Method: http.MethodPost,
+		Path:   "/v0/management/plugins/freetier2api/login/start",
+		Body:   []byte(`{"vendor_id":"autoclawglobal"}`),
+	})
+	if payload["ok"] != false {
+		t.Fatalf("ok = %v", payload["ok"])
+	}
+	message, _ := payload["message"].(string)
+	if !strings.Contains(message, "风控验证未通过") {
+		t.Fatalf("message = %q", message)
+	}
+}
+
+func TestHandleLoginCaptchaConfigRequest(t *testing.T) {
+	deps := newStubDeps(t)
+	deps.captcha = core.CaptchaConfig{Enabled: true, SceneID: "scene-1", Region: "ga", Prefix: "sq51tr"}
+	payload := loginRoutePayload(t, newServiceWithDeps(t, deps), pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/management/plugins/freetier2api/login/captcha-config",
+		Query:  map[string][]string{"vendor": {"autoclawglobal"}},
+	})
+	if payload["ok"] != true {
+		t.Fatalf("payload = %#v", payload)
+	}
+	captcha, _ := payload["captcha"].(map[string]any)
+	if captcha["enabled"] != true || captcha["scene_id"] != "scene-1" {
+		t.Fatalf("captcha = %#v", captcha)
+	}
+}
+
+func TestHandleLoginCaptchaConfigRejectsMissingVendor(t *testing.T) {
+	payload := loginRoutePayload(t, newService(t), pluginapi.ManagementRequest{
+		Method: http.MethodGet,
+		Path:   "/v0/management/plugins/freetier2api/login/captcha-config",
+	})
+	if payload["ok"] != false {
+		t.Fatalf("payload = %#v", payload)
+	}
+}
+
+// captchaLoginVendor 在 fakeVendor 之上补「页面内登录」的两项能力。
+type captchaLoginVendor struct {
+	fakeVendor
+}
+
+func (v *captchaLoginVendor) LoginVariants() []core.LoginVariant {
+	return []core.LoginVariant{
+		{ID: "zai", Label: "Zai", CallbackHint: "http://localhost:53699/auth/callback-zai"},
+		{ID: "google", Label: "Google", CallbackHint: "http://localhost:46952/auth/callback-google"},
+	}
+}
+func (v *captchaLoginVendor) LoginCaptchaConfig(context.Context) (core.CaptchaConfig, error) {
+	return core.CaptchaConfig{Enabled: true, SceneID: "scene"}, nil
+}
+func (v *captchaLoginVendor) LoginStart(context.Context, map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	return &pluginapi.AuthLoginStartResponse{}, nil
+}
+func (v *captchaLoginVendor) LoginPoll(context.Context, string) (*pluginapi.AuthLoginPollResponse, error) {
+	return &pluginapi.AuthLoginPollResponse{}, nil
+}
+func (v *captchaLoginVendor) LocalCallbackHint() string {
+	return "http://localhost:46952/auth/callback-google"
+}
+func (v *captchaLoginVendor) SubmitCallback(context.Context, string, string) (*core.CallbackSubmitResult, error) {
+	return &core.CallbackSubmitResult{}, nil
+}
+
+// TestVendorsPayloadExposesCaptchaLogin 锁定页面渲染所需的两项描述：只有声明
+// 了能力的供应商才会出现「先验证码再登录」的面板，而变体与回调地址来自后端
+// （页面不硬编码 AutoClaw）。
+func TestVendorsPayloadExposesCaptchaLogin(t *testing.T) {
+	deps := newStubDeps(t)
+	vendor := &captchaLoginVendor{fakeVendor{Meta: core.Meta{
+		VendorID: "autoclawglobal", VendorName: "AutoClaw 国际版", VendorRegion: "global",
+	}}}
+	if errRegister := deps.registry.Register(vendor); errRegister != nil {
+		t.Fatal(errRegister)
+	}
+	payload := newServiceWithDeps(t, deps).buildVendorsPayload()
+	vendors, _ := payload["vendors"].([]vendorDescriptor)
+	if len(vendors) != 1 {
+		t.Fatalf("vendors = %#v", payload["vendors"])
+	}
+	got := vendors[0]
+	if !got.LoginCaptcha || !got.SupportsLogin || !got.PasteCallback {
+		t.Fatalf("descriptor = %#v", got)
+	}
+	if len(got.LoginVariants) != 2 || got.LoginVariants[0].ID != "zai" {
+		t.Fatalf("variants = %#v", got.LoginVariants)
 	}
 }

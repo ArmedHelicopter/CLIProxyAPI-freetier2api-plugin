@@ -2,6 +2,8 @@ package zcode
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math/big"
@@ -13,14 +15,12 @@ import (
 
 // ZCode 凭证的解析、特征识别与脱敏。
 //
-// 一个 ZCode 账号可能同时持有两种凭证，语义完全不同：
+// 一个 ZCode 账号可能同时持有两种凭证：
 //
-//   - APIKey（api.z.ai，x-api-key）—— **对话通道**，免人机验证码；
-//   - JWTToken（zcode.z.ai，Bearer）—— Coding Plan 通道，上游强制校验
-//     X-Aliyun-Captcha-Verify-Param，没有真实浏览器求解器时不可用于对话。
+//   - JWTToken（zcode.z.ai，Bearer）—— Start Plan 对话通道、额度查询与套餐领取；
+//   - APIKey（x-api-key）—— 纯 API Key 账号的对话通道。
 //
-// 因此对话一律优先 APIKey；JWT 仅用于 billing 族（额度查询 / 套餐领取）。
-// OAuth 登录会一次拿到两者（JWT 直接下发，API Key 由 access_token 兑换）。
+// OAuth 登录一次拿到两者（JWT 直接下发，API Key 由 access_token 兑换）。
 
 // Credential 是归一化后的 ZCode 账号凭证。
 type Credential struct {
@@ -34,9 +34,7 @@ type Credential struct {
 	AuthMode string        `json:"auth_mode,omitempty"` // oauth / apikey
 }
 
-// UsesPlanChannel 报告本凭证是否具备 Coding Plan 通道能力。
-//
-// 只判断凭证形状，不代表当下可用：上游还要求验证码头，见 CanChatOverPlan。
+// UsesPlanChannel 报告本凭证是否具备 Start Plan（JWT）通道能力。
 func (c *Credential) UsesPlanChannel() bool {
 	return c != nil && strings.TrimSpace(c.JWTToken) != ""
 }
@@ -50,6 +48,27 @@ func (c *Credential) OutboundToken() string {
 		return c.APIKey
 	}
 	return strings.TrimSpace(c.JWTToken)
+}
+
+// AccountKey 返回按账号串行化时使用的稳定标识：user_id 优先，回退 email，
+// 再回退出站凭证指纹（手工导入的凭证可能两者都缺）；完全无凭证字段的异常
+// 对象返回空串，由调用方按空键兜底。
+func (c *Credential) AccountKey() string {
+	if c == nil {
+		return ""
+	}
+	if key := strings.TrimSpace(c.UserID); key != "" {
+		return "uid:" + key
+	}
+	if key := strings.TrimSpace(c.Email); key != "" {
+		return "email:" + key
+	}
+	token := c.OutboundToken()
+	if token == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(token))
+	return "token:" + hex.EncodeToString(sum[:8])
 }
 
 // ParseCredential 解析凭证 JSON。
@@ -269,11 +288,13 @@ func decodeJWTPayload(segment string) map[string]any {
 	return claims
 }
 
-// 计费族（billing/*、usage、event/report）的公共请求层。
+// 计费族（billing/*、usage）的公共请求层。
 //
 // 这些端点都在 zcode.z.ai 的 zcode-plan 之下，共用同一套身份头，且都**必须**
 // 带 X-Device-Mid——缺失时上游返回 code=3001。鉴权用 Coding Plan JWT
 // （API Key 通道没有套餐概念，不参与计费族）。
+//
+// event/report 不在此列：它不在 zcode-plan 之下、也不需要鉴权，见 activation.go。
 //
 // 参考 zcode2api/app/quota.py 的 _auth_headers 与 app/claim.py 的 _billing_request。
 
@@ -284,14 +305,14 @@ const (
 	billingMaxBody = 4 << 20
 )
 
-// 额度查询：billing/current（套餐）+ billing/balance（余量）。
+// 额度查询：billing/balance（持有套餐 + 余量）。
 //
 // 只对 Coding Plan（JWT）账号有意义——API Key 是用户自带的按量付费 Key，
 // 没有套餐窗口。参考 zcode2api/app/quota.py。
 
 // 每账号客户端设备档案（一号一台设备）与上游身份头构造。
 //
-// 为什么需要它：billing 族（current/balance/preview/claim）**必需** X-Device-Mid，
+// 为什么需要它：billing 族（balance/preview/claim）**必需** X-Device-Mid，
 // 缺失时上游返回 code=3001；同时上游按设备聚类做风控，多个账号共用同一套
 // 平台/内核/分辨率会聚成「一台机器开了 N 个账号」的关联信号。
 //
@@ -495,6 +516,22 @@ func (h *IdentityHeaders) Apply(target map[string]string) {
 	for key, value := range h.values {
 		target[key] = value
 	}
+}
+
+// upstreamAuthHeaders 是上游通用的身份与鉴权头。
+//
+// JWT 优先（Coding Plan 通道），没有 JWT 时回退 API Key：两条链路的网关都认
+// 这两种凭证，只是 billing 族仅对 JWT 有意义。请求级追踪头每请求重新生成。
+func upstreamAuthHeaders(cred *Credential) map[string]string {
+	headers := map[string]string{}
+	BuildIdentityHeaders(cred.Profile).Apply(headers)
+	if strings.TrimSpace(cred.JWTToken) != "" {
+		headers["Authorization"] = "Bearer " + cred.JWTToken
+	} else if strings.TrimSpace(cred.APIKey) != "" {
+		headers["x-api-key"] = cred.APIKey
+	}
+	headers["x-request-id"] = NewUUID()
+	return headers
 }
 
 // BuildIdentityHeaders 构造完整身份头（对齐官方桌面端 companion 头集合）。

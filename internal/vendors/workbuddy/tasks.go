@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -245,20 +247,35 @@ func (c *Client) ClaimRewardMP(ctx context.Context, cred *Credential, code strin
 }
 
 // parseClaimResult 解析领奖响应。
+//
+// 领奖是有副作用的请求。响应无法解析时不能把它当作「已领取」处理，否则
+// HTML 错误页、截断 JSON 等异常会被静默报告成成功且奖励为 0。用指针字段
+// 一次解码即可同时得到值与「字段是否存在」，无需先解成 map 再解一次 struct。
+//
+// 必须至少出现一个领奖契约字段（already_claimed / credit / energy）：
+// 空对象、null、完全陌生的 JSON 对象都不是成功响应。
 func parseClaimResult(data json.RawMessage) (credit, energy int64, err error) {
 	var payload struct {
-		AlreadyClaimed bool  `json:"already_claimed"`
-		Credit         int64 `json:"credit"`
-		Energy         int64 `json:"energy"`
+		AlreadyClaimed *bool  `json:"already_claimed"`
+		Credit         *int64 `json:"credit"`
+		Energy         *int64 `json:"energy"`
 	}
 	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-		// 结构不认识但请求成功：副作用已发生，按无新增处理。
+		return 0, 0, fmt.Errorf("decode claim result: %w", errUnmarshal)
+	}
+	if payload.AlreadyClaimed == nil && payload.Credit == nil && payload.Energy == nil {
+		return 0, 0, fmt.Errorf("decode claim result: missing reward fields")
+	}
+	if payload.AlreadyClaimed != nil && *payload.AlreadyClaimed {
 		return 0, 0, nil
 	}
-	if payload.AlreadyClaimed {
-		return 0, 0, nil
+	if payload.Credit != nil {
+		credit = *payload.Credit
 	}
-	return payload.Credit, payload.Energy, nil
+	if payload.Energy != nil {
+		energy = *payload.Energy
+	}
+	return credit, energy, nil
 }
 
 // IsMPTaskCode 报告任务码是否属于小程序口径。
@@ -1213,7 +1230,7 @@ func TaskSpecsFor(region Region) []core.TaskSpec {
 				Kind:         TaskKindDailyBonus,
 				Label:        "每日活跃奖励",
 				Description:  "国际版每日签到：活跃信标点亮成长热力图，Bonus Pack 次日凌晨发放",
-				DefaultHours: GlobalDailyBonusHours,
+				DefaultHours: globalDailyBonusHours,
 				Manual:       true,
 				Route:        "/dailybonus",
 			},
@@ -1455,7 +1472,10 @@ func runGrowthTask(ctx context.Context, client *Client, credential *Credential, 
 			return "任务已完成且已领奖", 0, 0, nil
 		}
 		if task.Done() {
-			credit, energy := claimGrowthReward(ctx, client, credential, code)
+			credit, energy, errClaim := claimGrowthReward(ctx, client, credential, code)
+			if errClaim != nil {
+				return "", 0, 0, fmt.Errorf("任务已达标，但领奖失败：%w", errClaim)
+			}
 			msg := "任务已达标（跳过重复执行）"
 			if credit > 0 || energy > 0 {
 				msg = fmt.Sprintf("任务已达标，已领奖 +%d 积分 +%d 能量", credit, energy)
@@ -1468,7 +1488,10 @@ func runGrowthTask(ctx context.Context, client *Client, credential *Credential, 
 		return "", 0, 0, errRun
 	}
 	if waitGrowthClaimable(ctx, client, credential, code) {
-		credit, energy := claimGrowthReward(ctx, client, credential, code)
+		credit, energy, errClaim := claimGrowthReward(ctx, client, credential, code)
+		if errClaim != nil {
+			return "", 0, 0, fmt.Errorf("%s；但领奖失败：%w", message, errClaim)
+		}
 		if credit > 0 || energy > 0 {
 			message += fmt.Sprintf("（领奖 +%d 积分 +%d 能量）", credit, energy)
 		}
@@ -1520,21 +1543,26 @@ func findGrowthTask(ctx context.Context, client *Client, credential *Credential,
 	return nil, nil
 }
 
-func claimGrowthReward(ctx context.Context, client *Client, credential *Credential, code string) (int64, int64) {
+// claimGrowthReward 领奖并把错误交给调用方。
+//
+// 早期这里吞掉错误返回 (0, 0)：领奖响应解析失败（HTML 错误页、上游改结构）
+// 会被 runGrowthTask 当成「任务已达标但没奖励」，用户看到的是一句成功文案。
+// 领奖有副作用，失败必须让页面看见。
+func claimGrowthReward(ctx context.Context, client *Client, credential *Credential, code string) (int64, int64, error) {
 	if IsMPTaskCode(code) {
 		credit, energy, errClaim := client.ClaimRewardMP(ctx, credential, code)
 		if errClaim != nil {
 			logger.Debug("claim mp reward for %s failed: %v", code, errClaim)
-			return 0, 0
+			return 0, 0, errClaim
 		}
-		return credit, energy
+		return credit, energy, nil
 	}
 	credit, energy, errClaim := client.ClaimReward(ctx, credential, code)
 	if errClaim != nil {
 		logger.Debug("claim reward for %s failed: %v", code, errClaim)
-		return 0, 0
+		return 0, 0, errClaim
 	}
-	return credit, energy
+	return credit, energy, nil
 }
 
 func acceptPendingTasks(ctx context.Context, client *Client, credential *Credential) int {
@@ -1921,10 +1949,10 @@ func tailOf(text string, n int) string {
 //     单次失败交给下一个排程点兜底；
 //   - 每天多个排程点：已点亮的点只花一次热力图读，几乎零成本。
 
-// GlobalDailyBonusHours 是国际版每日活跃奖励的默认排程点（本地时间）。
+// globalDailyBonusHours 是国际版每日活跃奖励的默认排程点（本地时间）。
 // 4 个点足够兜住「宿主刚启动网络未就绪」这类瞬时失败；运行幂等，
 // 多跑只多一次热力图读。
-var GlobalDailyBonusHours = []int{8, 12, 16, 20}
+var globalDailyBonusHours = []int{8, 12, 16, 20}
 
 // growthHeatmapCell 是成长热力图上的一格。
 type growthHeatmapCell struct {
@@ -2455,13 +2483,17 @@ func (c *Client) DailyCheckin(cred *Credential) (*CheckinResult, error) {
 }
 
 // Balance 是账号的资源余额。
+//
+// 数量用 float64：个人资源包的额度是整数，但企业用量接口的 credit 是小数
+// （实测 2.59 / 3.87 / 4.11）。用整数会把小数截断，消耗 0.9 积分时面板
+// 上完全看不到变化。
 type Balance struct {
 	// Remain 是剩余积分。
-	Remain int64
+	Remain float64
 	// Total 是本期总额度。
-	Total int64
-	// ExpiringSoon 是即将过期的积分（窗口由调用方定义）。
-	ExpiringSoon int64
+	Total float64
+	// Enterprise 表示这份余额来自企业用量接口（不是个人资源包）。
+	Enterprise bool
 	// Packages 是套餐明细。
 	Packages []BalancePackage
 }
@@ -2471,11 +2503,18 @@ type BalancePackage struct {
 	// Name 是资源包名称。
 	Name string
 	// Remain 是剩余量。
-	Remain int64
+	Remain float64
 	// Total 是总量。
-	Total int64
+	Total float64
 	// ExpireAt 是过期时刻（Unix 秒，0 表示不过期）。
 	ExpireAt int64
+	// ResetAt 是周期回满时刻（Unix 秒，0 表示无周期）。
+	//
+	// 与 ExpireAt 刻意分开：企业额度到点是**回满**，不是作废。
+	// 混用会让面板把「下月回满」显示成「即将过期」。
+	ResetAt int64
+	// Period 是周期文案（如 "2026-10-01 ~ 2026-10-31"），空表示不展示。
+	Period string
 }
 
 // billingResourceAccount 是余额响应里的单个套餐。
@@ -2541,8 +2580,7 @@ func packageRemainUsed(account billingResourceAccount) (remain, used, size int64
 
 // FetchBalance 查询账号余额。
 //
-// global 域先试无 /v2 的路径，404 时回落带 /v2 的路径；CN 只有带 /v2 的。
-// 这个差异来自上游两个部署的历史，不是笔误。
+// 个人资源接口只覆盖个人套餐；企业账号的额度见 resolveBalance。
 func (c *Client) FetchBalance(cred *Credential) (*Balance, error) {
 	if cred == nil {
 		return nil, fmt.Errorf("credential is required")
@@ -2551,12 +2589,6 @@ func (c *Client) FetchBalance(cred *Credential) (*Balance, error) {
 	if !c.enabledRealm(region) {
 		return nil, fmt.Errorf("realm %s is disabled by plugin configuration", region)
 	}
-	endpoints := GetEndpoints(region)
-	paths := []string{billingMeterPathV2}
-	if region.IsGlobal() {
-		paths = []string{billingMeterPath, billingMeterPathV2}
-	}
-
 	// 请求体是上游要求的固定形状：缺 ProductCode 或分页会拿到空列表。
 	now := time.Now()
 	body := map[string]any{
@@ -2568,28 +2600,45 @@ func (c *Client) FetchBalance(cred *Credential) (*Balance, error) {
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
 
-	var lastErr error
+	data, errCall := c.billingMeterJSON(cred, billingMeterPaths(region, billingMeterPath, billingMeterPathV2), body)
+	if errCall != nil {
+		return nil, errCall
+	}
+	var payload billingResourceResponse
+	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode balance: %w", errUnmarshal)
+	}
+	return c.resolveBalance(cred, region, parseBalance(payload))
+}
+
+// billingMeterPaths 返回某计费接口的候选路径。
+//
+// global 先试无 /v2 的路径，404 时回落带 /v2 的路径；CN 只有带 /v2 的。
+// 这个差异来自上游两个部署的历史，不是笔误。
+func billingMeterPaths(region Region, plain, v2 string) []string {
+	if region.IsGlobal() {
+		return []string{plain, v2}
+	}
+	return []string{v2}
+}
+
+// billingMeterJSON 依次尝试候选路径，返回第一个成功响应解开的 data。
+//
+// 只在 404 时换路径：其他错误换路径也救不回来。
+func (c *Client) billingMeterJSON(cred *Credential, paths []string, body any) (json.RawMessage, error) {
+	endpoints := GetEndpoints(cred.Realm())
+	lastErr := fmt.Errorf("billing endpoint is unavailable")
 	for _, path := range paths {
 		data, errCall := c.billingJSON(cred, endpoints.BillingBase+path, http.MethodPost, body)
-		if errCall != nil {
-			lastErr = errCall
-			// 只在 404 时换路径：其他错误换路径也救不回来。
-			if upstreamErr, okErr := errCall.(*core.Failure); okErr && upstreamErr.Kind == core.FailureKindNotFound {
-				continue
-			}
+		if errCall == nil {
+			return data, nil
+		}
+		lastErr = errCall
+		if upstreamErr, okErr := errCall.(*core.Failure); !okErr || upstreamErr.Kind != core.FailureKindNotFound {
 			return nil, errCall
 		}
-		var payload billingResourceResponse
-		if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-			lastErr = fmt.Errorf("decode balance: %w", errUnmarshal)
-			continue
-		}
-		return parseBalance(payload), nil
 	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("balance endpoint is unavailable")
+	return nil, lastErr
 }
 
 // parseBalance 归一化余额响应。
@@ -2599,16 +2648,96 @@ func parseBalance(payload billingResourceResponse) *Balance {
 	balance := &Balance{}
 	for _, account := range payload.Response.Data.Accounts {
 		remain, _, size := packageRemainUsed(account)
-		balance.Remain += remain
-		balance.Total += size
+		balance.Remain += float64(remain)
+		balance.Total += float64(size)
 		balance.Packages = append(balance.Packages, BalancePackage{
 			Name:     strings.TrimSpace(account.PackageName),
-			Remain:   remain,
-			Total:    size,
+			Remain:   float64(remain),
+			Total:    float64(size),
 			ExpireAt: parsePackageExpiry(account.CycleEndTime),
 		})
 	}
 	return balance
+}
+
+// resolveBalance 在企业账号拿到空个人额度时改用企业用量接口。
+//
+// 企业账号请求个人接口得到的是 HTTP 200 + 空 Accounts（不是错误），
+// 直接展示就是 0 / 0，操作者会误以为账号已耗尽。企业额度只有企业端点
+// 能给出，因此这里按「个人无额度 + 有企业租户 id」判定后回退。
+// 非企业账号保持原行为：空 Accounts 就是真的没有额度。
+func (c *Client) resolveBalance(cred *Credential, region Region, personal *Balance) (*Balance, error) {
+	if personal.Total > 0 {
+		return personal, nil
+	}
+	if strings.TrimSpace(cred.EnterpriseIDValue()) == "" {
+		return personal, nil
+	}
+	return c.fetchEnterpriseBalance(cred, region)
+}
+
+// enterpriseUsageResponse 是企业用量接口的响应。
+//
+// credit 是**本周期已消耗**（小数积分），limitNum 是本周期额度，剩余 = 两者之差。
+// cycleEndTime / cycleResetTime 只是周期回满时刻，不是资源包到期。
+type enterpriseUsageResponse struct {
+	Credit         *float64 `json:"credit"`
+	LimitNum       *float64 `json:"limitNum"`
+	CycleStartTime string   `json:"cycleStartTime"`
+	CycleEndTime   string   `json:"cycleEndTime"`
+	CycleResetTime string   `json:"cycleResetTime"`
+}
+
+// fetchEnterpriseBalance 用企业用量接口合成一份 Balance。
+//
+// 请求体给空对象：该端点按 token 里的企业租户定位，不需要分页与产品码；
+// 个人资源包那套必填字段在这里不适用。
+func (c *Client) fetchEnterpriseBalance(cred *Credential, region Region) (*Balance, error) {
+	data, errCall := c.billingMeterJSON(cred,
+		billingMeterPaths(region, enterpriseUsagePath, enterpriseUsagePathV2), map[string]any{})
+	if errCall != nil {
+		return nil, errCall
+	}
+	return parseEnterpriseBalance(data)
+}
+
+// parseEnterpriseBalance 归一化企业用量响应。
+//
+// limitNum 缺失视为契约不符：把它当 0 会重复「0 / 0」这个已被报告的假象。
+func parseEnterpriseBalance(data json.RawMessage) (*Balance, error) {
+	var payload enterpriseUsageResponse
+	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode enterprise balance: %w", errUnmarshal)
+	}
+	if payload.LimitNum == nil {
+		return nil, fmt.Errorf("decode enterprise balance: missing limitNum")
+	}
+	total := *payload.LimitNum
+	used := 0.0
+	if payload.Credit != nil {
+		used = *payload.Credit
+	}
+	remain := total - used
+	if remain < 0 {
+		remain = 0
+	}
+	if remain > total {
+		remain = total
+	}
+	balance := &Balance{Remain: remain, Total: total, Enterprise: true}
+	period := ""
+	start, end := strings.TrimSpace(payload.CycleStartTime), strings.TrimSpace(payload.CycleEndTime)
+	if start != "" && end != "" {
+		period = start + " ~ " + end
+	}
+	balance.Packages = append(balance.Packages, BalancePackage{
+		Name:    "企业额度",
+		Remain:  remain,
+		Total:   total,
+		ResetAt: parsePackageExpiry(core.FirstNonEmpty(payload.CycleResetTime, payload.CycleEndTime)),
+		Period:  period,
+	})
+	return balance, nil
 }
 
 // parsePackageExpiry 解析套餐到期时刻（UTC+8 墙钟）；解析失败返回 0。
@@ -2649,14 +2778,21 @@ func (c *Client) FetchQuota(cred *Credential) (*Balance, error) {
 // Groups/Buckets 放明细（展开后看）。
 func BuildQuotaResponse(credential *Credential, balance *Balance) pluginapi.QuotaFetchResponse {
 	region := credential.Realm()
+	plan := string(region)
+	planName := RealmDisplayName(region)
+	if balance.Enterprise {
+		// 企业额度与个人套餐是两条互不相通的额度线，不能混成同一个套餐名。
+		plan = "enterprise"
+		planName = "企业额度"
+	}
 	response := pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{
-			Plan:     string(region),
-			TierName: RealmDisplayName(region),
+			Plan:     plan,
+			TierName: planName,
 		},
 		Summary: []pluginapi.QuotaMetric{
-			{Key: "credit_remain", Label: "剩余积分", Value: float64(balance.Remain), Format: "number"},
-			{Key: "credit_total", Label: "总额度", Value: float64(balance.Total), Format: "number"},
+			{Key: "credit_remain", Label: "剩余积分", Value: balance.Remain, Format: "number"},
+			{Key: "credit_total", Label: "总额度", Value: balance.Total, Format: "number"},
 		},
 	}
 	if balance.Total > 0 {
@@ -2665,22 +2801,30 @@ func BuildQuotaResponse(credential *Credential, balance *Balance) pluginapi.Quot
 			used = 0
 		}
 		response.Summary = append(response.Summary,
-			pluginapi.QuotaMetric{Key: "credit_used", Label: "已用积分", Value: float64(used), Format: "number"})
+			pluginapi.QuotaMetric{Key: "credit_used", Label: "已用积分", Value: used, Format: "number"})
 	}
 	if len(balance.Packages) > 0 {
 		buckets := make([]pluginapi.QuotaBucket, 0, len(balance.Packages))
 		for _, pkg := range balance.Packages {
 			fraction := 0.0
 			if pkg.Total > 0 {
-				fraction = float64(pkg.Remain) / float64(pkg.Total)
+				fraction = pkg.Remain / pkg.Total
+			}
+			description := formatCreditAmount(pkg.Remain) + " / " + formatCreditAmount(pkg.Total)
+			if pkg.Period != "" {
+				description += " · 周期 " + pkg.Period
 			}
 			bucket := pluginapi.QuotaBucket{
 				Window:            pkg.Name,
 				RemainingFraction: fraction,
-				Description:       fmt.Sprintf("%d / %d", pkg.Remain, pkg.Total),
+				Description:       description,
 			}
+			// 到期（作废）与回满（周期重置）分开取值：企业额度到点回满，
+			// 不能被展示成「即将过期」。
 			if pkg.ExpireAt > 0 {
 				bucket.ResetTime = FormatUnixTime(pkg.ExpireAt)
+			} else if pkg.ResetAt > 0 {
+				bucket.ResetTime = FormatUnixTime(pkg.ResetAt)
 			}
 			buckets = append(buckets, bucket)
 		}
@@ -2690,6 +2834,14 @@ func BuildQuotaResponse(credential *Credential, balance *Balance) pluginapi.Quot
 		}}
 	}
 	return response
+}
+
+// formatCreditAmount 把积分数量格式化为可读文本。
+//
+// 企业额度是小数（实测 4.11 / 2.59），个人额度是整数：两位小数既够
+// 表达前者，也不会把后者写成 "2000.00"，同时隐去 float 运算的长尾。
+func formatCreditAmount(value float64) string {
+	return strconv.FormatFloat(math.Round(value*100)/100, 'f', -1, 64)
 }
 
 // FormatUnixTime 把 Unix 秒格式化为 RFC3339（无效值返回空串）。

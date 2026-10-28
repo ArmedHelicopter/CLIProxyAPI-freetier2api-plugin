@@ -51,23 +51,27 @@ type catalogEntry struct {
 	fetchedAt time.Time
 }
 
-var (
-	catalogMu    sync.Mutex
-	catalogCache = map[string]catalogEntry{}
-)
-
 const catalogTTL = 10 * time.Minute
 
-// resolveModelWithCatalog 用账号目录把请求模型名解析成 (config_name, wire id)。
+// catalogCache 是模型目录缓存，按账号 + function + 构建号分键。
+//
+// 属于 adapter 实例而不是包级变量：同一进程里的多个 App 实例各自独立，缓存
+// 生命周期跟着实例走。零值可用；nil 接收者表示不缓存（一次性调用直接打上游）。
+type catalogCache struct {
+	mu      sync.Mutex
+	entries map[string]catalogEntry
+}
+
+// resolve 用账号目录把请求模型名解析成 (config_name, wire id)。
 //
 // 模型名原样透传（不做别名归一）：目录里有什么就点什么，点不到即报错，
 // 避免猜一个错的 wire id 换来上游 4023。
-func resolveModelWithCatalog(ctx context.Context, model string, cfg Config, cred *Credential) (ResolvedModel, error) {
+func (c *catalogCache) resolve(ctx context.Context, model string, cfg Config, cred *Credential) (ResolvedModel, error) {
 	requested := strings.TrimSpace(model)
 	if requested == "" {
 		requested = cfg.DefaultModel
 	}
-	entry, okEntry := loadCatalog(ctx, cred, cfg)
+	entry, okEntry := c.load(ctx, cred, cfg)
 	if !okEntry {
 		return ResolvedModel{}, fmt.Errorf("trae 模型目录暂不可用，请稍后重试")
 	}
@@ -77,31 +81,46 @@ func resolveModelWithCatalog(ctx context.Context, model string, cfg Config, cred
 	return ResolvedModel{}, fmt.Errorf("模型 %s 不在该账号的可用目录中", requested)
 }
 
-// loadCatalog 读取账号的模型目录缓存；过期则重新拉取，拉取失败沿用旧条目。
+// load 读取账号的模型目录缓存；过期则重新拉取，拉取失败沿用旧条目。
 //
 // 缓存键带上 function 与构建号：目录内容由这两者共同决定，只按账号缓存会在
 // 版本号被配置改写后继续命中旧清单（最长 catalogTTL）。
-func loadCatalog(ctx context.Context, cred *Credential, cfg Config) (catalogEntry, bool) {
+func (c *catalogCache) load(ctx context.Context, cred *Credential, cfg Config) (catalogEntry, bool) {
 	key := strings.Join([]string{cfg.VendorID, cred.UID, cfg.Function, cfg.IDEVersionCode}, "|")
-	catalogMu.Lock()
-	entry, okCached := catalogCache[key]
-	catalogMu.Unlock()
-	if okCached && time.Since(entry.fetchedAt) < catalogTTL {
-		return entry, true
+	var (
+		entry    catalogEntry
+		okCached bool
+	)
+	if c != nil {
+		c.mu.Lock()
+		entry, okCached = c.entries[key]
+		c.mu.Unlock()
+		if okCached && time.Since(entry.fetchedAt) < catalogTTL {
+			return entry, true
+		}
 	}
 
 	fresh, okFresh := fetchCatalog(ctx, cred, cfg)
-	if okFresh {
-		catalogMu.Lock()
-		catalogCache[key] = fresh
-		catalogMu.Unlock()
-		return fresh, true
+	if !okFresh {
+		// 上游暂时不可用时沿用旧条目；从未拉到过才失败。
+		return entry, okCached
 	}
-	// 上游暂时不可用时沿用旧条目；从未拉到过才失败。
-	if okCached {
-		return entry, true
+	if c != nil {
+		now := time.Now()
+		c.mu.Lock()
+		if c.entries == nil {
+			c.entries = map[string]catalogEntry{}
+		}
+		// 顺手清掉过期条目：账号会长期存在，只增不删的缓存会一直涨。
+		for cachedKey, cached := range c.entries {
+			if now.Sub(cached.fetchedAt) >= catalogTTL {
+				delete(c.entries, cachedKey)
+			}
+		}
+		c.entries[key] = fresh
+		c.mu.Unlock()
 	}
-	return catalogEntry{}, false
+	return fresh, true
 }
 
 // catalogResponse 是 get_detail_param 的响应结构（只取需要的字段）。
@@ -284,12 +303,17 @@ func summarizeCatalog(items []catalogItem) string {
 	return strings.Join(parts, ", ")
 }
 
-// FetchModels 返回该凭证账号可用模型清单（直接来自上游目录）。
+// FetchModels 返回该凭证账号可用模型清单（直接来自上游目录，不跨调用缓存）。
 func FetchModels(ctx context.Context, cred *Credential, cfg Config) ([]Model, error) {
+	return new(catalogCache).fetchModels(ctx, cred, cfg)
+}
+
+// fetchModels 是 FetchModels 的实例缓存版本：命中 catalogCache 时不打上游。
+func (c *catalogCache) fetchModels(ctx context.Context, cred *Credential, cfg Config) ([]Model, error) {
 	if cred == nil || cred.AccessToken == "" {
 		return nil, fmt.Errorf("trae: 无可用凭证，无法拉取模型目录")
 	}
-	entry, okEntry := loadCatalog(ctx, cred, cfg)
+	entry, okEntry := c.load(ctx, cred, cfg)
 	if !okEntry {
 		return nil, fmt.Errorf("trae: 模型目录拉取失败")
 	}

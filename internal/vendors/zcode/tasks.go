@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -16,6 +17,7 @@ import (
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/logger"
 )
 
 // billingHeaders 构造计费族请求头。
@@ -23,13 +25,8 @@ import (
 // 平台/语言/时区/设备 ID 全部取账号档案：上游按设备聚类做风控，
 // 全局伪装值会让所有账号聚成同一台机器。
 func billingHeaders(cred *Credential) map[string]string {
-	headers := map[string]string{
-		"Content-Type": "application/json",
-		"User-Agent":   UserAgent,
-	}
-	BuildIdentityHeaders(cred.Profile).Apply(headers)
-	headers["Authorization"] = "Bearer " + cred.JWTToken
-	headers["x-request-id"] = NewUUID()
+	headers := upstreamAuthHeaders(cred)
+	headers["Content-Type"] = "application/json"
 	return headers
 }
 
@@ -153,8 +150,8 @@ func classifyBillingOutcome(code int, body map[string]any) string {
 	return base
 }
 
-// FetchQuota 查询 ZCode 账号的套餐与余量。
-func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchResponse, error) {
+// fetchQuota 查询 ZCode 账号的套餐与余量。
+func (v *adapter) fetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchResponse, error) {
 	if cred == nil {
 		return nil, transientErr("zcode credential is nil")
 	}
@@ -179,64 +176,205 @@ func FetchQuota(ctx context.Context, cred *Credential) (*pluginapi.QuotaFetchRes
 
 	// 一次快照同时供给三处：订阅名、各模型余量、套餐领取状态。
 	// 多出的那一次 preview 请求换来的是「按钮是否置灰」不必另开轮询端点。
-	snapshot := fetchPlanSnapshot(ctx, cred)
+	snapshot := v.fetchPlanSnapshot(ctx, cred)
 	applySubscription(snapshot, response)
 	response.Claim = claimStatusOf(snapshot)
-
-	metrics, errBalance := fetchBalances(ctx, cred)
-	if errBalance != nil {
-		return nil, errBalance
+	response.Summary = append(response.Summary, snapshot.metrics...)
+	response.Groups = append(response.Groups, snapshot.groups...)
+	if snapshot.errBalance != nil {
+		return nil, snapshot.errBalance
 	}
-	response.Summary = append(response.Summary, metrics...)
 	return response, nil
 }
 
 // applySubscription 用已持有的套餐补充订阅名（失败时保留默认值）。
 //
-// 数据来自套餐快照里已经拿到的 billing/current，不额外发请求。
+// 数据来自套餐快照里已经拿到的 billing/balance，不额外发请求。
 func applySubscription(snapshot planSnapshot, response *pluginapi.QuotaFetchResponse) {
-	for _, plan := range snapshot.offered {
-		if snapshot.held[plan.PlanID] && plan.Name != "" {
-			response.Subscription.Plan = plan.Name
-			response.Subscription.TierName = plan.PlanID
-			return
+	active := activePlans(snapshot.plans, snapshot.serverTime)
+	if len(active) == 0 {
+		return
+	}
+	best, bestScore := active[0], 0
+	for _, plan := range active {
+		score := 0
+		for _, bucket := range snapshot.balances {
+			if planIdentityOverlap(plan, bucket) {
+				score++
+			}
+		}
+		if score > bestScore {
+			best, bestScore = plan, score
 		}
 	}
+	if bestScore == 0 && len(snapshot.balances) > 0 {
+		// Do not report an arbitrary promotional plan when balances cannot be
+		// associated; the default subscription is more truthful than a mismatch.
+		return
+	}
+	name := core.RawStringField(best, "name")
+	if name == "" {
+		return
+	}
+	planID := normalizePlanID(core.FirstNonEmpty(
+		core.RawStringField(best, "plan_id"),
+		core.RawStringField(best, "planId"),
+	))
+	response.Subscription.Plan = name
+	response.Subscription.TierName = core.FirstNonEmpty(planID, "zcode")
 }
 
-// fetchBalances 读取各模型余量并转成指标。
-func fetchBalances(ctx context.Context, cred *Credential) ([]pluginapi.QuotaMetric, error) {
-	code, body, errRequest := billingRequest(ctx, cred, "GET", PathBillingBalance, nil)
-	if errRequest != nil {
-		return nil, errRequest
+func planIdentityOverlap(plan, bucket map[string]any) bool {
+	planIDs := map[string]struct{}{}
+	for _, key := range []string{"plan_id", "planId", "user_plan_id", "userPlanId", "entitlement_id", "entitlementId"} {
+		if value := normalizePlanID(core.RawStringField(plan, key)); value != "" {
+			planIDs[value] = struct{}{}
+		}
 	}
-	if code != codeSuccess {
-		return nil, Classify(0, classifyBillingOutcome(code, body))
+	for _, key := range []string{"plan_id", "planId", "user_plan_id", "userPlanId", "entitlement_id", "entitlementId"} {
+		if value := normalizePlanID(core.RawStringField(bucket, key)); value != "" {
+			if _, ok := planIDs[value]; ok {
+				return true
+			}
+		}
 	}
+	return false
+}
 
-	balances, _ := dataMap(body)["balances"].([]any)
+// balanceQuota 把 billing/balance 的额度桶一次遍历折成（指标, 窗口组）。
+//
+// 单遍历同时产出两份：逐桶指标进摘要串，窗口组驱动宿主卡片的进度条；
+// 分两趟各自解析同一响应曾让口径漂移（P1 审查意见）。
+// 同名桶按出现顺序去重计入汇总（上游同模型多条时只计首条，避免重复加总）。
+func balanceQuota(body map[string]any) ([]pluginapi.QuotaMetric, []pluginapi.QuotaGroup) {
+	balances := balanceRows(body)
 	if len(balances) == 0 {
 		return nil, nil
 	}
-
+	var totalRemaining, totalTotal, totalUsed float64
+	seen := map[string]bool{}
+	parsed := 0
 	metrics := make([]pluginapi.QuotaMetric, 0, len(balances))
-	for _, item := range balances {
-		entry, ok := item.(map[string]any)
-		if !ok {
-			continue
-		}
-		name := core.FirstNonEmpty(core.RawStringField(entry, "show_name"), core.RawStringField(entry, "model"))
+	group := pluginapi.QuotaGroup{DisplayName: "模型额度"}
+	for _, entry := range balances {
+		name := core.FirstNonEmpty(core.RawStringField(entry, "show_name"), core.RawStringField(entry, "showName"), core.RawStringField(entry, "model"))
 		if name == "" {
 			continue
 		}
-		metrics = append(metrics, pluginapi.QuotaMetric{
-			Key:   "remaining_" + sanitizeMetricKey(name),
-			Label: name + " 剩余",
-			Value: floatField(entry, "remaining_units"),
-			Unit:  "tokens",
-		})
+		parsed++
+		remaining := firstFloat(entry, "remaining_units", "remainingUnits", "available_units", "availableUnits")
+		used := firstFloat(entry, "used_units", "usedUnits")
+		total := firstFloat(entry, "total_units", "totalUnits", "grant_units", "grantUnits")
+		if !seen[name] {
+			seen[name] = true
+			totalRemaining += remaining
+			totalTotal += total
+			totalUsed += used
+		}
+		metrics = append(metrics, pluginapi.QuotaMetric{Key: "remaining_" + sanitizeMetricKey(name), Label: name + " 剩余", Value: remaining, Unit: "tokens"})
+		if used > 0 {
+			metrics = append(metrics, pluginapi.QuotaMetric{Key: "used_" + sanitizeMetricKey(name), Label: name + " 已用", Value: used, Unit: "tokens"})
+		}
+		fraction := 0.0
+		if total > 0 {
+			fraction = remaining / total
+			if fraction < 0 {
+				fraction = 0
+			}
+			if fraction > 1 {
+				fraction = 1
+			}
+		}
+		bucket := pluginapi.QuotaBucket{Window: name, RemainingFraction: fraction, Description: fmt.Sprintf("已用 %s / 共 %s tokens", formatTokens(used), formatTokens(total))}
+		if expires := int64(firstFloat(entry, "expires_at", "expiresAt", "period_end", "periodEnd")); expires > 0 {
+			bucket.ResetTime = time.Unix(expires, 0).UTC().Format(time.RFC3339)
+		}
+		group.Buckets = append(group.Buckets, bucket)
 	}
-	return metrics, nil
+	if parsed == 0 {
+		return nil, nil
+	}
+	summary := []pluginapi.QuotaMetric{{Key: "remaining", Label: "剩余", Value: totalRemaining, Unit: "tokens"}}
+	if totalTotal > 0 {
+		summary = append(summary, pluginapi.QuotaMetric{Key: "total", Label: "总量", Value: totalTotal, Unit: "tokens"})
+	}
+	if totalUsed > 0 {
+		summary = append(summary, pluginapi.QuotaMetric{Key: "used", Label: "已用", Value: totalUsed, Unit: "tokens"})
+	}
+	return append(summary, metrics...), []pluginapi.QuotaGroup{group}
+}
+
+func balanceRows(body map[string]any) []map[string]any {
+	data := dataMap(body)
+	if data == nil {
+		return nil
+	}
+	for _, key := range []string{"balances", "balance", "quotas", "entitlements"} {
+		if rows := objectRows(data[key]); len(rows) > 0 {
+			return rows
+		}
+	}
+	return nil
+}
+
+func firstFloat(raw map[string]any, keys ...string) float64 {
+	for _, key := range keys {
+		if value := floatField(raw, key); value != 0 {
+			return value
+		}
+	}
+	return 0
+}
+
+// planExpiryGroup 从仍生效的套餐里取**最近一个到期时刻**作为套餐有效期提示。
+//
+// 口径与 heldPlanIDs 一致（经 activePlans 共用）：空 status 视作 active、
+// active 但已过 ends_at 视作 expired。多套餐并存时取最近的到期——用户
+// 关心的是「下一份什么时候没」，取最晚会把近期到期藏起来。
+// 不占 ResetTime（那是「重置时间」语义，礼包不重置），走 Description。
+func planExpiryGroup(plans []map[string]any, serverTime int64) *pluginapi.QuotaGroup {
+	nearest := int64(0)
+	for _, plan := range activePlans(plans, serverTime) {
+		if ends := int64(floatField(plan, "ends_at")); ends > 0 && (nearest == 0 || ends < nearest) {
+			nearest = ends
+		}
+	}
+	if nearest == 0 {
+		return nil
+	}
+	return &pluginapi.QuotaGroup{DisplayName: "套餐有效期", Buckets: []pluginapi.QuotaBucket{{
+		Window:      "有效期",
+		Description: "套餐到期 " + time.Unix(nearest, 0).UTC().Format(time.RFC3339),
+	}}}
+}
+
+// activePlans 返回仍生效的套餐条目（原样引用，不拷贝）。
+//
+// 判定口径唯一：status 缺失视作 active（上游历史形态），status 非 active
+// 排除；active 但已过 ends_at 同样排除（官方客户端 normalizeStartPlanExpiry
+// 的归一）。heldPlanIDs 与 planExpiryGroup 共用本函数，保证「已持有」
+// 与「有效期」两张视图永远一致。
+func activePlans(plans []map[string]any, serverTime int64) []map[string]any {
+	out := make([]map[string]any, 0, len(plans))
+	for _, entry := range plans {
+		status := strings.ToLower(strings.TrimSpace(core.RawStringField(entry, "status")))
+		if status != "" && status != "active" {
+			continue
+		}
+		if startsAt := floatField(entry, "starts_at"); startsAt > 0 && serverTime > 0 && startsAt > float64(serverTime) {
+			continue
+		}
+		if endsAt := floatField(entry, "ends_at"); endsAt > 0 && serverTime > 0 && endsAt <= float64(serverTime) {
+			continue
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+// formatTokens 把 token 数格式化为整数字符串（小数四舍五入）。
+func formatTokens(value float64) string {
+	return strconv.FormatFloat(value, 'f', 0, 64)
 }
 
 // sanitizeMetricKey 把模型名转成稳定的指标键。
@@ -412,20 +550,37 @@ func parseCaptchaConfig(body []byte) core.CaptchaConfig {
 
 // planSnapshot 是一次「账号套餐视图」：上游投放了什么、账号已经持有什么。
 //
-// 两者都取自 billing 族：持有情况在 billing/current，投放情况在
-// billing/preview。一次快照就是两个请求，没有多余开销——它同时供额度查询、
-// 按钮状态与领取前的校验复用。
+// 全部取自 billing 族：投放情况在 billing/preview，持有情况与余量在
+// billing/balance（billing/current 已废弃，balance 的 data.plans 才是权威）。
+// 一次快照就是两个请求，供额度查询、按钮状态与领取前的校验复用。
 type planSnapshot struct {
 	// offered 是上游当前投放的套餐（按优先级降序）。
 	offered []core.PlanInfo
 	// held 是账号已持有且仍生效的套餐 ID 集合。
 	held map[string]bool
-	// errPreview 是 preview 请求的失败原因（current 失败时 held 为空）。
+	// plans 是 balance 返回的原始套餐条目（订阅名与状态展示用）。
+	plans []map[string]any
+	// balances 是当前额度桶，用于把订阅名关联到实际生效的套餐。
+	balances []map[string]any
+	// serverTime 是 balance 返回的服务端时间，用于统一判断套餐是否仍有效。
+	serverTime int64
+	// metrics 是 balance 换算出的各模型余量。
+	metrics []pluginapi.QuotaMetric
+	// groups 是 balance 换算出的窗口组（宿主卡片渲染进度条与到期时间）。
+	groups []pluginapi.QuotaGroup
+	// errPreview 是 preview 请求的失败原因（balance 失败时 held 为空）。
 	errPreview error
+	// errBalance 是 balance 请求的失败原因；非空时额度结果不完整。
+	errBalance error
+	// errActivation 是活跃上报的失败原因，用于解释「为什么一个活动都看不到」。
+	errActivation string
 }
 
 // claimable 返回尚未领取的投放套餐。
 func (s planSnapshot) claimable() []core.PlanInfo {
+	if s.errBalance != nil {
+		return nil
+	}
 	out := make([]core.PlanInfo, 0, len(s.offered))
 	for _, plan := range s.offered {
 		if !s.held[plan.PlanID] {
@@ -437,14 +592,39 @@ func (s planSnapshot) claimable() []core.PlanInfo {
 
 // fetchPlanSnapshot 拉取套餐视图。
 //
-// current 失败不算整体失败：此时把持有集合当作空（结果偏保守——已领的套餐
-// 会被再列成可领，用户点下去拿到上游 1003，语义依然正确）。preview 失败会
-// 记进 errPreview，由调用方决定是降级还是报错。
-func fetchPlanSnapshot(ctx context.Context, cred *Credential) planSnapshot {
+// 顺序有语义：活跃上报必须**先于** preview——上游按「当日活跃」决定投不投活动，
+// 反过来做会让新的一天永远拿不到活动（见 activation.go）。
+//
+// balance 失败不算整体失败：此时把持有集合当作空（结果偏保守——已领的套餐
+// 会被再列成可领，用户点下去拿到上游 1003，语义依然正确），但额度与订阅名
+// 会缺失，调用方据 errBalance 决定是否上报失败。preview 失败记进 errPreview。
+func (v *adapter) fetchPlanSnapshot(ctx context.Context, cred *Credential) planSnapshot {
 	snapshot := planSnapshot{held: map[string]bool{}}
-	if code, body, err := billingRequest(ctx, cred, http.MethodGet, PathBillingCurrent, nil); err == nil && code == codeSuccess {
-		snapshot.held = heldPlanIDs(body)
+	snapshot.errActivation = v.ensureActivation(ctx, cred)
+
+	code, body, errBalance := billingRequest(ctx, cred, http.MethodGet,
+		PathBillingBalance+"?app_version="+url.QueryEscape(ClientAppVersion), nil)
+	balanceShapeErr := validateBillingBalance(body)
+	switch {
+	case errBalance != nil:
+		snapshot.errBalance = errBalance
+	case code != codeSuccess:
+		snapshot.errBalance = Classify(0, classifyBillingOutcome(code, body))
+	case balanceShapeErr != nil:
+		// A successful envelope without the billing arrays is incomplete, not zero quota.
+		// Keep claims and quota unavailable instead of presenting false empty state.
+		snapshot.errBalance = balanceShapeErr
+	default:
+		snapshot.plans = planRows(body)
+		snapshot.balances = balanceRows(body)
+		snapshot.serverTime = serverSeconds(body)
+		snapshot.held = heldPlanIDs(snapshot.plans, snapshot.serverTime)
+		snapshot.metrics, snapshot.groups = balanceQuota(body)
+		if expiry := planExpiryGroup(snapshot.plans, snapshot.serverTime); expiry != nil {
+			snapshot.groups = append(snapshot.groups, *expiry)
+		}
 	}
+
 	offered, code, errOffered := fetchOfferedPlans(ctx, cred)
 	if errOffered != nil {
 		snapshot.errPreview = errOffered
@@ -458,21 +638,52 @@ func fetchPlanSnapshot(ctx context.Context, cred *Credential) planSnapshot {
 	return snapshot
 }
 
-// heldPlanIDs 从 billing/current 响应里取账号已持有且生效的套餐 ID。
+func validateBillingBalance(body map[string]any) error {
+	data := dataMap(body)
+	if data == nil {
+		return transientErr("ZCode billing balance 响应缺少 data")
+	}
+	if _, ok := data["plans"].([]any); !ok {
+		return transientErr("ZCode billing balance 响应缺少 plans")
+	}
+	if _, ok := data["balances"].([]any); !ok {
+		return transientErr("ZCode billing balance 响应缺少 balances")
+	}
+	return nil
+}
+
+// planRows 取 balance 响应里的 data.plans。
+func planRows(body map[string]any) []map[string]any {
+	return objectRows(dataMap(body)["plans"])
+}
+
+// objectRows 把 JSON 数组里的对象挑出来，忽略其他形态的条目。
+func objectRows(value any) []map[string]any {
+	items, _ := value.([]any)
+	rows := make([]map[string]any, 0, len(items))
+	for _, item := range items {
+		if entry, okEntry := item.(map[string]any); okEntry {
+			rows = append(rows, entry)
+		}
+	}
+	return rows
+}
+
+// serverSeconds 取响应体里的服务端时间（秒）；缺失时返回 0。
 //
-// status 非 active（已过期 / 已停用）的不算持有，否则活动下线后按钮会永远灰着。
-func heldPlanIDs(body map[string]any) map[string]bool {
+// 用服务端时间而不是本机时钟：过期判定要跟上游口径一致，本机时钟漂移会让
+// 刚结束的活动继续显示成「已持有」。
+func serverSeconds(body map[string]any) int64 {
+	return int64(floatField(dataMap(body), "server_time"))
+}
+
+// heldPlanIDs 从 balance 的 data.plans 里取账号已持有且生效的套餐 ID。
+//
+// 生效口径见 activePlans（status 缺失视作 active、过 ends_at 视作 expired）：
+// status 非 active 的不算持有，否则活动下线后按钮会永远灰着。
+func heldPlanIDs(plans []map[string]any, serverTime int64) map[string]bool {
 	held := map[string]bool{}
-	raw, _ := dataMap(body)["plans"].([]any)
-	for _, item := range raw {
-		entry, okEntry := item.(map[string]any)
-		if !okEntry {
-			continue
-		}
-		status := strings.ToLower(strings.TrimSpace(core.RawStringField(entry, "status")))
-		if status != "" && status != "active" {
-			continue
-		}
+	for _, entry := range activePlans(plans, serverTime) {
 		planID := normalizePlanID(core.FirstNonEmpty(
 			core.RawStringField(entry, "plan_id"),
 			core.RawStringField(entry, "planId"),
@@ -497,58 +708,95 @@ func fetchOfferedPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, 
 		return nil, code, nil
 	}
 
-	raw, _ := dataMap(body)["plans"].([]any)
-	plans := make([]core.PlanInfo, 0, len(raw))
+	return normalizePlans(planRows(body)), codeSuccess, nil
+}
+
+// normalizePlans 把原始套餐条目归一化成 PlanInfo 列表。
+//
+// 丢弃没有 plan_id 的条目、按 plan_id 去重，再按优先级降序 / plan_id 升序排列：
+// 同优先级也要有稳定顺序，否则页面展示会随上游返回顺序抖动。billing/preview 与
+// marketing/touch 两条链路共用这段约定。
+func normalizePlans(rows []map[string]any) []core.PlanInfo {
+	plans := make([]core.PlanInfo, 0, len(rows))
 	seen := map[string]bool{}
-	for _, item := range raw {
-		entry, okEntry := item.(map[string]any)
-		if !okEntry {
-			continue
-		}
-		plan := parsePlan(entry)
+	for _, row := range rows {
+		plan := parsePlan(row)
 		if plan == nil || seen[plan.PlanID] {
 			continue
 		}
 		seen[plan.PlanID] = true
 		plans = append(plans, *plan)
 	}
-	// 优先级降序；同优先级按 plan_id 排序保证顺序稳定（否则同批活动的展示
-	// 顺序会随上游返回顺序抖动）。
 	sort.SliceStable(plans, func(i, j int) bool {
 		if plans[i].Priority != plans[j].Priority {
 			return plans[i].Priority > plans[j].Priority
 		}
 		return plans[i].PlanID < plans[j].PlanID
 	})
-	return plans, codeSuccess, nil
+	return plans
+}
+
+// ProbeActivity 只读探测账号当前可见的活动投放，不执行领取。
+//
+// 探测允许 API Key 账号参与（如 1024 Dev Day 这类不限 Coding Plan 的活动），
+// 因此不走 billingBlockReason（那条通道只服务 JWT）。活跃上报失败只降级成
+// Warning：缺 user_id 的 API Key 凭证报不上活跃，但营销通道可能仍有投放，
+// 直接失败会让端点对它完全不可用。
+func (v *adapter) ProbeActivity(ctx context.Context, cred *core.Credential) (core.ActivityProbeResult, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return core.ActivityProbeResult{}, errNative
+	}
+	if native == nil {
+		return core.ActivityProbeResult{}, core.NewPluginError("zcode_credential_missing", "zcode credential is nil", http.StatusBadRequest)
+	}
+	warning := v.ensureActivation(ctx, native)
+	activities, errQuery := queryMarketingTouch(ctx, native)
+	if errQuery != nil {
+		return core.ActivityProbeResult{}, errQuery
+	}
+	return core.ActivityProbeResult{Activities: activities, Warning: warning}, nil
 }
 
 // PreviewPlans 返回账号当前可领的套餐（已剔除已持有的）。
 //
 // 空切片表示没有可领的，页面据此把按钮置灰成「已领取」。
-func PreviewPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, error) {
+func (v *adapter) PreviewPlans(ctx context.Context, cred *core.Credential) ([]core.PlanInfo, error) {
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return nil, errNative
+	}
+	return v.previewPlans(ctx, native)
+}
+
+func (v *adapter) previewPlans(ctx context.Context, cred *Credential) ([]core.PlanInfo, error) {
 	if reason := billingBlockReason(cred); reason != "" {
 		return nil, core.NewPluginError("zcode_no_plan_channel", reason, http.StatusBadRequest)
 	}
-	snapshot := fetchPlanSnapshot(ctx, cred)
+	snapshot := v.fetchPlanSnapshot(ctx, cred)
 	if snapshot.errPreview != nil {
 		return nil, snapshot.errPreview
 	}
-	claimable := snapshot.claimable()
-	if len(claimable) == 0 {
-		return nil, nil
-	}
-	return claimable, nil
+	return snapshot.claimable(), nil
 }
 
 // claimStatusOf 把套餐视图折成额度响应里的领取状态。
+//
+// **「空列表」与「没查到」必须分开**：preview 成功且确实没有投放时才是「已领取」；
+// 活跃上报或 preview 失败时说成「已领取」是在骗页面，用户会以为没活动可领而错过。
 func claimStatusOf(snapshot planSnapshot) *pluginapi.ClaimStatus {
 	status := &pluginapi.ClaimStatus{
 		Available: len(snapshot.offered),
 		Claimable: len(snapshot.claimable()),
 	}
-	if snapshot.errPreview != nil {
+	switch {
+	case snapshot.errBalance != nil:
+		status.Error = "额度/套餐状态查询失败：" + snapshot.errBalance.Error()
+	case snapshot.errPreview != nil:
 		status.Error = snapshot.errPreview.Error()
+	case len(snapshot.offered) == 0 && snapshot.errActivation != "":
+		// 活动投放以当日活跃为资格：没报上活跃，空列表不说明「已领完」。
+		status.Error = snapshot.errActivation
 	}
 	return status
 }
@@ -665,7 +913,7 @@ func (v *adapter) claimPlan(ctx context.Context, cred *Credential, req core.Clai
 			"zcode_captcha_required", "请先在页面上完成人机验证", http.StatusBadRequest)
 	}
 
-	plan, errPick := pickClaimPlan(ctx, cred, req.PlanID)
+	plan, errPick := v.pickClaimPlan(ctx, cred, req.PlanID)
 	if errPick != nil {
 		return core.ClaimPlanResponse{}, errPick
 	}
@@ -706,8 +954,8 @@ func (v *adapter) claimPlan(ctx context.Context, cred *Credential, req core.Clai
 //
 // 指定 plan_id 时校验它当前确实可领（预览里存在且未持有）；没指定就取
 // 优先级最高的可领项。两者都拿不到候选时报错，避免把无效plan_id 打给上游。
-func pickClaimPlan(ctx context.Context, cred *Credential, planID string) (*core.PlanInfo, error) {
-	available, errPreview := PreviewPlans(ctx, cred)
+func (v *adapter) pickClaimPlan(ctx context.Context, cred *Credential, planID string) (*core.PlanInfo, error) {
+	available, errPreview := v.previewPlans(ctx, cred)
 	if errPreview != nil {
 		return nil, errPreview
 	}
@@ -777,15 +1025,6 @@ func (v *adapter) CaptchaConfig(ctx context.Context) (core.CaptchaConfig, error)
 	return FetchCaptchaConfig(ctx)
 }
 
-// PreviewPlans 实现 core.PlanPreviewProvider。
-func (v *adapter) PreviewPlans(ctx context.Context, cred *core.Credential) ([]core.PlanInfo, error) {
-	native, errNative := v.Native(cred)
-	if errNative != nil {
-		return nil, errNative
-	}
-	return PreviewPlans(ctx, native)
-}
-
 // ClaimPlan 实现 core.PlanClaimProvider。
 func (v *adapter) ClaimPlan(ctx context.Context, cred *core.Credential, req core.ClaimPlanRequest) (core.ClaimPlanResponse, error) {
 	native, errNative := v.Native(cred)
@@ -795,5 +1034,277 @@ func (v *adapter) ClaimPlan(ctx context.Context, cred *core.Credential, req core
 	return v.claimPlan(ctx, native, req)
 }
 
-// compile-time断言：adapter 具备领取套餐的三项能力。
-var _ core.PlanClaimer = (*adapter)(nil)
+// ---- 活跃上报 ----
+//
+// 活动投放以「当日活跃」为资格信号：官方桌面端每次启动、每个自然日都会上报
+// 埋点，不发这两条事件的账号 preview 恒空。这里只补报，不领取。
+
+// 激活事件上报：让上游把本账号当作「今日活跃的官方客户端」。
+//
+// 为什么需要它：billing/preview 的返回**不是**纯粹的账号权益快照，活动套餐的投放
+// 以「当日活跃」为资格信号。官方桌面端每次启动发 app_launch、每个自然日发一次
+// app_daily_active（packages/services/src/telemetry/telemetryCore.ts 的
+// reportAppLaunch / reportAppDailyActive）。不发这两条事件的账号，preview 恒空——
+// 于是插件算出的可领数为 0，控制台把按钮永久灰成「已领取」，而账号其实一个套餐
+// 都没领。这与领取接口本身无关：有活动时手动领取是能成功的。
+//
+// 事件体严格对齐官方 sendReport 的 16 个字段；端点不在 zcode-plan 之下，也不带
+// Authorization（官方该端点同样匿名上报）。
+
+// activationElements 是官方在启动/日活时上报的两个元素名。
+var activationElements = []string{"app_launch", "app_daily_active"}
+
+// activationTimeout 是单条埋点的上限：埋点失败不得拖住额度查询。
+const activationTimeout = 10 * time.Second
+
+// activationState 是「每个账号每个自然日只上报一次」的进程内去重表。
+//
+// 状态属于实例而不是落盘：多 App 并存时各自独立（与 claimGate 同一约定）。
+// 进程重启后多报一轮无副作用——上游本身按 device_mid + 日期去重。
+type activationState struct {
+	mu   sync.Mutex
+	last map[string]string // uid → 本地日期（账号档案时区）
+}
+
+func newActivationState() *activationState {
+	return &activationState{last: map[string]string{}}
+}
+
+// shouldReport 报告本次是否要上报，并在需要时先占位（避免并发重复上报）。
+func (s *activationState) shouldReport(uid string, today string) bool {
+	if s == nil {
+		return true
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.last[uid] == today {
+		return false
+	}
+	s.last[uid] = today
+	return true
+}
+
+// forget 撤销占位：上报失败时允许下一次重试。
+func (s *activationState) forget(uid string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	delete(s.last, uid)
+	s.mu.Unlock()
+}
+
+// localDate 返回账号档案时区下的自然日（YYYY-MM-DD）。
+//
+// 时区取不到时退回 UTC：去重粒度粗一点没有副作用，只是可能多报一次。
+func localDate(profile DeviceProfile, now time.Time) string {
+	zone := strings.TrimSpace(profile.Timezone)
+	if zone != "" {
+		if location, errLoad := time.LoadLocation(zone); errLoad == nil {
+			return now.In(location).Format("2006-01-02")
+		}
+	}
+	return now.UTC().Format("2006-01-02")
+}
+
+// activationEventBody 构造官方 sendReport 的 16 字段事件体。
+func activationEventBody(element string, cred *Credential, userID string) map[string]any {
+	profile := cred.Profile
+	profile.ensure()
+	return map[string]any{
+		"event_id":           NewUUID(),
+		"client_timezone":    profile.Timezone,
+		"client_language":    profile.Language,
+		"element_name":       element,
+		"event_region":       "app",
+		"event_type":         "view",
+		"event_text":         "",
+		"event_extra_detail": map[string]any{},
+		"user_id":            userID,
+		"screen_resolution":  profile.Screen,
+		"app_version":        ClientAppVersion,
+		"device_os_category": profile.OSCategory(),
+		"device_os_version":  profile.OSVersion,
+		"device_mid":         profile.DeviceMID,
+		"mac_id":             "",
+		"marketing_params":   "{}",
+	}
+}
+
+// postActivationEvent 上报单条激活事件。
+//
+// 走 hostbridge.Client 与其他上游请求同一出口；不带 Authorization，只带官方
+// 来源头（身份头里与本次上报相关的字段已在事件体里，头本身用于通过网关）。
+func postActivationEvent(ctx context.Context, cred *Credential, body map[string]any) error {
+	encoded, errMarshal := json.Marshal(body)
+	if errMarshal != nil {
+		return errMarshal
+	}
+
+	req, errNew := http.NewRequestWithContext(ctx, http.MethodPost,
+		ZCodeOrigin+PathEventReport, bytes.NewReader(encoded))
+	if errNew != nil {
+		return errNew
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", UserAgent)
+	req.Header.Set("HTTP-Referer", ZCodeOrigin)
+	req.Header.Set("X-Title", ClientTitle)
+
+	resp, errDo := hostbridge.Client(ctx, activationTimeout).Do(req)
+	if errDo != nil {
+		return fmt.Errorf("激活上报失败: %w", errDo)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("激活上报 HTTP %d: %s", resp.StatusCode, truncateText(string(raw), 120))
+	}
+	// 业务码非 0 视为失败；响应非 JSON 时按成功处理（网关可能回空体）。
+	var parsed map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &parsed); errUnmarshal == nil {
+		if code := businessCode(parsed); code != -1 && code != 0 {
+			return fmt.Errorf("激活上报业务码 %d: %s", code, truncateText(string(raw), 120))
+		}
+	}
+	return nil
+}
+
+// ensureActivation 保证本账号今天已向平台报过活跃，返回失败原因（空串表示无需再报
+// 或已成功）。
+//
+// 失败**不阻断**后续 preview：官方客户端同样不因埋点失败停业务，这里把原因交给
+// 调用方决定是展示还是忽略。
+func (v *adapter) ensureActivation(ctx context.Context, cred *Credential) string {
+	if cred == nil {
+		return ""
+	}
+	userID := strings.TrimSpace(cred.UserID)
+	if userID == "" {
+		userID = UserIDFromJWT(cred.JWTToken)
+	}
+	if userID == "" {
+		// 无用户身份无法上报（官方事件体以 user_id 归属）；如实说明而不是静默跳过，
+		// 否则用户会继续看到一个永远空的活动列表。
+		return "凭证缺少 user_id，无法上报活跃事件（活动投放可能不完整；可重新登录或补充 user_id）"
+	}
+
+	today := localDate(cred.Profile, time.Now())
+	if !v.activations.shouldReport(userID, today) {
+		return ""
+	}
+
+	for _, element := range activationElements {
+		if err := postActivationEvent(ctx, cred, activationEventBody(element, cred, userID)); err != nil {
+			v.activations.forget(userID)
+			logger.Info("zcode 激活上报失败 (%s): %v", element, err)
+			return err.Error()
+		}
+	}
+	return ""
+}
+
+// truncateText 截断过长的上游响应片段，避免把整页 HTML 塞进错误消息。
+func truncateText(text string, limit int) string {
+	text = strings.TrimSpace(text)
+	if len(text) <= limit {
+		return text
+	}
+	return text[:limit] + "…"
+}
+
+// ---- 营销投放 ----
+//
+// marketing/touch 是 ZCode 的投放通道，与计费族是两条独立链路：只读、不参与
+// 领取，且对 API Key 账号同样开放（billing 只服务 JWT 的 Coding Plan）。
+
+// 营销触达（marketing/touch）：ZCode 的投放通道。
+//
+// 与计费族（billing/*）是两条独立链路：营销通道只读、不参与领取，且对 API Key
+// 账号同样开放（billing 只服务 JWT 的 Coding Plan）。投放以「当日活跃」为资格
+// 信号，事件上报由调用方在探测前完成（见 activation.go）。
+
+const pathMarketingTouch = "/api/v1/marketing/touch"
+
+// marketingHeaders 复用上游身份与鉴权头；本接口是只读 GET，只额外声明 Accept。
+func marketingHeaders(cred *Credential) map[string]string {
+	headers := upstreamAuthHeaders(cred)
+	headers["Accept"] = "application/json"
+	return headers
+}
+
+// queryMarketingTouch 拉取账号当前可见的活动投放。
+func queryMarketingTouch(ctx context.Context, cred *Credential) ([]core.PlanInfo, error) {
+	u, errParse := url.Parse(ZCodeOrigin + pathMarketingTouch)
+	if errParse != nil {
+		return nil, errParse
+	}
+	// seq=0 取首屏。上游没有公开游标语义，这里不做猜测性翻页：多翻一轮会把
+	// 同一批投放重复拉一遍，反而放大请求量。
+	u.RawQuery = "seq=0"
+
+	req, errNew := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if errNew != nil {
+		return nil, errNew
+	}
+	for key, value := range marketingHeaders(cred) {
+		req.Header.Set(key, value)
+	}
+
+	resp, errDo := hostbridge.Client(ctx, billingHTTPTimeout).Do(req)
+	if errDo != nil {
+		return nil, errDo
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, billingMaxBody))
+	if errRead != nil {
+		return nil, errRead
+	}
+	return parseMarketingTouch(resp.StatusCode, raw)
+}
+
+// parseMarketingTouch 解析营销触达响应。
+//
+// 只认 data.deliveries[].banner.background.args.zcode_plan：活动套餐塞在 banner
+// 的渲染参数里，其余投递（纯文案/图片）没有 plan_id，会被 normalizePlans 丢掉。
+//
+// 不按 starts_at/ends_at 二次过滤：上游已按当前时间筛选投放，本机时钟漂移只会
+// 误伤。这里返回的是「上游当前投放」，不是「本账号此刻可领」。
+func parseMarketingTouch(status int, raw []byte) ([]core.PlanInfo, error) {
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
+		return nil, core.NewPluginError("zcode_activity_response",
+			"营销活动响应不是合法 JSON: "+truncateText(string(raw), 120), http.StatusBadGateway)
+	}
+	if status < 200 || status >= 300 {
+		return nil, core.NewPluginError("zcode_activity_http",
+			fmt.Sprintf("营销活动查询 HTTP %d: %s", status, truncateText(string(raw), 120)), http.StatusBadGateway)
+	}
+	// 2xx 且没有业务码时按成功处理：网关可能剥掉信封，与激活上报同一约定。
+	if code := businessCode(payload); code != 0 && code != -1 {
+		message := core.FirstNonEmpty(core.RawStringField(payload, "msg"), "上游未给出原因")
+		return nil, core.NewPluginError("zcode_activity_business",
+			fmt.Sprintf("营销活动查询业务码 %d: %s", code, message), http.StatusBadGateway)
+	}
+
+	deliveries := objectRows(dataMap(payload)["deliveries"])
+	plans := make([]map[string]any, 0, len(deliveries))
+	for _, delivery := range deliveries {
+		if plan := nestedMap(delivery, "banner", "background", "args", "zcode_plan"); plan != nil {
+			plans = append(plans, plan)
+		}
+	}
+	return normalizePlans(plans), nil
+}
+
+// nestedMap 沿字段路径逐层取对象，任一层缺失或不是对象时返回 nil。
+func nestedMap(raw map[string]any, path ...string) map[string]any {
+	for _, key := range path {
+		if raw, _ = raw[key].(map[string]any); raw == nil {
+			return nil
+		}
+	}
+	return raw
+}

@@ -40,9 +40,9 @@ func TestAppsHaveIsolatedRegistryAndState(t *testing.T) {
 		t.Fatalf("apply second: %v", errApply)
 	}
 	first.MutateState(func(state *state.State) {
-		state.VendorSettings = map[string]string{"workbuddy_prompt_mode": "custom"}
+		state.PromptMode = "custom"
 	})
-	if got := second.SnapshotState().VendorSettings["workbuddy_prompt_mode"]; got != "" {
+	if got := second.SnapshotState().PromptMode; got != "" {
 		t.Fatalf("second app saw first app state: %q", got)
 	}
 }
@@ -119,7 +119,7 @@ func (v *recordingVendor) ExecuteStream(context.Context, *core.Credential, *core
 func (v *recordingVendor) Configure(_ core.Settings, raw map[string]string) {
 	v.baseURL = raw["vendor_base_url"]
 	v.ua = raw["vendor_ua"]
-	v.prompt = raw["workbuddy_prompt_mode"]
+	v.prompt = raw["prompt_mode"]
 }
 
 // TestAppsIsolateVendorConfig 验证两个 App 的供应商实例各自持有自己的配置。
@@ -147,17 +147,17 @@ func TestAppsIsolateVendorConfig(t *testing.T) {
 	firstCfg := app.DefaultConfig()
 	firstCfg.StateDir = t.TempDir()
 	firstCfg.Raw = map[string]string{
-		"vendor_base_url":       "http://first.test",
-		"vendor_ua":             "UA-First/1.0",
-		"workbuddy_prompt_mode": "custom",
+		"vendor_base_url": "http://first.test",
+		"vendor_ua":       "UA-First/1.0",
 	}
+	firstCfg.PromptMode = "custom"
 	secondCfg := app.DefaultConfig()
 	secondCfg.StateDir = t.TempDir()
 	secondCfg.Raw = map[string]string{
-		"vendor_base_url":       "http://second.test",
-		"vendor_ua":             "UA-Second/2.0",
-		"workbuddy_prompt_mode": "append",
+		"vendor_base_url": "http://second.test",
+		"vendor_ua":       "UA-Second/2.0",
 	}
+	secondCfg.PromptMode = "append"
 	if errApply := first.ApplyConfig(firstCfg); errApply != nil {
 		t.Fatalf("apply first: %v", errApply)
 	}
