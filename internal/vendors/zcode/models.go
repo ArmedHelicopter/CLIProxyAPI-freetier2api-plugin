@@ -120,7 +120,7 @@ func parseConfigModels(body []byte) []Model {
 		if id == "" {
 			continue
 		}
-		imageSupport := item.Capabilities.Vision || item.Capabilities.Image || item.Capabilities.SupportsImages || hasImageModality(item.Capabilities.Input) || hasImageModality(item.Capabilities.InputModalities) || hasImageModality(item.InputModalities) || hasImageModality(item.Modalities.Input)
+		imageSupport := item.Capabilities.Vision || item.Capabilities.Image || item.Capabilities.SupportsImages || hasImageModality(item.Capabilities.Input) || hasImageModality(item.Capabilities.InputModalities) || hasImageModality(item.InputModalities) || hasImageModality(item.Modalities.Input) || knownVisionModel(id)
 		models = append(models, Model{
 			ID:             id,
 			Name:           core.FirstNonEmpty(item.Name, id),
@@ -133,6 +133,10 @@ func parseConfigModels(body []byte) []Model {
 		})
 	}
 	return models
+}
+
+func knownVisionModel(id string) bool {
+	return strings.EqualFold(strings.TrimSpace(id), "GLM-5.3-Flash")
 }
 
 func hasImageModality(values []string) bool {
