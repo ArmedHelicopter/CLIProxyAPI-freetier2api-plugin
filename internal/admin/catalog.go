@@ -7,6 +7,7 @@ package admin
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -451,7 +452,9 @@ func equalCachedModels(a, b []core.CachedModel) bool {
 	for _, item := range b {
 		prev, ok := index[key{item.VendorID, item.ID}]
 		if !ok || prev.Name != item.Name || prev.ContextLength != item.ContextLength ||
-			prev.MaxOutputTokens != item.MaxOutputTokens || prev.Credits != item.Credits {
+			prev.MaxOutputTokens != item.MaxOutputTokens || prev.Credits != item.Credits ||
+			prev.SupportsImages != item.SupportsImages || prev.SupportsTool != item.SupportsTool ||
+			!slices.Equal(prev.Efforts, item.Efforts) || prev.DefaultEffort != item.DefaultEffort {
 			return false
 		}
 	}
