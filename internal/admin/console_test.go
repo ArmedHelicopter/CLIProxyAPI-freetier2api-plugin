@@ -421,7 +421,7 @@ func TestConsoleLoadModelsButtonRefreshesUpstream(t *testing.T) {
 	page := Page("/plugins/freetier2api")
 
 	for _, literal := range []string{
-		`api("POST", "/keepalive"`,
+		`api("POST", "/quotas", { refresh_credentials: true })`,
 		`btnRefreshQuotaAuth`,
 		`api("POST", "/models/refresh"`, // 真正触发上游拉取
 		`refreshModels(false);`,         // 按钮绑定到刷新入口

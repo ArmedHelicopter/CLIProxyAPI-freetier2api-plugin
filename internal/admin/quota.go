@@ -115,7 +115,7 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	}
 	done, owner := s.acquireQuotaRun()
 	if owner {
-		go s.runQuotaBatch(done, jobs)
+		go s.runQuotaBatch(done, jobs, body.RefreshCredentials)
 	}
 	select {
 	case <-done:
@@ -163,7 +163,7 @@ func (s *Service) finishQuotaRun(done chan struct{}) {
 //
 // 每个账号完成即写缓存（成功与失败都写），因此页面在轮次中途刷新也能
 // 看到已完成的账号，而不是整批退回「查询中」。
-func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
+func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob, forceRefresh bool) {
 	defer s.finishQuotaRun(done)
 
 	ctx, cancel := context.WithTimeout(hostbridge.WithCallbackID(context.Background(), ""), requestTimeout)
@@ -178,7 +178,7 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 			result := outcome.result
 			s.cacheQuotaResult(result)
 		}()
-		quota, refreshed, errQuota := s.queryQuota(ctx, current)
+		quota, refreshed, errQuota := s.queryQuota(ctx, current, forceRefresh)
 		outcome.result.RefreshAttempted = refreshed
 		if errQuota != nil {
 			outcome.result.Message = errQuota.Error()
@@ -244,20 +244,23 @@ func quotaFailureType(err error) string {
 	return string(core.FailureKindTransient)
 }
 
-func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.QuotaFetchResponse, bool, error) {
+func (s *Service) queryQuota(ctx context.Context, job quotaJob, forceRefresh bool) (*pluginapi.QuotaFetchResponse, bool, error) {
 	quotaProvider, okQuota := core.As[core.QuotaProvider](job.vendor)
 	if !okQuota {
 		return nil, false, core.QuotaUnsupported(job.vendor)
 	}
 	quota, errQuota := quotaProvider.Quota(ctx, job.credential)
 	refreshed := false
-	if errQuota != nil && isAuthExpired(errQuota) {
+	if forceRefresh || (errQuota != nil && isAuthExpired(errQuota)) {
 		// 凭证过期类错误：先保活刷新一次再重试。MiniMax 的 access token 只有
 		// 1 小时有效期，不刷新的话额度列会一直挂着 401，用户只能自己想到去点
 		// 「一键保活」——那条路还要求他先认出这是凭证问题。
 		refreshedCredential, refreshErr := s.refreshedCredential(ctx, "", job)
 		if refreshErr != nil {
-			return nil, true, refreshErr
+			if forceRefresh || isAuthExpired(errQuota) {
+				return nil, true, refreshErr
+			}
+			return quota, false, errQuota
 		}
 		if refreshedCredential != nil {
 			refreshed = true

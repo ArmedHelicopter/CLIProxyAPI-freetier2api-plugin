@@ -217,7 +217,8 @@ func (s *Service) buildLogsPayload(req pluginapi.ManagementRequest) map[string]a
 }
 
 type accountBatchRequest struct {
-	AccountIDs []string `json:"account_ids"`
+	AccountIDs         []string `json:"account_ids"`
+	RefreshCredentials bool     `json:"refresh_credentials,omitempty"`
 }
 
 func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {

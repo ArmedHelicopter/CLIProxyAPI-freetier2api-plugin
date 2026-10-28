@@ -2613,13 +2613,16 @@ details > summary { cursor: pointer; color: var(--muted); font-size: 12.5px; }
     var btn = this;
     btn.disabled = true;
     banner("ok", "正在刷新全部账号凭证并重新查询额度…", 0);
-    api("POST", "/keepalive", {}).then(function (res) {
-      if (res && res.failed > 0) {
-        banner(res.succeeded > 0 ? "warn" : "err", res.message || "凭证刷新失败", 8000);
+    api("POST", "/quotas", { refresh_credentials: true }).then(function (res) {
+      var results = (res && res.results) || [];
+      var failed = results.filter(function (item) { return !item.ok; }).length;
+      var succeeded = results.length - failed;
+      if (failed > 0) {
+        banner(succeeded > 0 ? "warn" : "err", "凭证刷新完成：" + succeeded + " 成功，" + failed + " 失败", 8000);
       } else if (res) {
-        banner("ok", res.message || "凭证刷新完成", 5000);
+        banner("ok", "凭证刷新并查询完成：" + succeeded + " 个账号", 5000);
       }
-      return loadQuotas(false);
+      return loadStatus(true);
     }).catch(function (err) {
       banner("err", "刷新额度凭证失败：" + err.message, 8000);
     }).then(function () { btn.disabled = false; });
