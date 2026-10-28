@@ -28,7 +28,7 @@ func TestParseConfigModels(t *testing.T) {
 		{"modelId":"GLM-5.3","name":"GLM-5.3","contextWindow":1000000,"maxCompletionTokens":128000,
 		 "reasoning":{"levels":{"low":{},"high":{}}}},
 		{"modelId":"GLM-5.3-Flash","name":"GLM-5.3-Flash","contextWindow":1000000,"maxCompletionTokens":128000,
-		 "capabilities":{"input":["text"]}}
+		 "capabilities":{"input":["text","image"]}}
 	]}}`)
 	models := parseConfigModels(body)
 	if len(models) != 2 {
