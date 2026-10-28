@@ -77,6 +77,14 @@ cd CLIProxyAPI-freetier2api-plugin
 
 编译产物输出至 `dist/freetier2api.<so|dylib|dll>`。
 
+> Windows 隔离开发构建与测试必须使用 `E:\_ryanDev\_kernel_stage_8.0.43`，不得写入生产安装目录。无人值守测试不得调用 `discovery.live.exe`、`cmd/discover`、`-discover` 或任何需要 UAC 提权的模型发现工具；缺少权限时应直接失败。
+
+## 模型能力与图片输入
+
+供应商模型目录会自动获取并传播模型能力。插件将上游的 `vision`、`image`、`input`、`inputModalities` 和 `modalities.input` 等字段统一转换为宿主契约的 `supported_input_modalities`。因此，模型只有在上游明确声明图片输入能力时才会标记为支持图片；例如 ZCode `GLM-5.3-Flash` 会发布 `text,image`。
+
+对于 ZCode 图片请求，当前已支持 `data:image/...;base64,...`。外部 HTTP 图片 URL 尚未自动下载；如果请求中包含外链图片，当前转换层会跳过该图片，调用方应先将图片转为 data URL。外链图片失败不会被转换层作为明确错误返回，这是已知限制。
+
 ## 使用方法
 
 ### 1. 登录控制台并添加账号
