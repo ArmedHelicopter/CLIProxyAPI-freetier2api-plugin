@@ -134,6 +134,9 @@ func (v *fakeCheckinVendor) ExecuteStream(context.Context, *core.Credential, *co
 	return nil
 }
 func (v *fakeCheckinVendor) SupportsCheckin() bool { return true }
+func (v *fakeCheckinVendor) Refresh(context.Context, *core.Credential) (*core.Credential, bool, error) {
+	return nil, false, nil
+}
 func (v *fakeCheckinVendor) Checkin(context.Context, *core.Credential) (*core.CheckinResult, error) {
 	return v.result, v.err
 }

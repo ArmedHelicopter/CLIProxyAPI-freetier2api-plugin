@@ -45,6 +45,16 @@ func (c *Catalog) Specs() []core.TaskSpec {
 			out = append(out, spec)
 		}
 	}
+	if !seen[core.TaskKindKeepalive] && c.anyRefresher() {
+		seen[core.TaskKindKeepalive] = true
+		out = append(out, core.TaskSpec{
+			Kind:         core.TaskKindKeepalive,
+			Label:        "Token 保活",
+			Description:  "刷新账号 token",
+			DefaultHours: []int{2, 6, 10, 14, 18, 22},
+			Manual:       true,
+		})
+	}
 	return out
 }
 
@@ -145,8 +155,23 @@ func NextWake(now time.Time, schedule map[string][]int) ([]string, time.Time) {
 }
 
 func (c *Catalog) anyCheckin() bool {
+	if c == nil || c.registry == nil {
+		return false
+	}
 	for _, vendor := range c.registry.Vendors() {
 		if core.SupportsCheckin(vendor) {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *Catalog) anyRefresher() bool {
+	if c == nil || c.registry == nil {
+		return false
+	}
+	for _, vendor := range c.registry.Vendors() {
+		if _, ok := core.As[core.Refresher](vendor); ok {
 			return true
 		}
 	}

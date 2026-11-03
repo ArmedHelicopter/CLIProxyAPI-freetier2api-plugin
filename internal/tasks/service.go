@@ -28,6 +28,9 @@ type Service struct {
 	// refreshGate 按账号串行化凭证续期（见 keepalive.go）。
 	refreshGate refreshGate
 
+	keepaliveMu     sync.Mutex
+	rejectedRefresh map[string]string
+
 	// jobMu/jobCtx/jobCancel 是后台动作（一键完成、异步任务族）的生命周期：
 	// 插件关停时会 dlclose 动态库，若还有后台 goroutine 在打宿主回调就会崩。
 	// Stop 先取消它，再给 jobWG 一个宽限期等 goroutine 自己退出。
@@ -93,10 +96,14 @@ func (s *Service) Start(ctx context.Context) {
 	jobCtx, jobCancel := context.WithCancel(context.Background())
 	s.jobCtx, s.jobCancel = jobCtx, jobCancel
 	s.jobMu.Unlock()
-	s.schedulerWG.Add(1)
+	s.schedulerWG.Add(2)
 	go func() {
 		defer s.schedulerWG.Done()
 		s.runTaskScheduler(runCtx)
+	}()
+	go func() {
+		defer s.schedulerWG.Done()
+		s.runExpiryKeepaliveLoop(runCtx)
 	}()
 }
 

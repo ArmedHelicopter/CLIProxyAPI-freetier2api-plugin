@@ -9,14 +9,18 @@ package tasks
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
 )
 
 // rotatingVendor 模拟刷新时轮换 token 的上游，并统计刷新次数。
@@ -101,4 +105,71 @@ func TestRefreshAccountDeduplicatesConcurrentRefresh(t *testing.T) {
 	if got := vendor.calls.Load(); got != 2 {
 		t.Fatalf("upstream refresh calls = %d, want 2", got)
 	}
+}
+
+func TestCatalogRegistersKeepaliveForRefreshableVendors(t *testing.T) {
+	registry := core.NewRegistry()
+	if err := registry.Register(&fakeCheckinVendor{id: "minimaxcodecn"}); err != nil {
+		t.Fatal(err)
+	}
+	spec, ok := NewCatalog(registry).SpecByKind(core.TaskKindKeepalive)
+	if !ok || len(spec.DefaultHours) < 4 {
+		t.Fatalf("keepalive spec = %+v, want a multi-hour default schedule", spec)
+	}
+}
+
+func TestExpiryKeepaliveRefreshesOnlyInsideLeadAndSuppressesRevokedTokens(t *testing.T) {
+	now := time.Date(2026, 11, 2, 18, 0, 0, 0, time.UTC)
+	calls := 0
+	reject := false
+	vendor := &expiryVendor{fakeCheckinVendor: fakeCheckinVendor{id: "minimaxcodecn"}, refresh: func(_ context.Context, cred *core.Credential) (*core.Credential, bool, error) {
+		calls++
+		if reject {
+			return nil, false, core.NewPluginError("minimax_reauthorization_required", "refresh token revoked", http.StatusUnauthorized)
+		}
+		cred.ApplyTokenRefresh("new-access", "new-refresh", now.Add(time.Hour).Unix())
+		return cred, true, nil
+	}}
+	registry := core.NewRegistry()
+	if err := registry.Register(vendor); err != nil {
+		t.Fatal(err)
+	}
+	expiresAt := now.Add(50 * time.Minute).Unix()
+	refreshToken := "refresh-1"
+	hostbridge.Configure(func(_, method string, _ any) (json.RawMessage, error) {
+		if method == "host.auth.list" {
+			return json.RawMessage(`{"auths":[{"id":"minimaxcodecn-u1","auth_index":"1","name":"minimaxcodecn-u1.json","provider":"freetier"}]}`), nil
+		}
+		return json.RawMessage(`{"auth_index":"1","json":{"vendor":"minimaxcodecn"}}`), nil
+	})
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+	deps := newFakeDeps(now)
+	deps.registry = registry
+	deps.cfg.EnabledRealms = []string{"cn"}
+	deps.pool = auth.NewPool(registry, func(context.Context, string, []byte, string, map[string]string) (*core.Credential, core.Vendor, error) {
+		return &core.Credential{VendorID: vendor.ID(), Region: "cn", FileID: "minimaxcodecn-u1", Token: "old-access", RefreshToken: refreshToken, ExpiresAt: expiresAt}, vendor, nil
+	})
+	service := New(deps)
+
+	if got := service.RunExpiryKeepalivePass(context.Background()); got != 0 || calls != 0 {
+		t.Fatalf("outside lead = %d calls=%d, want 0", got, calls)
+	}
+	expiresAt = now.Add(10 * time.Minute).Unix()
+	if got := service.RunExpiryKeepalivePass(context.Background()); got != 1 || calls != 1 || deps.refreshSaves != 1 {
+		t.Fatalf("inside lead = %d calls=%d saves=%d, want 1/1/1", got, calls, deps.refreshSaves)
+	}
+	service.markRejectedRefresh("minimaxcodecn:minimaxcodecn-u1", "refresh-1")
+	before := calls
+	if got := service.RunExpiryKeepalivePass(context.Background()); got != 0 || calls != before {
+		t.Fatalf("rejected refresh token was retried: pass=%d calls=%d", got, calls)
+	}
+}
+
+type expiryVendor struct {
+	fakeCheckinVendor
+	refresh func(context.Context, *core.Credential) (*core.Credential, bool, error)
+}
+
+func (v *expiryVendor) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
+	return v.refresh(ctx, cred)
 }
