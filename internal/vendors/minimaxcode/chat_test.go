@@ -245,6 +245,49 @@ func TestRenderToolsSectionEmptyAndChoice(t *testing.T) {
 	}
 }
 
+func TestNativeToolCallsOverrideTextMarkers(t *testing.T) {
+	agg := &frameAggregator{}
+	agg.add(map[string]any{
+		"agent_message_chunk": map[string]any{
+			"msg_content": "我摸清了现状",
+			"tool_calls": []any{map[string]any{
+				"tool_name": "write_file", "tool_call_id": "call-1", "tool_call_status": float64(5),
+				"tool_call_args": `{"path":"2.1.md","content":"# 2.1"}`,
+			}},
+		},
+	})
+	if len(agg.nativeCalls) != 1 || agg.nativeCalls[0].Name != "write_file" || agg.nativeCalls[0].ID != "call-1" {
+		t.Fatalf("native calls = %+v", agg.nativeCalls)
+	}
+	tools := nativeToolDefinitions([]any{map[string]any{"function": map[string]any{"name": "write_file", "parameters": map[string]any{"type": "object"}}}})
+	if len(tools) != 1 || tools[0]["name"] != "write_file" {
+		t.Fatalf("native tools = %+v", tools)
+	}
+	images := imageAttachments([]any{map[string]any{"content": []any{
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "data:image/png;base64,abc"}},
+		map[string]any{"type": "image_url", "image_url": map[string]any{"url": "file:///tmp/page-5.png?raw=1"}},
+	}}})
+	if len(images) != 2 || images[0]["data_url"] == nil || images[0]["mime_type"] != "image/png" {
+		t.Fatalf("inline attachment = %+v", images)
+	}
+	if images[1]["file_path"] != "file:///tmp/page-5.png?raw=1" || images[1]["file_name"] != "page-5.png" {
+		t.Fatalf("file attachment = %+v", images[1])
+	}
+}
+
+func TestNativeToolCallStatusFiltersArgumentDeltas(t *testing.T) {
+	agg := &frameAggregator{}
+	agg.add(map[string]any{"agent_message_chunk": map[string]any{"tool_calls": []any{map[string]any{
+		"tool_name": "write_file", "tool_call_id": "call-1", "tool_call_status": float64(4), "tool_call_args_delta": "{\"path\"",
+	}}}})
+	agg.add(map[string]any{"agent_message": map[string]any{"tool_calls": []any{map[string]any{
+		"tool_name": "write_file", "tool_call_id": "call-1", "tool_call_status": float64(5), "tool_call_args": `{"path":"2.1.md"}`,
+	}}}})
+	if len(agg.nativeCalls) != 1 || agg.nativeCalls[0].Arguments != `{"path":"2.1.md"}` {
+		t.Fatalf("completed call was not preferred: %+v", agg.nativeCalls)
+	}
+}
+
 func TestParseToolCallsPlainAndBareObject(t *testing.T) {
 	plain := "普通回答，没有工具。"
 	gotText, calls := parseToolCalls(plain)
