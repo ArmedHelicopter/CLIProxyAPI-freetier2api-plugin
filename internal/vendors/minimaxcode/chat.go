@@ -58,6 +58,9 @@ type frameAggregator struct {
 	chunkText, chunkThinking strings.Builder
 	msgText, msgThinking     strings.Builder
 	miscText, miscThinking   strings.Builder
+	promptTokens             int
+	completionTokens         int
+	reasoningTokens          int
 	finishReason             string
 	err                      string
 }
@@ -73,6 +76,7 @@ func (a *frameAggregator) add(payload map[string]any) {
 	if fr := findDeepString(payload, "finish_reason", "finishReason"); fr != "" {
 		a.finishReason = fr
 	}
+	a.observeUsage(payload)
 
 	chunkNode, hasChunk := payload["agent_message_chunk"].(map[string]any)
 	msgNode, hasMsg := payload["agent_message"].(map[string]any)
@@ -133,6 +137,66 @@ func (a *frameAggregator) errorText() string {
 		return a.err
 	}
 	return ""
+}
+
+func (a *frameAggregator) observeUsage(payload map[string]any) {
+	for _, key := range []string{"usage", "token_usage", "tokenUsage"} {
+		if usage, ok := payload[key].(map[string]any); ok {
+			a.applyUsage(usage)
+		}
+	}
+	if message, ok := payload["agent_message"].(map[string]any); ok {
+		for _, key := range []string{"usage", "token_usage", "tokenUsage"} {
+			if usage, ok := message[key].(map[string]any); ok {
+				a.applyUsage(usage)
+			}
+		}
+	}
+}
+
+func (a *frameAggregator) applyUsage(usage map[string]any) {
+	if value := int(core.GetInt64(usage, "prompt_tokens", "input_tokens", "promptTokens", "inputTokens")); value > 0 {
+		a.promptTokens = value
+	}
+	if value := int(core.GetInt64(usage, "completion_tokens", "output_tokens", "completionTokens", "outputTokens")); value > 0 {
+		a.completionTokens = value
+	}
+	if value := int(core.GetInt64(usage, "reasoning_tokens", "reasoningTokens", "thinking_tokens")); value > 0 {
+		a.reasoningTokens = value
+	}
+	if details, ok := usage["completion_tokens_details"].(map[string]any); ok {
+		if value := int(core.GetInt64(details, "reasoning_tokens")); value > 0 {
+			a.reasoningTokens = value
+		}
+	}
+}
+
+func (a *frameAggregator) usageMap(estimatedPrompt int, content, reasoning string, calls []ToolCall) map[string]any {
+	prompt := a.promptTokens
+	if prompt <= 0 {
+		prompt = estimatedPrompt
+	}
+	reasoningTokens := a.reasoningTokens
+	if reasoningTokens <= 0 && reasoning != "" {
+		reasoningTokens = EstimateTokens(reasoning)
+	}
+	var tools strings.Builder
+	for _, call := range calls {
+		tools.WriteString(call.Name)
+		tools.WriteString(call.Arguments)
+	}
+	completion := a.completionTokens
+	estimatedCompletion := EstimateTokens(content+tools.String()) + reasoningTokens
+	if completion <= 0 || reasoningTokens > completion {
+		completion = estimatedCompletion
+	}
+	usage := map[string]any{
+		"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion,
+	}
+	if reasoningTokens > 0 {
+		usage["completion_tokens_details"] = map[string]any{"reasoning_tokens": reasoningTokens}
+	}
+	return usage
 }
 
 // isUserRoleNode 判断节点是否标记为用户角色（回显帧）。
@@ -298,8 +362,6 @@ func chat(ctx context.Context, cred *Credential, req *core.ExecuteRequest, baseU
 		}
 	}
 
-	completionTokens := EstimateTokens(contentStr + reasoningStr)
-
 	out := map[string]any{
 		"id":      fmt.Sprintf("chatcmpl-%d", time.Now().UnixMilli()),
 		"object":  "chat.completion",
@@ -312,11 +374,7 @@ func chat(ctx context.Context, cred *Credential, req *core.ExecuteRequest, baseU
 				"finish_reason": finishReason,
 			},
 		},
-		"usage": map[string]any{
-			"prompt_tokens":     promptTokens,
-			"completion_tokens": completionTokens,
-			"total_tokens":      promptTokens + completionTokens,
-		},
+		"usage": agg.usageMap(promptTokens, contentStr, reasoningStr, calls),
 	}
 
 	return json.Marshal(out)
@@ -335,7 +393,7 @@ func chatStream(ctx context.Context, cred *Credential, req *core.ExecuteRequest,
 	}
 	toolsEnabled := cp.toolsEnabled()
 
-	respBody, modelName, _, errDo := doMessageRequest(ctx, cred, req, baseURLOverride, workspace)
+	respBody, modelName, promptTokens, errDo := doMessageRequest(ctx, cred, req, baseURLOverride, workspace)
 	if errDo != nil {
 		return errDo
 	}
@@ -491,21 +549,23 @@ func chatStream(ctx context.Context, cred *Credential, req *core.ExecuteRequest,
 	if len(calls) > 0 {
 		finish = "tool_calls"
 	}
+	content, reasoning := agg.finalize()
+	usage := agg.usageMap(promptTokens, content, reasoning, calls)
 	finalChunk := map[string]any{
-		"id":      chunkID,
-		"object":  "chat.completion.chunk",
-		"created": created,
-		"model":   modelName,
-		"choices": []any{
-			map[string]any{
-				"index":         0,
-				"delta":         map[string]any{},
-				"finish_reason": finish,
-			},
-		},
+		"id": chunkID, "object": "chat.completion.chunk", "created": created, "model": modelName,
+		"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": finish}},
+		"usage":   usage,
 	}
 	finalBytes, _ := json.Marshal(finalChunk)
-	return onChunk(finalBytes)
+	if errEmit := onChunk(finalBytes); errEmit != nil {
+		return errEmit
+	}
+	usageChunk := map[string]any{
+		"id": chunkID, "object": "chat.completion.chunk", "created": created, "model": modelName,
+		"choices": []any{}, "usage": usage,
+	}
+	usageBytes, _ := json.Marshal(usageChunk)
+	return onChunk(usageBytes)
 }
 
 func doMessageRequest(ctx context.Context, cred *Credential, req *core.ExecuteRequest, baseURLOverride string, workspace *workspaceCache) (io.ReadCloser, string, int, error) {
@@ -566,7 +626,7 @@ func doMessageRequest(ctx context.Context, cred *Credential, req *core.ExecuteRe
 	path := fmt.Sprintf(EpMessage, sessionID)
 	target := buildAgentTarget(cred, streamBase, path, http.MethodPost, string(bodyBytes), true)
 
-	resp, errDo := doRequest(ctx, cred, target, streamBase, 120*time.Second)
+	resp, errDo := doStreamRequest(ctx, cred, target, streamBase)
 	if errDo != nil {
 		return nil, "", 0, fmt.Errorf("send message request: %w", errDo)
 	}
@@ -893,6 +953,20 @@ func doRequest(ctx context.Context, cred *Credential, target Target, origin stri
 	}
 	req.Header = buildHeaders(cred, target, origin)
 	return hostbridge.Client(ctx, timeout).Do(req)
+}
+
+func doStreamRequest(ctx context.Context, cred *Credential, target Target, origin string) (*http.Response, error) {
+	var bodyReader io.Reader
+	if target.Body != "" {
+		bodyReader = bytes.NewReader([]byte(target.Body))
+	}
+	req, errNew := http.NewRequestWithContext(ctx, target.Method, target.URL, bodyReader)
+	if errNew != nil {
+		return nil, fmt.Errorf("create stream request: %w", errNew)
+	}
+	req.Header = buildHeaders(cred, target, origin)
+	req.Header.Set("Accept", "text/event-stream")
+	return hostbridge.StreamClient(ctx, 0).Do(req)
 }
 
 // fetchUserInfo 获取当前账号 realUserID 和展示标识。
