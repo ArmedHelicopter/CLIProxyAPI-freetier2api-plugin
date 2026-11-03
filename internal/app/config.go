@@ -47,17 +47,6 @@ func (a *App) decodeConfig(raw []byte) (pluginConfig, error) {
 	return cfg, nil
 }
 
-// promptModeFor 返回当前生效的提示词模式（WorkBuddy 运行时设置）。
-func (a *App) promptModeFor() string {
-	if mode := strings.TrimSpace(a.SnapshotState().VendorSettings["workbuddy_prompt_mode"]); mode != "" {
-		return mode
-	}
-	if mode := strings.TrimSpace(a.Config().Raw["workbuddy_prompt_mode"]); mode != "" {
-		return mode
-	}
-	return "passthrough"
-}
-
 // ApplyConfig 应用配置：初始化日志与状态目录、设置指纹盐、下发供应商配置。
 func (a *App) ApplyConfig(cfg pluginConfig) error {
 	if errDir := ensureStateDir(cfg); errDir != nil {
@@ -65,8 +54,15 @@ func (a *App) ApplyConfig(cfg pluginConfig) error {
 	}
 	logger.SetLevel(cfg.LogLevel)
 	if errLog := logger.InitFile(cfg.LogToFile, filepath.Join(cfg.StateDir, "logs")); errLog != nil {
-		logger.Error("init log file sink failed: %v", errLog)
+		logger.Error("初始化日志文件输出失败：%v", errLog)
 	}
+	// 宿主日志镜像：面板的日志页只读宿主 main.log，不开这个开关
+	// 插件日志在面板里完全不可见。路径留空时按状态目录自动探测。
+	hostLogFile := strings.TrimSpace(cfg.HostLogFile)
+	if hostLogFile == "" && cfg.LogToHost {
+		hostLogFile = logger.ResolveHostLogFile(cfg.StateDir)
+	}
+	logger.InitHostSink(cfg.LogToHost, hostLogFile, logger.LevelFromName(cfg.HostLogLevel))
 	a.store.Configure(cfg.StateDir)
 	salt, errSalt := a.ensureMachineSalt(cfg)
 	if errSalt != nil {
@@ -134,7 +130,7 @@ func (a *App) ensureMachineSalt(cfg pluginConfig) (string, error) {
 	if errWrite := os.WriteFile(path, []byte(salt+"\n"), 0o600); errWrite != nil {
 		return "", fmt.Errorf("write machine salt: %w", errWrite)
 	}
-	logger.Info("machine salt generated at %s (do not change: it defines this deployment's device fingerprints)", path)
+	logger.Info("已在 %s 生成机器盐（请勿更改：它决定本部署的设备指纹）", path)
 	return salt, nil
 }
 

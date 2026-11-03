@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -32,8 +31,6 @@ const (
 	loginFlowTTL = 10 * time.Minute
 	// loginHTTPTimeout 是登录相关请求的上限。
 	loginHTTPTimeout = 30 * time.Second
-	// loginMaxResponseBytes 是登录响应的读取上限。
-	loginMaxResponseBytes = 1 << 20
 	// loginPollInterval 是同一会话两次访问上游 poll 端点之间的最小间隔。
 	//
 	// 控制台页的轮询频率远高于上游建议（上游客户端是 1 秒一次），
@@ -153,7 +150,10 @@ func pollDeviceToken(ctx context.Context, entry *pendingLogin) (token, refreshTo
 		return "", "", false, errDo
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, loginMaxResponseBytes))
+	body, errRead := readQoderResponseBody(resp.Body)
+	if errRead != nil {
+		return "", "", false, fmt.Errorf("读取上游 poll 响应失败：%w", errRead)
+	}
 
 	switch resp.StatusCode {
 	case http.StatusNotFound:
@@ -205,7 +205,7 @@ func FetchPlanName(ctx context.Context, token string, region Region) string {
 // BuildLoginStorage 生成落盘用的凭证 JSON（扁平格式）。
 //
 // 与导入路径同构：刷新时代码（auth.refresh）能原样读回这些字段。
-func BuildLoginStorage(region Region, token, refreshToken string, profile LoginProfile, plan string) ([]byte, *Credential) {
+func BuildLoginStorage(region Region, token, refreshToken string, profile LoginProfile, plan string, identity MachineIdentity) ([]byte, *Credential) {
 	payload := map[string]any{
 		"device_token": token,
 		"region":       string(region),
@@ -227,6 +227,16 @@ func BuildLoginStorage(region Region, token, refreshToken string, profile LoginP
 	if plan != "" {
 		payload["plan"] = plan
 	}
+	// 设备身份随凭证一起落盘：国际版活动只下发给登录过官方客户端的设备，
+	// 上游按 machinetoken 精确校验。登录时能拿到本机官方组件签发的身份，
+	// 就一并写进凭证，用户不必再手工把 runtime-info 的输出抄进配置。
+	if identity.Native() {
+		payload["machine_token"] = identity.Token
+		payload["machine_type"] = identity.Type
+		if identity.Code != "" {
+			payload["machine_code"] = identity.Code
+		}
+	}
 	if profile.UserID != "" {
 		payload["qoder_account_id"] = profile.UserID
 	}
@@ -244,6 +254,9 @@ func BuildLoginStorage(region Region, token, refreshToken string, profile LoginP
 		Region:       region,
 		Label:        label,
 		Email:        profile.Email,
+		MachineToken: identity.Token,
+		MachineType:  identity.Type,
+		MachineCode:  identity.Code,
 	}
 }
 
@@ -345,6 +358,11 @@ func RefreshCredential(ctx context.Context, cred *Credential) (*Credential, bool
 		Region:       cred.Region,
 		Label:        cred.Label,
 		Email:        cred.Email,
+		// 设备身份必须跟着续期走：它是账号能看见国际版活动的前提，
+		// 续期时丢掉等于每刷新一次就把活动权限清零（旧实现的真实缺陷）。
+		MachineToken: cred.MachineToken,
+		MachineType:  cred.MachineType,
+		MachineCode:  cred.MachineCode,
 	}
 	return updated, true, nil
 }

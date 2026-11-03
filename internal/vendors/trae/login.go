@@ -69,7 +69,6 @@ func LoginStart(ctx context.Context, cfg Config, store *SessionStore) (*pluginap
 		SessionID: sessionID,
 		VendorID:  cfg.VendorID,
 		Region:    cfg.Region,
-		IsSolo:    cfg.Solo,
 		MachineID: machineID,
 		DeviceID:  deviceID,
 		TraceID:   traceID,
@@ -127,12 +126,11 @@ func LoginPoll(ctx context.Context, state string, store *SessionStore) (*plugina
 	}
 }
 
-// PendingSession 记录一次进行中的 Trae 或 Trae Solo 登录。
+// PendingSession 记录一次进行中的 Trae 登录。
 type PendingSession struct {
 	SessionID string
-	VendorID  string // trae-cn, trae-global, trae-solo
+	VendorID  string // traecn / traeglobal
 	Region    Region
-	IsSolo    bool
 	MachineID string
 	DeviceID  string
 	TraceID   string
@@ -198,10 +196,6 @@ func (s *SessionStore) owns(sessionID, vendorID string) bool {
 		}
 	case "traeglobal", "trae-global":
 		if strings.HasPrefix(norm, "traeglobal_") || strings.HasPrefix(norm, "trae_global_") {
-			return true
-		}
-	case "traesolo", "trae-solo":
-		if strings.HasPrefix(norm, "traesolo_") || strings.HasPrefix(norm, "trae_solo_") {
 			return true
 		}
 	}
@@ -282,7 +276,7 @@ func (s *SessionStore) EnsureCallbackServer() error {
 
 	listener, errListen := net.Listen("tcp", "127.0.0.1:18080")
 	if errListen != nil {
-		logger.Debug("trae: 18080 已被占用，改用随机端口: %v", errListen)
+		logger.Debug("trae：18080 已被占用，改用随机端口：%v", errListen)
 		listener, errListen = net.Listen("tcp", "127.0.0.1:0")
 		if errListen != nil {
 			return fmt.Errorf("listen callback: %w", errListen)
@@ -296,9 +290,9 @@ func (s *SessionStore) EnsureCallbackServer() error {
 	s.serverAddr = "http://" + listener.Addr().String()
 	s.listening = true
 	go func() {
-		logger.Info("trae: 本地授权回调监听已启动: %s/authorize", s.serverAddr)
+		logger.Info("trae：本地授权回调监听已启动：%s/authorize", s.serverAddr)
 		if errServe := srv.Serve(listener); errServe != nil && errServe != http.ErrServerClosed {
-			logger.Error("trae: 回调服务退出: %v", errServe)
+			logger.Error("trae：回调服务退出：%v", errServe)
 		}
 	}()
 	return nil
@@ -457,7 +451,7 @@ func (s *SessionStore) handleAuthorizeCallback(w http.ResponseWriter, r *http.Re
 // HTTP 回调与控制台「粘贴回调链接」共用这一段——两条路径只差「怎么拿到回调
 // 链接」，完成逻辑必须一致，否则同一次登录会因为入口不同产出不同凭证。
 func (s *SessionStore) completeLogin(ctx context.Context, matched *PendingSession, info *CallbackInfo) (*pluginapi.AuthData, error) {
-	// 执行 Token 换取：host/clientID 一律按实例 profile 取（国内版与 SOLO 同为
+	// 执行 Token 换取：host/clientID 一律按实例 profile 取（国内版为
 	// api.trae.cn + en1oxy7wnw8j9n，国际版为 growsg-normal.trae.ai + ono9krqynydwx5）。
 	cfg, okConfig := ConfigForVendor(matched.VendorID)
 	if !okConfig {
@@ -479,7 +473,7 @@ func (s *SessionStore) completeLogin(ctx context.Context, matched *PendingSessio
 	if refreshToken != "" {
 		newAccess, newRefresh, exp, errEx := exchangeTraeToken(ctx, authHost, clientID, uid, refreshToken)
 		if errEx != nil {
-			logger.Error("trae: callback exchange token warning: %v, falling back to original", errEx)
+			logger.Error("trae：回调换令牌告警：%v，回退使用原凭证", errEx)
 		} else {
 			accessToken = newAccess
 			if newRefresh != "" {
@@ -495,9 +489,7 @@ func (s *SessionStore) completeLogin(ctx context.Context, matched *PendingSessio
 	}
 
 	label := "Trae-" + nickname
-	if matched.IsSolo {
-		label = "TraeSolo-" + nickname
-	} else if matched.Region == RegionGlobal {
+	if matched.Region == RegionGlobal {
 		label = "TraeGlobal-" + nickname
 	}
 
@@ -513,9 +505,7 @@ func (s *SessionStore) completeLogin(ctx context.Context, matched *PendingSessio
 		"machine_id":    matched.MachineID,
 		"device_id":     matched.DeviceID,
 		"label":         label,
-	}
-	if !matched.IsSolo {
-		storageMap["region"] = string(matched.Region)
+		"region":        string(matched.Region),
 	}
 
 	rawStorage, errJSON := json.MarshalIndent(storageMap, "", "  ")
@@ -536,7 +526,7 @@ func (s *SessionStore) completeLogin(ctx context.Context, matched *PendingSessio
 	matched.AuthData = authData
 	matched.State = "success"
 
-	logger.Info("trae: 授权成功，账号=%s (%s), vendor=%s", uid, nickname, matched.VendorID)
+	logger.Info("trae：授权成功，账号=%s（%s）供应商=%s", uid, nickname, matched.VendorID)
 	return authData, nil
 }
 
@@ -603,7 +593,7 @@ func (s *SessionStore) SubmitCallback(ctx context.Context, state, rawURL string)
 //
 // 协议（已联调验证）：POST {host}/cloudide/api/v3/trae/oauth/ExchangeToken，
 // PascalCase 载荷，响应取 Result.Token / Result.RefreshToken / Result.TokenExpireAt。
-// host/clientID 由调用方按实例 profile 给出（国内版与 SOLO 同为 api.trae.cn +
+// host/clientID 由调用方按实例 profile 给出（国内版为 api.trae.cn +
 // en1oxy7wnw8j9n，国际版为 growsg-normal.trae.ai + ono9krqynydwx5）。
 func exchangeTraeToken(ctx context.Context, authHost, clientID, userID, refreshToken string) (string, string, int64, error) {
 	payload := map[string]string{
@@ -620,14 +610,18 @@ func exchangeTraeToken(ctx context.Context, authHost, clientID, userID, refreshT
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := hostbridge.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, perRequestTimeout)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return "", "", 0, errDo
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return "", "", 0, fmt.Errorf("read token exchange response: %w", errRead)
+	}
 	if resp.StatusCode >= 400 {
 		return "", "", 0, fmt.Errorf("upstream exchange error %d: %s", resp.StatusCode, string(body))
 	}
@@ -719,14 +713,18 @@ func RefreshCredential(ctx context.Context, cred *Credential, cfg Config) (*Cred
 	}
 	req.Header.Set("Content-Type", "application/json")
 
-	client := hostbridge.Client(ctx, 30*time.Second)
+	client := hostbridge.Client(ctx, perRequestTimeout)
 	resp, errDo := client.Do(req)
 	if errDo != nil {
 		return nil, false, fmt.Errorf("trae refresh token request failed: %w", errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if errRead != nil {
+		// 半截 body 不能当完整响应交给解析层：网络问题会被误报成业务错误。
+		return nil, false, fmt.Errorf("read refresh token response: %w", errRead)
+	}
 	if resp.StatusCode >= 400 {
 		return nil, false, Classify(resp.StatusCode, string(body))
 	}
@@ -775,7 +773,8 @@ func MergeStorageJSON(original []byte, updated *Credential) ([]byte, error) {
 		if updated.ExpiresAt > 0 {
 			m["expires_at"] = updated.ExpiresAt
 		}
-		// TRAE SOLO 的凭证可能是嵌套 {auth:{...}} 结构，两处都要写。
+		// 解析允许嵌套的 {auth:{...}} 结构（见 parseCredential），写回必须对称，
+		// 否则嵌套凭证续期后只在顶层更新，下次解析仍读到旧 token。
 		if authObj, ok := m["auth"].(map[string]any); ok {
 			authObj["accessToken"] = updated.AccessToken
 			if updated.RefreshToken != "" {

@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -49,10 +50,17 @@ type adapter struct {
 	//
 	// 控制台要展示倍率，但宿主契约（pluginapi.ModelInfo）没有这个字段，
 	// 只能由本实例在转换模型时顺手记下，供 ConsoleModels 回读。
-	creditsMu sync.RWMutex
-	credits   map[string]string
+	credits core.CreditTable
 	// settings 是原始配置键（设备身份需要读 qoder_desktop_version）。
 	settings atomic.Value // map[string]string
+	// localIdentity 是本机官方组件签发的设备身份（每实例解析一次）。
+	//
+	// 缓存必须挂在实例上：国内版与国际版要用不同的 environment 各解析一份，
+	// 包级缓存会让一个进程里的两个区域互相拿到对方的身份。
+	localIdentity struct {
+		once  sync.Once
+		value MachineIdentity
+	}
 }
 
 // Instances 构造 Qoder 的两个区域实例。
@@ -229,7 +237,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	if errBridge != nil {
 		return errBridge
 	}
-	return StreamChatCompletions(b, req.Payload, sink.Emit)
+	return StreamChatCompletions(ctx, b, req.Payload, sink.Emit)
 }
 
 // ---- 额度与签到 ----
@@ -254,15 +262,10 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if errNative != nil {
 		return nil, errNative
 	}
-	// machineid 的推导与其它 Qoder 调用点（额度、登录、jobToken 交换）保持
-	// 同一口径：上游不校验它的内容，但同一账号在不同链路上报不同的
-	// machineid 等于自曝多设备，没有必要。
-	//
-	// 种子按**账号 token** 取，因此同一机器上的多个国际号各自有一套身份。
-	// 这不影响上游的同人去重（服务端按人/设备判，不看我们报的值），也让每个
-	// 账号的请求在形态上与它自己的 cosy 会话一致。
-	seed := FingerprintSeed("", native.Token)
-	identity := ResolveIdentity(seed, v.settingsSnapshot())
+	// 设备身份优先取用户提供的真值（凭证字段 → 全局配置），其次取本机官方
+	// 组件签发的身份（见 credential.go）。插件不会自行派生：上游对机器头做
+	// 精确校验，派生值会让可领取活动被整条过滤。都拿不到时不发机器头。
+	identity := ResolveIdentity(native, v.settingsSnapshot(), v.localMachineIdentity())
 	result, errCheckin := Checkin(ctx, native, identity)
 	if errCheckin != nil {
 		return nil, errCheckin
@@ -273,9 +276,20 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 		// CheckinWindowNotOpen（窗口未开启），不会走到这里。
 		Already:     result.Status == CheckinAlreadyClaimed,
 		Credit:      int64(result.Amount),
+		Streak:      int64(result.StreakDays),
 		Message:     result.Message,
 		NotRecorded: result.NotRecorded,
 	}, nil
+}
+
+// localMachineIdentity 返回本机官方组件签发的设备身份；拿不到时为零值。
+//
+// 解析要 spawn 官方组件（约 4 秒），因此每实例只做一次。
+func (v *adapter) localMachineIdentity() MachineIdentity {
+	v.localIdentity.once.Do(func() {
+		v.localIdentity.value = LocalMachineIdentity(v.region)
+	})
+	return v.localIdentity.value
 }
 
 // settingsSnapshot 返回配置键快照。
@@ -289,7 +303,9 @@ func (v *adapter) settingsSnapshot() map[string]string {
 // ConfigFields 声明 Qoder 专属 YAML 配置。
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{
-		{Name: "qoder_desktop_version", Type: pluginapi.ConfigFieldTypeString, Description: "cosy-version 桌面端版本覆盖。"},
+		{Name: "qoder_machine_token", Type: pluginapi.ConfigFieldTypeString, Description: "官方组件签发的 machineToken，用于解锁国际版每日领取活动。"},
+		{Name: "qoder_machine_type", Type: pluginapi.ConfigFieldTypeString, Description: "与 qoder_machine_token 配对的 machineType，必须成对填写。"},
+		{Name: "qoder_machine_code", Type: pluginapi.ConfigFieldTypeString, Description: "可选的 machineCode（不填不影响活动可见性）。"},
 	}
 }
 
@@ -326,10 +342,13 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 		return &pluginapi.AuthLoginPollResponse{Status: pluginapi.AuthLoginStatusPending}, nil
 	}
 	plan := FetchPlanName(ctx, result.Token, result.Region)
-	storage, cred := BuildLoginStorage(result.Region, result.Token, result.RefreshToken, result.Profile, plan)
+	// 设备身份：登录这台机器上若装过官方客户端，直接把 runtime-info 签发的
+	// machineToken/machineType 写进凭证——国际版活动按它精确校验，缺了就只能
+	// 看到「无可用签到活动」。
+	storage, cred := BuildLoginStorage(result.Region, result.Token, result.RefreshToken, result.Profile, plan, v.localMachineIdentity())
 	authID := LoginAuthID(result.Profile, state)
 	fileName := core.FileNameFor(v.ID(), strings.TrimPrefix(authID, "qoder-"))
-	logger.Info("completed qoder login (vendor=%s email=%s)", v.ID(), cred.Email)
+	logger.Info("qoder 登录完成（供应商=%s 邮箱=%s）", v.ID(), cred.Email)
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "登录成功",
@@ -437,7 +456,14 @@ func (v *adapter) bridgeCacheKey(cred *Credential) string {
 // Qoder 加密网关要求的 model_config.key / x-model-key。
 func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	slugByKey := v.models.replace(models)
-	credits := make(map[string]string, len(models))
+	core.FillCredits(&v.credits, models,
+		func(model Model) string { return slugByKey[strings.TrimSpace(model.Key)] },
+		func(model Model) string {
+			if model.PriceFactor == nil {
+				return ""
+			}
+			return strconv.FormatFloat(*model.PriceFactor, 'f', -1, 64)
+		})
 	registered := core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		key := strings.TrimSpace(model.Key)
 		if key == "" {
@@ -451,9 +477,6 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 		if name == "" {
 			name = key
 		}
-		if rate := rateLabel(model.PriceFactor); rate != "" {
-			credits[id] = rate
-		}
 		return core.ModelDescriptor{
 			ID:                 id,
 			Name:               name,
@@ -464,9 +487,6 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 			CanDisableThinking: !model.IsReasoning,
 		}, true
 	})
-	v.creditsMu.Lock()
-	v.credits = credits
-	v.creditsMu.Unlock()
 	return registered
 }
 
@@ -474,24 +494,7 @@ func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 //
 // 只报倍率这一维信息，模型清单本身由目录层从注册结果推导。
 func (v *adapter) ModelCredits() map[string]string {
-	v.creditsMu.RLock()
-	defer v.creditsMu.RUnlock()
-	if len(v.credits) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(v.credits))
-	for id, value := range v.credits {
-		out[id] = value
-	}
-	return out
-}
-
-// rateLabel 把上游的 price_factor 转成形如 0.08X 的展示文案；<=0 视为未提供。
-func rateLabel(factor float64) string {
-	if factor <= 0 {
-		return ""
-	}
-	return fmt.Sprintf("%.2fX", factor)
+	return v.credits.Snapshot()
 }
 
 // describeModel 拼接模型说明（带价格倍率）。
@@ -503,8 +506,8 @@ func describeModel(model Model) string {
 	if model.IsReasoning {
 		description += "（推理）"
 	}
-	if model.PriceFactor > 0 {
-		description += fmt.Sprintf("，计费倍率 x%.2f", model.PriceFactor)
+	if model.PriceFactor != nil {
+		description += fmt.Sprintf("，计费倍率 x%.2f", *model.PriceFactor)
 	}
 	return description
 }
@@ -533,3 +536,41 @@ func (r *payloadRecorder) WriteHeader(statusCode int) { r.status = statusCode }
 func (r *payloadRecorder) Payload() []byte { return r.body }
 
 func (v *adapter) SupportsCheckin() bool { return true }
+
+// RunAllTasks 执行一键任务。Qoder 的活动福利只有一条链路：每日领取
+// 会把当天开放的 campaign（活动）一并领取，协议层的 Checkin 已经覆盖，
+// 所以这里只产出签到那一行，不额外造空行。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, 1)
+	if row := core.CheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
+	}
+	return results
+}
+
+// RunTask 执行单条任务。Qoder 可自动执行的动作只有签到/活动领取。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	if strings.TrimSpace(code) != core.AutoTaskCodeCheckin {
+		return core.TaskRunResult{Status: "skipped", Message: "该供应商没有这条任务"}, nil
+	}
+	row := core.CheckinAutoTask(ctx, v, cred)
+	if row == nil {
+		return core.TaskRunResult{Status: "skipped", Message: "该账号不支持签到"}, nil
+	}
+	return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+}
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.CheckinProvider      = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+	_ core.LoginSessionOwner    = (*adapter)(nil)
+	_ core.ModelsProvider       = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+	_ core.StorageMerger        = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
+)

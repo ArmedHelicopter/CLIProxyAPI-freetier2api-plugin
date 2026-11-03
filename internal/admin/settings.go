@@ -1,21 +1,20 @@
 package admin
 
 import (
-	"encoding/json"
 	"net/http"
 	"strings"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/state"
 	"freetier2api-plugin/internal/tasks"
 )
 
 type settingsUpdateRequest struct {
-	AutoCheckin         *bool            `json:"auto_checkin"`
-	AutoCheckinAt       string           `json:"auto_checkin_at"`
-	AutoTasks           *bool            `json:"auto_tasks"`
-	WorkbuddyPromptMode string           `json:"workbuddy_prompt_mode"`
-	TaskSchedules       map[string][]int `json:"task_schedules"`
+	AutoCheckin   *bool            `json:"auto_checkin"`
+	AutoCheckinAt string           `json:"auto_checkin_at"`
+	AutoTasks     *bool            `json:"auto_tasks"`
+	TaskSchedules map[string][]int `json:"task_schedules"`
 
 	// Deprecated: 兼容旧版页面/脚本的固定字段。
 	CheckinHours   []int `json:"checkin_hours"`
@@ -26,9 +25,18 @@ type settingsUpdateRequest struct {
 }
 
 func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body settingsUpdateRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[settingsUpdateRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
+	}
+	// 固定签到时刻在校验阶段就挡掉：它以前在 Mutate 内部静默忽略非法值，
+	// 用户看到 200 以为存进去了，实际没生效。
+	autoCheckinAt := strings.TrimSpace(body.AutoCheckinAt)
+	if autoCheckinAt != "" {
+		if _, _, errClock := ParseClock(autoCheckinAt); errClock != nil {
+			return ErrorResponse(core.NewPluginError("auto_checkin_at_invalid",
+				"固定签到时刻格式应为 HH:MM（24 小时制）", http.StatusBadRequest))
+		}
 	}
 	changed := map[string]any{}
 	s.deps.MutateState(func(current *state.State) {
@@ -36,25 +44,13 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 			current.AutoCheckin = body.AutoCheckin
 			changed["auto_checkin"] = *body.AutoCheckin
 		}
-		if at := strings.TrimSpace(body.AutoCheckinAt); at != "" {
-			if _, _, errClock := ParseClock(at); errClock == nil {
-				current.AutoCheckinAt = at
-				changed["auto_checkin_at"] = at
-			}
+		if autoCheckinAt != "" {
+			current.AutoCheckinAt = autoCheckinAt
+			changed["auto_checkin_at"] = autoCheckinAt
 		}
 		if body.AutoTasks != nil {
 			current.AutoTasks = body.AutoTasks
 			changed["auto_tasks"] = *body.AutoTasks
-		}
-		if mode := strings.ToLower(strings.TrimSpace(body.WorkbuddyPromptMode)); mode != "" {
-			switch mode {
-			case "passthrough", "custom", "append":
-				if current.VendorSettings == nil {
-					current.VendorSettings = map[string]string{}
-				}
-				current.VendorSettings["workbuddy_prompt_mode"] = mode
-				changed["workbuddy_prompt_mode"] = mode
-			}
 		}
 		if current.TaskSchedules == nil {
 			current.TaskSchedules = map[string][]int{}
@@ -88,15 +84,11 @@ func (s *Service) handleSettingsRequest(req pluginapi.ManagementRequest) plugina
 	}
 	s.tasks.Poke()
 	return JSONResponse(http.StatusOK, map[string]any{
-		"ok": true, "changed": changed, "settings": s.tasks.EffectiveSettings(),
+		"ok": true, "changed": changed, "settings": s.settingsView(),
 	})
 }
 
-// handleScheduledRun 手动触发一个定时任务。
-func (s *Service) handleScheduledRun(_ pluginapi.ManagementRequest, kind string) pluginapi.ManagementResponse {
-	s.tasks.RunAsync(kind)
-	return JSONResponse(http.StatusOK, map[string]any{
-		"ok": true, "started": true, "task": kind,
-		"message": "任务已在后台开始执行，进度见插件日志",
-	})
+// settingsView 是 /status 的 settings 载荷：任务引擎的可读设置。
+func (s *Service) settingsView() map[string]any {
+	return s.tasks.EffectiveSettings()
 }

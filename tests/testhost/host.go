@@ -36,10 +36,17 @@ type Host struct {
 
 	// calls 记录被调用的宿主方法名（供断言）。
 	calls []string
+	// callbackIDs 记录每次调用的宿主回调 ID：空串表示后台作用域。
+	// 真实宿主在 management.handle 返回后就会关掉那批回调 scope，因此
+	// 「后台任务带上了请求回调 ID」必须能在测试里被发现。
+	callbackIDs []string
 	// authFiles 是 host.auth.list 的返回内容。
 	authFiles []core.HostAuth
 	// authJSON 是 auth_index → 凭证 JSON。
 	authJSON map[string]string
+	// authPaths 是 auth_index → 宿主返回的凭证文件路径（host.auth.get 的 path）。
+	// 真实宿主的 path 不保证绝对：以相对 auth-dir 启动的宿主会返回相对路径。
+	authPaths map[string]string
 	// upstream 是出站请求的应答函数（按 method + url 匹配）。
 	upstream func(method, url, body string) UpstreamResponse
 	// upstreamCalls 记录出站请求次数（供 singleflight 类断言）。
@@ -57,8 +64,9 @@ type Host struct {
 // New 构造一个 Fake Host。
 func New() *Host {
 	return &Host{
-		authJSON: map[string]string{},
-		streams:  map[string]*Stream{},
+		authJSON:  map[string]string{},
+		authPaths: map[string]string{},
+		streams:   map[string]*Stream{},
 		upstream: func(string, string, string) UpstreamResponse {
 			return UpstreamResponse{Status: http.StatusNotFound, Body: `{"code":404,"msg":"not stubbed"}`}
 		},
@@ -69,6 +77,7 @@ func New() *Host {
 func (h *Host) Call(callbackID, method string, payload any) (json.RawMessage, error) {
 	h.mu.Lock()
 	h.calls = append(h.calls, method)
+	h.callbackIDs = append(h.callbackIDs, callbackID)
 	h.mu.Unlock()
 
 	switch method {
@@ -84,12 +93,21 @@ func (h *Host) Call(callbackID, method string, payload any) (json.RawMessage, er
 		return marshalJSON(map[string]any{"auths": h.SnapshotAuthFiles()})
 	case pluginabi.MethodHostAuthGet:
 		return h.handleAuthGet(payload)
+	case pluginabi.MethodHostAuthSave:
+		return h.handleAuthSave(payload)
 	case pluginabi.MethodHostStreamEmit:
 		return h.handleStreamEmit(payload)
 	case pluginabi.MethodHostStreamClose:
 		return h.handleStreamClosePayload(payload)
 	}
 	return nil, fmt.Errorf("fake host does not implement %s", method)
+}
+
+// CallbackIDs 返回每次宿主回调携带的回调 ID（副本，按调用顺序）。
+func (h *Host) CallbackIDs() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]string(nil), h.callbackIDs...)
 }
 
 // SnapshotAuthFiles 返回当前注册的凭证（副本）。
@@ -109,6 +127,26 @@ func (h *Host) AddAccount(authIndex, name, credentialJSON string) {
 	h.authFiles = append(h.authFiles, core.HostAuth{
 		ID: name, AuthIndex: authIndex, Name: name, Provider: core.ProviderKey, Label: name,
 	})
+}
+
+// SetAccountCredential 覆盖某个账号的凭证 JSON，账号身份（文件名）不变。
+//
+// 用于模拟 token 刷新 / 重登后宿主重写同一个凭证文件：内容变了，身份没变。
+func (h *Host) SetAccountCredential(authIndex, credentialJSON string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.authJSON[authIndex] = credentialJSON
+}
+
+// SetAuthFilePath 让 host.auth.get 返回凭证的物理文件路径。
+//
+// 真实宿主的 path 不保证绝对：以相对 auth-dir 启动的宿主（EasyCLIProxyAPI
+// 默认就是 ../oauth）会把 WalkDir 得到的相对路径原样返回。这里也原样透传，
+// 供删除等依赖路径的功能复现该形态。
+func (h *Host) SetAuthFilePath(authIndex, path string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.authPaths[authIndex] = path
 }
 
 // MarkUnavailable 模拟宿主路由层给凭证打上「临时不可用」（上游限流/超时后的
@@ -252,13 +290,60 @@ func (h *Host) handleAuthGet(payload any) (json.RawMessage, error) {
 
 	h.mu.Lock()
 	raw, okRaw := h.authJSON[req.AuthIndex]
+	path := h.authPaths[req.AuthIndex]
 	h.mu.Unlock()
 	if !okRaw {
 		return json.RawMessage(`{"auth_index":"` + req.AuthIndex + `","json":null}`), nil
 	}
 	// 真实宿主的 HostAuthGetResponse.JSON 是 json.RawMessage：原样内联，
 	// 不能走 []byte 序列化（那会变成 base64，插件侧解不出来）。
-	return json.RawMessage(`{"auth_index":"` + req.AuthIndex + `","json":` + raw + `}`), nil
+	response := struct {
+		AuthIndex string          `json:"auth_index"`
+		Path      string          `json:"path,omitempty"`
+		JSON      json.RawMessage `json:"json"`
+	}{AuthIndex: req.AuthIndex, Path: path, JSON: json.RawMessage(raw)}
+	return marshalJSON(response)
+}
+
+// handleAuthSave 模拟 host.auth.save：把凭证写进宿主内存注册表。
+//
+// 假宿主没有磁盘 auth 目录，因此只更新 authJSON，并按 JSON 里的 disabled
+// 字段同步 authFiles 的禁用状态——启用/停用账号的端到端行为靠这一步可观测。
+func (h *Host) handleAuthSave(payload any) (json.RawMessage, error) {
+	var req struct {
+		Name string          `json:"name"`
+		JSON json.RawMessage `json:"json"`
+	}
+	if errUnmarshal := json.Unmarshal(mustMarshal(payload), &req); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	var fields map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(req.JSON, &fields); errUnmarshal != nil {
+		return nil, errUnmarshal
+	}
+	var disabled bool
+	_ = json.Unmarshal(fields["disabled"], &disabled)
+
+	h.mu.Lock()
+	for index := range h.authFiles {
+		if h.authFiles[index].Name != req.Name && h.authFiles[index].ID != req.Name {
+			continue
+		}
+		h.authFiles[index].Disabled = disabled
+		h.authJSON[h.authFiles[index].AuthIndex] = string(req.JSON)
+	}
+	path := h.authPaths[resolvedAuthIndex(h, req.Name)]
+	h.mu.Unlock()
+	return marshalJSON(map[string]any{"name": req.Name, "path": path})
+}
+
+func resolvedAuthIndex(h *Host, name string) string {
+	for _, entry := range h.authFiles {
+		if entry.Name == name || entry.ID == name {
+			return entry.AuthIndex
+		}
+	}
+	return ""
 }
 
 func (h *Host) handleStreamEmit(payload any) (json.RawMessage, error) {

@@ -2,10 +2,12 @@ package workbuddy
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/logger"
 )
 
 func TestClassifyOrderingMatters(t *testing.T) {
@@ -41,6 +43,11 @@ func TestClassifyOrderingMatters(t *testing.T) {
 		{"image invalid", 400, `{"code":11135,"msg":"invalid_image_data"}`, core.FailureKindImageInvalid},
 		// 内容策略拦截。
 		{"content blocked", 400, `{"msg":"blocked by security policy"}`, core.FailureKindContentBlocked},
+		// 渠道校验失败：上游会包在 HTTP 500 里，仍必须按请求级拒绝处理。
+		{"channel rejected on 500", 500, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, core.FailureKindChannelRejected},
+		{"channel rejected on 200", 200, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, core.FailureKindChannelRejected},
+		// 11128 只出现在 requestId 里不算渠道校验失败。
+		{"11128 in requestId is not channel rejected", 400, `{"code":12345,"msg":"bad request","requestId":"trace-11128-abc"}`, core.FailureKindClient},
 		// 参数非法。
 		{"bad params", 400, `{"msg":"Unmarshal chat params failed"}`, core.FailureKindBadParams},
 		// 其它 4xx。
@@ -93,6 +100,8 @@ func TestClassifyRetryableAndStatus(t *testing.T) {
 		{"prompt too long is not retryable", 400, `{"msg":"prompt is too long"}`, false, 400},
 		{"image invalid is not retryable", 400, `{"msg":"invalid_image_data"}`, false, 400},
 		{"bad params is not retryable", 400, `{"msg":"Unmarshal chat params failed"}`, false, 400},
+		// 渠道校验失败：上游用 500 表达，但宿主必须按请求级错误处置（400 不冷却账号）。
+		{"channel rejected is not retryable", 500, `{"code":11128,"msg":"unapproved channel"}`, false, 400},
 	}
 	for _, testCase := range cases {
 		t.Run(testCase.name, func(t *testing.T) {
@@ -142,5 +151,95 @@ func TestClassifyIsModelRateLimit(t *testing.T) {
 	}
 	if IsModelRateLimit(`{"code":1,"msg":"rate limit"}`) {
 		t.Fatal("non-6004 must not be model-level rate limit")
+	}
+}
+
+// TestChannelRejectedKeepsReadableDetail 验证 11128 不会退化成裸数字码。
+//
+// 宿主对不可重试的错误直接回给客户端；错误码与消息都必须保留 11128 与上游说明，
+// 否则用户只能看到「no auth available / last upstream error: 11128」。
+func TestChannelRejectedKeepsReadableDetail(t *testing.T) {
+	body := `{"actions":["EDIT_INPUT","SUBMIT_FEEDBACK"],"code":11128,` +
+		`"msg":"Illegal API invocation from an unapproved channel",` +
+		`"displayMsg":{"en":"Request blocked. Please send it again"}}`
+	classified := Classify(http.StatusInternalServerError, body)
+	pluginErr, okPlugin := core.ToPluginError(classified).(*core.PluginError)
+	if !okPlugin {
+		t.Fatalf("ToPluginError() = %T, want *core.PluginError", core.ToPluginError(classified))
+	}
+	if pluginErr.Code != "upstream_channel_rejected" {
+		t.Fatalf("code = %q, want upstream_channel_rejected", pluginErr.Code)
+	}
+	if pluginErr.Retryable || pluginErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("retryable=%v status=%d, want false/400", pluginErr.Retryable, pluginErr.HTTPStatus)
+	}
+	for _, want := range []string{"11128", "unapproved channel"} {
+		if !strings.Contains(pluginErr.Message, want) {
+			t.Fatalf("message %q must contain %q", pluginErr.Message, want)
+		}
+	}
+}
+
+// channelRejectedBody 是 Issue #42 的原始 11128 正文：上游新增渠道校验后的真实回包。
+const channelRejectedBody = `{"code":11128,"msg":"Illegal API invocation from an unapproved channel",` +
+	`"requestId":"01a176819f987048670eda9f9a912d5",` +
+	`"displayMsg":{"en":"Request blocked. Please send it again","zh":"请求被拦截，请重新发送"},` +
+	`"displayTips":{"en":"This call failed channel verification, possibly because it was not sent from an official client. Please resend from the official client.",` +
+	`"zh":"这次调用没通过渠道校验，可能不是官方客户端发出的。请用官方版本重新发送。",` +
+	`"zh-hant":"本次呼叫未通過通路驗證。"},` +
+	`"actions":["EDIT_INPUT","SUBMIT_FEEDBACK"]}`
+
+// TestChannelRejectedMessageFoldsMultilingualBody 验证 11128 折叠后的消息仍然可读、可反馈。
+//
+// 上游正文是 en/zh/zh-hant 三份文案的 JSON，直接透传只会让用户看到一坨 500；
+// 折叠后必须仍保留上游 msg、中文提示与 requestId（反馈上游时唯一能对齐的凭据）。
+func TestChannelRejectedMessageFoldsMultilingualBody(t *testing.T) {
+	failure := Classify(http.StatusInternalServerError, channelRejectedBody)
+	if failure.Kind != core.FailureKindChannelRejected || failure.Status != http.StatusBadRequest {
+		t.Fatalf("kind=%s status=%d, want channel_rejected/400", failure.Kind, failure.Status)
+	}
+	if failure.Retryable() {
+		t.Fatal("channel rejection must not be retryable: 换号同样过不了渠道校验")
+	}
+	for _, want := range []string{
+		"Illegal API invocation from an unapproved channel",
+		"这次调用没通过渠道校验",
+		"code=11128",
+		"requestId=01a176819f987048670eda9f9a912d5",
+	} {
+		if !strings.Contains(failure.Msg, want) {
+			t.Fatalf("message %q must contain %q", failure.Msg, want)
+		}
+	}
+	if strings.Contains(failure.Msg, "displayTips") {
+		t.Fatalf("message must not dump the raw envelope: %q", failure.Msg)
+	}
+}
+
+// TestChannelRejectedKeepsRawBodyInLog 验证拦截证据进日志。
+//
+// 消息折叠后正文不再随错误返回；日志必须留全量原文（含 requestId），
+// 否则 Issue #42 截图里的信息在排障时会彻底丢失。
+func TestChannelRejectedKeepsRawBodyInLog(t *testing.T) {
+	_, since := logger.Snapshot(0, 1)
+	enrichClassifyError(http.StatusInternalServerError, channelRejectedBody, http.Header{})
+	entries, _ := logger.Snapshot(since, 200)
+	for _, entry := range entries {
+		if strings.Contains(entry.Message, "channel verification") &&
+			strings.Contains(entry.Message, "01a176819f987048670eda9f9a912d5") {
+			return
+		}
+	}
+	t.Fatalf("channel rejection must be logged with the upstream requestId, got %d entries", len(entries))
+}
+
+// TestChannelRejectedFallsBackToRawBody 验证非 JSON 正文不会被折叠吞掉。
+func TestChannelRejectedFallsBackToRawBody(t *testing.T) {
+	failure := Classify(http.StatusForbidden, "Illegal API invocation from an unapproved channel")
+	if failure.Kind != core.FailureKindChannelRejected {
+		t.Fatalf("kind=%s, want channel_rejected", failure.Kind)
+	}
+	if !strings.Contains(failure.Msg, "Illegal API invocation from an unapproved channel") {
+		t.Fatalf("message %q must keep the raw body", failure.Msg)
 	}
 }

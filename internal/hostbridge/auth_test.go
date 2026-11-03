@@ -1,6 +1,8 @@
 package hostbridge
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -41,5 +43,39 @@ func TestListHostAuthsClaimsHijackedCredentials(t *testing.T) {
 		if entry.Provider == "qoder" && strings.Contains(entry.Name, "qoder-login") {
 			t.Fatalf("foreign credential leaked in: %+v", entry)
 		}
+	}
+}
+
+// TestResolveAuthPathNormalizesHostPath 锁定宿主路径只在边界换算一次。
+//
+// 宿主不一定给绝对路径：EasyCLIProxyAPI 把 oauth.auth-dir 配成 ../oauth，
+// 扫盘得到的相对路径原样经 host.auth.list / host.auth.get 返回。所有路径消费方
+// （删除、stat、读文件兜底、续期写回）都拿这里的结果，不能再各自换算。
+func TestResolveAuthPathNormalizesHostPath(t *testing.T) {
+	cwd, errGetwd := os.Getwd()
+	if errGetwd != nil {
+		t.Fatalf("getwd: %v", errGetwd)
+	}
+	absolute := filepath.Join(cwd, "workbuddy-1.json")
+	relative := filepath.Join("..", "oauth", "traecn-1.json")
+	resolved := filepath.Clean(filepath.Join(cwd, "..", "oauth", "traecn-1.json"))
+
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"绝对路径原样保留", absolute, filepath.Clean(absolute)},
+		{"相对路径按工作目录解析", relative, resolved},
+		{"空路径仍为空", "  ", ""},
+		{"首尾空白被去掉", " " + absolute + "\n", filepath.Clean(absolute)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := ResolveAuthPath(tc.in)
+			if got != tc.want {
+				t.Fatalf("ResolveAuthPath(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
 	}
 }

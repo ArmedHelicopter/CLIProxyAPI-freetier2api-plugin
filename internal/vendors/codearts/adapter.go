@@ -4,17 +4,76 @@ package codearts
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
-	"freetier2api-plugin/internal/hostbridge"
 )
 
 // adapter 是 core.Vendor 在 CodeArts 上的实现。
 type adapter struct {
 	*core.NativeAdapter[*Credential]
+	creditEnabled atomic.Bool
+	// benefitClaims 是「账号 → 今日福利领取状态」，实例内隔离。
+	//
+	// 条目与用过的账号一一对应（有界，平台侧限制每供应商账号数），账号删除后
+	// 残留的只是几十字节的日期，不值得为它引入淘汰器 + 与正在领取的协程竞争
+	// 删除时机；重启后条目清空，由上游幂等接口如实返回结果。
+	benefitClaims sync.Map
+
+	// credits 缓存最近一轮目录探测的倍率表（官方模型 ID → 展示文案）。
+	credits core.CreditTable
+
+	// modelsByLower 是小写模型名 → 注册 ID 的索引，用于把请求里的旧写法
+	// 归一成目录里的正式 ID。
+	modelsMu      sync.RWMutex
+	modelsByLower map[string]string
 }
+
+const creditEnabledKey = "codearts_credit_enabled"
+
+// Configure 只在运维明确开启时使用积分通道；缺失或非法值均保持免费通道。
+func (v *adapter) Configure(_ core.Settings, raw map[string]string) {
+	enabled, err := strconv.ParseBool(strings.TrimSpace(raw[creditEnabledKey]))
+	v.creditEnabled.Store(err == nil && enabled)
+}
+
+func (v *adapter) ConfigFields() []pluginapi.ConfigField {
+	return []pluginapi.ConfigField{{
+		Name: creditEnabledKey, Type: pluginapi.ConfigFieldTypeBoolean,
+		Description: "CodeArts 积分推理通道，默认关闭。开启后按账号积分计费；不会从免费福利通道自动切换。修改后请刷新模型目录。",
+	}}
+}
+
+// fetchModels 与执行使用同一个显式通道设置。积分通道只展示真实内置目录，
+// 不混入福利专用模型，也不在目录查询失败时猜测可计费的模型。
+func (v *adapter) fetchModels(ctx context.Context, cred *Credential) ([]Model, error) {
+	if !v.creditEnabled.Load() {
+		return FetchModels(ctx, cred)
+	}
+	if cred == nil {
+		return nil, nil
+	}
+	body, err := fetchBuiltinCatalog(ctx, cred)
+	if err != nil {
+		return nil, err
+	}
+	if failure, failed := ErrorFromPayload(body); failed {
+		return nil, failure
+	}
+	return parseBuiltinModels(body)
+}
+
+// VetoModelFallback 实现 core.ModelFallbackVeto。
+//
+// 积分通道下这份清单就是「能推哪些模型」的判据，探测失败必须如实返回空：
+// 回落到上次的清单等于继续推广可能已无权限的模型。
+func (v *adapter) VetoModelFallback() bool { return v.creditEnabled.Load() }
 
 // Instances 构造 CodeArts 实例（单一部署，国内区）。
 func Instances(env core.Env) []core.Vendor {
@@ -69,41 +128,132 @@ func (v *adapter) Match(fileName, provider string, raw map[string]any) bool {
 
 // ---- 模型 ----
 
-// StaticModels 返回模型清单（无需凭证）。
+// StaticModels 返回模型清单。
+//
+// 福利通道的模型是按凭证下发的（FetchBenefitModels 需要 AK/SK 签名），所以这里
+// 和 ModelsForAuth 一样借一个可用凭证探测：两条路径同源，控制台缓存才不会出现
+// 「刷新模型目录后少 5 个模型」（issue #58）。没有可用凭证时退回内置目录——
+// model.static 可能先于凭证加载被调用，报错会让宿主把整家供应商当成探测失败。
 func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, error) {
-	models, errModels := FetchModels(ctx, nil)
+	probe, _ := core.ProbeNativeCredential(v.Env, v.ID(), func(c *core.Credential) (*Credential, bool) {
+		native, okNative := c.Native.(*Credential)
+		return native, okNative
+	})
+	models, errModels := v.fetchModels(ctx, probe)
 	if errModels != nil {
 		return nil, errModels
 	}
-	return modelsToPluginAPI(models), nil
+	return v.modelsToPluginAPI(models), nil
 }
 
 // ModelsForAuth 返回该凭证可用的模型。
 func (v *adapter) ModelsForAuth(ctx context.Context, cred *core.Credential) ([]pluginapi.ModelInfo, error) {
 	native, _ := v.Native(cred)
-	models, errModels := FetchModels(ctx, native)
+	models, errModels := v.fetchModels(ctx, native)
 	if errModels != nil {
 		return nil, errModels
 	}
-	return modelsToPluginAPI(models), nil
+	return v.modelsToPluginAPI(models), nil
 }
 
-// modelsToPluginAPI 把上游模型条目转成宿主契约类型。
-func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
+// modelsToPluginAPI 把上游模型条目转成宿主契约类型，顺带记下倍率表。
+//
+// 倍率与清单必须出自同一轮探测：分开取会出现「模型换了一批、倍率还是上一批」
+// 的错配。CodeArts 的倍率来自内置目录 credit[].ratio_display，福利通道没有
+// 倍率字段，因此福利模型不进表（控制台显示「—」，不臆造成免费）。
+func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
+	core.FillCredits(&v.credits, models,
+		func(model Model) string { return model.ID },
+		func(model Model) string { return model.Credits })
+	ids := make(map[string]string, len(models))
+	for _, model := range models {
+		if id := strings.TrimSpace(model.ID); id != "" {
+			ids[strings.ToLower(id)] = id
+		}
+	}
+	v.modelsMu.Lock()
+	v.modelsByLower = ids
+	v.modelsMu.Unlock()
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		if strings.TrimSpace(model.ID) == "" {
 			return core.ModelDescriptor{}, false
 		}
 		return core.ModelDescriptor{
-			ID:                 model.ID,
-			Name:               model.Name,
-			Description:        model.Description,
-			ContextLength:      int64(model.ContextWindow),
-			MaxOutputTokens:    int64(model.MaxTokens),
-			SupportsTools:      model.SupportsTools,
-			CanDisableThinking: !model.IsReasoning,
+			ID:              model.ID,
+			Name:            model.Name,
+			Description:     model.Description,
+			ContextLength:   int64(model.ContextWindow),
+			MaxOutputTokens: int64(model.MaxTokens),
+			SupportsTools:   model.SupportsTools,
+			SupportsImages:  model.SupportsImages,
 		}, true
 	})
+}
+
+// prepareRequestBody 在出站前做两处最小改写：
+//
+//  1. model 归一成注册时的 ID：宿主按 ID 精确匹配，客户端却可能沿用旧文档/
+//     旧别名的大小写写法（例如小写 glm-5.2 对应注册的 GLM-5.2），上游对模型名
+//     大小写敏感，原样出站会被拒；
+//  2. max_tokens / max_completion_tokens 夹到上游硬顶（见 clampTokenFields）。
+//
+// 两处共用一次解析与一次序列化：各做一遍会让每个对话请求多两次 JSON 往返，
+// 而且第二遍是在第一遍的产物上再解析，纯属浪费。
+func (v *adapter) prepareRequestBody(body []byte) []byte {
+	var payload map[string]json.RawMessage
+	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
+		return body
+	}
+	changed := v.canonicalizeModelField(payload)
+	if clampTokenFields(payload) {
+		changed = true
+	}
+	if !changed {
+		return body
+	}
+	encoded, errMarshal := json.Marshal(payload)
+	if errMarshal != nil {
+		return body
+	}
+	return encoded
+}
+
+// canonicalizeModelField 就地改写 model 字段，返回是否真的改了。
+// 未注册的名字保持原样，交给上游判定。
+func (v *adapter) canonicalizeModelField(payload map[string]json.RawMessage) bool {
+	raw, okRaw := payload["model"]
+	if !okRaw {
+		return false
+	}
+	var name string
+	if errUnmarshal := json.Unmarshal(raw, &name); errUnmarshal != nil {
+		return false
+	}
+	canonical := v.canonicalModelName(name)
+	if canonical == name {
+		return false
+	}
+	encoded, errMarshal := json.Marshal(canonical)
+	if errMarshal != nil {
+		return false
+	}
+	payload["model"] = encoded
+	return true
+}
+
+// canonicalModelName 用最新一轮目录把名字映射回注册 ID；未注册返回原名。
+func (v *adapter) canonicalModelName(name string) string {
+	v.modelsMu.RLock()
+	defer v.modelsMu.RUnlock()
+	if canonical, ok := v.modelsByLower[strings.ToLower(strings.TrimSpace(name))]; ok {
+		return canonical
+	}
+	return name
+}
+
+// ModelCredits 实现 core.CreditsProvider：返回「官方模型 ID → 计费倍率」。
+func (v *adapter) ModelCredits() map[string]string {
+	return v.credits.Snapshot()
 }
 
 // ---- 执行 ----
@@ -116,9 +266,9 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 	}
 	payload, errChat := Chat(ctx, "", ChatRequest{
 		Credential: native,
-		Body:       req.Payload,
+		Body:       v.prepareRequestBody(req.Payload),
 		Stream:     false,
-		Benefit:    true,
+		Benefit:    !v.creditEnabled.Load(),
 	})
 	if errChat != nil {
 		return nil, core.ToPluginError(errChat)
@@ -137,15 +287,15 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 	}
 	resp, errStream := ChatStream(ctx, "", ChatRequest{
 		Credential: native,
-		Body:       req.Payload,
+		Body:       v.prepareRequestBody(req.Payload),
 		Stream:     true,
-		Benefit:    true,
+		Benefit:    !v.creditEnabled.Load(),
 	})
 	if errStream != nil {
 		return core.ToPluginError(errStream)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	return hostbridge.ForwardRawSSE(resp.Body, sink.Emit)
+	return ForwardStream(resp.Body, sink.Emit)
 }
 
 // ---- 额度与签到 ----
@@ -168,13 +318,25 @@ func (v *adapter) Checkin(ctx context.Context, cred *core.Credential) (*core.Che
 	if errNative != nil {
 		return nil, errNative
 	}
-	result, errClaim := Checkin(ctx, native)
+	key := cred.FileIDValue()
+	if key == "" {
+		key = sha256Hex([]byte(native.DomainID + "|" + native.UserID + "|" + native.AccessKeyID))
+	}
+	claimState, _ := v.benefitClaims.LoadOrStore(key, &benefitCheckinState{})
+	state, okState := claimState.(*benefitCheckinState)
+	if !okState || state == nil {
+		// 同一张 map 只应存一种类型；兜底而不是直接断言，避免将来复用 map 时 panic。
+		state = &benefitCheckinState{}
+	}
+	result, errClaim := checkin(ctx, native, state)
 	if errClaim != nil {
 		return nil, core.ToPluginError(errClaim)
 	}
 	return &core.CheckinResult{
-		Already: result.Already,
-		Message: result.Message,
+		Already:     result.Already,
+		Credit:      result.Credit,
+		Message:     result.Message,
+		NotRecorded: result.NotRecorded,
 	}, nil
 }
 
@@ -200,3 +362,100 @@ func (v *adapter) LocalCallbackHint() string { return LocalCallbackURL }
 func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*core.CallbackSubmitResult, error) {
 	return SubmitCallback(ctx, v.Env.Logins, state, rawURL)
 }
+
+// AutoTaskCodeOpsBenefit 是一键任务里「活动福利」那一行的任务码。
+const AutoTaskCodeOpsBenefit = "(活动福利)"
+
+// RunAllTasks 执行一键任务：先走签到（积分签到 + 每日登录活动 + 福利通道），
+// 再把活动列表里剩下的可领活动一并领掉。
+//
+// 签到只认每日登录那一条（OpsDailyLoginType），而 EpOpsDelivery 返回的活动
+// 列表里往往还有别的已开放活动；那些活动官方 IDE 有领取按钮，代理此前从不
+// 触碰，等于白丢。这里按 claimable 逐条领取，已领取/已核销的跳过。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, 2)
+	if row := core.CheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "error", Message: core.ToPluginError(errNative).Error()})
+	}
+	activities, errFetch := fetchOpsActivities(ctx, native)
+	if errFetch != nil {
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "error", Message: core.ToPluginError(errFetch).Error()})
+	}
+	var claimed []string
+	var total int64
+	var failed []string
+	for _, activity := range activities {
+		// 每日登录活动已由签到领过，重复领只会拿到「已领取」。
+		if activity.Type == OpsDailyLoginType || !activity.Claimable {
+			continue
+		}
+		if claimedStatuses[strings.ToUpper(activity.Status)] {
+			continue
+		}
+		claim, errClaim := claimOps(ctx, native, activity.CampaignID)
+		if errClaim != nil {
+			failed = append(failed, activity.CampaignID+"："+core.ToPluginError(errClaim).Error())
+			continue
+		}
+		if claim.benefitID != "" {
+			// 与签到一致：需要二次确认的通道补 confirm，失败不推翻已领取的事实。
+			_, _ = signedSnapJSON(ctx, http.MethodPost, SnapEngineApiHost+EpOpsConfirm, native,
+				[]byte(`{"campaignId":"`+jsonEscape(activity.CampaignID)+`"}`))
+		}
+		amount := claim.credit
+		if amount == 0 {
+			amount = activity.Amount
+		}
+		total += amount
+		label := activity.CampaignID
+		if len(label) > 8 {
+			// 活动 id 通常是 ASCII，但上游换过命名；按字符边界切不吃亏。
+			label = core.TrimToBytes(label, 8)
+		}
+		claimed = append(claimed, label+" +"+strconv.FormatInt(amount, 10))
+	}
+	switch {
+	case len(claimed) > 0:
+		message := "领取 " + strconv.Itoa(len(claimed)) + " 个活动，共 +" + strconv.FormatInt(total, 10) + " 积分"
+		if len(failed) > 0 {
+			message += "；失败 " + strconv.Itoa(len(failed)) + " 个：" + strings.Join(failed, " / ")
+		}
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "done", Message: message})
+	case len(failed) > 0:
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "error", Message: strings.Join(failed, " / ")})
+	default:
+		return append(results, core.AutoTaskResult{Code: AutoTaskCodeOpsBenefit, Status: "skipped", Message: "没有其它可领活动"})
+	}
+}
+
+// RunTask 执行单条任务。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	trimmed := strings.TrimSpace(code)
+	if trimmed != core.AutoTaskCodeCheckin && trimmed != AutoTaskCodeOpsBenefit {
+		return core.TaskRunResult{Status: "skipped", Message: "该供应商没有这条任务"}, nil
+	}
+	for _, row := range v.RunAllTasks(ctx, cred) {
+		if row.Code == trimmed {
+			return core.TaskRunResult{Status: row.Status, Message: row.Message, Credit: row.Credit, Energy: row.Energy}, nil
+		}
+	}
+	return core.TaskRunResult{Status: "skipped", Message: "该账号不支持这条任务"}, nil
+}
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.CallbackSubmitter    = (*adapter)(nil)
+	_ core.CheckinProvider      = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+	_ core.ModelsProvider       = (*adapter)(nil)
+	_ core.QuotaProvider        = (*adapter)(nil)
+	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.TaskRunner           = (*adapter)(nil)
+)

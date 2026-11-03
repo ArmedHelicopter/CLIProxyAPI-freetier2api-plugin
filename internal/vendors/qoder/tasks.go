@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -19,8 +20,9 @@ import (
 
 // 本文件实现 Qoder 的额度查询。
 //
-// 与 WorkBuddy 的积分余额不同，Qoder 的额度是「套餐用量桶」：上游返回
-// userQuota / addOnQuota 两个对象，各有 used / total / remaining。
+// 与 WorkBuddy 的积分余额不同，Qoder 的额度是「用量桶」：上游返回
+// userQuota（套餐）、addOnQuota（加购）与 orgResourcePackage（组织共享
+// 资源包）三个对象，各有 used / total(或 cap) / remaining。
 // 归一成宿主的 QuotaFetchResponse（Summary 放关键数字，Groups 放明细）。
 
 // quotaHTTPTimeout 是额度相关请求的上限。
@@ -39,6 +41,7 @@ type Quota struct {
 	Plan            string
 	UserQuota       *QuotaBucket
 	AddonQuota      *QuotaBucket
+	OrgPackage      *QuotaBucket
 	IsQuotaExceeded bool
 	ExpiresAt       int64
 }
@@ -61,7 +64,152 @@ func FetchQuota(ctx context.Context, cred *Credential) (*Quota, error) {
 		ExpiresAt:       int64(toFloat(raw, "expiresAt")),
 		UserQuota:       extractQuotaBucket(raw, "userQuota"),
 		AddonQuota:      extractQuotaBucket(raw, "addOnQuota"),
+		OrgPackage:      extractOrgPackage(raw),
 	}, nil
+}
+
+// knownQuotaBucketKeys 是已经单独解析过的顶层桶，通用扫描要跳过。
+var knownQuotaBucketKeys = []string{"userQuota", "addOnQuota", "addonQuota", "user_quota", "add_on_quota", "orgResourcePackage"}
+
+// extractOrgPackage 读取「资源包」额度（企业/团队账号的主额度桶）。
+//
+// 企业账号的可用额度不在 userQuota / addOnQuota 里：前者是订阅席位
+// （3000/3000 用尽），后者可能整包过期（total=3000、remaining=0），真正能用的
+// 在另一个顶层桶里（网页端叫「资源包」，issue #70 的截图是 0/2000）。
+//
+// **不写死键名**：个人账号上取不到这个字段的样本，键名与内部字段名都没有
+// 实测证据（个人账号的响应只有 userQuota / addOnQuota，字段是
+// `{total, remaining, used, unit, percentage}`）。所以这里改成结构发现：
+// 凡是顶层里「同时有总额与剩余两个数值」又不属于已知桶的对象，就按资源包读，
+// 内部字段兼容 total/cap/capacity 与 remaining/available/left。
+// 这样上游改键名也不会再漏读，也不会因为猜错名字而静默返回 nil。
+func extractOrgPackage(data map[string]any) *QuotaBucket {
+	// 1. 已知键名优先：国内版团队账号的「资源包」叫 orgResourcePackage，
+	// 总额字段叫 cap，另带 available 说明当前能不能取用。available=false
+	// （过期 / 停用 / 已退还）时余额取不出来，按桶不存在处理（issue #70）。
+	if obj, okObj := data["orgResourcePackage"].(map[string]any); okObj {
+		if available, okAvailable := obj["available"].(bool); okAvailable && !available {
+			return nil
+		}
+		if len(obj) == 0 {
+			return nil
+		}
+		numbers := readBucketNumbers(obj)
+		bucket := &QuotaBucket{Used: numbers.used, Total: numbers.total, Remaining: numbers.remaining}
+		bucket.ResetTime = resetTimeOf(obj)
+		return bucket
+	}
+	// 2. 结构发现兜底：其他账号类型若键名不叫 orgResourcePackage，凡是顶层里
+	// 「同时有总额与剩余两个数值」又不属于已知桶的对象，就按资源包读，
+	// 内部字段兼容 total/cap/capacity 与 remaining/available/left。
+	var best *QuotaBucket
+	for key, value := range data {
+		if slices.Contains(knownQuotaBucketKeys, key) {
+			continue
+		}
+		object, okObject := value.(map[string]any)
+		if !okObject {
+			continue
+		}
+		bucket := quotaBucketFromObject(object)
+		// 多个候选时取余额最大的那个：页头要显示的是「还能用多少」。
+		if bucket == nil || (best != nil && bucket.Remaining <= best.Remaining) {
+			continue
+		}
+		best = bucket
+	}
+	return best
+}
+
+// quotaBucketFromObject 按已知别名把一个桶对象读成 QuotaBucket。
+// 总额与剩余必须**同时**存在，否则返回 nil——避免把别的对象误认成额度桶。
+func quotaBucketFromObject(object map[string]any) *QuotaBucket {
+	numbers := readBucketNumbers(object)
+	if !numbers.hasTotal || !numbers.hasRemaining {
+		return nil
+	}
+	bucket := &QuotaBucket{Used: numbers.used, Total: numbers.total, Remaining: numbers.remaining}
+	bucket.ResetTime = resetTimeOf(object)
+	return bucket
+}
+
+// resetTimeOf 读桶的重置时刻，兼容 resetTime 与 reset_time 两种拼写。
+//
+// 上游不同接口的字段拼写不一致。两处解析各写一套迟早会漂：漏掉别名的那条
+// 路径会把「有重置时间」显示成「不重置」（#71 第二轮复审 P2-7）。
+func resetTimeOf(object map[string]any) string {
+	if reset, okReset := object["resetTime"].(string); okReset {
+		return reset
+	}
+	if reset, okReset := object["reset_time"].(string); okReset {
+		return reset
+	}
+	return ""
+}
+
+// bucketNumbers 是桶内三个数值及其「是否存在」标记。
+type bucketNumbers struct {
+	total, remaining, used          float64
+	hasTotal, hasRemaining, hasUsed bool
+}
+
+// readBucketNumbers 按同一套别名取桶内数值。
+//
+// 资源包（结构发现，键名不固定）和固定键桶（userQuota / addOnQuota）走同一份
+// 别名表：两套各写一份时，上游把 total 改名成 cap，只会有一边认得出来，另一
+// 边静默变 0。缺 used 时按 total - remaining 反推，仅当两者都在。
+func readBucketNumbers(object map[string]any) bucketNumbers {
+	numbers := bucketNumbers{}
+	numbers.total, numbers.hasTotal = firstNumberField(object, "total", "cap", "capacity")
+	numbers.remaining, numbers.hasRemaining = firstNumberField(object, "remaining", "available", "left")
+	numbers.used, numbers.hasUsed = firstNumberField(object, "used")
+	if !numbers.hasUsed && numbers.hasTotal && numbers.hasRemaining {
+		numbers.used = numbers.total - numbers.remaining
+		if numbers.used < 0 {
+			numbers.used = 0
+		}
+	}
+	return numbers
+}
+
+// toFloat 把 JSON 里的数值字段读成 float64（兼容多种数字形态）。
+func toFloat(m map[string]any, key string) float64 {
+	switch value := m[key].(type) {
+	case float64:
+		return value
+	case int:
+		return float64(value)
+	case int64:
+		return float64(value)
+	case json.Number:
+		parsed, _ := value.Float64()
+		return parsed
+	}
+	return 0
+}
+
+// firstNumberField 按顺序取第一个存在且为数值的字段。
+func firstNumberField(object map[string]any, keys ...string) (float64, bool) {
+	for _, key := range keys {
+		value, okValue := object[key]
+		if !okValue {
+			continue
+		}
+		switch typed := value.(type) {
+		case float64:
+			return typed, true
+		case int:
+			return float64(typed), true
+		case int64:
+			return float64(typed), true
+		case json.Number:
+			parsed, errParsed := typed.Float64()
+			if errParsed == nil {
+				return parsed, true
+			}
+		}
+	}
+	return 0, false
 }
 
 // quotaBearerToken 把凭证换成额度接口认识的 bearer token。
@@ -100,7 +248,7 @@ func httpGetBearerJSON(ctx context.Context, endpoint, token string) (map[string]
 		return nil, NewError("qoder_upstream_transient", errDo.Error(), http.StatusBadGateway)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	body, errRead := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, errRead := readQoderResponseBody(resp.Body)
 	if errRead != nil {
 		return nil, NewError("qoder_upstream_error", errRead.Error(), http.StatusBadGateway)
 	}
@@ -138,22 +286,27 @@ func fetchPlanTierName(ctx context.Context, endpoints Endpoints, token string) s
 // 页面显示「上游未返回额度」，而真实语义是「有额度信息，只是余额为 0」。
 func extractQuotaBucket(data map[string]any, key string) *QuotaBucket {
 	obj, okObj := data[key].(map[string]any)
-	if !okObj || len(obj) == 0 {
+	if !okObj {
 		return nil
 	}
+	// 桶对象存在即视为上游承认这份额度，缺字段按 0 处理（不走 quotaBucketFromObject
+	// 的「两字段齐全才算」判据——那是给键名不固定的资源包做误认防护的）。
+	numbers := readBucketNumbers(obj)
 	bucket := &QuotaBucket{
-		Used:      toFloat(obj, "used"),
-		Total:     toFloat(obj, "total"),
-		Remaining: toFloat(obj, "remaining"),
+		Used:      numbers.used,
+		Total:     numbers.total,
+		Remaining: numbers.remaining,
 	}
-	if reset, okReset := obj["resetTime"].(string); okReset {
-		bucket.ResetTime = reset
-	} else if reset, okReset := obj["reset_time"].(string); okReset {
-		bucket.ResetTime = reset
-	}
+	bucket.ResetTime = resetTimeOf(obj)
 	return bucket
 }
 
+// extractOrgPackage 提取组织共享资源包（orgResourcePackage）。
+//
+// 国内版团队账号的「资源包」就是它：由组织统一购买、团队成员共享，字段
+// 与套餐桶不同——总额叫 cap，另外带 available 说明当前能不能取用。
+// available=false（过期 / 停用 / 已退还）时余额取不出来，按桶不存在处理，
+// 否则账号表会显示一份无法使用的额度。
 // BuildQuotaResponse 把上游额度翻译成宿主的归一化结构。
 func BuildQuotaResponse(quota *Quota) pluginapi.QuotaFetchResponse {
 	response := pluginapi.QuotaFetchResponse{}
@@ -162,36 +315,117 @@ func BuildQuotaResponse(quota *Quota) pluginapi.QuotaFetchResponse {
 			Plan: quota.Plan, TierName: quota.Plan, TierID: quota.Plan,
 		}
 	}
-	if group := quotaGroup("套餐额度", quota.UserQuota); group != nil {
-		response.Groups = append(response.Groups, *group)
-	}
-	if group := quotaGroup("个人拓展包", quota.AddonQuota); group != nil {
-		response.Groups = append(response.Groups, *group)
-	}
-	if quota.UserQuota != nil {
-		// total 必须一并输出：页面的「剩余/总额 + 使用率」要它才能算比例。
+	// 全 0 的桶既不进 Summary 也不进 Groups：Free 账号的「套餐额度 0/0」
+	// 会在面板上占掉一整排 chip 加一条 0% 进度条，纯粹是噪音。
+	// 但若**所有**桶都是空的（额度真用光了），至少保留一个，否则面板只会
+	// 显示「暂无额度数据」，看不出「已经用完」。
+	anyData := quotaBucketHasData(quota.UserQuota) || quotaBucketHasData(quota.AddonQuota) || quotaBucketHasData(quota.OrgPackage)
+	keepEmpty := func(bucket *QuotaBucket) bool { return !anyData || quotaBucketHasData(bucket) }
+	// 三桶按「谁还有余额」排序后输出：插件的 auth.Totals 取**第一个有容量的
+	// 族**当页头数字（total>0 即算有容量），所以顺序就是语义。
+	// 排错的表现：企业账号的页头永远停在已过期那桶的「0 / 3000」。
+	//
+	// Groups（面板上的额度条）与 Summary 必须同序：页头数字取的是 Summary 里
+	// 第一个有容量的族，两条路径各排各的就会出现「页头 2000/3000、第一条
+	// 却写着 0/3000」这种自相矛盾的展示。
+	for _, family := range orderedQuotaFamilies(quota) {
+		if !keepEmpty(family.bucket) {
+			continue
+		}
+		if group := quotaGroup(family.group, family.bucket); group != nil {
+			response.Groups = append(response.Groups, *group)
+		}
+		// total 必须一并输出：页面的「剩余/总额 + 剩余率」要它才能算比例。
 		// 上游对 Free 计划可能给 total=0（额度按剩余量计），此时仍输出 0——
 		// 页面会显示 "—"，比编一个数诚实。
+		// Unit 一律留空：宿主面板把 unit 直接拼在数字后面，填 "credits" 会渲染成
+		// 「497 credits」中英混排，而 Label 里的「额度」已经说明了计量口径。
 		response.Summary = append(response.Summary,
-			pluginapi.QuotaMetric{Key: "user_quota_remaining", Label: "套餐剩余额度", Value: quota.UserQuota.Remaining, Unit: "credits"},
-			pluginapi.QuotaMetric{Key: "user_quota_total", Label: "套餐总额度", Value: quota.UserQuota.Total, Unit: "credits"},
-			pluginapi.QuotaMetric{Key: "user_quota_used", Label: "套餐已用额度", Value: quota.UserQuota.Used, Unit: "credits"})
-	}
-	if quota.AddonQuota != nil {
-		response.Summary = append(response.Summary,
-			pluginapi.QuotaMetric{Key: "addon_quota_remaining", Label: "拓展包剩余额度", Value: quota.AddonQuota.Remaining, Unit: "credits"},
-			pluginapi.QuotaMetric{Key: "addon_quota_total", Label: "拓展包总额度", Value: quota.AddonQuota.Total, Unit: "credits"},
-			pluginapi.QuotaMetric{Key: "addon_quota_used", Label: "拓展包已用额度", Value: quota.AddonQuota.Used, Unit: "credits"})
+			pluginapi.QuotaMetric{Key: family.prefix + "_remaining", Label: family.label + "剩余额度", Value: family.bucket.Remaining},
+			pluginapi.QuotaMetric{Key: family.prefix + "_total", Label: family.label + "总额度", Value: family.bucket.Total},
+			pluginapi.QuotaMetric{Key: family.prefix + "_used", Label: family.label + "已用额度", Value: family.bucket.Used})
 	}
 	if quota.IsQuotaExceeded {
 		response.Summary = append(response.Summary,
-			pluginapi.QuotaMetric{Key: "quota_exceeded", Label: "额度状态", Value: 1, Unit: "已用尽"})
+			pluginapi.QuotaMetric{Key: "quota_exceeded", Label: "额度已用尽", Value: 1})
 	}
-	if quota.ExpiresAt > 0 {
+	if expires := quotaExpiryUnixSeconds(quota.ExpiresAt); expires > 0 {
 		response.Summary = append(response.Summary,
-			pluginapi.QuotaMetric{Key: "expires_at", Label: "额度到期时间", Value: float64(quota.ExpiresAt), Format: "number", Unit: "unix"})
+			pluginapi.QuotaMetric{Key: "expires_at", Label: "额度到期（Unix 秒）", Value: float64(expires)})
 	}
 	return response
+}
+
+// quotaExpiryUnixSeconds 把上游的到期时间规整成 Unix 秒；不展示时返回 0。
+//
+// 上游给的是**毫秒**（253402214400000 = 9999-12-31），直接当秒输出会让面板
+// 渲染成「253,402,214,400,000」这种天文数字。另外「永不过期」类时间戳没有
+// 信息量，一律折叠成不展示。
+func quotaExpiryUnixSeconds(raw int64) int64 {
+	if raw <= 0 {
+		return 0
+	}
+	seconds := raw
+	if seconds > 1e12 { // 大于 1e12 的秒级时间戳不存在，只可能是毫秒
+		seconds /= 1000
+	}
+	const maxPlausibleUnix = 4102444800 // 2100-01-01，超出视为「永不过期」
+	if seconds <= 0 || seconds > maxPlausibleUnix {
+		return 0
+	}
+	return seconds
+}
+
+// quotaFamilyMetric 是一个额度桶在 Summary 里的键前缀、chip 上的名字与
+// Summary 里用的短名。
+type quotaFamilyMetric struct {
+	prefix string
+	label  string
+	group  string
+	bucket *QuotaBucket
+}
+
+// orderedQuotaFamilies 按「谁还有余额」排定额度桶的输出顺序。
+//
+// 插件 auth.Totals 取第一个有容量的族当页头数字，而「有容量」包含
+// 「total>0、remaining==0」（额度合法用完）。Qoder 的桶会出现这种状态：
+//
+//	企业账号  套餐 3000/3000 用尽 → 个人拓展包过期(total=3000,remaining=0)
+//	          → 组织资源包 2000/3000 ← 真正可用的在这里
+//	Free 计划 套餐 0/0（上游就是给 0）→ 个人拓展包 50/200
+//
+// 若按固定顺序输出，页头会被已过期的桶占住，显示「0 / 3000」，而账号其实
+// 还能用 2000。所以按三级排：有剩余 → 有总额 → 其余，同级保持
+// 套餐 → 拓展包 → 组织资源包 的自然顺序（个人账号优先看套餐）。
+func orderedQuotaFamilies(quota *Quota) []quotaFamilyMetric {
+	all := []quotaFamilyMetric{
+		{prefix: "user_quota", label: "套餐", group: "套餐额度", bucket: quota.UserQuota},
+		{prefix: "addon_quota", label: "个人拓展包", group: "个人拓展包", bucket: quota.AddonQuota},
+		{prefix: "org_quota", label: "组织资源包", group: "组织资源包", bucket: quota.OrgPackage},
+	}
+	ordered := make([]quotaFamilyMetric, 0, len(all))
+	taken := make([]bool, len(all))
+	appendMatching := func(keep func(quotaFamilyMetric) bool) {
+		for index, family := range all {
+			if taken[index] || family.bucket == nil || !keep(family) {
+				continue
+			}
+			taken[index] = true
+			ordered = append(ordered, family)
+		}
+	}
+	appendMatching(func(family quotaFamilyMetric) bool { return family.bucket.Remaining > 0 })
+	appendMatching(func(family quotaFamilyMetric) bool { return family.bucket.Total > 0 })
+	appendMatching(func(quotaFamilyMetric) bool { return true })
+	return ordered
+}
+
+// quotaBucketHasData 判断一个额度桶是否承载真实数据（任一维度非零）。
+func quotaBucketHasData(bucket *QuotaBucket) bool {
+	if bucket == nil {
+		return false
+	}
+	return bucket.Total != 0 || bucket.Remaining != 0 || bucket.Used != 0
 }
 
 // quotaGroup 把额度桶转成「剩余比例」分组。
@@ -202,7 +436,7 @@ func quotaGroup(displayName string, bucket *QuotaBucket) *pluginapi.QuotaGroup {
 	fraction := 0.0
 	switch {
 	case bucket.Total > 0:
-		fraction = clampFraction(bucket.Remaining / bucket.Total)
+		fraction = core.ClampFraction(bucket.Remaining / bucket.Total)
 	case bucket.Remaining > 0:
 		fraction = 1
 	}
@@ -216,34 +450,6 @@ func quotaGroup(displayName string, bucket *QuotaBucket) *pluginapi.QuotaGroup {
 			Description:       description,
 		}},
 	}
-}
-
-// clampFraction 把比例夹到 [0, 1]。
-func clampFraction(value float64) float64 {
-	switch {
-	case value < 0:
-		return 0
-	case value > 1:
-		return 1
-	default:
-		return value
-	}
-}
-
-// toFloat 把 JSON 里的数值字段读成 float64（兼容多种数字形态）。
-func toFloat(m map[string]any, key string) float64 {
-	switch value := m[key].(type) {
-	case float64:
-		return value
-	case int:
-		return float64(value)
-	case int64:
-		return float64(value)
-	case json.Number:
-		parsed, _ := value.Float64()
-		return parsed
-	}
-	return 0
 }
 
 // 签到状态取值。
@@ -375,8 +581,9 @@ type dailyCheckinStatus struct {
 
 // Checkin 执行一次签到。
 //
-// identity 是本次要携带的官方客户端设备身份；国际版缺它时活动列表会被
-// 上游静默过滤，因此这里在查活动**之前**就如实报告「缺少设备身份」。
+// identity 是用户提供的官方组件设备身份；没有时它为零值，请求里不发机器头
+// （见 checkinHeaders）。国内版不需要身份；国际版没有身份就看不到活动，
+// 此时结果会说明原因而不是笼统报「无可用签到活动」。
 func Checkin(ctx context.Context, cred *Credential, identity MachineIdentity) (*CheckinResult, error) {
 	result := &CheckinResult{Status: CheckinError}
 	bearer := checkinBearer(cred.Token)
@@ -446,9 +653,20 @@ func campaignsCheckin(ctx context.Context, region Region, bearer string, identit
 	// 今天 10:00 开启的那一轮才算今天领的。
 	var current *campaignInfo
 	var past *campaignInfo
+	// blocked 记录第一条「可领但成就未完成」的活动：没有可领活动时用它给出
+	// 可操作的原因，而不是笼统的「无可用签到活动」。
+	var blocked *campaignInfo
 	for index := range campaigns {
 		campaign := &campaigns[index]
 		if campaign.ActionType != "CLAIM_BENEFIT" {
+			continue
+		}
+		// 成就未完成的 CLAIMABLE 活动**不能**被当成当前轮去领取：上游会拒绝，
+		// 而同一列表里今天已领的每日活动会被它覆盖，导致后续轮次误报失败。
+		if campaignAchievementBlocked(campaign) {
+			if blocked == nil {
+				blocked = campaign
+			}
 			continue
 		}
 		if campaign.StartAt <= 0 {
@@ -531,10 +749,45 @@ func campaignsCheckin(ctx context.Context, region Region, bearer string, identit
 		result.Message = fmt.Sprintf("上一轮领取窗口（%s）已结束且未领取，官方不补领", result.WindowDate)
 		return result
 	}
+	if blocked != nil {
+		// 有活动，但都被成就门槛挡住：给出「先完成哪个成就」，而不是「无活动」。
+		result.Status = CheckinNoCampaign
+		result.NotRecorded = true
+		result.CampaignID = blocked.CampaignID
+		result.Message = achievementMessage(blocked)
+		return result
+	}
 	result.Status = CheckinNoCampaign
 	result.NotRecorded = true
-	result.Message = "无可用签到活动"
+	result.Message = noCampaignMessage(region, identity)
 	return result
+}
+
+// campaignAchievementBlocked 报告活动是否「可领但成就未完成」。
+//
+// 这类活动在列表里仍是 CLAIMABLE，直接领取会被上游拒绝；选择当前轮时
+// 必须跳过，否则会覆盖同一列表里今天已领的每日活动，把「今日已领取」
+// 误报成成就未完成。
+func campaignAchievementBlocked(campaign *campaignInfo) bool {
+	if campaign == nil {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(campaign.ClaimStatus), "CLAIMED") {
+		return false
+	}
+	return strings.TrimSpace(campaign.RequiredAchievementKey) != "" && !campaign.AchievementCompleted
+}
+
+// noCampaignMessage 说明「没有可领取活动」的真实原因。
+//
+// 国际版的活动只下发给登录过官方客户端的那台真机（上游按 machinetoken 精确
+// 校验，2026-10-23 实测：派生值、容器内官方组件、改一位的值全部无效）。没带
+// 身份时不能笼统地说「无可用签到活动」——那会让用户以为今天本来就没活动。
+func noCampaignMessage(region Region, identity MachineIdentity) string {
+	if region == RegionGlobal && !identity.Native() {
+		return "国际版活动只下发给登录过官方客户端的设备；请在该机器上运行 runtime-info，把输出的 machineToken/machineType 填入凭证或插件配置"
+	}
+	return "无可用签到活动"
 }
 
 // claimCampaign 领取一次活动，并在领取后回读上游确认发放。
@@ -582,12 +835,25 @@ func claimCampaign(ctx context.Context, region Region, bearer string, identity M
 		result.Status = CheckinAlreadyClaimed
 		result.Message = "今日已领取"
 		return result
+	case "ACHIEVEMENT_NOT_COMPLETED", "ACHIEVEMENT_NOT_COMPLETE", "ACHIEVEMENT_REQUIRED":
+		// 领取时上游才校验成就：如实告知需要先完成哪个成就。
+		result.Status = CheckinNoCampaign
+		result.NotRecorded = true
+		result.Message = achievementMessage(target)
+		return result
 	case "":
 		result.Status = CheckinError
 		result.NotRecorded = true
 		result.Message = fmt.Sprintf("领取响应缺少状态: %s", core.Truncate(raw, 300))
 		return result
 	default:
+		if strings.Contains(strings.ToUpper(claim.FailureCode), "ACHIEVEMENT") ||
+			strings.Contains(strings.ToUpper(claim.ErrorCode), "ACHIEVEMENT") {
+			result.Status = CheckinNoCampaign
+			result.NotRecorded = true
+			result.Message = achievementMessage(target)
+			return result
+		}
 		result.Status = CheckinNoCampaign
 		result.NotRecorded = true
 		result.Message = fmt.Sprintf("上游状态 %s，未领取%s", claim.Status, claimFailureSuffix(claim))
@@ -813,29 +1079,26 @@ func parseCampaigns(raw any) []campaignInfo {
 // cosy-clienttype: 10 是桌面端标识；上游按它放行签到接口，
 // 不需要 cosy 签名（这是签到与对话接口最大的差异）。
 //
-// 机器头只在拿到**官方组件给的真身份**时才发（见 identity.go）：国际版
-// 缺了它们，可领取活动会被上游静默过滤；而发派生假身份同样会被过滤，
-// 所以拿不到就一个都不发。
-// checkinHeaders 是桌面端签到所需的请求头（抓包确认）。
-//
-// cosy-clienttype: 10 是桌面端标识；上游按它放行签到接口，
-// 不需要 cosy 签名（这是签到与对话接口最大的差异）。
-//
-// 机器头必须**成对**出现（token + type）：实测缺任一个，国际版可领取活动
-// 会被上游静默过滤。身份由 identity.go 按账号种子派生。
+// 机器头**只在用户提供了官方组件签发的真身份时才发**（见 identity.go）：
+// 上游对 machinetoken/machinetype 做精确校验，任何派生、随机或拼接的值都会
+// 让可领取活动被整条过滤——国内版本来看得见，发假头反而看不见。没有真身份
+// 时一个都不发，这是唯一不会自我破坏的选择。
 func checkinHeaders(bearer string, identity MachineIdentity) map[string]string {
 	headers := map[string]string{
-		"authorization":        "Bearer " + bearer,
-		"accept":               "application/json",
-		"accept-language":      "zh-CN",
-		"user-agent":           "Qoder",
-		"cosy-clienttype":      "10",
-		"cosy-version":         identity.Version,
-		"cosy-machineid":       identity.MachineID,
-		"cosy-machinetoken":    identity.Token,
-		"cosy-machinetype":     identity.Type,
-		"cosy-machineos":       identity.MachineOS,
-		"cosy-machinehostname": identity.Hostname,
+		"authorization":   "Bearer " + bearer,
+		"accept":          "application/json",
+		"accept-language": "zh-CN",
+		"user-agent":      "Qoder",
+		"cosy-clienttype": "10",
+		"cosy-version":    identity.Version,
+	}
+	if !identity.Native() {
+		return headers
+	}
+	headers["cosy-machinetoken"] = identity.Token
+	headers["cosy-machinetype"] = identity.Type
+	if identity.Code != "" {
+		headers["cosy-machinecode"] = identity.Code
 	}
 	return headers
 }
@@ -879,7 +1142,10 @@ func doCheckinRequest(ctx context.Context, region Region, method, path, bearer s
 		return 0, nil, fmt.Sprintf("do request: %v", errDo)
 	}
 	defer func() { _ = resp.Body.Close() }()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, errRead := readQoderResponseBody(resp.Body)
+	if errRead != nil {
+		return resp.StatusCode, nil, "read response: " + errRead.Error()
+	}
 	var parsed any
 	if len(data) > 0 {
 		_ = json.Unmarshal(data, &parsed)

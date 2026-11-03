@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -237,6 +238,81 @@ func RandomHex(n int) string {
 	return hex.EncodeToString(buf)
 }
 
+// jwtPayload 解码 JWT 的第二段 payload（不验签）；解不出返回 nil。
+func jwtPayload(token string) []byte {
+	parts := strings.Split(strings.TrimSpace(token), ".")
+	if len(parts) < 2 {
+		return nil
+	}
+	payload, errDecode := base64.RawURLEncoding.DecodeString(parts[1])
+	if errDecode == nil {
+		return payload
+	}
+	seg := parts[1]
+	if rem := len(seg) % 4; rem > 0 {
+		seg += strings.Repeat("=", 4-rem)
+	}
+	if payload, errDecode = base64.URLEncoding.DecodeString(seg); errDecode == nil {
+		return payload
+	}
+	return nil
+}
+
+// MaskToken 返回脱敏后的 token（展示用）：保留前 4 后 4 位，中间用 * 填充。
+// 不超过 8 位时全部遮挡；空值返回空串。
+func MaskToken(token string) string {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return ""
+	}
+	if len(trimmed) <= 8 {
+		return strings.Repeat("*", len(trimmed))
+	}
+	return trimmed[:4] + strings.Repeat("*", len(trimmed)-8) + trimmed[len(trimmed)-4:]
+}
+
+// JWTExpiry 解码 JWT payload 的 exp（秒），解不出返回 0。不验签，只读 exp。
+func JWTExpiry(token string) int64 {
+	payload := jwtPayload(token)
+	if len(payload) == 0 {
+		return 0
+	}
+	var claims struct {
+		Exp int64 `json:"exp"`
+	}
+	if errUnmarshal := json.Unmarshal(payload, &claims); errUnmarshal != nil || claims.Exp <= 0 {
+		return 0
+	}
+	return claims.Exp
+}
+
+// JWTUserID 解码 JWT payload 里的用户 id（依次尝试常见键），解不出返回空。
+func JWTUserID(token string) string {
+	payload := jwtPayload(token)
+	if len(payload) == 0 {
+		return ""
+	}
+	var claims map[string]any
+	if errUnmarshal := json.Unmarshal(payload, &claims); errUnmarshal != nil {
+		return ""
+	}
+	return GetString(claims, "user_id", "userId", "uid", "userID")
+}
+
+// TokenFingerprint 返回 token 的稳定短指纹（SHA-256 前 12 位十六进制）。
+//
+// 用于「上游不给 uid」时给账号一个稳定且互不相同的文件名后缀（见 FileNameFor）：
+// 同一份凭证每次算出同一个值，不同凭证实际上不可能相同，且不可逆、不落盘。
+// 空值返回空串。
+func TokenFingerprint(token string) string {
+	trimmed := strings.TrimSpace(token)
+	if trimmed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(sum[:6])
+}
+
 // NewPKCEPair 生成 PKCE 的 verifier 与 S256 challenge。
 func NewPKCEPair() (verifier, challenge string, err error) {
 	buffer := make([]byte, 32)
@@ -259,22 +335,52 @@ func FirstNonZero(values ...int64) int64 {
 	return 0
 }
 
-// IntFromAny 把 JSON 数值转成 int（缺失或非法返回 0）。
-func IntFromAny(value any) int {
+// ParseClock 解析 HH:MM 形式的本地时刻（00:00-23:59）。
+//
+// 配置校验与后台排程共用这一份判定：两边各写一套曾是真实的分歧来源——
+// 校验通过的时刻排程解析不出来，自动签到静默退回默认小时。
+func ParseClock(raw string) (hour, minute int, ok bool) {
+	parts := strings.Split(strings.TrimSpace(raw), ":")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	hour, errHour := strconv.Atoi(strings.TrimSpace(parts[0]))
+	minute, errMinute := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if errHour != nil || errMinute != nil || hour < 0 || hour > 23 || minute < 0 || minute > 59 {
+		return 0, 0, false
+	}
+	return hour, minute, true
+}
+
+// FloatFromAny 宽容解析数字：接受 JSON 数字、json.Number 与数字字符串。
+//
+// 上游同一个字段在不同接口 / 不同版本上可能下发 12 / "12" / null，严格解码会
+// 让整条响应解析失败，把一次成功签到报成 decode 错误。无法解析返回 0。
+func FloatFromAny(value any) float64 {
 	switch number := value.(type) {
 	case float64:
-		return int(number)
-	case int64:
-		return int(number)
-	case int:
 		return number
+	case float32:
+		return float64(number)
+	case int:
+		return float64(number)
+	case int64:
+		return float64(number)
 	case json.Number:
-		parsed, errParse := number.Int64()
-		if errParse == nil {
-			return int(parsed)
+		if parsed, errParse := number.Float64(); errParse == nil {
+			return parsed
+		}
+	case string:
+		if parsed, errParse := strconv.ParseFloat(strings.TrimSpace(number), 64); errParse == nil {
+			return parsed
 		}
 	}
 	return 0
+}
+
+// IntFromAny 把 JSON 数值转成 int（缺失或非法返回 0，小数截断）。
+func IntFromAny(value any) int {
+	return int(FloatFromAny(value))
 }
 
 // StringField 读取 map 中的字符串字段（去空白）。

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -28,6 +29,14 @@ type UpstreamError interface {
 	Retryable() bool
 	// UpstreamKind 返回错误分类标识（用于日志与错误码）。
 	UpstreamKind() string
+}
+
+// RetryHinter 由能给出上游明示等待时间的错误实现。
+//
+// 宿主把 retry_after_seconds 翻成 Retry-After 响应头，客户端据此退避；
+// 没实现或返回 0 时保持原样（不额外发头）。
+type RetryHinter interface {
+	RetryAfter() time.Duration
 }
 
 // UpstreamDetail 由能提供上游原始响应正文的错误实现。
@@ -54,12 +63,143 @@ func ToPluginError(err error) error {
 			status = http.StatusBadGateway
 		}
 		code := upstreamCode(upstreamErr.UpstreamKind())
+		var pluginErr *PluginError
 		if upstreamErr.Retryable() {
-			return RetryablePluginError(code, upstreamErr.Error(), status)
+			pluginErr = RetryablePluginError(code, err.Error(), status)
+		} else {
+			pluginErr = NewPluginError(code, err.Error(), status)
 		}
-		return NewPluginError(code, upstreamErr.Error(), status)
+		pluginErr.RetryAfterSeconds = retryAfterSeconds(err)
+		return pluginErr
+	}
+	// 宿主 HTTP 桥（host.http.do / do_stream）在非 2xx 时把整个响应折叠成一条
+	// RPC 错误文本，插件拿不到 http.Response。这类错误必须按文本还原状态码：
+	// 否则 429 会被当成普通传输故障报 502，宿主不做限流冷却，客户端还会拿到
+	// 500（实测 workbuddyglobal 429 → 客户端 internal_server_error）。
+	if failure := classifyTransportError(err); failure != nil {
+		status := failure.HTTPStatus()
+		code := upstreamCode(failure.Kind.String())
+		if failure.Retryable() {
+			return RetryablePluginError(code, failure.Msg, status)
+		}
+		return NewPluginError(code, failure.Msg, status)
 	}
 	return RetryablePluginError("upstream_request_failed", err.Error(), http.StatusBadGateway)
+}
+
+// transportStatusHints 是宿主桥错误文本里出现的状态短语到状态码的映射。
+//
+// 顺序敏感：长短语在前，避免 "Request Entity Too Large" 先被更短的短语吃掉。
+var transportStatusHints = []struct {
+	marker string
+	status int
+}{
+	{"Request Entity Too Large", http.StatusRequestEntityTooLarge},
+	{"Service Unavailable", http.StatusServiceUnavailable},
+	{"Gateway Timeout", http.StatusGatewayTimeout},
+	{"Too Many Requests", http.StatusTooManyRequests},
+	{"Payment Required", http.StatusPaymentRequired},
+	{"Unauthorized", http.StatusUnauthorized},
+	{"Bad Gateway", http.StatusBadGateway},
+	{"Forbidden", http.StatusForbidden},
+	{"Not Found", http.StatusNotFound},
+	{"Bad Request", http.StatusBadRequest},
+}
+
+// classifyTransportError 把宿主 HTTP 桥的传输层错误还原成分类错误。
+//
+// 只处理带桥标记（host.http.do* / host_call_failed）的错误：普通错误里出现
+// "not found" 之类的字面量（例如本地文件缺失）不该被误判成上游 404。
+// 返回的 Msg 已剥掉 host.http.do_stream: host_call_failed: execute host http request:
+// 这类内部前缀，只留下「上游 HTTP 429 Too Many Requests（host）」。
+func classifyTransportError(err error) *Failure {
+	if err == nil {
+		return nil
+	}
+	message := err.Error()
+	if !strings.Contains(message, "host.http.do") && !strings.Contains(message, "host_call_failed") {
+		return nil
+	}
+	status := 0
+	for _, hint := range transportStatusHints {
+		if strings.Contains(message, hint.marker) {
+			status = hint.status
+			break
+		}
+	}
+	if status == 0 {
+		return nil
+	}
+	return &Failure{Kind: transportKind(status), Status: status, Msg: transportMessage(status, message)}
+}
+
+// transportKind 把还原出的状态码映射成可处置分类。
+func transportKind(status int) FailureKind {
+	switch status {
+	case http.StatusTooManyRequests:
+		return FailureKindSoftRate
+	case http.StatusUnauthorized:
+		return FailureKindCredential
+	case http.StatusPaymentRequired:
+		return FailureKindHardCredit
+	case http.StatusForbidden:
+		return FailureKindWAFBlock
+	case http.StatusNotFound:
+		return FailureKindNotFound
+	case http.StatusBadRequest, http.StatusRequestEntityTooLarge:
+		return FailureKindBadParams
+	case http.StatusServiceUnavailable:
+		return FailureKindBusy
+	default:
+		return FailureKindTransient
+	}
+}
+
+// transportMessage 生成给下游看的上游错误描述，附上被请求的上游主机便于定位。
+func transportMessage(status int, raw string) string {
+	message := fmt.Sprintf("上游 HTTP %d %s", status, http.StatusText(status))
+	if host := transportHost(raw); host != "" {
+		message = fmt.Sprintf("%s（%s）", message, host)
+	}
+	return message
+}
+
+// transportHost 从 Go http.Client 的错误文本里取出上游主机名。
+//
+// 典型形态：Post "https://www.workbuddy.ai/v2/chat/completions": Too Many Requests
+func transportHost(raw string) string {
+	for _, verb := range []string{`Post "`, `Get "`, `Put "`, `Patch "`, `Delete "`} {
+		start := strings.Index(raw, verb)
+		if start < 0 {
+			continue
+		}
+		rest := raw[start+len(verb):]
+		end := strings.IndexByte(rest, '"')
+		if end <= 0 {
+			continue
+		}
+		if parsed, errParse := url.Parse(rest[:end]); errParse == nil && parsed.Host != "" {
+			return parsed.Host
+		}
+	}
+	return ""
+}
+
+// retryAfterSeconds 取出上游明示的等待秒数（向上取整）。
+func retryAfterSeconds(err error) int {
+	var hinter RetryHinter
+	if !errors.As(err, &hinter) {
+		return 0
+	}
+	wait := hinter.RetryAfter()
+	if wait <= 0 {
+		return 0
+	}
+	seconds := int((wait + time.Second - 1) / time.Second)
+	if seconds < 1 {
+		seconds = 1
+	}
+	return seconds
 }
 
 // upstreamCode 生成错误码：upstream_<kind>。
@@ -84,6 +224,9 @@ type envelopeError struct {
 	Message    string `json:"message"`
 	Retryable  bool   `json:"retryable,omitempty"`
 	HTTPStatus int    `json:"http_status,omitempty"`
+	// RetryAfterSeconds 是上游明示的等待秒数。宿主（CPA 8.0.5x）会把它翻成
+	// 响应头 Retry-After 交给客户端；旧宿主忽略该字段，不影响兼容。
+	RetryAfterSeconds int `json:"retry_after_seconds,omitempty"`
 }
 
 // PluginError 是插件内部的结构化错误：可携带 HTTP 状态码与可重试标记。
@@ -95,6 +238,8 @@ type PluginError struct {
 	Message    string
 	Retryable  bool
 	HTTPStatus int
+	// RetryAfterSeconds 来自上游明示的等待信息（0 表示未给出）。
+	RetryAfterSeconds int
 }
 
 // Error 实现 error 接口。
@@ -140,10 +285,11 @@ func ErrorEnvelopeFromError(err error) []byte {
 	}
 	if pluginErr, ok := err.(*PluginError); ok {
 		raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
-			Code:       pluginErr.Code,
-			Message:    pluginErr.Message,
-			Retryable:  pluginErr.Retryable,
-			HTTPStatus: pluginErr.HTTPStatus,
+			Code:              pluginErr.Code,
+			Message:           pluginErr.Message,
+			Retryable:         pluginErr.Retryable,
+			HTTPStatus:        pluginErr.HTTPStatus,
+			RetryAfterSeconds: pluginErr.RetryAfterSeconds,
 		}})
 		return raw
 	}
@@ -161,20 +307,21 @@ func ErrorEnvelopeFromError(err error) []byte {
 type FailureKind string
 
 const (
-	FailureKindNone           FailureKind = "none"
-	FailureKindHardCredit     FailureKind = "hard_credit"
-	FailureKindSoftRate       FailureKind = "soft_rate"
-	FailureKindSessionDead    FailureKind = "session_dead"
-	FailureKindNotFound       FailureKind = "not_found"
-	FailureKindServer         FailureKind = "server"
-	FailureKindContentBlocked FailureKind = "content_blocked"
-	FailureKindBadParams      FailureKind = "bad_params"
-	FailureKindAccountFault   FailureKind = "account_fault"
-	FailureKindModelBlocked   FailureKind = "model_blocked"
-	FailureKindWAFBlock       FailureKind = "waf_block"
-	FailureKindPromptTooLong  FailureKind = "prompt_too_long"
-	FailureKindImageInvalid   FailureKind = "image_invalid"
-	FailureKindClient         FailureKind = "client"
+	FailureKindNone            FailureKind = "none"
+	FailureKindHardCredit      FailureKind = "hard_credit"
+	FailureKindSoftRate        FailureKind = "soft_rate"
+	FailureKindSessionDead     FailureKind = "session_dead"
+	FailureKindNotFound        FailureKind = "not_found"
+	FailureKindServer          FailureKind = "server"
+	FailureKindContentBlocked  FailureKind = "content_blocked"
+	FailureKindChannelRejected FailureKind = "channel_rejected"
+	FailureKindBadParams       FailureKind = "bad_params"
+	FailureKindAccountFault    FailureKind = "account_fault"
+	FailureKindModelBlocked    FailureKind = "model_blocked"
+	FailureKindWAFBlock        FailureKind = "waf_block"
+	FailureKindPromptTooLong   FailureKind = "prompt_too_long"
+	FailureKindImageInvalid    FailureKind = "image_invalid"
+	FailureKindClient          FailureKind = "client"
 
 	// 兼容通用供应商的短分类。
 	FailureKindCredential FailureKind = "credential"
@@ -194,18 +341,26 @@ func (k FailureKind) String() string {
 
 // Failure 是带分类的上游错误。
 //
-// Msg 保持上游原文；Code 是上游业务码的可读形式（可为空）。RetryAfter /
+// Msg 保持上游原文；Code 是上游业务码的可读形式（可为空）。RetryWait /
 // ResetAt 是上游明示的等待信息，零值表示未给出。
 type Failure struct {
-	Kind       FailureKind
-	Status     int
-	Code       string
-	Msg        string
-	RetryAfter time.Duration
-	ResetAt    time.Time
+	Kind      FailureKind
+	Status    int
+	Code      string
+	Msg       string
+	RetryWait time.Duration
+	ResetAt   time.Time
 
 	// RetryableOverride 允许供应商覆盖通用的可重试判定（nil 表示按 FailureKind 推导）。
 	RetryableOverride *bool
+}
+
+// RetryAfter 实现 RetryHinter：把上游明示的等待时长交给宿主。
+func (e *Failure) RetryAfter() time.Duration {
+	if e == nil {
+		return 0
+	}
+	return e.RetryWait
 }
 
 // Failure 实现 error 接口。
@@ -227,7 +382,17 @@ func (e *Failure) HTTPStatus() int {
 	if e == nil {
 		return http.StatusBadGateway
 	}
-	if e.Status > 0 {
+	// 账号级故障常被上游包在 400（甚至 200 的 SSE 错误帧）里返回，透传原始
+	// 状态码会让宿主错过冷却分支，被封账号于是每轮都被重新选中。
+	// 只对 account_fault 强制 403：session_dead 的原始状态码另有语义
+	// （zcode 的 403 要保留，宿主据此走软冷却而非刷新凭证）。
+	if e.Kind == FailureKindAccountFault {
+		return http.StatusForbidden
+	}
+	// 只有真正的错误状态才算数：上游把业务错误塞进 200/206 的包体（SSE 错误帧
+	// 最常见）时，透传 2xx 会让宿主把「账号被封」当成成功状态码——冷却分支
+	// 命中不了，凭证就每轮都被重新选中。这类一律按 Kind 推导。
+	if e.Status >= http.StatusBadRequest {
 		return e.Status
 	}
 	switch e.Kind {
@@ -259,8 +424,8 @@ func (e *Failure) Retryable() bool {
 		return *e.RetryableOverride
 	}
 	switch e.Kind {
-	case FailureKindContentBlocked, FailureKindPromptTooLong, FailureKindImageInvalid, FailureKindBadParams,
-		FailureKindClient, FailureKindCredential:
+	case FailureKindContentBlocked, FailureKindChannelRejected, FailureKindPromptTooLong,
+		FailureKindImageInvalid, FailureKindBadParams, FailureKindClient, FailureKindCredential:
 		return false
 	default:
 		return true
@@ -300,10 +465,32 @@ func ClassifyStatus(status int) FailureKind {
 }
 
 // Truncate 截断过长的上游正文，避免错误信息淹没日志。
+//
+// 按 rune 截断而不是按字节：上游正文常是中文，按字节切会把最后一个字符
+// 劈成半个 UTF-8 序列，日志与面板里显示成 U+FFFD。limit 仍按字节口径理解
+// （调用方历来如此），只是切点会回退到字符边界。
 func Truncate(value string, limit int) string {
 	trimmed := strings.TrimSpace(value)
 	if limit <= 0 || len(trimmed) <= limit {
 		return trimmed
 	}
-	return trimmed[:limit] + "..."
+	return TrimToBytes(trimmed, limit) + "..."
+}
+
+// TrimToBytes 把字符串截到不超过 limit 字节，切点落在 UTF-8 字符边界上。
+//
+// 用于「按字节设上限、但不能切坏字符」的场合。limit <= 0 时返回空串。
+func TrimToBytes(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	if len(value) <= limit {
+		return value
+	}
+	cut := limit
+	// 回退到最近的字符起始字节：UTF-8 续字节形如 10xxxxxx。
+	for cut > 0 && value[cut]&0xC0 == 0x80 {
+		cut--
+	}
+	return value[:cut]
 }

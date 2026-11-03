@@ -4,17 +4,26 @@ package tasks
 
 import (
 	"context"
-	"encoding/json"
+	"fmt"
 	"net/http"
 	"time"
 
 	"freetier2api-plugin/internal/core"
 )
 
-type taskRunRequest struct {
+// QueueRequest 是「启动任务队列」的请求参数。
+//
+// 解析放在管理接口层（tasks 不得依赖 admin）：本包只接收已解析的参数，
+// 不再自己解 JSON——那会让畸形请求静默退化成默认队列。
+type QueueRequest struct {
 	Concurrency int  `json:"concurrency"`
 	Growth      bool `json:"growth"`
 	School      bool `json:"school"`
+}
+
+// DefaultQueueRequest 是请求体缺省时的队列参数（旧控制台的默认行为）。
+func DefaultQueueRequest() QueueRequest {
+	return QueueRequest{Concurrency: 1, Growth: true, School: true}
 }
 
 // Scan 扫描全部账号的待办任务。
@@ -30,12 +39,8 @@ func (s *Service) Scan(ctx context.Context, callbackID string) map[string]any {
 // QueueSnapshot 返回任务队列快照。
 func (s *Service) QueueSnapshot() map[string]any { return s.taskQueueSnapshot() }
 
-// StartQueue 解析请求并启动任务队列。
-func (s *Service) StartQueue(body []byte, callbackID string) (map[string]any, int) {
-	request := taskRunRequest{Concurrency: 1, Growth: true, School: true}
-	if len(body) > 0 {
-		_ = json.Unmarshal(body, &request)
-	}
+// StartQueue 按已解析的参数启动任务队列。
+func (s *Service) StartQueue(request QueueRequest, callbackID string) (map[string]any, int) {
 	concurrency := request.Concurrency
 	if concurrency < 1 {
 		concurrency = 1
@@ -109,9 +114,16 @@ func (s *Service) RunAuto(ctx context.Context, callbackID, identifier, code stri
 	}, http.StatusOK
 }
 
-// RunAutoAll 对全部账号依次执行一键完成。
-func (s *Service) RunAutoAll(ctx context.Context, callbackID string) map[string]any {
-	loaded := s.collectAccounts(ctx, callbackID)
+// RunAutoAll 对指定账号（targets 为空表示全部）依次执行一键完成。
+//
+// 这是同步版本，只给测试与内部调用；管理接口走后台任务（见 StartAutoAll）。
+func (s *Service) RunAutoAll(ctx context.Context, callbackID string, targets []string) map[string]any {
+	return s.runAutoAllTargets(ctx, callbackID, targets, nil)
+}
+
+// runAutoAllTargets 串行跑完目标账号，onProgress 在每个账号开始前回报进度。
+func (s *Service) runAutoAllTargets(ctx context.Context, callbackID string, targets []string, onProgress func(done, total int)) map[string]any {
+	loaded := s.collectAccounts(ctx, callbackID, targets)
 	if len(loaded) == 0 {
 		return map[string]any{"ok": true, "accounts": 0, "message": "没有可用账号"}
 	}
@@ -123,15 +135,24 @@ func (s *Service) RunAutoAll(ctx context.Context, callbackID string) map[string]
 		Results []autoAllResult `json:"results,omitempty"`
 	}
 	out := make([]accountResult, 0, len(loaded))
-	for _, account := range loaded {
+	cancelled := false
+	for index, account := range loaded {
+		// 关停时 ctx 会先被取消：不要在卸载插件的路上再起一次上游请求。
+		if ctx.Err() != nil {
+			cancelled = true
+			break
+		}
+		if onProgress != nil {
+			onProgress(index, len(loaded))
+		}
 		entry := accountResult{Label: account.label(), UID: account.uid(), Realm: account.vendor.Region()}
 		if _, okRunner := core.As[core.TaskRunner](account.vendor); !okRunner {
 			entry.Skipped = "该供应商没有可自动执行的任务"
 			out = append(out, entry)
 			continue
 		}
-		if !s.tryLockAccount(account.uid()) {
-			entry.Skipped = "该账号有其它任务动作在执行"
+		if errLock := s.lockAccount(ctx, account.uid()); errLock != nil {
+			entry.Skipped = "等待该账号的其它任务超时：" + errLock.Error()
 			out = append(out, entry)
 			continue
 		}
@@ -139,6 +160,7 @@ func (s *Service) RunAutoAll(ctx context.Context, callbackID string) map[string]
 		s.unlockAccount(account.uid())
 		out = append(out, entry)
 		if !core.SleepContext(ctx, accountGap) {
+			cancelled = true
 			break
 		}
 	}
@@ -150,7 +172,14 @@ func (s *Service) RunAutoAll(ctx context.Context, callbackID string) map[string]
 			}
 		}
 	}
-	return map[string]any{"ok": true, "accounts": len(out), "tasks_done": done, "results": out}
+	payload := map[string]any{"ok": true, "accounts": len(out), "tasks_done": done, "results": out}
+	if cancelled {
+		// 关停/超时会把一轮砍在中途：如实标注「没跑完」，否则结果看起来像
+		// 全部账号都执行过了。
+		payload["cancelled"] = true
+		payload["message"] = fmt.Sprintf("执行被中断：已完成 %d / %d 个账号", len(out), len(loaded))
+	}
+	return payload
 }
 
 // ActivityStatus 返回各账号的活动任务状态（/school/status 的兼容投影）。

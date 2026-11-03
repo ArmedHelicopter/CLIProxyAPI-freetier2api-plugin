@@ -231,8 +231,10 @@ func TestQuotaResetDomesticAndGlobal(t *testing.T) {
 	host := installFakeHost(t)
 	setupTestPlugin(t)
 
-	host.addAccount("1", "cn-account", sampleCredentialJSON("cn", "cn1"))
+	host.addAccount("1", "cn-account", personalCredentialJSON("cn", "cn1"))
 	host.addAccount("2", "global-account", sampleCredentialJSON("global", "g1"))
+	// 企业账号（带 enterpriseId）：没有签到活动，应给出可解释的「不支持」。
+	host.addAccount("3", "cn-enterprise-account", sampleCredentialJSON("cn", "cn-ent"))
 	host.setUpstream(func(method, url, body string) fakeUpstreamResponse {
 		if strings.Contains(url, "daily-checkin") {
 			return fakeUpstreamResponse{
@@ -277,6 +279,19 @@ func TestQuotaResetDomesticAndGlobal(t *testing.T) {
 	}
 	if !respCN.Success {
 		t.Fatalf("cn account quota reset should succeed, message: %s", respCN.Message)
+	}
+
+	// 企业账号打的 daily-checkin 恒返回 400 code 10001：不报失败，而是「不支持 + 原因」。
+	resEnterprise := callMethod(t, pluginabi.MethodQuotaReset, pluginapi.QuotaResetRequest{AuthID: "3"})
+	var respEnterprise pluginapi.QuotaResetResponse
+	if errUnmarshal := json.Unmarshal(resEnterprise, &respEnterprise); errUnmarshal != nil {
+		t.Fatalf("decode enterprise quota reset: %v", errUnmarshal)
+	}
+	if respEnterprise.Success {
+		t.Fatal("企业账号没有签到活动，不能报成功")
+	}
+	if !strings.Contains(respEnterprise.Message, "企业账号") {
+		t.Fatalf("enterprise quota reset message should explain the reason, got: %s", respEnterprise.Message)
 	}
 }
 

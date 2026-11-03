@@ -42,7 +42,6 @@ func TestDecodeValidation(t *testing.T) {
 		"enabled_realms: mars\n",
 		"log_level: verbose\n",
 		"auto_checkin_at: 25:00\n",
-		"prompt_mode: overwrite\n",
 	} {
 		if _, err := DecodePluginConfig([]byte(raw), DefaultPluginConfig()); err == nil {
 			t.Fatalf("expected error for %q", raw)
@@ -54,6 +53,11 @@ func TestParseClock(t *testing.T) {
 	hour, minute, err := ParseClock("09:05")
 	if err != nil || hour != 9 || minute != 5 {
 		t.Fatalf("ParseClock = %d,%d,%v", hour, minute, err)
+	}
+	for _, invalid := range []string{"", "9", "24:00", "09:60", "09:05:00"} {
+		if _, _, err := ParseClock(invalid); err == nil {
+			t.Fatalf("ParseClock(%q) 应报错", invalid)
+		}
 	}
 }
 

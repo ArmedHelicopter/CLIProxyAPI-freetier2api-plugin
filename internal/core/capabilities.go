@@ -12,6 +12,7 @@ package core
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -97,6 +98,19 @@ type CallbackSubmitter interface {
 	SubmitCallback(ctx context.Context, state, rawURL string) (*CallbackSubmitResult, error)
 }
 
+// SMSLoginProvider 由支持「手机号 + 短信验证码」登录的供应商实现。
+//
+// 两步交互与 LoginProvider 的「发起/轮询」模型不同：验证码要用户从手机上
+// 读出来回填，控制台据此渲染专用的两步表单（发码 → 输码登录）。
+// 实现它即表示控制台「添加账号」入口显示手机号表单。
+type SMSLoginProvider interface {
+	// SendLoginCode 发送短信验证码，返回本次登录会话的关联键
+	// （后续 VerifyLoginCode 必须带回它；AutoClaw 是 deviceId）。
+	SendLoginCode(ctx context.Context, phone string) (sessionKey string, err error)
+	// VerifyLoginCode 用验证码完成登录，返回落盘凭证 JSON 与展示标签。
+	VerifyLoginCode(ctx context.Context, sessionKey, phone, code string) (storageJSON []byte, label string, err error)
+}
+
 // Refresher 由需要校验/续期凭证的供应商实现。
 //
 // 未实现时调用方视为「已校验且无需写盘」（refreshed=false）。
@@ -118,6 +132,29 @@ type CheckinProvider interface {
 	Checkin(ctx context.Context, cred *Credential) (*CheckinResult, error)
 }
 
+// DailyBeaconVendor 由「签到实际是上报每日活跃信标」的供应商实现。
+//
+// 这类签到上游按天幂等，但热力图是异步聚合的：同一天的第二个排程点读到的
+// 热力图可能还没亮，于是又上报一次，把当天计数翻倍。上游没有可查的幂等键，
+// 因此由任务层按本地记录去重（见 state.DailyBonusSent）。
+type DailyBeaconVendor interface {
+	// CheckinUsesDailyBeacon 报告当前配置下签到是否走每日活跃信标。
+	CheckinUsesDailyBeacon() bool
+}
+
+// CheckinCapability 由「能按账号判定签到」的供应商实现。
+//
+// 供应商级的 SupportsCheckin 只能表达「这个供应商/区域有没有签到活动」，
+// 表达不了「同类凭证里有一部分账号天生不支持签到」——WorkBuddy 企业账号
+// 打 daily-checkin 会被上游以 400 code 10001 拒绝。实现该接口后，控制台
+// 按钮、自动任务与额度重置都按账号判定，避免出现必然失败的入口。
+type CheckinCapability interface {
+	// SupportsCheckinFor 报告该凭证是否支持签到。
+	SupportsCheckinFor(cred *Credential) bool
+	// CheckinUnsupportedReason 返回不可签到的可读原因（可签到或未知时为空串）。
+	CheckinUnsupportedReason(cred *Credential) string
+}
+
 // AuthModeReporter 由「凭证本身就是敏感材料」的供应商实现。
 //
 // 目前只有 apikey 型供应商需要它：页面据此脱敏展示。
@@ -128,6 +165,17 @@ type AuthModeReporter interface {
 // StorageMerger 由「刷新后需要把新凭证合并回原文件」的供应商实现。
 type StorageMerger interface {
 	MergeStorageJSON(original []byte, credential *Credential) ([]byte, error)
+}
+
+// LegacyIDReporter 由「从单一供应商 ID 拆成多实例」的包实现，声明拆分前的旧 ID。
+//
+// 拆实例会换掉注册表里的 vendorID，用户在 disabled_models 与模型别名里写的
+// <旧ID>:<模型> 随之失效（静默不生效）。声明旧 ID 后，Registry 把它当成家族
+// 前缀展开到全部实例（见 Registry.VendorIDsForPrefix），用户配置无需迁移。
+//
+// 未拆分的供应商不实现即可。
+type LegacyIDReporter interface {
+	LegacyIDs() []string
 }
 
 // Configurable 由需要读取供应商专属配置的实例实现。
@@ -150,7 +198,8 @@ type CreditsProvider interface {
 }
 
 // FormatRate 把上游各种原始倍率串（如 "x0.71 credits"、"x0.05"、"0.5"）
-// 归一化为统一的始终保留两位小数的 "0.50X" 样式；非数值文案（如 "免费"、"订阅"）原样保留。
+// 归一化为统一的始终保留两位小数的 "0.50X" 样式；非数值文案（如 "免费"、"订阅"）原样保留；
+// 负数与 NaN/Inf 视为「未知」返回空串（上游常用它们表示缺数据）。
 func FormatRate(raw string) string {
 	s := strings.TrimSpace(raw)
 	if s == "" {
@@ -162,7 +211,12 @@ func FormatRate(raw string) string {
 	clean = strings.TrimPrefix(clean, "x")
 	clean = strings.TrimSuffix(clean, "x")
 	clean = strings.TrimSpace(clean)
-	if num, err := strconv.ParseFloat(clean, 64); err == nil && num >= 0 {
+	if num, err := strconv.ParseFloat(clean, 64); err == nil {
+		// 负数倍率不存在；NaN/Inf 是上游把缺数据写成占位符，展示出来会变成
+		// 一个看得见的假倍率。这两种情况一律当「未知」。
+		if math.IsNaN(num) || math.IsInf(num, 0) || num < 0 {
+			return ""
+		}
 		return fmt.Sprintf("%.2fX", num)
 	}
 	return s
@@ -218,6 +272,21 @@ type ModelCacheLoader interface {
 	LoadModelCache(cached []CachedModel)
 }
 
+// ModelFallbackVeto 由「探测失败必须如实返回空」的供应商实现。
+//
+// 多数供应商的模型清单是账号无关的目录，探测失败（上游抖动、限流、超时）时
+// 回落到上次成功的清单只是恢复可用性；但计费通道的清单本身就是「能推哪些
+// 模型」的判据，回落等于继续推广可能已无权限的模型，必须如实报空。
+type ModelFallbackVeto interface {
+	VetoModelFallback() bool
+}
+
+// VetoesModelFallback 报告该供应商是否拒绝在探测失败时回落缓存。
+func VetoesModelFallback(vendor Vendor) bool {
+	veto, okVeto := As[ModelFallbackVeto](vendor)
+	return okVeto && veto.VetoModelFallback()
+}
+
 // ConsoleModelProvider 由需要向控制台补充展示明细的供应商实现。
 //
 // 未实现时控制台直接用 Catalog 缓存的注册清单（模型 ID、上下文、输出上限、
@@ -238,6 +307,29 @@ func As[T any](vendor Vendor) (T, bool) {
 func SupportsCheckin(vendor Vendor) bool {
 	provider, okProvider := As[CheckinProvider](vendor)
 	return okProvider && provider.SupportsCheckin()
+}
+
+// SupportsCheckinFor 报告某个凭证是否支持签到。
+//
+// 未实现 CheckinCapability 的供应商回落到供应商级判定，保持既有行为。
+func SupportsCheckinFor(vendor Vendor, cred *Credential) bool {
+	if !SupportsCheckin(vendor) {
+		return false
+	}
+	capability, okCapability := As[CheckinCapability](vendor)
+	if !okCapability {
+		return true
+	}
+	return capability.SupportsCheckinFor(cred)
+}
+
+// CheckinUnsupportedReason 返回某凭证不可签到的可读原因；无原因时返回空串。
+func CheckinUnsupportedReason(vendor Vendor, cred *Credential) string {
+	capability, okCapability := As[CheckinCapability](vendor)
+	if !okCapability {
+		return ""
+	}
+	return strings.TrimSpace(capability.CheckinUnsupportedReason(cred))
 }
 
 // ModelsFor 返回某凭证可用的模型：可选实现优先，否则回落 StaticModels。
@@ -301,6 +393,34 @@ type ConfigFieldsProvider interface {
 // 一起被调用（预览页要 SDK 参数才能渲染控件，领取要用预览结果选套餐）。
 // 拆成三个小接口只会让调用点多写两次类型断言。
 
+// LoginVariant 是「同一供应商有多个 OAuth 身份源」时控制台要渲染的一个入口。
+//
+// ID 会放进 LoginStart 的 metadata["oauth_variant"]，由供应商自己解释
+// （AutoClaw 是 zai / google）；CallbackHint 是该变体在浏览器里会停住的
+// localhost 回调地址，页面据此提示用户把哪条链接粘回来。
+type LoginVariant struct {
+	ID           string `json:"id"`
+	Label        string `json:"label"`
+	CallbackHint string `json:"callback_hint,omitempty"`
+}
+
+// LoginVariantProvider 由「登录有多个变体」的供应商实现。
+//
+// 实现即表示控制台要把这些变体渲染成按钮；不实现则仍按单一登录入口处理。
+type LoginVariantProvider interface {
+	LoginVariants() []LoginVariant
+}
+
+// LoginCaptchaProvider 由「登录前必须在浏览器里过一道人机验证」的供应商实现。
+//
+// 登录与套餐领取的差别：套餐领取拿到令牌就去领取；登录拿到令牌只是换授权地址的
+// 前置条件，后续还有「浏览器登录 → 回调链接粘贴 → 换码」。因此单独成一个能力，
+// 而不是复用 PlanClaimer（那会让供应商被迫实现不相干的 PreviewPlans/ClaimPlan）。
+type LoginCaptchaProvider interface {
+	// LoginCaptchaConfig 返回控件初始化参数（当前是阿里云场景 ID/region/prefix）。
+	LoginCaptchaConfig(ctx context.Context) (CaptchaConfig, error)
+}
+
 // CaptchaConfig 是人机验证 SDK 的初始化参数。
 //
 // 前端据此渲染控件，拿到令牌后原样回传 VerifyParam；Region 为空表示上游
@@ -314,6 +434,9 @@ type CaptchaConfig struct {
 
 // PlanGrant 是套餐授予的一项额度（通常是某模型的 token 额度）。
 type PlanGrant struct {
+	// ID 是上游授予的唯一标识（entitlement_id）；缺失时为空。
+	// 额度汇总按它去重，避免「同模型同额度但确属两份授予」被折叠。
+	ID     string  `json:"id,omitempty"`
 	Model  string  `json:"model"`
 	Units  float64 `json:"units"`
 	Period string  `json:"period,omitempty"`
@@ -361,7 +484,20 @@ type PlanClaimer interface {
 	ClaimPlan(ctx context.Context, cred *Credential, req ClaimPlanRequest) (ClaimPlanResponse, error)
 }
 
-// RuntimeFieldsProvider 由需要声明管理页可改字段的供应商实现。
-type RuntimeFieldsProvider interface {
-	RuntimeFields() []pluginapi.ConfigField
+// ActivityProbeResult 是一次只读活动探测的结果。
+//
+// Activities 复用 PlanInfo：上游投放的活动与套餐同构（同一个 plan_id、同一份
+// 授予明细），另立一套字段只会多一次逐字段搬运。它**不代表可领**——是否已持有、
+// 是否在领取窗口内由供应商判断，这里如实返回上游当前投放。
+// Warning 说明本次结果可能不完整的原因（例如活跃上报失败），空串表示链路完整；
+// 有 Activities 时 Warning 也可能非空。
+type ActivityProbeResult struct {
+	Activities []PlanInfo `json:"activities"`
+	Warning    string     `json:"warning,omitempty"`
+}
+
+// ActivityProbe 是只读的活动探测能力，与套餐领取能力分离。
+// 实现可以在探测前执行必要的无副作用资格同步（例如日活事件），但不得领取。
+type ActivityProbe interface {
+	ProbeActivity(ctx context.Context, cred *Credential) (ActivityProbeResult, error)
 }

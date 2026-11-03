@@ -10,10 +10,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -245,20 +247,35 @@ func (c *Client) ClaimRewardMP(ctx context.Context, cred *Credential, code strin
 }
 
 // parseClaimResult 解析领奖响应。
+//
+// 领奖是有副作用的请求。响应无法解析时不能把它当作「已领取」处理，否则
+// HTML 错误页、截断 JSON 等异常会被静默报告成成功且奖励为 0。用指针字段
+// 一次解码即可同时得到值与「字段是否存在」，无需先解成 map 再解一次 struct。
+//
+// 必须至少出现一个领奖契约字段（already_claimed / credit / energy）：
+// 空对象、null、完全陌生的 JSON 对象都不是成功响应。
 func parseClaimResult(data json.RawMessage) (credit, energy int64, err error) {
 	var payload struct {
-		AlreadyClaimed bool  `json:"already_claimed"`
-		Credit         int64 `json:"credit"`
-		Energy         int64 `json:"energy"`
+		AlreadyClaimed *bool  `json:"already_claimed"`
+		Credit         *int64 `json:"credit"`
+		Energy         *int64 `json:"energy"`
 	}
 	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-		// 结构不认识但请求成功：副作用已发生，按无新增处理。
+		return 0, 0, fmt.Errorf("decode claim result: %w", errUnmarshal)
+	}
+	if payload.AlreadyClaimed == nil && payload.Credit == nil && payload.Energy == nil {
+		return 0, 0, fmt.Errorf("decode claim result: missing reward fields")
+	}
+	if payload.AlreadyClaimed != nil && *payload.AlreadyClaimed {
 		return 0, 0, nil
 	}
-	if payload.AlreadyClaimed {
-		return 0, 0, nil
+	if payload.Credit != nil {
+		credit = *payload.Credit
 	}
-	return payload.Credit, payload.Energy, nil
+	if payload.Energy != nil {
+		energy = *payload.Energy
+	}
+	return credit, energy, nil
 }
 
 // IsMPTaskCode 报告任务码是否属于小程序口径。
@@ -1088,7 +1105,7 @@ func (c *Client) ReportChatActivity(ctx context.Context, cred *Credential, conve
 		"isPlan":           false, "isAutoExecuteTerminal": false, "isAutoModify": false,
 		"codebaseEnable": false,
 		"maxToken":       0, "maxSteps": 0, "temperature": 0, "maxRetries": 0,
-		"mentionContexts": []any{}, "knowledgeId": "", "knowledgeName": "",
+		"mentionContexts": []any{}, "knowledgeId": knowledgeIDEmpty, "knowledgeName": knowledgeNameEmpty,
 		"codebaseId": "", "mentionContextCount": 0, "command": "",
 		"expertId": "", "recommendId": "", "skillId": "", "skillCount": 0,
 		"totalCount": 0, "fileUri": "", "presentAt": now,
@@ -1121,6 +1138,17 @@ func (c *Client) ReportWebElementClick(ctx context.Context, cred *Credential, pa
 	}
 	return c.ReportWebEvents(ctx, cred, pageURL, []map[string]any{event})
 }
+
+// chat_request_send 事件里「未挂知识库」的标准形态。
+//
+// 官方客户端抓包一律是空字符串（credential.go 的三条事件序列就是这么来的）；
+// 每日活跃信标最初手写成空数组，于是同一个 eventCode 出现了两种类型。上游目前
+// 两种都收，但任何一次 schema 收紧都只会打断其中一条路径，所以统一到抓包形态，
+// 并集中在这里，避免四处再各自分叉。
+const (
+	knowledgeIDEmpty   = ""
+	knowledgeNameEmpty = ""
+)
 
 // nowMs 返回当前毫秒时间戳。
 func nowMs() int64 { return time.Now().UnixMilli() }
@@ -1213,7 +1241,7 @@ func TaskSpecsFor(region Region) []core.TaskSpec {
 				Kind:         TaskKindDailyBonus,
 				Label:        "每日活跃奖励",
 				Description:  "国际版每日签到：活跃信标点亮成长热力图，Bonus Pack 次日凌晨发放",
-				DefaultHours: GlobalDailyBonusHours,
+				DefaultHours: globalDailyBonusHours,
 				Manual:       true,
 				Route:        "/dailybonus",
 			},
@@ -1351,6 +1379,37 @@ func mergeTasks(primary, extra []Task) []Task {
 // ---- 任务执行 ----
 
 func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	trimmed := strings.TrimSpace(code)
+	if trimmed == core.AutoTaskCodeCheckin {
+		row := core.CheckinAutoTask(ctx, v, cred)
+		if row == nil {
+			return core.TaskRunResult{Status: "skipped", Message: "该账号不支持签到"}, nil
+		}
+		return core.TaskRunResult{Status: row.Status, Message: row.Message}, nil
+	}
+	// 活动族：与一键任务里那几行走同一套 RunScheduled。
+	for _, family := range []struct {
+		code string
+		kind string
+	}{
+		{AutoTaskCodeTravel, TaskKindTravel},
+		{AutoTaskCodeActivity, TaskKindActivity},
+		{AutoTaskCodeBlackcat, TaskKindBlackcat},
+		{AutoTaskCodeSchool, TaskKindSchool},
+		{AutoTaskCodeStreak, TaskKindStreak},
+	} {
+		if trimmed != family.code {
+			continue
+		}
+		message, errFamily := v.RunScheduled(ctx, cred, family.kind)
+		if errFamily != nil {
+			return core.TaskRunResult{}, errFamily
+		}
+		if message == "" {
+			return core.TaskRunResult{Status: "skipped", Message: "当前无需动作（不在窗口或已完成）"}, nil
+		}
+		return core.TaskRunResult{Status: "done", Message: message}, nil
+	}
 	if v.region.IsGlobal() {
 		return core.TaskRunResult{Status: "skipped", Message: "国际版账号没有成长任务"}, nil
 	}
@@ -1359,7 +1418,7 @@ func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code strin
 		return core.TaskRunResult{}, err
 	}
 	client := v.client(ctx)
-	if strings.TrimSpace(code) == "school_daily" {
+	if trimmed == "school_daily" {
 		message, errRun := RunSchool(ctx, client, native)
 		if errRun != nil {
 			return core.TaskRunResult{}, errRun
@@ -1388,16 +1447,31 @@ func (v *adapter) PrepareTasks(ctx context.Context, cred *core.Credential) int {
 	return acceptPendingTasks(ctx, v.client(ctx), native)
 }
 
+// 一键任务里代表各活动族的那一行任务码。它们与定时排程的 kind 一一对应，
+// 复用 RunScheduled 的实现，避免两套逻辑各自漂移。
+const (
+	AutoTaskCodeTravel   = "(猫猫旅行)"
+	AutoTaskCodeActivity = "(活跃上报)"
+	AutoTaskCodeBlackcat = "(夜猫子)"
+	AutoTaskCodeSchool   = "(开学季)"
+	AutoTaskCodeStreak   = "(连登奖励)"
+)
+
 func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
-	if v.region.IsGlobal() {
-		return nil
+	results := make([]core.AutoTaskResult, 0, len(autoActions)+7)
+	if row := core.CheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
 	}
 	native, err := v.Native(cred)
 	if err != nil {
-		return []core.AutoTaskResult{{Code: "(账号)", Status: "error", Message: err.Error()}}
+		return append(results, core.AutoTaskResult{Code: "(账号)", Status: "error", Message: err.Error()})
 	}
 	client := v.client(ctx)
-	results := make([]core.AutoTaskResult, 0, len(autoActions)+1)
+	if v.region.IsGlobal() {
+		// 国际版没有成长任务体系：可自动领取的福利只有每日活跃奖励，
+		// 已由上面的签到行覆盖，这里不再补空行。
+		return results
+	}
 	if accepted := acceptPendingTasks(ctx, client, native); accepted > 0 {
 		results = append(results, core.AutoTaskResult{
 			Code: "(批量报名)", Status: "done",
@@ -1441,6 +1515,29 @@ func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core
 		results = append(results, result)
 		core.SleepContext(ctx, 1050*time.Millisecond)
 	}
+	// 成长任务之外的活动福利：猫猫旅行、活跃/连登上报、夜猫子、开学季、
+	// 连登奖励。它们原本只在定时排程里跑，一键任务里缺一块，用户点了
+	// 「一键做任务」也拿不到这部分奖励。
+	for _, family := range []struct {
+		code string
+		kind string
+	}{
+		{AutoTaskCodeTravel, TaskKindTravel},
+		{AutoTaskCodeActivity, TaskKindActivity},
+		{AutoTaskCodeBlackcat, TaskKindBlackcat},
+		{AutoTaskCodeSchool, TaskKindSchool},
+		{AutoTaskCodeStreak, TaskKindStreak},
+	} {
+		message, errFamily := v.RunScheduled(ctx, cred, family.kind)
+		switch {
+		case errFamily != nil:
+			results = append(results, core.AutoTaskResult{Code: family.code, Status: "error", Message: errFamily.Error()})
+		case message == "":
+			// 空消息表示本次无需动作（不在窗口 / 活动期外），不占一行。
+		default:
+			results = append(results, core.AutoTaskResult{Code: family.code, Status: "done", Message: message})
+		}
+	}
 	return results
 }
 
@@ -1455,7 +1552,10 @@ func runGrowthTask(ctx context.Context, client *Client, credential *Credential, 
 			return "任务已完成且已领奖", 0, 0, nil
 		}
 		if task.Done() {
-			credit, energy := claimGrowthReward(ctx, client, credential, code)
+			credit, energy, errClaim := claimGrowthReward(ctx, client, credential, code)
+			if errClaim != nil {
+				return "", 0, 0, fmt.Errorf("任务已达标，但领奖失败：%w", errClaim)
+			}
 			msg := "任务已达标（跳过重复执行）"
 			if credit > 0 || energy > 0 {
 				msg = fmt.Sprintf("任务已达标，已领奖 +%d 积分 +%d 能量", credit, energy)
@@ -1468,7 +1568,10 @@ func runGrowthTask(ctx context.Context, client *Client, credential *Credential, 
 		return "", 0, 0, errRun
 	}
 	if waitGrowthClaimable(ctx, client, credential, code) {
-		credit, energy := claimGrowthReward(ctx, client, credential, code)
+		credit, energy, errClaim := claimGrowthReward(ctx, client, credential, code)
+		if errClaim != nil {
+			return "", 0, 0, fmt.Errorf("%s；但领奖失败：%w", message, errClaim)
+		}
 		if credit > 0 || energy > 0 {
 			message += fmt.Sprintf("（领奖 +%d 积分 +%d 能量）", credit, energy)
 		}
@@ -1483,19 +1586,27 @@ func waitGrowthClaimable(ctx context.Context, client *Client, credential *Creden
 	if mp {
 		attempts = 2
 	}
-	for attempt := 1; attempt < attempts; attempt++ {
+	for attempt := 1; attempt <= attempts; attempt++ {
+		// 先查后等：任务刚创建时多数已经可领，无脑先睡 3 秒纯属白等，
+		// 每个任务白白多花 3~9 秒。
+		task, errTask := findGrowthTask(ctx, client, credential, code)
+		if errTask == nil {
+			// 已领过是终态，不必再等。
+			if task != nil && task.Claimed {
+				return false
+			}
+			if task != nil && (task.Claimable() || task.Done()) {
+				return true
+			}
+			// task == nil 不能当终态：动作刚做完时上游列表还没把该任务吐出来
+			// （列表最终一致），此刻放弃等于白做任务、拿不到奖励。宁可多等
+			// 一轮——只有 attempts 用尽才判失败。
+		}
+		if attempt == attempts {
+			break
+		}
 		if !core.SleepContext(ctx, 3*time.Second) {
 			return false
-		}
-		task, errTask := findGrowthTask(ctx, client, credential, code)
-		if errTask != nil {
-			continue
-		}
-		if task == nil || task.Claimed {
-			return false
-		}
-		if task.Claimable() || task.Done() {
-			return true
 		}
 	}
 	return false
@@ -1520,21 +1631,26 @@ func findGrowthTask(ctx context.Context, client *Client, credential *Credential,
 	return nil, nil
 }
 
-func claimGrowthReward(ctx context.Context, client *Client, credential *Credential, code string) (int64, int64) {
+// claimGrowthReward 领奖并把错误交给调用方。
+//
+// 早期这里吞掉错误返回 (0, 0)：领奖响应解析失败（HTML 错误页、上游改结构）
+// 会被 runGrowthTask 当成「任务已达标但没奖励」，用户看到的是一句成功文案。
+// 领奖有副作用，失败必须让页面看见。
+func claimGrowthReward(ctx context.Context, client *Client, credential *Credential, code string) (int64, int64, error) {
 	if IsMPTaskCode(code) {
 		credit, energy, errClaim := client.ClaimRewardMP(ctx, credential, code)
 		if errClaim != nil {
-			logger.Debug("claim mp reward for %s failed: %v", code, errClaim)
-			return 0, 0
+			logger.Debug("%s 领取 MP 奖励失败：%v", code, errClaim)
+			return 0, 0, errClaim
 		}
-		return credit, energy
+		return credit, energy, nil
 	}
 	credit, energy, errClaim := client.ClaimReward(ctx, credential, code)
 	if errClaim != nil {
-		logger.Debug("claim reward for %s failed: %v", code, errClaim)
-		return 0, 0
+		logger.Debug("%s 领取奖励失败：%v", code, errClaim)
+		return 0, 0, errClaim
 	}
-	return credit, energy
+	return credit, energy, nil
 }
 
 func acceptPendingTasks(ctx context.Context, client *Client, credential *Credential) int {
@@ -1636,7 +1752,7 @@ func (v *adapter) RunScheduled(ctx context.Context, cred *core.Credential, kind 
 		}
 		return checkActivityStreak(ctx, client, native), nil
 	case TaskKindTravel:
-		return RunTravel(ctx, client, native), nil
+		return RunTravel(ctx, client, native)
 	case TaskKindBlackcat:
 		if !InNightWindow(time.Now()) {
 			return "", nil
@@ -1656,7 +1772,7 @@ func checkActivityStreak(ctx context.Context, client *Client, credential *Creden
 		return ""
 	}
 	if streak.Days == 0 {
-		logger.Error("activity: report succeeded but streak.days=0 (event may have been silently dropped)")
+		logger.Error("活动：上报成功但连续天数为 0（事件可能被上游静默丢弃）")
 		return ""
 	}
 	return fmt.Sprintf("连登天数 %d", streak.Days)
@@ -1678,7 +1794,7 @@ func runChatFive(ctx context.Context, client *Client, credential *Credential) (s
 }
 
 func runFirstBuddy(ctx context.Context, client *Client, credential *Credential) (string, error) {
-	return RunTravel(ctx, client, credential), nil
+	return RunTravel(ctx, client, credential)
 }
 
 func runModelChat(ctx context.Context, client *Client, credential *Credential) (string, error) {
@@ -1801,7 +1917,7 @@ func runExpertChain(ctx context.Context, client *Client, credential *Credential,
 		}
 		requestID, errChat := client.DesktopChatWithRequestID(ctx, credential, expert.ID, "fast-model", conversationID)
 		if errChat != nil {
-			logger.Debug("expert chat failed for %s: %v", expert.ID, errChat)
+			logger.Debug("%s 专家对话失败：%v", expert.ID, errChat)
 			continue
 		}
 		if errReport := client.ReportDesktopEvents(ctx, credential,
@@ -1921,10 +2037,10 @@ func tailOf(text string, n int) string {
 //     单次失败交给下一个排程点兜底；
 //   - 每天多个排程点：已点亮的点只花一次热力图读，几乎零成本。
 
-// GlobalDailyBonusHours 是国际版每日活跃奖励的默认排程点（本地时间）。
+// globalDailyBonusHours 是国际版每日活跃奖励的默认排程点（本地时间）。
 // 4 个点足够兜住「宿主刚启动网络未就绪」这类瞬时失败；运行幂等，
 // 多跑只多一次热力图读。
-var GlobalDailyBonusHours = []int{8, 12, 16, 20}
+var globalDailyBonusHours = []int{8, 12, 16, 20}
 
 // growthHeatmapCell 是成长热力图上的一格。
 type growthHeatmapCell struct {
@@ -1998,8 +2114,8 @@ func DailyBonusBeaconEvent(credential *Credential) map[string]any {
 		"requestModelId":       "deepseek-v4-flash",
 		"requestModelName":     "DeepSeek V4 Flash",
 		"mentionContexts":      []any{},
-		"knowledgeId":          []any{},
-		"knowledgeName":        []any{},
+		"knowledgeId":          knowledgeIDEmpty,
+		"knowledgeName":        knowledgeNameEmpty,
 		"presentAt":            now,
 		"rootRequestId":        conversationID,
 		"parentConversationId": conversationID,
@@ -2024,7 +2140,8 @@ func (c *Client) SendDailyBonusBeacon(ctx context.Context, cred *Credential) err
 // 返回的 CheckinResult 语义：
 //   - Already=true：今天已点亮（本轮或早前轮次点亮的都算），无需再上报；
 //   - Already=false：本轮新上报了信标。积分在次日凌晨发放，因此 Credit/Energy
-//     此刻拿不到，恒为 0；Streak 携带热力图上的点亮天数供展示。
+//     此刻拿不到，恒为 0；Streak 是上游连登接口给出的天数（拿不到则为 0，
+//     表示「上游没提供」，上层会保留上一次的值）。
 //
 // 仅接受 global 域凭证：CN 的成长域在 copilot.tencent.com，收入路径是
 // DailyCheckin，两者互不通用。
@@ -2039,22 +2156,50 @@ func (c *Client) GlobalDailyBonus(ctx context.Context, cred *Credential) (*Check
 	if !c.enabledRealm(region) {
 		return nil, fmt.Errorf("realm %s is disabled by plugin configuration", region)
 	}
-	today, lit, errToday := c.GrowthHeatmapToday(ctx, cred)
+	todayKey := time.Now().In(cstZone).Format("2006-01-02")
+	_, lit, errToday := c.GrowthHeatmapToday(ctx, cred)
 	if errToday != nil {
 		return nil, fmt.Errorf("heatmap: %w", errToday)
 	}
-	if today.Score > 0 {
-		return &CheckinResult{Already: true, Streak: int64(len(lit))}, nil
+	// 必须按日期匹配「今天」，不能把最后一格当成今天：热力图顺序、
+	// 是否含今天都不是协议保证的。
+	if heatmapLitOn(lit, todayKey) {
+		return &CheckinResult{Already: true, Streak: c.streakDays(ctx, cred)}, nil
 	}
 	if errSend := c.SendDailyBonusBeacon(ctx, cred); errSend != nil {
 		return nil, fmt.Errorf("report: %w", errSend)
 	}
-	// 热力图聚合滞后数秒，立即回读可能仍是 0；尽力而为，仅用于日志展示，
-	// 当天状态以本条上报为准（下个排程点会看到点亮）。
-	if _, litAfter, errRe := c.GrowthHeatmapToday(ctx, cred); errRe == nil {
-		lit = litAfter
+	// 热力图聚合滞后数秒，立即回读可能仍未点亮；当天状态以本条上报为准，
+	// 下个排程点会看到点亮，这里不因「尚未聚合」把签到判成失败。
+	streak := c.streakDays(ctx, cred)
+	message := "活跃信标已上报，奖励积分次日凌晨发放"
+	if streak > 0 {
+		message = fmt.Sprintf("活跃信标已上报（已连续点亮 %d 天），奖励积分次日凌晨发放", streak)
 	}
-	return &CheckinResult{Already: false, Streak: int64(len(lit))}, nil
+	return &CheckinResult{Streak: streak, Message: message}, nil
+}
+
+// streakDays 读上游的连续登录天数；查不到时返回 0（表示「上游没提供」）。
+//
+// 不从热力图推算：断签、补签、跨月重置的规则都在上游，本地按「点亮日期集合」
+// 数出来的连续天数必然分叉（历史 bug 就是拿 len(lit) 当连续天数，只增不减）。
+// 返回 0 时上层会保留上一次的值，而不是把已有天数清成 0。
+func (c *Client) streakDays(ctx context.Context, cred *Credential) int64 {
+	streak, errStreak := c.GrowthStreak(ctx, cred)
+	if errStreak != nil || streak == nil || streak.Days <= 0 {
+		return 0
+	}
+	return streak.Days
+}
+
+// heatmapLitOn 报告热力图是否包含指定日期的点亮记录。
+func heatmapLitOn(lit []string, date string) bool {
+	for _, item := range lit {
+		if item == date {
+			return true
+		}
+	}
+	return false
 }
 
 // 本文件实现连登兑换与抽奖、猫猫旅行、夜猫子、开学季四套闭环。
@@ -2145,7 +2290,9 @@ func makeupYesterday(ctx context.Context, client *Client, credential *Credential
 	if errStreak != nil || streak.MakeupCards <= 0 {
 		return ""
 	}
-	yesterday := time.Now().AddDate(0, 0, -1).Format("2006-01-02")
+	// 上游按 UTC+8 划分自然日：宿主机时区不是东八区时，这里直接取本地时间
+	// 会补错一天（补成前天或今天），所以显式换算。
+	yesterday := time.Now().In(cstZone).AddDate(0, 0, -1).Format("2006-01-02")
 	if errUse := client.UseMakeupCard(ctx, credential, yesterday); errUse != nil {
 		return ""
 	}
@@ -2155,40 +2302,40 @@ func makeupYesterday(ctx context.Context, client *Client, credential *Credential
 // RunTravel 执行单账号猫猫旅行的一个动作。
 //
 // 状态机：无猫 → 领养；有猫 → 按 status 分派（idle 派出 / arrived 领奖 / traveling 跳过）。
-func RunTravel(ctx context.Context, client *Client, credential *Credential) string {
+func RunTravel(ctx context.Context, client *Client, credential *Credential) (string, error) {
 	info, errInfo := client.BuddyInfo(ctx, credential)
 	if errInfo != nil {
-		return ""
+		return "", errInfo
 	}
 	if !info.HasBuddy {
-		return adoptBuddy(ctx, client, credential)
+		return adoptBuddy(ctx, client, credential), nil
 	}
 
 	status, errStatus := client.TravelStatus(ctx, credential)
 	if errStatus != nil {
-		return ""
+		return "", errStatus
 	}
 	switch status.State {
 	case "arrived":
 		if status.RecordID <= 0 {
-			return ""
+			return "", nil
 		}
 		credit, errClaim := client.TravelClaim(ctx, credential, status.RecordID)
 		if errClaim != nil {
-			return ""
+			return "", errClaim
 		}
-		return fmt.Sprintf("旅行领奖 +%d", credit)
+		return fmt.Sprintf("旅行领奖 +%d", credit), nil
 	case "idle":
 		if status.DailyLimitReached {
-			return ""
+			return "", nil
 		}
 		if errDepart := client.TravelDepart(ctx, credential, travelLocationID); errDepart != nil {
-			return ""
+			return "", errDepart
 		}
-		return "派出旅行"
+		return "派出旅行", nil
 	default:
 		// traveling 或未知状态：本轮不做动作。
-		return ""
+		return "", nil
 	}
 }
 
@@ -2236,13 +2383,14 @@ func RunBlackcat(ctx context.Context, client *Client, credential *Credential) (s
 		return "", nil
 	}
 	completed := int64(0)
+	var errChat error
 	for index := int64(0); index < need; index++ {
 		conversationID := fmt.Sprintf("wb2api-night-%d-%d", nowUnixMs(), index)
 		// 真实对话：上游要求夜猫子判据是「窗口内的真实 glm-5.2 对话」。
-		if errChat := client.DesktopChat(ctx, credential, "", "glm-5.2", "GLM-5.2", conversationID); errChat != nil {
+		if errChat = client.DesktopChat(ctx, credential, "", "glm-5.2", "GLM-5.2", conversationID); errChat != nil {
 			break
 		}
-		if errReport := client.ReportChatActivity(ctx, credential, conversationID, "", "glm-5.2", "GLM-5.2"); errReport != nil {
+		if errChat = client.ReportChatActivity(ctx, credential, conversationID, "", "glm-5.2", "GLM-5.2"); errChat != nil {
 			break
 		}
 		completed++
@@ -2251,7 +2399,9 @@ func RunBlackcat(ctx context.Context, client *Client, credential *Credential) (s
 		}
 	}
 	if completed == 0 {
-		return "", nil
+		// 一次都没跑成要把错误交回去：折成空字符串会让上层显示「0 个账号」，
+		// 看起来像无事可做，实际是上游拒了。
+		return "", errChat
 	}
 	return fmt.Sprintf("夜间对话 %d 次", completed), nil
 }
@@ -2276,6 +2426,9 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 	}
 
 	completed := 0
+	// 逐任务失败不再静默 continue：一次都没跑成时必须把原因交回上层，
+	// 否则排程日志只显示「0 个账号」，看不出是活动没开还是被上游拒了。
+	var errFirst error
 	for _, task := range status.Tasks {
 		switch task.Code {
 		case "task_student_verify":
@@ -2287,9 +2440,15 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 		}
 		// viewed 是计数前置：未激活的任务，后续行为事件不计分。
 		if errView := client.SchoolTaskViewed(ctx, credential, task.Code); errView != nil {
+			if errFirst == nil {
+				errFirst = fmt.Errorf("%s: %w", task.Code, errView)
+			}
 			continue
 		}
 		if errRun := runSchoolTask(ctx, client, credential, task.Code); errRun != nil {
+			if errFirst == nil {
+				errFirst = fmt.Errorf("%s: %w", task.Code, errRun)
+			}
 			continue
 		}
 		// 等异步计分落定再领奖。
@@ -2297,6 +2456,9 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 			continue
 		}
 		if _, errClaim := client.SchoolTaskClaim(ctx, credential, task.Code); errClaim != nil {
+			if errFirst == nil {
+				errFirst = fmt.Errorf("%s: %w", task.Code, errClaim)
+			}
 			continue
 		}
 		completed++
@@ -2316,7 +2478,7 @@ func RunSchool(ctx context.Context, client *Client, credential *Credential) (str
 		}
 	}
 	if completed == 0 && drawn == 0 {
-		return "", nil
+		return "", errFirst
 	}
 	return fmt.Sprintf("完成 %d 个任务、抽奖 %d 次", completed, drawn), nil
 }
@@ -2404,12 +2566,41 @@ type CheckinResult struct {
 	Energy int64
 	// Streak 是连续签到天数。
 	Streak int64
+	// NotRecorded 表示本次没有真正领到（活动未开启 / 领取处理中 / 无资格）。
+	NotRecorded bool
+	// Message 是上游给出的可读说明。
+	Message string
+}
+
+// checkinActivityStatus 是签到状态的权威来源。
+type checkinActivityStatus struct {
+	Active         bool  `json:"active"`
+	TodayCheckedIn bool  `json:"today_checked_in"`
+	StreakDays     int64 `json:"streak_days"`
+}
+
+// CheckinActivityStatus 查询签到活动状态（POST checkin-activity-status）。
+//
+// 这是「活动是否开启 / 今天是否已领」的权威判据；不要用 checkin-status，
+// 后者返回占位数据（active:false、checkin_dates:null）。
+func (c *Client) CheckinActivityStatus(cred *Credential) (*checkinActivityStatus, error) {
+	endpoints := GetEndpoints(cred.Realm())
+	data, errCall := c.billingJSON(cred, endpoints.BillingBase+checkinActivityStatusPath, http.MethodPost, map[string]any{})
+	if errCall != nil {
+		return nil, errCall
+	}
+	var status checkinActivityStatus
+	if errUnmarshal := json.Unmarshal(data, &status); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode checkin activity status: %w", errUnmarshal)
+	}
+	return &status, nil
 }
 
 // DailyCheckin 执行每日签到。
 //
-// 「今天已签到」被识别为幂等成功：上游对重复签到返回业务错误，
-// 直接当失败会让自动签到任务每天报错一次。
+// 先查权威状态再领取：活动未开启 / 今日已领由状态接口判定，而不是把上游的
+// 业务拒绝当成失败。领取回执按业务码与文案分类——code=0 也可能表示「签到失败」，
+// 只有真正领到才记成功。
 func (c *Client) DailyCheckin(cred *Credential) (*CheckinResult, error) {
 	if cred == nil {
 		return nil, fmt.Errorf("credential is required")
@@ -2424,29 +2615,66 @@ func (c *Client) DailyCheckin(cred *Credential) (*CheckinResult, error) {
 		paths = []string{dailyCheckinPath, dailyCheckinPathV2}
 	}
 
+	// 状态预查失败不阻断领取：把瞬时故障当成「不能签到」会让账号整天漏签。
+	if status, errStatus := c.CheckinActivityStatus(cred); errStatus == nil && status != nil {
+		if !status.Active {
+			return &CheckinResult{NotRecorded: true, Message: "签到活动未开启"}, nil
+		}
+		if status.TodayCheckedIn {
+			return &CheckinResult{Already: true, Streak: status.StreakDays}, nil
+		}
+	}
+
 	var lastErr error
 	for _, path := range paths {
-		data, errCall := c.billingJSON(cred, endpoints.BillingBase+path, http.MethodPost, map[string]any{})
+		status, code, msg, data, raw, errCall := c.claimDailyCheckin(cred, endpoints.BillingBase+path)
 		if errCall != nil {
-			if IsAlreadyCheckin(errCall) {
-				return &CheckinResult{Already: true}, nil
-			}
 			lastErr = errCall
 			if upstreamErr, okErr := errCall.(*core.Failure); okErr && upstreamErr.Kind == core.FailureKindNotFound {
 				continue
 			}
 			return nil, errCall
 		}
+		switch {
+		case code == 10001 || code == 1001:
+			// 10001 不是「签到成功」专属码，但在这个端点上表示已领。
+			if core.ContainsAny(msg, []string{"失败"}) {
+				return nil, &core.Failure{Status: status, Code: fmt.Sprintf("%d", code), Msg: msg, Kind: core.FailureKindClient}
+			}
+			return &CheckinResult{Already: true, Message: msg}, nil
+		case code == 1002 || code == 1003:
+			// 1002 = 无资格，1003 = 活动结束：不是失败，也不是已签到。
+			return &CheckinResult{NotRecorded: true, Message: core.FirstNonEmpty(msg, "当前无领取资格")}, nil
+		case code != 0:
+			return nil, Classify(status, string(raw))
+		}
+		// code == 0：仍要看文案——上游会用 code=0 + 「签到失败」表达没签成。
+		if core.ContainsAny(msg, []string{"失败"}) {
+			return nil, &core.Failure{Status: status, Code: "0", Msg: msg, Kind: core.FailureKindClient}
+		}
+		if core.ContainsAny(msg, []string{"处理中", "请勿重复操作", "系统繁忙", "稍后再试"}) {
+			return &CheckinResult{NotRecorded: true, Message: msg}, nil
+		}
 		var payload struct {
-			Credit int64 `json:"credit"`
-			Energy int64 `json:"energy"`
-			Streak int64 `json:"streak"`
+			Credit    int64  `json:"credit"`
+			Energy    int64  `json:"energy"`
+			Streak    int64  `json:"streak"`
+			StreakAlt int64  `json:"streak_days"`
+			Message   string `json:"message"`
 		}
-		if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-			// 签到成功但响应结构不认识：仍算成功（副作用已发生）。
-			return &CheckinResult{}, nil
+		// 领取已经成功：回执结构变了只丢明细（积分 / 连签），不能把一次
+		// 真实到账的签到报成失败，否则用户会重复点、历史里也记成 error。
+		if len(data) > 0 {
+			if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+				logger.Debug("workbuddy：签到回执解析失败，按成功处理：%v", errUnmarshal)
+			}
 		}
-		return &CheckinResult{Credit: payload.Credit, Energy: payload.Energy, Streak: payload.Streak}, nil
+		return &CheckinResult{
+			Credit:  payload.Credit,
+			Energy:  payload.Energy,
+			Streak:  core.FirstNonZero(payload.Streak, payload.StreakAlt),
+			Message: core.FirstNonEmpty(payload.Message, msg),
+		}, nil
 	}
 	if lastErr != nil {
 		return nil, lastErr
@@ -2454,14 +2682,59 @@ func (c *Client) DailyCheckin(cred *Credential) (*CheckinResult, error) {
 	return nil, fmt.Errorf("checkin endpoint is unavailable")
 }
 
+// claimDailyCheckin 发一次领取请求并返回原始信封字段。
+//
+// 不用 billingJSON：它在业务码非 0 时只返回分类错误，丢掉了 msg 与 data，
+// 而签到结果恰好要靠文案区分「已签到 / 处理中 / 失败」。
+func (c *Client) claimDailyCheckin(cred *Credential, url string) (status int, code int64, msg string, data json.RawMessage, raw []byte, err error) {
+	body, errMarshal := json.Marshal(map[string]any{})
+	if errMarshal != nil {
+		return 0, 0, "", nil, nil, errMarshal
+	}
+	req, errReq := http.NewRequestWithContext(c.opts.Context, http.MethodPost, url, strings.NewReader(string(body)))
+	if errReq != nil {
+		return 0, 0, "", nil, nil, fmt.Errorf("build checkin request: %w", errReq)
+	}
+	c.applyBillingHeaders(req, cred)
+
+	resp, errDo := c.shortClient().Do(req)
+	if errDo != nil {
+		return 0, 0, "", nil, nil, fmt.Errorf("checkin request: %w", errDo)
+	}
+	defer closeBody(resp.Body)
+	raw, errRead := io.ReadAll(io.LimitReader(resp.Body, apiBodyLimit))
+	if errRead != nil {
+		return resp.StatusCode, 0, "", nil, nil, fmt.Errorf("read checkin response: %w", errRead)
+	}
+	var envelope struct {
+		Code int64           `json:"code"`
+		Msg  string          `json:"msg"`
+		Data json.RawMessage `json:"data"`
+	}
+	if errUnmarshal := json.Unmarshal(raw, &envelope); errUnmarshal != nil {
+		if resp.StatusCode >= 400 {
+			return resp.StatusCode, 0, "", nil, raw, enrichClassifyError(resp.StatusCode, string(raw), resp.Header)
+		}
+		return resp.StatusCode, 0, "", nil, raw, fmt.Errorf("decode checkin response: %w", errUnmarshal)
+	}
+	if resp.StatusCode >= 400 && envelope.Code == 0 {
+		return resp.StatusCode, 0, envelope.Msg, envelope.Data, raw, enrichClassifyError(resp.StatusCode, string(raw), resp.Header)
+	}
+	return resp.StatusCode, envelope.Code, envelope.Msg, envelope.Data, raw, nil
+}
+
 // Balance 是账号的资源余额。
+//
+// 数量用 float64：个人资源包的额度是整数，但企业用量接口的 credit 是小数
+// （实测 2.59 / 3.87 / 4.11）。用整数会把小数截断，消耗 0.9 积分时面板
+// 上完全看不到变化。
 type Balance struct {
 	// Remain 是剩余积分。
-	Remain int64
+	Remain float64
 	// Total 是本期总额度。
-	Total int64
-	// ExpiringSoon 是即将过期的积分（窗口由调用方定义）。
-	ExpiringSoon int64
+	Total float64
+	// Enterprise 表示这份余额来自企业用量接口（不是个人资源包）。
+	Enterprise bool
 	// Packages 是套餐明细。
 	Packages []BalancePackage
 }
@@ -2471,11 +2744,18 @@ type BalancePackage struct {
 	// Name 是资源包名称。
 	Name string
 	// Remain 是剩余量。
-	Remain int64
+	Remain float64
 	// Total 是总量。
-	Total int64
+	Total float64
 	// ExpireAt 是过期时刻（Unix 秒，0 表示不过期）。
 	ExpireAt int64
+	// ResetAt 是周期回满时刻（Unix 秒，0 表示无周期）。
+	//
+	// 与 ExpireAt 刻意分开：企业额度到点是**回满**，不是作废。
+	// 混用会让面板把「下月回满」显示成「即将过期」。
+	ResetAt int64
+	// Period 是周期文案（如 "2026-10-01 ~ 2026-10-31"），空表示不展示。
+	Period string
 }
 
 // billingResourceAccount 是余额响应里的单个套餐。
@@ -2541,8 +2821,7 @@ func packageRemainUsed(account billingResourceAccount) (remain, used, size int64
 
 // FetchBalance 查询账号余额。
 //
-// global 域先试无 /v2 的路径，404 时回落带 /v2 的路径；CN 只有带 /v2 的。
-// 这个差异来自上游两个部署的历史，不是笔误。
+// 个人资源接口只覆盖个人套餐；企业账号的额度见 resolveBalance。
 func (c *Client) FetchBalance(cred *Credential) (*Balance, error) {
 	if cred == nil {
 		return nil, fmt.Errorf("credential is required")
@@ -2551,12 +2830,6 @@ func (c *Client) FetchBalance(cred *Credential) (*Balance, error) {
 	if !c.enabledRealm(region) {
 		return nil, fmt.Errorf("realm %s is disabled by plugin configuration", region)
 	}
-	endpoints := GetEndpoints(region)
-	paths := []string{billingMeterPathV2}
-	if region.IsGlobal() {
-		paths = []string{billingMeterPath, billingMeterPathV2}
-	}
-
 	// 请求体是上游要求的固定形状：缺 ProductCode 或分页会拿到空列表。
 	now := time.Now()
 	body := map[string]any{
@@ -2568,28 +2841,45 @@ func (c *Client) FetchBalance(cred *Credential) (*Balance, error) {
 		"PackageEndTimeRangeEnd":   now.Add(365 * 101 * 24 * time.Hour).Format(packageEndLayout),
 	}
 
-	var lastErr error
+	data, errCall := c.billingMeterJSON(cred, billingMeterPaths(region, billingMeterPath, billingMeterPathV2), body)
+	if errCall != nil {
+		return nil, errCall
+	}
+	var payload billingResourceResponse
+	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode balance: %w", errUnmarshal)
+	}
+	return c.resolveBalance(cred, region, parseBalance(payload))
+}
+
+// billingMeterPaths 返回某计费接口的候选路径。
+//
+// global 先试无 /v2 的路径，404 时回落带 /v2 的路径；CN 只有带 /v2 的。
+// 这个差异来自上游两个部署的历史，不是笔误。
+func billingMeterPaths(region Region, plain, v2 string) []string {
+	if region.IsGlobal() {
+		return []string{plain, v2}
+	}
+	return []string{v2}
+}
+
+// billingMeterJSON 依次尝试候选路径，返回第一个成功响应解开的 data。
+//
+// 只在 404 时换路径：其他错误换路径也救不回来。
+func (c *Client) billingMeterJSON(cred *Credential, paths []string, body any) (json.RawMessage, error) {
+	endpoints := GetEndpoints(cred.Realm())
+	lastErr := fmt.Errorf("billing endpoint is unavailable")
 	for _, path := range paths {
 		data, errCall := c.billingJSON(cred, endpoints.BillingBase+path, http.MethodPost, body)
-		if errCall != nil {
-			lastErr = errCall
-			// 只在 404 时换路径：其他错误换路径也救不回来。
-			if upstreamErr, okErr := errCall.(*core.Failure); okErr && upstreamErr.Kind == core.FailureKindNotFound {
-				continue
-			}
+		if errCall == nil {
+			return data, nil
+		}
+		lastErr = errCall
+		if upstreamErr, okErr := errCall.(*core.Failure); !okErr || upstreamErr.Kind != core.FailureKindNotFound {
 			return nil, errCall
 		}
-		var payload billingResourceResponse
-		if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
-			lastErr = fmt.Errorf("decode balance: %w", errUnmarshal)
-			continue
-		}
-		return parseBalance(payload), nil
 	}
-	if lastErr != nil {
-		return nil, lastErr
-	}
-	return nil, fmt.Errorf("balance endpoint is unavailable")
+	return nil, lastErr
 }
 
 // parseBalance 归一化余额响应。
@@ -2599,16 +2889,96 @@ func parseBalance(payload billingResourceResponse) *Balance {
 	balance := &Balance{}
 	for _, account := range payload.Response.Data.Accounts {
 		remain, _, size := packageRemainUsed(account)
-		balance.Remain += remain
-		balance.Total += size
+		balance.Remain += float64(remain)
+		balance.Total += float64(size)
 		balance.Packages = append(balance.Packages, BalancePackage{
 			Name:     strings.TrimSpace(account.PackageName),
-			Remain:   remain,
-			Total:    size,
+			Remain:   float64(remain),
+			Total:    float64(size),
 			ExpireAt: parsePackageExpiry(account.CycleEndTime),
 		})
 	}
 	return balance
+}
+
+// resolveBalance 在企业账号拿到空个人额度时改用企业用量接口。
+//
+// 企业账号请求个人接口得到的是 HTTP 200 + 空 Accounts（不是错误），
+// 直接展示就是 0 / 0，操作者会误以为账号已耗尽。企业额度只有企业端点
+// 能给出，因此这里按「个人无额度 + 有企业租户 id」判定后回退。
+// 非企业账号保持原行为：空 Accounts 就是真的没有额度。
+func (c *Client) resolveBalance(cred *Credential, region Region, personal *Balance) (*Balance, error) {
+	if personal.Total > 0 {
+		return personal, nil
+	}
+	if strings.TrimSpace(cred.EnterpriseIDValue()) == "" {
+		return personal, nil
+	}
+	return c.fetchEnterpriseBalance(cred, region)
+}
+
+// enterpriseUsageResponse 是企业用量接口的响应。
+//
+// credit 是**本周期已消耗**（小数积分），limitNum 是本周期额度，剩余 = 两者之差。
+// cycleEndTime / cycleResetTime 只是周期回满时刻，不是资源包到期。
+type enterpriseUsageResponse struct {
+	Credit         *float64 `json:"credit"`
+	LimitNum       *float64 `json:"limitNum"`
+	CycleStartTime string   `json:"cycleStartTime"`
+	CycleEndTime   string   `json:"cycleEndTime"`
+	CycleResetTime string   `json:"cycleResetTime"`
+}
+
+// fetchEnterpriseBalance 用企业用量接口合成一份 Balance。
+//
+// 请求体给空对象：该端点按 token 里的企业租户定位，不需要分页与产品码；
+// 个人资源包那套必填字段在这里不适用。
+func (c *Client) fetchEnterpriseBalance(cred *Credential, region Region) (*Balance, error) {
+	data, errCall := c.billingMeterJSON(cred,
+		billingMeterPaths(region, enterpriseUsagePath, enterpriseUsagePathV2), map[string]any{})
+	if errCall != nil {
+		return nil, errCall
+	}
+	return parseEnterpriseBalance(data)
+}
+
+// parseEnterpriseBalance 归一化企业用量响应。
+//
+// limitNum 缺失视为契约不符：把它当 0 会重复「0 / 0」这个已被报告的假象。
+func parseEnterpriseBalance(data json.RawMessage) (*Balance, error) {
+	var payload enterpriseUsageResponse
+	if errUnmarshal := json.Unmarshal(data, &payload); errUnmarshal != nil {
+		return nil, fmt.Errorf("decode enterprise balance: %w", errUnmarshal)
+	}
+	if payload.LimitNum == nil {
+		return nil, fmt.Errorf("decode enterprise balance: missing limitNum")
+	}
+	total := *payload.LimitNum
+	used := 0.0
+	if payload.Credit != nil {
+		used = *payload.Credit
+	}
+	remain := total - used
+	if remain < 0 {
+		remain = 0
+	}
+	if remain > total {
+		remain = total
+	}
+	balance := &Balance{Remain: remain, Total: total, Enterprise: true}
+	period := ""
+	start, end := strings.TrimSpace(payload.CycleStartTime), strings.TrimSpace(payload.CycleEndTime)
+	if start != "" && end != "" {
+		period = start + " ~ " + end
+	}
+	balance.Packages = append(balance.Packages, BalancePackage{
+		Name:    "企业额度",
+		Remain:  remain,
+		Total:   total,
+		ResetAt: parsePackageExpiry(core.FirstNonEmpty(payload.CycleResetTime, payload.CycleEndTime)),
+		Period:  period,
+	})
+	return balance, nil
 }
 
 // parsePackageExpiry 解析套餐到期时刻（UTC+8 墙钟）；解析失败返回 0。
@@ -2649,14 +3019,21 @@ func (c *Client) FetchQuota(cred *Credential) (*Balance, error) {
 // Groups/Buckets 放明细（展开后看）。
 func BuildQuotaResponse(credential *Credential, balance *Balance) pluginapi.QuotaFetchResponse {
 	region := credential.Realm()
+	plan := string(region)
+	planName := RealmDisplayName(region)
+	if balance.Enterprise {
+		// 企业额度与个人套餐是两条互不相通的额度线，不能混成同一个套餐名。
+		plan = "enterprise"
+		planName = "企业额度"
+	}
 	response := pluginapi.QuotaFetchResponse{
 		Subscription: &pluginapi.QuotaSubscription{
-			Plan:     string(region),
-			TierName: RealmDisplayName(region),
+			Plan:     plan,
+			TierName: planName,
 		},
 		Summary: []pluginapi.QuotaMetric{
-			{Key: "credit_remain", Label: "剩余积分", Value: float64(balance.Remain), Format: "number"},
-			{Key: "credit_total", Label: "总额度", Value: float64(balance.Total), Format: "number"},
+			{Key: "credit_remain", Label: "剩余积分", Value: balance.Remain, Format: "number"},
+			{Key: "credit_total", Label: "总额度", Value: balance.Total, Format: "number"},
 		},
 	}
 	if balance.Total > 0 {
@@ -2665,22 +3042,62 @@ func BuildQuotaResponse(credential *Credential, balance *Balance) pluginapi.Quot
 			used = 0
 		}
 		response.Summary = append(response.Summary,
-			pluginapi.QuotaMetric{Key: "credit_used", Label: "已用积分", Value: float64(used), Format: "number"})
+			pluginapi.QuotaMetric{Key: "credit_used", Label: "已用积分", Value: used, Format: "number"})
 	}
 	if len(balance.Packages) > 0 {
-		buckets := make([]pluginapi.QuotaBucket, 0, len(balance.Packages))
+		// 同名包先合并：营销活动会下发一串同名的「裂变包」，每个 100/100，
+		// 不合并就是五条 100% 进度条，把真正在消耗的套餐挤到看不见。
+		// 合并按首次出现顺序，周期/到期时间取第一个非空值。
+		type packageAggregate struct {
+			remain   float64
+			total    float64
+			period   string
+			expireAt int64
+			resetAt  int64
+		}
+		order := make([]string, 0, len(balance.Packages))
+		merged := make(map[string]*packageAggregate, len(balance.Packages))
 		for _, pkg := range balance.Packages {
+			agg, ok := merged[pkg.Name]
+			if !ok {
+				agg = &packageAggregate{}
+				merged[pkg.Name] = agg
+				order = append(order, pkg.Name)
+			}
+			agg.remain += pkg.Remain
+			agg.total += pkg.Total
+			if agg.period == "" {
+				agg.period = pkg.Period
+			}
+			if agg.expireAt == 0 {
+				agg.expireAt = pkg.ExpireAt
+			}
+			if agg.resetAt == 0 {
+				agg.resetAt = pkg.ResetAt
+			}
+		}
+		buckets := make([]pluginapi.QuotaBucket, 0, len(order))
+		for _, name := range order {
+			agg := merged[name]
 			fraction := 0.0
-			if pkg.Total > 0 {
-				fraction = float64(pkg.Remain) / float64(pkg.Total)
+			if agg.total > 0 {
+				fraction = agg.remain / agg.total
+			}
+			description := formatCreditAmount(agg.remain) + " / " + formatCreditAmount(agg.total)
+			if agg.period != "" {
+				description += " · 周期 " + agg.period
 			}
 			bucket := pluginapi.QuotaBucket{
-				Window:            pkg.Name,
+				Window:            name,
 				RemainingFraction: fraction,
-				Description:       fmt.Sprintf("%d / %d", pkg.Remain, pkg.Total),
+				Description:       description,
 			}
-			if pkg.ExpireAt > 0 {
-				bucket.ResetTime = FormatUnixTime(pkg.ExpireAt)
+			// 到期（作废）与回满（周期重置）分开取值：企业额度到点回满，
+			// 不能被展示成「即将过期」。
+			if agg.expireAt > 0 {
+				bucket.ResetTime = FormatUnixTime(agg.expireAt)
+			} else if agg.resetAt > 0 {
+				bucket.ResetTime = FormatUnixTime(agg.resetAt)
 			}
 			buckets = append(buckets, bucket)
 		}
@@ -2690,6 +3107,14 @@ func BuildQuotaResponse(credential *Credential, balance *Balance) pluginapi.Quot
 		}}
 	}
 	return response
+}
+
+// formatCreditAmount 把积分数量格式化为可读文本。
+//
+// 企业额度是小数（实测 4.11 / 2.59），个人额度是整数：两位小数既够
+// 表达前者，也不会把后者写成 "2000.00"，同时隐去 float 运算的长尾。
+func formatCreditAmount(value float64) string {
+	return strconv.FormatFloat(math.Round(value*100)/100, 'f', -1, 64)
 }
 
 // FormatUnixTime 把 Unix 秒格式化为 RFC3339（无效值返回空串）。

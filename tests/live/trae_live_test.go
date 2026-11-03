@@ -137,9 +137,7 @@ func traeLiveCredential(t *testing.T) (*trae.Credential, trae.Config) {
 	}
 
 	cfg := trae.ConfigFor(trae.RegionCN)
-	if strings.Contains(strings.ToLower(path), "traesolo") {
-		cfg = trae.SoloConfig()
-	} else if strings.Contains(strings.ToLower(path), "traeglobal") {
+	if strings.Contains(strings.ToLower(path), "traeglobal") {
 		cfg = trae.ConfigFor(trae.RegionGlobal)
 	}
 	cred, errParse := trae.ParseCredentialFor(raw, cfg)
@@ -250,4 +248,25 @@ func TestTraeLiveModels(t *testing.T) {
 		names = append(names, model.ID)
 	}
 	t.Logf("目录模型数=%d: %s", len(models), truncateProbe(strings.Join(names, ","), 800))
+}
+
+// TestTraeLiveUG 跑一轮 Trae 活动福利领取。
+//
+// 这条链路会真实发放积分（并消耗本轮的领取机会），所以默认跳过：
+// 只有显式设置 TRAE_LIVE_UG=1 才执行。它验证的是「活动表 → 触发 →
+// 分享裂变 → 汇总」整条路径在真实上游上的形状，mock 测不到的部分在这里兜。
+func TestTraeLiveUG(t *testing.T) {
+	if os.Getenv("TRAE_LIVE_UG") == "" {
+		t.Skip("设置 TRAE_LIVE_UG=1 才会真实领取活动福利（会消耗本轮领取机会）")
+	}
+	cred, cfg := traeLiveCredential(t)
+
+	results, errUG := trae.ClaimUG(context.Background(), cred, cfg)
+	if errUG != nil {
+		t.Fatalf("ClaimUG: %v", errUG)
+	}
+	t.Logf("汇总: %s", trae.SummarizeUG(results))
+	for _, r := range results {
+		t.Logf("  [%v] %s — %s", r.Status, r.Label, r.Message)
+	}
 }

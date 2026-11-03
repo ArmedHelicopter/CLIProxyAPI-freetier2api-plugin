@@ -13,10 +13,10 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
-	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
@@ -81,7 +81,7 @@ func (a *App) handleAuthParse(request []byte) ([]byte, error) {
 		return nil, core.NewPluginError("credential_invalid", errCredential.Error(), http.StatusUnprocessableEntity)
 	}
 
-	logger.Info("parsed auth %s (vendor=%s)",
+	logger.Info("已解析授权 %s（供应商=%s）",
 		core.FirstNonEmpty(credential.LabelValue(), rpc.FileName, rpc.Path), vendor.ID())
 
 	auth, errAuth := buildAuthDataFor(vendor, credential, rpc.FileName, rpc.RawJSON)
@@ -106,6 +106,9 @@ func buildAuthDataFor(vendor core.Vendor, credential *core.Credential, fileName 
 	if errStorage != nil {
 		return pluginapi.AuthData{}, errStorage
 	}
+	// 回给宿主的 StorageJSON 与写盘/写下一次续期必须一致：宿主要以它为准
+	// 保存时，未归一的 uid 会再次派生出第二条账号（见 hostbridge.AlignCredentialUID）。
+	storage = hostbridge.AlignCredentialUID(storage, fileName)
 	return pluginapi.AuthData{
 		Provider:    providerKey,
 		ID:          id,
@@ -114,9 +117,33 @@ func buildAuthDataFor(vendor core.Vendor, credential *core.Credential, fileName 
 		StorageJSON: storage,
 		Metadata:    credentialMetadata(credential, vendor.ID()),
 		Attributes:  credentialAttributes(credential, vendor.ID()),
-		// 让宿主在启动后不久就驱动一次刷新校验。
-		NextRefreshAfter: time.Now().Add(authRefreshInterval),
+		// 已过期或临近过期的凭证立即排程，其余按固定周期。
+		NextRefreshAfter: nextRefreshAfterFor(credential, time.Now()),
 	}, nil
+}
+
+// nextRefreshAfterFor 计算宿主下一次自动刷新校验的时间。
+//
+// freetier 在宿主里没有内建 RefreshLead。凭证若带 expires_at，且已经过期
+// 或距过期不足一个刷新周期，就返回当前时刻，避免启动后继续拿着过期 token
+// 空等一个完整周期。
+func nextRefreshAfterFor(credential *core.Credential, now time.Time) time.Time {
+	next := now.Add(authRefreshInterval)
+	if credential == nil || credential.RefreshTokenValue() == "" {
+		return next
+	}
+	expiresAt := credential.ExpiresAtValue()
+	if expiresAt <= 0 {
+		return next
+	}
+	due := time.Unix(expiresAt, 0).Add(-authRefreshInterval)
+	if !due.After(now) {
+		return now
+	}
+	if due.Before(next) {
+		return due
+	}
+	return next
 }
 
 // ensureVendorField 保证凭证 JSON 里带 vendor 字段。
@@ -162,6 +189,10 @@ func credentialMetadata(credential *core.Credential, vendorID string) map[string
 	if refreshToken := credential.RefreshTokenValue(); refreshToken != "" {
 		metadata["refresh_token"] = refreshToken
 		metadata["auth_mode"] = "oauth"
+		// 宿主自动刷新循环在 NextRefreshAfter 到期后，只对声明了该字段的
+		// 无内建 RefreshLead 凭证继续排程。缺了它，freetier 会在第一次到期后
+		// 被移出自动刷新队列。
+		metadata["refresh_interval_seconds"] = int(authRefreshInterval / time.Second)
 	}
 	if expiresAt := credential.ExpiresAtValue(); expiresAt > 0 {
 		metadata["expires_at"] = expiresAt
@@ -218,11 +249,11 @@ func (a *App) handleAuthRefresh(request []byte) ([]byte, error) {
 	updated, refreshed, errRefresh := core.RefreshVendor(vendor, ctx, credential)
 	if errRefresh != nil {
 		if isCredentialRejected(errRefresh) {
-			logger.Error("auth refresh rejected for %s: %v", rpc.AuthID, errRefresh)
+			logger.Error("%s 的授权刷新被拒绝：%v", rpc.AuthID, errRefresh)
 			return nil, core.ToPluginError(errRefresh)
 		}
 		// 抖动或未知错误：保留原凭证，稍后重试。
-		logger.Debug("auth refresh deferred for %s: %v", rpc.AuthID, errRefresh)
+		logger.Debug("%s 的授权刷新延后：%v", rpc.AuthID, errRefresh)
 		auth, errData := a.refreshedAuthData(rpc, rpc.StorageJSON, credential)
 		if errData != nil {
 			return nil, errData
@@ -241,14 +272,16 @@ func (a *App) handleAuthRefresh(request []byte) ([]byte, error) {
 			storage = merged
 		}
 	}
-	logger.Info("auth refresh succeeded for %s (vendor=%s refreshed=%t)", rpc.AuthID, vendor.ID(), refreshed)
+	logger.Info("%s 授权刷新成功（供应商=%s 已刷新=%t）", rpc.AuthID, vendor.ID(), refreshed)
 	auth, errData := a.refreshedAuthData(rpc, storage, updated)
 	if errData != nil {
 		return nil, errData
 	}
+	nextRefresh := nextRefreshAfterFor(updated, time.Now())
+	auth.NextRefreshAfter = nextRefresh
 	return core.OKEnvelope(pluginapi.AuthRefreshResponse{
 		Auth:             auth,
-		NextRefreshAfter: time.Now().Add(authRefreshInterval),
+		NextRefreshAfter: nextRefresh,
 	})
 }
 
@@ -413,21 +446,74 @@ func (a *App) handleAuthLoginStart(request []byte) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(hostbridge.WithCallbackID(context.Background(), rpc.HostCallbackID), loginHTTPTimeout)
 	defer cancel()
 
+	response, errStart := a.startVendorLogin(ctx, vendor, rpc.Metadata)
+	if errStart != nil {
+		return nil, errStart
+	}
+	logger.Info("已发起登录（供应商=%s）", vendor.ID())
+	return core.OKEnvelope(response)
+}
+
+// StartLogin 发起一次供应商登录（控制台页面路径）。
+//
+// 与宿主 <provider>-auth-url 的调用共用 startVendorLogin，差别只在入口：
+// 页面路径要能拿到供应商给出的可读错误（例如「滑块验证过期了，重拖一次」），
+// 所以由插件自己的管理路由承接，而不是绕宿主那条只会回 500 的转发路径。
+func (a *App) StartLogin(ctx context.Context, vendorID string, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	vendor, okVendor := a.registry.ByID(strings.TrimSpace(vendorID))
+	if !okVendor {
+		return nil, core.NewPluginError("vendor_not_found", "vendor not found: "+vendorID, http.StatusNotFound)
+	}
+	if !a.vendorEnabled(vendor) {
+		return nil, core.NewPluginError("vendor_disabled",
+			fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
+	}
+	response, errStart := a.startVendorLogin(ctx, vendor, metadata)
+	if errStart != nil {
+		return nil, errStart
+	}
+	logger.Info("已发起控制台登录（供应商=%s）", vendor.ID())
+	return response, nil
+}
+
+// LoginCaptchaConfig 取登录前的人机验证控件参数。
+func (a *App) LoginCaptchaConfig(ctx context.Context, vendorID string) (core.CaptchaConfig, error) {
+	vendor, okVendor := a.registry.ByID(strings.TrimSpace(vendorID))
+	if !okVendor {
+		return core.CaptchaConfig{}, core.NewPluginError("vendor_not_found", "vendor not found: "+vendorID, http.StatusNotFound)
+	}
+	if !a.vendorEnabled(vendor) {
+		return core.CaptchaConfig{}, core.NewPluginError("vendor_disabled",
+			fmt.Sprintf("vendor %s is disabled by plugin configuration", vendor.ID()), http.StatusBadRequest)
+	}
+	provider, okCaptcha := core.As[core.LoginCaptchaProvider](vendor)
+	if !okCaptcha {
+		return core.CaptchaConfig{}, core.NewPluginError("captcha_unsupported",
+			vendor.Name()+" 的登录不需要页面内人机验证", http.StatusBadRequest)
+	}
+	config, errConfig := provider.LoginCaptchaConfig(ctx)
+	if errConfig != nil {
+		return core.CaptchaConfig{}, core.ToPluginError(errConfig)
+	}
+	return config, nil
+}
+
+// startVendorLogin 是两条登录入口（宿主 auth-url / 插件管理路由）的共同实现。
+//
+// 供应商标识由这里统一注入：宿主靠 metadata.vendor 把登录会话绑定回具体供应商，
+// 缺了它宿主拿不到授权链接，页面只会看到「获取授权链接失败」。
+func (a *App) startVendorLogin(ctx context.Context, vendor core.Vendor, metadata map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
 	login, okLogin := core.As[core.LoginProvider](vendor)
 	if !okLogin {
 		return nil, core.LoginUnsupported(vendor)
 	}
-	response, errStart := login.LoginStart(ctx, rpc.Metadata)
+	if errLimit := a.pool.CheckVendorLimit(ctx, hostbridge.CallbackID(ctx), vendor, ""); errLimit != nil {
+		return nil, errLimit
+	}
+	response, errStart := login.LoginStart(ctx, metadata)
 	if errStart != nil {
 		return nil, core.ToPluginError(errStart)
 	}
-	// 供应商标识由根层统一注入，不交给各供应商自己记着。
-	//
-	// 宿主靠 metadata.vendor 把登录会话绑定回具体供应商；缺了它宿主拿不到
-	// 授权链接，页面只会看到「获取授权链接失败」。把这一步放在分发点而不是
-	// 各供应商的 LoginStart 里：新增供应商时没人会记得补，且漏掉时没有任何
-	// 编译期或运行期提示——本插件曾因此让 codearts / trae / traesolo 三个
-	// 供应商长期无法添加账号。
 	if response != nil {
 		if response.Metadata == nil {
 			response.Metadata = map[string]any{}
@@ -435,8 +521,7 @@ func (a *App) handleAuthLoginStart(request []byte) ([]byte, error) {
 		response.Metadata[core.VendorKey] = vendor.ID()
 		response.Metadata["region"] = vendor.Region()
 	}
-	logger.Info("started login (vendor=%s)", vendor.ID())
-	return core.OKEnvelope(response)
+	return response, nil
 }
 
 // handleAuthLoginPoll 轮询一次登录状态。
@@ -466,6 +551,14 @@ func (a *App) handleAuthLoginPoll(request []byte) ([]byte, error) {
 	response, errPoll := login.LoginPoll(ctx, sessionID)
 	if errPoll != nil {
 		return nil, core.ToPluginError(errPoll)
+	}
+	if response != nil && response.Status == pluginapi.AuthLoginStatusSuccess {
+		if errLimit := a.pool.CheckVendorLimit(ctx, rpc.HostCallbackID, vendor, response.Auth.FileName); errLimit != nil {
+			return core.OKEnvelope(&pluginapi.AuthLoginPollResponse{
+				Status:  pluginapi.AuthLoginStatusError,
+				Message: errLimit.Error(),
+			})
+		}
 	}
 	return core.OKEnvelope(response)
 }
@@ -525,6 +618,53 @@ func (a *App) vendorForLoginSession(sessionID string) (core.Vendor, error) {
 	return nil, core.NewPluginError("session_not_found", "登录会话不存在或已过期，请重新发起登录", http.StatusNotFound)
 }
 
+// SendLoginSMS 发送短信验证码（vendorID 定位实现 SMSLoginProvider 的实例）。
+func (a *App) SendLoginSMS(ctx context.Context, vendorID, phone string) (string, error) {
+	vendor, okVendor := a.registry.ByID(vendorID)
+	if !okVendor {
+		return "", core.NewPluginError("vendor_not_found", "vendor not found: "+vendorID, http.StatusNotFound)
+	}
+	sender, okSMS := core.As[core.SMSLoginProvider](vendor)
+	if !okSMS {
+		return "", core.NewPluginError("sms_unsupported", vendor.Name()+" 不支持手机验证码登录", http.StatusBadRequest)
+	}
+	callbackID := hostbridge.CallbackID(ctx)
+	if errLimit := a.pool.CheckVendorLimit(ctx, callbackID, vendor, ""); errLimit != nil {
+		return "", errLimit
+	}
+	sessionKey, errSend := sender.SendLoginCode(ctx, phone)
+	if errSend != nil {
+		return "", core.ToPluginError(errSend)
+	}
+	return sessionKey, nil
+}
+
+// VerifyLoginSMS 用短信验证码完成登录并返回落盘凭证 JSON。
+func (a *App) VerifyLoginSMS(ctx context.Context, vendorID, sessionKey, phone, code string) (string, string, string, error) {
+	vendor, okVendor := a.registry.ByID(vendorID)
+	if !okVendor {
+		return "", "", "", core.NewPluginError("vendor_not_found", "vendor not found: "+vendorID, http.StatusNotFound)
+	}
+	sender, okSMS := core.As[core.SMSLoginProvider](vendor)
+	if !okSMS {
+		return "", "", "", core.NewPluginError("sms_unsupported", vendor.Name()+" 不支持手机验证码登录", http.StatusBadRequest)
+	}
+	storageJSON, label, errVerify := sender.VerifyLoginCode(ctx, sessionKey, phone, code)
+	if errVerify != nil {
+		return "", "", "", core.ToPluginError(errVerify)
+	}
+	// 文件名按账号身份生成：UID → 展示名 → 凭证指纹（core.FileNameFor 的兜底）。
+	// 展示名会重复、也会为空，单拿它当文件名正是「第二个账号覆盖第一个」的成因
+	// （#55）；指纹还需要 access token 作种子，这里一并交给 FileNameFor。
+	identifier, token := label, ""
+	if credential, errParse := vendor.Parse(storageJSON, ""); errParse == nil {
+		identifier = core.FirstNonEmpty(credential.UIDValue(), label)
+		token = credential.TokenValue()
+	}
+	fileName := core.FileNameFor(vendor.ID(), identifier, token)
+	return fileName, label, string(storageJSON), nil
+}
+
 // SubmitLoginCallback 处理控制台粘贴回来的 localhost 回调链接。
 //
 // 只有实现 core.CallbackSubmitter 的供应商支持（Trae 家族与 CodeArts）：上游
@@ -550,12 +690,21 @@ func (a *App) SubmitLoginCallback(ctx context.Context, state, rawURL string) (*c
 		return nil, core.NewPluginError("invalid_request", "请粘贴浏览器地址栏里的完整回调链接", http.StatusBadRequest)
 	}
 
+	callbackID := hostbridge.CallbackID(ctx)
+	if errLimit := a.pool.CheckVendorLimit(ctx, callbackID, vendor, ""); errLimit != nil {
+		return nil, errLimit
+	}
 	result, errSubmit := submitter.SubmitCallback(ctx, sessionID, trimmed)
 	if errSubmit != nil {
 		return nil, core.ToPluginError(errSubmit)
 	}
 	if result == nil {
 		return nil, core.NewPluginError("login_failed", "回调处理失败，请重新发起登录", http.StatusInternalServerError)
+	}
+	if result.Status == pluginapi.AuthLoginStatusSuccess {
+		if errLimit := a.pool.CheckVendorLimit(ctx, callbackID, vendor, result.Auth.FileName); errLimit != nil {
+			return nil, errLimit
+		}
 	}
 	return result, nil
 }
@@ -593,17 +742,13 @@ func (a *App) firstVendorForRegion(region string) (core.Vendor, bool) {
 // 写两处是刻意的双保险：
 //   - host.auth.save 让宿主热更新内存注册表；
 //   - 直接写文件兜住 host.auth.save 不可用的场景。
+//
+// 两处必须写**同一份**内容：uid 大小写归一由 hostbridge.SaveAuth /
+// hostbridge.AlignCredentialUID 统一完成（见那里的说明），这里只负责
+// 选对归一的基准名，并把返回的 JSON 原样落盘。
 func (a *App) saveRefreshedCredential(ctx context.Context, callbackID string, vendor core.Vendor,
 	entry core.HostAuth, original []byte, updated *core.Credential, filePath string) {
 	payload, okPayload := refreshedStorageJSON(vendor, original, updated)
-	if okPayload {
-		if _, errSave := hostbridge.Call(callbackID, pluginabi.MethodHostAuthSave, pluginapi.HostAuthSaveRequest{
-			Name: entry.Name,
-			JSON: payload,
-		}); errSave != nil {
-			logger.Debug("keepalive %s: host.auth.save failed: %v", entry.Name, errSave)
-		}
-	}
 	targetPath := filePath
 	if targetPath == "" {
 		targetPath = entry.Path
@@ -611,17 +756,41 @@ func (a *App) saveRefreshedCredential(ctx context.Context, callbackID string, ve
 	if targetPath == "" {
 		return
 	}
+	name := authWriteName(entry, targetPath)
+	if okPayload {
+		// SaveAuth 内部做 uid 归一，返回实际写给宿主的 JSON。
+		saved, errSave := hostbridge.SaveAuth(callbackID, name, payload)
+		if errSave != nil {
+			logger.Debug("保活 %s：宿主授权保存失败：%v", entry.Name, errSave)
+		}
+		payload = saved
+	} else {
+		// 合并失败也要归一：未归一的凭证同样会被宿主按 uid 再登记一条。
+		payload = hostbridge.AlignCredentialUID(payload, name)
+	}
 	// 临时文件 + rename：凭证文件被宿主 fsnotify 监听，半写状态会让宿主读到一个
 	// 截断的 JSON。rename 在同一文件系统内是原子的，宿主只会看到旧版或新版。
 	tmp := targetPath + ".tmp"
 	if errWrite := os.WriteFile(tmp, payload, 0o600); errWrite != nil {
-		logger.Debug("keepalive %s: write credential file failed: %v", entry.Name, errWrite)
+		logger.Debug("保活 %s：写入凭证文件失败：%v", entry.Name, errWrite)
 		return
 	}
 	if errRename := os.Rename(tmp, targetPath); errRename != nil {
 		_ = os.Remove(tmp)
-		logger.Debug("keepalive %s: replace credential file failed: %v", entry.Name, errRename)
+		logger.Debug("保活 %s：替换凭证文件失败：%v", entry.Name, errRename)
 	}
+}
+
+// authWriteName 返回 uid 归一时的基准文件名。
+//
+// 宿主给同一条账号两个来源：Name 是注册键，Path 是物理文件；两者大小写
+// 可能不同。注册键才是宿主用来判重的拼写，因此优先用它；Name 缺失时退回
+// 即将写入的磁盘文件名（否则归一出来的拼写谁也不认）。
+func authWriteName(entry core.HostAuth, targetPath string) string {
+	if name := strings.TrimSpace(entry.Name); name != "" {
+		return name
+	}
+	return filepath.Base(targetPath)
 }
 
 // refreshedStorageJSON 用供应商自己的合并逻辑更新凭证 JSON。

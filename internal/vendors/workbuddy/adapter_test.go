@@ -1,41 +1,26 @@
 package workbuddy
 
 import (
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"freetier2api-plugin/internal/core"
 )
 
-func TestConfigureAppliesPromptAndUADefaults(t *testing.T) {
+func TestConfigureAppliesUADefaults(t *testing.T) {
 	dir := t.TempDir()
-	promptPath := filepath.Join(dir, "prompt.md")
-	if err := os.WriteFile(promptPath, []byte("custom prompt"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	rt := newRuntime(core.Env{})
 	rt.configure(core.Settings{
 		EnabledRealms: []string{"cn"},
 		MachineSalt:   "salt-1",
 		StateDir:      dir,
 	}, map[string]string{
-		"workbuddy_prompt_mode":           "custom",
-		"workbuddy_prompt_file":           promptPath,
-		"workbuddy_client_version":        "9.9.9",
-		"workbuddy_sanitize_fingerprints": "false",
+		"workbuddy_client_version": "9.9.9",
 	})
 
 	cfg := *rt.cfg.Load()
 	if cfg.clientVersion != "9.9.9" {
 		t.Fatalf("client version = %q", cfg.clientVersion)
-	}
-	if cfg.promptMode != PromptModeCustom || cfg.promptText != "custom prompt" {
-		t.Fatalf("prompt = %q/%q", cfg.promptMode, cfg.promptText)
-	}
-	if cfg.sanitizeFingerprints {
-		t.Fatal("sanitize flag not applied")
 	}
 	if *rt.salt.Load() != "salt-1" {
 		t.Fatalf("install salt = %q", *rt.salt.Load())
@@ -52,10 +37,10 @@ func TestWorkBuddyRuntimeIsolated(t *testing.T) {
 	second := newRuntime(core.Env{})
 
 	first.configure(core.Settings{MachineSalt: "salt-first"}, map[string]string{
-		"workbuddy_prompt_mode": "custom",
+		"workbuddy_client_version": "9.9.9",
 	})
 	second.configure(core.Settings{MachineSalt: "salt-second"}, map[string]string{
-		"workbuddy_prompt_mode": "append",
+		"workbuddy_client_version": "8.8.8",
 	})
 	first.setEffortTables(
 		map[string]string{"glm-5.2": "high"},
@@ -72,11 +57,11 @@ func TestWorkBuddyRuntimeIsolated(t *testing.T) {
 	if got := *second.salt.Load(); got != "salt-second" {
 		t.Fatalf("second salt = %q", got)
 	}
-	if got := first.prompt.Load().Mode; got != "custom" {
-		t.Fatalf("first prompt mode = %q", got)
+	if got := first.cfg.Load().clientVersion; got != "9.9.9" {
+		t.Fatalf("first client version = %q", got)
 	}
-	if got := second.prompt.Load().Mode; got != "append" {
-		t.Fatalf("second prompt mode = %q", got)
+	if got := second.cfg.Load().clientVersion; got != "8.8.8" {
+		t.Fatalf("second client version = %q", got)
 	}
 	defaults, supported := first.effortTables()
 	if defaults["glm-5.2"] != "high" || len(supported["glm-5.2"]) != 2 {
@@ -126,5 +111,30 @@ func TestBuildCacheKeyIsolatesAccounts(t *testing.T) {
 	}
 	if buildCacheKey("account-aaaa1111", "conv-1") != keyA {
 		t.Fatal("cache key must be deterministic")
+	}
+}
+
+// TestCheckinUnsupportedReasonEnterprise 企业账号没有签到活动。
+//
+// 企业账号打 daily-checkin 恒得到 400 code 10001；如果仍按「支持签到」处理，
+// 自动任务每天会给它记一条失败日志。判据是凭证里的企业租户 id。
+func TestCheckinUnsupportedReasonEnterprise(t *testing.T) {
+	personal := testTaskCredential("uid-personal")
+	if reason := checkinUnsupportedReason(personal); reason != "" {
+		t.Fatalf("个人账号应支持签到，得到 reason=%q", reason)
+	}
+
+	enterprise := testTaskCredential("uid-enterprise")
+	enterprise.EnterpriseID = "fysxmvfpz6dc"
+	reason := checkinUnsupportedReason(enterprise)
+	if !strings.Contains(reason, "企业账号") {
+		t.Fatalf("企业账号的不可签到原因必须可读，得到 %q", reason)
+	}
+
+	// 国际版走每日活跃奖励，与国内版签到端点无关。
+	global := testGlobalCredential("uid-global-enterprise")
+	global.EnterpriseID = "ent-global"
+	if reason := checkinUnsupportedReason(global); reason != "" {
+		t.Fatalf("国际版活跃奖励不受国内企业判定影响，得到 reason=%q", reason)
 	}
 }

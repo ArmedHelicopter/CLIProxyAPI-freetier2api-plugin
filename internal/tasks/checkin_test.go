@@ -1,0 +1,449 @@
+package tasks
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"freetier2api-plugin/cpasdk/pluginapi"
+	"freetier2api-plugin/internal/auth"
+	"freetier2api-plugin/internal/core"
+	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/state"
+)
+
+// 签到落库的行为测试。
+//
+// 落库语义是「假性成功」的最后一道闸：只要签到结果被记成「今日已签到」，
+// 控制台就会显示已签到，而上游窗口错过不补领——积分就此永久丢失。
+// 因此「本次没真正领到」必须不落库。
+
+// fakeDeps 是只实现落库所需能力的最小 Deps。
+type fakeDeps struct {
+	pool     *auth.Pool
+	registry *core.Registry
+	now      time.Time
+	state    state.State
+	cfg      Config
+	// mutations 统计落盘次数：一次签到只应产生一次状态变更。
+	mutations int
+	// refreshSaves 统计凭证写回次数：并发续期只应写回一次。
+	refreshSaves int
+}
+
+func (f *fakeDeps) Registry() *core.Registry { return f.registry }
+func (f *fakeDeps) Pool() *auth.Pool         { return f.pool }
+func (f *fakeDeps) Config() Config           { return f.cfg }
+func (f *fakeDeps) State() state.State       { return f.state }
+func (f *fakeDeps) Now() time.Time           { return f.now }
+
+func (f *fakeDeps) MutateState(mutate func(*state.State)) {
+	f.mutations++
+	mutate(&f.state)
+}
+
+func (f *fakeDeps) SaveRefreshedCredential(
+	ctx context.Context, callbackID string, vendor core.Vendor,
+	entry core.HostAuth, original []byte, updated *core.Credential, filePath string,
+) {
+	f.refreshSaves++
+}
+
+// newFakeDeps 构造一个带好 map 的最小 Deps。
+func newFakeDeps(now time.Time) *fakeDeps {
+	return &fakeDeps{now: now, state: *state.New()}
+}
+
+// TestRecordCheckinResultSkipsUnfinished 验证：未完成的签到不落库。
+func TestRecordCheckinResultSkipsUnfinished(t *testing.T) {
+	credential := &core.Credential{FileID: "qodercn-user"}
+	deps := newFakeDeps(time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC))
+	service := &Service{deps: deps}
+
+	// 上游窗口未开启：本次什么都没领到。
+	service.recordCheckinResult(&fakeCheckinVendor{id: "qodercn"}, credential, CheckinTriggerSchedule, &core.CheckinResult{
+		Message:     "上游领取窗口 10:00（UTC+8）开启，当前未开启",
+		NotRecorded: true,
+	})
+	if len(deps.state.Checkin) != 0 {
+		t.Fatalf("未完成的签到不应落库，实际 = %+v", deps.state.Checkin)
+	}
+}
+
+// TestRecordCheckinResultRecordsCompleted 验证：真正领到的签到照常落库。
+func TestRecordCheckinResultRecordsCompleted(t *testing.T) {
+	credential := &core.Credential{FileID: "qodercn-user"}
+	deps := newFakeDeps(time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC))
+	service := &Service{deps: deps}
+
+	service.recordCheckinResult(&fakeCheckinVendor{id: "qodercn"}, credential, CheckinTriggerSchedule, &core.CheckinResult{Credit: 100})
+	record, ok := deps.state.Checkin["qodercn-user"]
+	if !ok {
+		t.Fatal("已完成的签到应落库")
+	}
+	if record.LastDate != "2026-10-21" {
+		t.Errorf("last_date = %q, 期望 2026-10-21", record.LastDate)
+	}
+	if record.Credit != 100 {
+		t.Errorf("credit = %d, 期望 100", record.Credit)
+	}
+}
+
+// TestRecordCheckinResultKeepsVendorDefault 验证：未声明 NotRecorded 的厂商
+// 行为不变（零值兼容，其它厂商的签到记录照常写入）。
+func TestRecordCheckinResultKeepsVendorDefault(t *testing.T) {
+	credential := &core.Credential{FileID: "workbuddycn-user"}
+	deps := newFakeDeps(time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC))
+	service := &Service{deps: deps}
+
+	// Already=true、Credit=0：既有厂商「已领取但本次无新积分」的形态。
+	service.recordCheckinResult(&fakeCheckinVendor{id: "qodercn"}, credential, CheckinTriggerSchedule, &core.CheckinResult{Already: true})
+	record, ok := deps.state.Checkin["workbuddycn-user"]
+	if !ok {
+		t.Fatal("未声明 NotRecorded 的结果应照常落库（其它厂商行为不得改变）")
+	}
+	if record.LastDate != "2026-10-21" {
+		t.Errorf("last_date = %q, 期望 2026-10-21", record.LastDate)
+	}
+}
+
+// fakeCheckinVendor 是只实现签到能力的最小 Vendor：历史落库只依赖 ID 与
+// CheckinProvider，其余方法按契约返回零值。
+type fakeCheckinVendor struct {
+	id     string
+	result *core.CheckinResult
+	err    error
+}
+
+func (v *fakeCheckinVendor) ID() string                                     { return v.id }
+func (v *fakeCheckinVendor) Name() string                                   { return v.id }
+func (v *fakeCheckinVendor) Region() string                                 { return "cn" }
+func (v *fakeCheckinVendor) ModelPrefix() string                            { return "" }
+func (v *fakeCheckinVendor) Match(string, string, map[string]any) bool      { return false }
+func (v *fakeCheckinVendor) Parse([]byte, string) (*core.Credential, error) { return nil, nil }
+func (v *fakeCheckinVendor) StaticModels(context.Context) ([]pluginapi.ModelInfo, error) {
+	return nil, nil
+}
+func (v *fakeCheckinVendor) Execute(context.Context, *core.Credential, *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
+	return nil, nil
+}
+func (v *fakeCheckinVendor) ExecuteStream(context.Context, *core.Credential, *core.ExecuteRequest, core.StreamSink) error {
+	return nil
+}
+func (v *fakeCheckinVendor) SupportsCheckin() bool { return true }
+func (v *fakeCheckinVendor) Checkin(context.Context, *core.Credential) (*core.CheckinResult, error) {
+	return v.result, v.err
+}
+
+// TestCheckinRecordsHistoryForEveryPath 验证三条结果路径都进历史。
+//
+// 失败路径过去完全不落库：横幅一消失就再也查不到「哪个账号、为什么失败」，
+// 这正是本 issue 要解决的问题。
+func TestCheckinRecordsHistoryForEveryPath(t *testing.T) {
+	credential := &core.Credential{FileID: "qodercn-user"}
+	key := state.CheckinHistoryKey("qodercn", "qodercn-user")
+
+	t.Run("success", func(t *testing.T) {
+		deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 1, 0, time.UTC))
+		service := &Service{deps: deps}
+		vendor := &fakeCheckinVendor{id: "qodercn", result: &core.CheckinResult{Credit: 100, Message: "签到成功"}}
+
+		if _, errRun := service.Checkin(context.Background(), vendor, credential, CheckinTriggerManual); errRun != nil {
+			t.Fatalf("Checkin: %v", errRun)
+		}
+		history := deps.state.CheckinHistory[key]
+		if len(history) != 1 {
+			t.Fatalf("历史条数 = %d, 期望 1", len(history))
+		}
+		entry := history[0]
+		if entry.Status != "success" || entry.Credit != 100 || entry.Message != "签到成功" {
+			t.Errorf("历史条目 = %+v, 期望成功且 credit=100", entry)
+		}
+		if entry.Trigger != string(CheckinTriggerManual) {
+			t.Errorf("trigger = %q, 期望 manual", entry.Trigger)
+		}
+		if entry.RunAt != "2026-10-25T10:00:01Z" {
+			t.Errorf("run_at = %q, 期望本次执行时间", entry.RunAt)
+		}
+		if deps.state.Checkin["qodercn-user"].LastDate != "2026-10-25" {
+			t.Error("成功签到仍要更新「最近一次」记录")
+		}
+		if deps.mutations != 1 {
+			t.Errorf("落盘次数 = %d, 期望 1（最近一次与历史在同一次 Mutate 里写）", deps.mutations)
+		}
+	})
+
+	t.Run("already", func(t *testing.T) {
+		deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC))
+		service := &Service{deps: deps}
+		vendor := &fakeCheckinVendor{id: "qodercn", result: &core.CheckinResult{Already: true, Message: "今日已完成签到"}}
+
+		if _, errRun := service.Checkin(context.Background(), vendor, credential, CheckinTriggerSchedule); errRun != nil {
+			t.Fatalf("Checkin: %v", errRun)
+		}
+		if status := deps.state.CheckinHistory[key][0].Status; status != "already" {
+			t.Errorf("status = %q, 期望 already", status)
+		}
+		if trigger := deps.state.CheckinHistory[key][0].Trigger; trigger != string(CheckinTriggerSchedule) {
+			t.Errorf("trigger = %q, 期望 schedule", trigger)
+		}
+	})
+
+	t.Run("error", func(t *testing.T) {
+		deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC))
+		service := &Service{deps: deps}
+		vendor := &fakeCheckinVendor{id: "qodercn", err: &core.Failure{Kind: core.FailureKindServer, Msg: "上游 500"}}
+
+		if _, errRun := service.Checkin(context.Background(), vendor, credential, CheckinTriggerSchedule); errRun == nil {
+			t.Fatal("上游失败必须把错误透传给调用方")
+		}
+		history := deps.state.CheckinHistory[key]
+		if len(history) != 1 || history[0].Status != "error" {
+			t.Fatalf("失败也要进历史，实际 = %+v", history)
+		}
+		if !strings.Contains(history[0].Message, "上游 500") {
+			t.Errorf("历史必须保留报错原文，实际 = %q", history[0].Message)
+		}
+		if len(deps.state.Checkin) != 0 {
+			t.Error("失败的签到不得写成「今日已签到」")
+		}
+	})
+
+	t.Run("not-recorded", func(t *testing.T) {
+		deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC))
+		service := &Service{deps: deps}
+		vendor := &fakeCheckinVendor{id: "qodercn", result: &core.CheckinResult{
+			Message: "无可用签到活动", NotRecorded: true,
+		}}
+
+		if _, errRun := service.Checkin(context.Background(), vendor, credential, CheckinTriggerManual); errRun != nil {
+			t.Fatalf("Checkin: %v", errRun)
+		}
+		if status := deps.state.CheckinHistory[key][0].Status; status != "error" {
+			t.Errorf("status = %q, 期望 error（本次没领到不等于成功）", status)
+		}
+		if len(deps.state.Checkin) != 0 {
+			t.Error("NotRecorded 的结果不得写入「最近一次」记录")
+		}
+	})
+}
+
+// TestCheckinHistoryKeepsOnlyToday 验证历史只保留当天：同日不限条数，
+// 跨天（按签到时区判断）一律丢弃旧记录。
+func TestCheckinHistoryKeepsOnlyToday(t *testing.T) {
+	credential := &core.Credential{FileID: "qodercn-user"}
+	key := state.CheckinHistoryKey("qodercn", "qodercn-user")
+	deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC))
+	service := &Service{deps: deps}
+
+	for index := 1; index <= 3; index++ {
+		deps.now = time.Date(2026, 10, 25, 10, 0, index, 0, time.UTC)
+		vendor := &fakeCheckinVendor{id: "qodercn", result: &core.CheckinResult{Message: fmt.Sprintf("第 %d 次", index)}}
+		if _, errRun := service.Checkin(context.Background(), vendor, credential, CheckinTriggerManual); errRun != nil {
+			t.Fatalf("Checkin: %v", errRun)
+		}
+	}
+
+	history := deps.state.CheckinHistory[key]
+	if len(history) != 3 {
+		t.Fatalf("同一天的历史条数 = %d, 期望 3（不再按条数截断）", len(history))
+	}
+	if history[0].Message != "第 3 次" || history[2].Message != "第 1 次" {
+		t.Fatalf("历史顺序 = %+v, 期望新→旧", history)
+	}
+
+	// 跨天：新一天的第一条写下时，前一天的三条全部淘汰。
+	deps.now = time.Date(2026, 10, 26, 9, 30, 0, 0, time.UTC)
+	vendor := &fakeCheckinVendor{id: "qodercn", result: &core.CheckinResult{Message: "次日"}}
+	if _, errRun := service.Checkin(context.Background(), vendor, credential, CheckinTriggerManual); errRun != nil {
+		t.Fatalf("Checkin: %v", errRun)
+	}
+	history = deps.state.CheckinHistory[key]
+	if len(history) != 1 || history[0].Message != "次日" {
+		t.Fatalf("跨天后历史 = %+v, 期望只剩当天一条", history)
+	}
+}
+
+// TestPruneCheckinHistoryOnStart 验证启动清理：跨天残留被删、当天记录保留、
+// 全是旧记录时整个键被移除。
+func TestPruneCheckinHistoryOnStart(t *testing.T) {
+	deps := newFakeDeps(time.Date(2026, 10, 25, 8, 0, 0, 0, time.UTC))
+	old := state.CheckinHistoryKey("qodercn", "old-user")
+	sameDay := state.CheckinHistoryKey("qodercn", "same-day")
+	stale := state.CheckinHistoryKey("qodercn", "stale-user")
+	deps.state.CheckinHistory[old] = []state.CheckinHistoryEntry{
+		{RunAt: "2026-10-24T09:00:00+08:00", Status: "ok", Message: "昨天"},
+	}
+	deps.state.CheckinHistory[sameDay] = []state.CheckinHistoryEntry{
+		{RunAt: "2026-10-25T09:00:00+08:00", Status: "ok", Message: "今天"},
+		{RunAt: "2026-10-24T09:00:00+08:00", Status: "ok", Message: "昨天"},
+	}
+	deps.state.CheckinHistory[stale] = []state.CheckinHistoryEntry{
+		{RunAt: "not-a-time", Status: "ok", Message: "解析不了"},
+	}
+	service := &Service{deps: deps}
+
+	if dropped := service.pruneCheckinHistory(); dropped != 3 {
+		t.Fatalf("丢弃条数 = %d, 期望 3", dropped)
+	}
+	if _, ok := deps.state.CheckinHistory[old]; ok {
+		t.Error("全是旧记录的键必须整条移除")
+	}
+	if _, ok := deps.state.CheckinHistory[stale]; ok {
+		t.Error("时间解析失败的记录无法证明属于当天，必须丢弃")
+	}
+	kept := deps.state.CheckinHistory[sameDay]
+	if len(kept) != 1 || kept[0].Message != "今天" {
+		t.Fatalf("当天记录 = %+v, 期望只留「今天」", kept)
+	}
+	if dropped := service.pruneCheckinHistory(); dropped != 0 {
+		t.Fatalf("第二次清理丢弃 %d 条, 期望 0（幂等）", dropped)
+	}
+}
+
+// TestCheckinHistoryKeySeparatesVendors 验证历史按「供应商 + 账号」隔离：
+// 两个渠道的同名文件不得互相串记录（额度缓存踩过同一个坑）。
+func TestCheckinHistoryKeySeparatesVendors(t *testing.T) {
+	credential := &core.Credential{FileID: "same-file"}
+	deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC))
+	service := &Service{deps: deps}
+
+	for _, vendorID := range []string{"qodercn", "qoderglobal"} {
+		vendor := &fakeCheckinVendor{id: vendorID, result: &core.CheckinResult{Message: vendorID}}
+		if _, errRun := service.Checkin(context.Background(), vendor, credential, CheckinTriggerManual); errRun != nil {
+			t.Fatalf("Checkin %s: %v", vendorID, errRun)
+		}
+	}
+	for _, vendorID := range []string{"qodercn", "qoderglobal"} {
+		history := deps.state.CheckinHistory[state.CheckinHistoryKey(vendorID, "same-file")]
+		if len(history) != 1 || history[0].Message != vendorID {
+			t.Fatalf("%s 的历史 = %+v, 期望只有自己那一条", vendorID, history)
+		}
+	}
+}
+
+// TestRecordCheckinResultPersistsStreak 验证：供应商透传的连签天数会落库，
+// 且上游本次没给（0）时不会被清空。
+//
+// 连签天数此前是断链的：供应商算出来了，适配层丢掉，宿主也没有字段可写，
+// 控制台因此永远显示 0 天。
+func TestRecordCheckinResultPersistsStreak(t *testing.T) {
+	credential := &core.Credential{FileID: "workbuddy-user"}
+	deps := newFakeDeps(time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC))
+	service := &Service{deps: deps}
+	vendor := &fakeCheckinVendor{id: "workbuddyglobal"}
+
+	service.recordCheckinResult(vendor, credential, CheckinTriggerSchedule, &core.CheckinResult{
+		Credit: 120,
+		Streak: 7,
+	})
+	if got := deps.state.Checkin[credential.FileIDValue()].Streak; got != 7 {
+		t.Fatalf("连签天数 = %d, 期望 7", got)
+	}
+
+	// 上游本次没给天数：保留上一次的值，不能清成 0。
+	service.recordCheckinResult(vendor, credential, CheckinTriggerSchedule, &core.CheckinResult{Credit: 120})
+	if got := deps.state.Checkin[credential.FileIDValue()].Streak; got != 7 {
+		t.Errorf("上游未给天数时连签 = %d, 期望保留 7", got)
+	}
+
+	// 上游给了新值：覆盖。
+	service.recordCheckinResult(vendor, credential, CheckinTriggerSchedule, &core.CheckinResult{
+		Already: true,
+		Streak:  8,
+	})
+	if got := deps.state.Checkin[credential.FileIDValue()].Streak; got != 8 {
+		t.Errorf("连签天数 = %d, 期望 8", got)
+	}
+}
+
+// refreshableCheckinVendor 支持 Checkin 与 Refresh 的测试 Vendor。
+type refreshableCheckinVendor struct {
+	fakeCheckinVendor
+	checkinCount int
+	refreshed    bool
+}
+
+func (v *refreshableCheckinVendor) Checkin(ctx context.Context, cred *core.Credential) (*core.CheckinResult, error) {
+	v.checkinCount++
+	if cred.TokenValue() == "expired-token" {
+		return nil, &core.Failure{
+			Kind:   core.FailureKindCredential,
+			Status: 401,
+			Code:   "APIG.0602",
+			Msg:    "Bad request: the security token has expired",
+		}
+	}
+	return &core.CheckinResult{Credit: 1000, Message: "签到成功 +1000 积分"}, nil
+}
+
+func (v *refreshableCheckinVendor) Refresh(ctx context.Context, cred *core.Credential) (*core.Credential, bool, error) {
+	v.refreshed = true
+	cred.ApplyTokenRefresh("fresh-token", "new-rt", time.Now().Add(12*time.Hour).Unix())
+	return cred, true, nil
+}
+
+// TestCheckinAutoRefreshesOn401 验证：当 Checkin 遇到 401 凭证过期时，
+// 任务服务会自动通过 RefreshAccount 刷新凭据并落盘写回，重试完成签到。
+func TestCheckinAutoRefreshesOn401(t *testing.T) {
+	vendor := &refreshableCheckinVendor{fakeCheckinVendor: fakeCheckinVendor{id: "testvendor"}}
+	reg := core.NewRegistry()
+	reg.Register(vendor)
+
+	cred := &core.Credential{
+		VendorID: "testvendor",
+		FileID:   "user1",
+		Token:    "expired-token",
+		UID:      "user1",
+	}
+
+	pool := auth.NewPool(reg, func(ctx context.Context, callbackID string, storageJSON []byte, authID string, attrs map[string]string) (*core.Credential, core.Vendor, error) {
+		return cred, vendor, nil
+	})
+
+	// mock hostbridge 列表
+	hostbridge.Configure(func(_ string, method string, payload any) (json.RawMessage, error) {
+		switch method {
+		case "host.auth.list":
+			return json.Marshal([]map[string]any{
+				{"id": "user1", "name": "user1.json", "auth_index": "user1.json", "provider": "freetier"},
+			})
+		case "host.auth.get":
+			return json.Marshal(map[string]any{
+				"auth_index": "user1.json",
+				"name":       "user1.json",
+				"json":       []byte(`{"token":"expired-token"}`),
+			})
+		}
+		return nil, fmt.Errorf("unexpected method: %s", method)
+	})
+	t.Cleanup(func() { hostbridge.Configure(nil) })
+
+	deps := newFakeDeps(time.Date(2026, 10, 25, 10, 0, 0, 0, time.UTC))
+	deps.pool = pool
+	deps.registry = reg
+	service := New(deps)
+
+	result, err := service.Checkin(context.Background(), vendor, cred, CheckinTriggerSchedule)
+	if err != nil {
+		t.Fatalf("Checkin failed: %v", err)
+	}
+	if result == nil || result.Credit != 1000 {
+		t.Fatalf("unexpected checkin result: %+v", result)
+	}
+	if vendor.checkinCount != 2 {
+		t.Errorf("checkinCount = %d, want 2 (initial 401 + retry)", vendor.checkinCount)
+	}
+	if !vendor.refreshed {
+		t.Error("expected vendor to be refreshed")
+	}
+	if cred.TokenValue() != "fresh-token" {
+		t.Errorf("expected token to be updated, got %q", cred.TokenValue())
+	}
+	if deps.refreshSaves != 1 {
+		t.Errorf("refreshSaves = %d, want 1", deps.refreshSaves)
+	}
+}

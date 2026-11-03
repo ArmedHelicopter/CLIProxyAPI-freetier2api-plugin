@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
+	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/hostbridge"
 )
 
@@ -84,17 +85,22 @@ func campaignsBody(campaigns ...string) string {
 		strings.Join(campaigns, ","))
 }
 
-// testIdentity 返回一份插件派生的设备身份。
+// testIdentity 返回一份「用户提供的」设备身份。
 //
-// 值本身无所谓：上游只要求 token/type 成对，这里只驱动请求头组装与判定。
+// 值本身无所谓：这里只驱动请求头组装与判定。上游对真值做精确校验，但那
+// 属于服务端行为，单测只验证「有身份就发、没身份就不发」的契约。
 func testIdentity() MachineIdentity {
-	return ResolveIdentity("test-seed", nil)
+	return ResolveIdentity(nil, map[string]string{
+		"qoder_machine_token": "token-from-official-component",
+		"qoder_machine_type":  "type-from-official-component",
+		"qoder_machine_code":  "code-from-official-component",
+	}, MachineIdentity{})
 }
 
 // TestCheckinGlobalSendsNativeMachineHeaders 覆盖：拿到真身份后，活动查询、
 // 领取与发放回查都要带同一组机器头（上游在三条链路上都按身份过滤）。
 func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	const campaignID = "camp-global-identity"
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
@@ -132,10 +138,12 @@ func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
 	want := map[string]string{
 		"Cosy-Machinetoken": identity.Token,
 		"Cosy-Machinetype":  identity.Type,
-		"Cosy-Machineid":    identity.MachineID,
-		"Cosy-Machineos":    identity.MachineOS,
+		"Cosy-Machinecode":  identity.Code,
 		"Cosy-Version":      identity.Version,
 	}
+	// 派生机器头（machineid / machineos / hostname）一律不发：上游只认官方
+	// 组件签发的精确值，别的机器头既解锁不了活动，还会让请求形态偏离官方客户端。
+	forbidden := []string{"Cosy-Machineid", "Cosy-Machineos", "Cosy-Machinehostname"}
 	checked := 0
 	for _, request := range upstream.requests {
 		if !strings.Contains(request.url, "/sash/") {
@@ -145,6 +153,11 @@ func TestCheckinGlobalSendsNativeMachineHeaders(t *testing.T) {
 		for key, value := range want {
 			if got := request.headers[key]; len(got) == 0 || got[0] != value {
 				t.Errorf("%s %s 的头 %s = %v, 期望 [%s]", request.method, request.url, key, got, value)
+			}
+		}
+		for _, key := range forbidden {
+			if got := request.headers[key]; len(got) != 0 {
+				t.Errorf("%s %s 不应发送 %s = %v", request.method, request.url, key, got)
 			}
 		}
 	}
@@ -168,6 +181,33 @@ func claimedCampaign(id, key string, startAt, endAt int64) string {
 		`"benefit":{"kind":"CREDITS","amount":100}}`, id, key, startAt, endAt)
 }
 
+// pinCheckinNow 把签到判定时钟固定到 at，并在用例结束时恢复。
+func pinCheckinNow(t *testing.T, at time.Time) time.Time {
+	t.Helper()
+	restore := checkinNow
+	checkinNow = func() time.Time { return at }
+	t.Cleanup(func() { checkinNow = restore })
+	return at
+}
+
+// checkinOpenNow 返回「当日窗口已开启」的固定时刻（UTC+8 15:00）。
+//
+// 这批用例按返回的 now 构造上游活动窗口，必须与签到判定共用同一个时钟。
+// 直接取真实时间时，本地 10:00 之前构造出来的是上一轮窗口，领取逻辑按
+// 设计返回 window_not_open，用例于是每天有 8 小时必然失败（CI 跑在 UTC，
+// 北京时间的凌晨正好落在窗口开启前）。签到正确性只取决于相对时刻，把时钟
+// 与窗口一起钉死即可稳定覆盖。
+func checkinOpenNow(t *testing.T) time.Time {
+	t.Helper()
+	return pinCheckinNow(t, time.Date(2026, 10, 22, 15, 0, 0, 0, campaignZone))
+}
+
+// checkinBeforeOpenNow 返回「当日窗口尚未开启」的固定时刻（UTC+8 09:00）。
+func checkinBeforeOpenNow(t *testing.T) time.Time {
+	t.Helper()
+	return pinCheckinNow(t, time.Date(2026, 10, 22, 9, 0, 0, 0, campaignZone))
+}
+
 // roundWindow 返回当前轮与上一轮的时间窗口（UTC+8 秒级时间戳）。
 //
 // 活动 startAt 落在当天 10:00、endAt 落在次日 10:00 之前，与上游实测一致。
@@ -184,7 +224,7 @@ func roundWindow(t *testing.T, now time.Time) (startAt, endAt int64, prevStart, 
 
 // TestCheckinClaimsCurrentRound 覆盖：当前轮可领取时应真正领取并确认到账。
 func TestCheckinClaimsCurrentRound(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	const campaignID = "camp-current"
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
@@ -247,7 +287,7 @@ func TestCheckinClaimsCurrentRound(t *testing.T) {
 // 上游每日 10:00（UTC+8）开启新一轮。9 点那一轮只能看到**上一轮**已领取
 // 的活动——把它当成「今日已领取」就是 issue 报告的假性成功。
 func TestCheckinBeforeWindowIsNotRecorded(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinBeforeOpenNow(t)
 	_, _, prevStart, prevEnd := roundWindow(t, now)
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
 	upstream.responses["GET https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"] = testhostResponse{
@@ -279,7 +319,7 @@ func TestCheckinBeforeWindowIsNotRecorded(t *testing.T) {
 
 // TestCheckinCurrentRoundAlreadyClaimed 覆盖：当前轮已领取才算「今日已领取」。
 func TestCheckinCurrentRoundAlreadyClaimed(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
 	upstream.responses["GET https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"] = testhostResponse{
@@ -306,7 +346,7 @@ func TestCheckinCurrentRoundAlreadyClaimed(t *testing.T) {
 
 // TestCheckinBlockedByUpstream 覆盖：上游风控去重不得当成成功。
 func TestCheckinBlockedByUpstream(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	const campaignID = "camp-blocked"
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
@@ -345,7 +385,7 @@ func TestCheckinBlockedByUpstream(t *testing.T) {
 
 // TestCheckinNotConfirmedWithoutGrant 覆盖：领取 200 但回读不到发放记录。
 func TestCheckinNotConfirmedWithoutGrant(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	const campaignID = "camp-unconfirmed"
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
@@ -387,7 +427,7 @@ func TestCheckinNotConfirmedWithoutGrant(t *testing.T) {
 
 // TestCheckinAchievementGate 覆盖：需先完成成就的活动不能当成已领。
 func TestCheckinAchievementGate(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	gated := fmt.Sprintf(`{"campaignId":"camp-gated","campaignKey":"act-milktea","actionType":"CLAIM_BENEFIT",`+
 		`"claimStatus":"ACHIEVEMENT_NOT_COMPLETED","startAt":%d,"endAt":%d,`+
@@ -419,12 +459,80 @@ func TestCheckinAchievementGate(t *testing.T) {
 	}
 }
 
+// TestCheckinSkipsGatedCampaignAfterDailyClaimed 覆盖真实报障：
+// 今日每日活动已领，列表里同时还有一条「可领但成就未完成」的活动。
+// 后者不能被选中去领取，否则「今日已领取」会被误报成成就未完成。
+func TestCheckinSkipsGatedCampaignAfterDailyClaimed(t *testing.T) {
+	now := checkinOpenNow(t)
+	startAt, endAt, _, _ := roundWindow(t, now)
+	daily := claimedCampaign("camp-daily", "act-20261027-334", startAt, endAt)
+	gated := fmt.Sprintf(`{"campaignId":"camp-gated","campaignKey":"act-milktea","actionType":"CLAIM_BENEFIT",`+
+		`"claimStatus":"CLAIMABLE","startAt":%d,"endAt":%d,`+
+		`"requiredAchievementKey":"sites_first_use","achievementCompleted":false,`+
+		`"benefit":{"kind":"CREDITS","amount":100}}`, startAt, endAt)
+	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
+	upstream.responses["GET https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"] = testhostResponse{
+		status: http.StatusOK,
+		body:   campaignsBody(daily, gated),
+	}
+	upstream.responses["GET https://openapi.qoder.com.cn/sash/api/v1/me/daily-check-in/status"] = testhostResponse{
+		status: http.StatusOK,
+		body:   `{"status":"DISABLED"}`,
+	}
+	installStubHost(t, upstream)
+
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
+	if errCheckin != nil {
+		t.Fatalf("Checkin 返回错误: %v", errCheckin)
+	}
+	if result.Status != CheckinAlreadyClaimed {
+		t.Fatalf("状态 = %q, 期望 %q（消息：%s）", result.Status, CheckinAlreadyClaimed, result.Message)
+	}
+	for _, request := range upstream.requests {
+		if request.method == http.MethodPost && strings.Contains(request.url, "/claim") {
+			t.Fatalf("今日已领取时不应再发 claim，实际请求 %s", request.url)
+		}
+	}
+}
+
+// TestCheckinClaimRejectedByAchievement 覆盖：领取响应直接返回成就未完成。
+func TestCheckinClaimRejectedByAchievement(t *testing.T) {
+	now := checkinOpenNow(t)
+	startAt, endAt, _, _ := roundWindow(t, now)
+	const campaignID = "camp-achievement-claim"
+	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
+	upstream.responses["GET https://openapi.qoder.com.cn/sash/api/v1/me/campaigns"] = testhostResponse{
+		status: http.StatusOK,
+		body:   campaignsBody(claimableCampaign(campaignID, "act-milktea", startAt, endAt)),
+	}
+	upstream.responses["POST https://openapi.qoder.com.cn/sash/api/v1/me/campaigns/"+campaignID+"/claim"] = testhostResponse{
+		status: http.StatusOK,
+		body:   `{"status":"ACHIEVEMENT_NOT_COMPLETED","failureCode":"ACHIEVEMENT_NOT_COMPLETED"}`,
+	}
+	upstream.responses["GET https://openapi.qoder.com.cn/sash/api/v1/me/daily-check-in/status"] = testhostResponse{
+		status: http.StatusOK,
+		body:   `{"status":"DISABLED"}`,
+	}
+	installStubHost(t, upstream)
+
+	result, errCheckin := Checkin(context.Background(), &Credential{Token: "dt-test", Region: RegionCN}, MachineIdentity{})
+	if errCheckin != nil {
+		t.Fatalf("Checkin 返回错误: %v", errCheckin)
+	}
+	if !result.NotRecorded {
+		t.Error("领取被成就拒绝时不应落库")
+	}
+	if !strings.Contains(result.Message, "成就") {
+		t.Errorf("消息应说明成就门槛，实际 = %s", result.Message)
+	}
+}
+
 // TestCheckinGlobalRegionUsesGlobalEndpoint 覆盖：国际版走国际版域名。
 //
 // 国际版与国内版共用同一套 campaigns 活动（官方文档与官方活动页均确认），
 // 因此不能对国际版做静态跳过。
 func TestCheckinGlobalRegionUsesGlobalEndpoint(t *testing.T) {
-	now := time.Now().In(campaignZone)
+	now := checkinOpenNow(t)
 	startAt, endAt, _, _ := roundWindow(t, now)
 	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
 	upstream.responses["GET https://openapi.qoder.sh/sash/api/v1/me/campaigns"] = testhostResponse{
@@ -592,4 +700,87 @@ func TestCampaignWindowDateUsesUTC8(t *testing.T) {
 	if got := campaignWindowDate(campaign); got != "2026-10-21" {
 		t.Errorf("窗口日期 = %s, 期望 2026-10-21", got)
 	}
+}
+
+// TestFetchQuotaReadsOrgResourcePackage 覆盖 issue #70：国内版团队账号的
+// 「资源包」在 orgResourcePackage 里，总额字段叫 cap。
+//
+// 旧实现只读 userQuota / addOnQuota，套餐席位用尽后账号表就一直停在
+// 0/3000，而控制台的用量明细里明明还有 2,000 资源包额度可用。
+func TestFetchQuotaReadsOrgResourcePackage(t *testing.T) {
+	const usage = `{"userQuota":{"total":3000,"used":3000,"remaining":0,"unit":"credits"},` +
+		`"orgResourcePackage":{"used":0,"cap":2000,"remaining":2000,"percentage":0,"available":true,"unit":"credits"}}`
+
+	quota, response := fetchQuotaWithUsage(t, usage)
+
+	if quota.OrgPackage == nil {
+		t.Fatal("未读取到 orgResourcePackage")
+	}
+	if quota.OrgPackage.Total != 2000 || quota.OrgPackage.Remaining != 2000 {
+		t.Errorf("资源包 = %+v, 期望 cap 与 remaining 都是 2000", *quota.OrgPackage)
+	}
+	if got, ok := summaryValue(response.Summary, "org_quota_remaining"); !ok || got != 2000 {
+		t.Errorf("org_package_remaining = %v (存在=%v), 期望 2000", got, ok)
+	}
+	if got, ok := summaryValue(response.Summary, "org_quota_total"); !ok || got != 2000 {
+		t.Errorf("org_package_total = %v (存在=%v), 期望 2000", got, ok)
+	}
+	found := false
+	for _, group := range response.Groups {
+		if group.DisplayName == "组织资源包" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("Groups 缺少「组织资源包」分组: %+v", response.Groups)
+	}
+}
+
+// TestFetchQuotaSkipsUnavailableOrgPackage 覆盖 available=false：过期 /
+// 停用 / 已退还的资源包余额取不出来，按桶不存在处理，否则账号表会显示
+// 一份无法使用的额度。
+func TestFetchQuotaSkipsUnavailableOrgPackage(t *testing.T) {
+	const usage = `{"userQuota":{"total":3000,"used":3000,"remaining":0,"unit":"credits"},` +
+		`"orgResourcePackage":{"used":0,"cap":2000,"remaining":2000,"percentage":0,"available":false,"unit":"credits"}}`
+
+	quota, response := fetchQuotaWithUsage(t, usage)
+
+	if quota.OrgPackage != nil {
+		t.Fatalf("available=false 的资源包不应计入额度，得到 %+v", *quota.OrgPackage)
+	}
+	if _, ok := summaryValue(response.Summary, "org_quota_remaining"); ok {
+		t.Error("available=false 的资源包不应输出 org_quota_* 摘要")
+	}
+}
+
+// fetchQuotaWithUsage 用给定的额度响应跑一次 FetchQuota，返回原生结果与
+// 归一化后的宿主响应。
+func fetchQuotaWithUsage(t *testing.T, usageBody string) (*Quota, pluginapi.QuotaFetchResponse) {
+	t.Helper()
+	upstream := &stubUpstream{responses: map[string]testhostResponse{}}
+	upstream.responses["GET https://openapi.qoder.com.cn/api/v2/quota/usage"] = testhostResponse{
+		status: http.StatusOK,
+		body:   usageBody,
+	}
+	upstream.responses["GET https://openapi.qoder.com.cn/api/v2/user/plan"] = testhostResponse{
+		status: http.StatusOK,
+		body:   `{"plan_tier_name":"Teams"}`,
+	}
+	installStubHost(t, upstream)
+
+	quota, errQuota := FetchQuota(context.Background(), &Credential{Token: "dt-test", Region: RegionCN})
+	if errQuota != nil {
+		t.Fatalf("FetchQuota 返回错误: %v", errQuota)
+	}
+	return quota, BuildQuotaResponse(quota)
+}
+
+// summaryValue 取摘要里某个键的值；键不存在时返回 0 与 false。
+func summaryValue(metrics []pluginapi.QuotaMetric, key string) (float64, bool) {
+	for _, metric := range metrics {
+		if metric.Key == key {
+			return metric.Value, true
+		}
+	}
+	return 0, false
 }

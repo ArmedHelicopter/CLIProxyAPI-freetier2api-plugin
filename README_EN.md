@@ -1,0 +1,184 @@
+# FreeTier 2API Plugin
+
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://go.dev/)
+[![CLIProxyAPI](https://img.shields.io/badge/CLIProxyAPI-Plugin-2496ED?style=flat)](https://github.com/router-for-me/CLIProxyAPI)
+[![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+A native dynamic library plugin that connects multiple free-tier AI providers to [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI), reusing the host's OpenAI / Anthropic / Responses compatible routing, authentication, proxy, and load balancing.
+
+[中文](README.md) | English
+
+If this project helps you, a Star would mean a lot.
+
+> **About this repository**: the original repository `jiandanc/CLIProxyAPI-freetier2api-plugin` disappeared from GitHub together with its owner's account (both the account and the repository return 404). This repository continues that line; from **v0.1.29** onward it is maintained by `cxy2730`. The plugin ID stays `freetier`, so existing installations can upgrade in place. History and all tags up to `v0.1.28` are preserved.
+
+## Features
+
+- Native integration with CLIProxyAPI's Anthropic `/v1/messages`, OpenAI `/v1/chat/completions`, and OpenAI `/v1/responses` endpoints without running a separate gateway service
+- Supports 15 free-tier provider instances across 8 vendor families (AutoClaw CN/Global and Raccoon included) with strict per-vendor credential isolation and no account cap
+- Dynamic model catalog discovery, custom model aliases, and cross-provider load balancing / failover
+- Built-in single-page Web console for OAuth device login, localhost callback paste, API Key import, account aliases, batch enable/disable/delete, quota tracking, check-in, model toggling, and settings (the task center and log page were removed; logs live in the host UI)
+- Request bodies pass through untouched: no prompt injection, replacement, or appending, and no rewriting of `system` / `tools` / sampling parameters
+- Automated daily check-in, automated daily tasks, and token keepalive refresh (check-in history keeps today only and is cleared on day change)
+- No OAuth login entry in the host panel: the plugin is intentionally absent from CLIProxyAPI’s "OAuth login" list, so accounts are added from the plugin console only
+- Pure Go standard library implementation with zero third-party runtime dependencies
+
+## Supported Providers
+
+| Vendor ID | Display Name | Realm | Auth Mode | Credential File Prefix |
+| --- | --- | --- | --- | --- |
+| `workbuddycn` | WorkBuddy CN | `cn` | OAuth Device Flow | `workbuddycn-*.json` |
+| `workbuddyglobal` | WorkBuddy Global | `global` | OAuth Device Flow | `workbuddyglobal-*.json` |
+| `autoclawcn` | AutoClaw CN | `cn` | API Key | `autoclawcn-*.json` |
+| `autoclawglobal` | AutoClaw Global | `global` | API Key | `autoclawglobal-*.json` |
+| `qodercn` | Qoder CN | `cn` | OAuth Device Flow | `qodercn-*.json` |
+| `qoderglobal` | Qoder Global | `global` | OAuth Device Flow | `qoderglobal-*.json` |
+| `raccoon` | Raccoon (XiaoHuanXiong) | — | API Key | `raccoon-*.json` |
+| `opencodezen` | OpenCode ZEN | `global` | API Key | `opencodezen-*.json` |
+| `cline` | Cline | `global` | WorkOS Device Flow | `cline-*.json` |
+| `zcodecn` | ZCode CN | `cn` | OAuth CLI Flow (BigModel) | `zcodecn-*.json` |
+| `zcodeglobal` | ZCode Global | `global` | OAuth CLI Flow (z.ai) | `zcodeglobal-*.json` |
+| `traecn` | Trae CN | `cn` | OAuth Flow | `traecn-*.json` |
+| `traeglobal` | Trae Global | `global` | OAuth Flow | `traeglobal-*.json` |
+| `codearts` | CodeArts | `cn` | OAuth Flow | `codearts-*.json` |
+| `minimaxcodecn` | MiniMax Code CN | `cn` | OAuth Device Flow | `minimaxcodecn-*.json` |
+| `minimaxcodeglobal` | MiniMax Code Global | `global` | OAuth Device Flow | `minimaxcodeglobal-*.json` |
+
+## Quick Start
+
+### Option 1: Install via CPA Plugin Store
+
+This plugin was listed in the official CLIProxyAPI plugin registry, but that entry still points at the now-dead original repository, so one-click install fails until the registry is updated:
+
+1. Open the CLIProxyAPI Admin Panel → **Plugin Store**.
+2. Search for **FreeTier 2API** and click Install (use Option 2 until the entry is fixed).
+
+### Option 2: Manual Installation from Releases
+
+Download the archive for your platform from [Releases](https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin/releases), extract the shared library (`freetier.so` / `freetier.dylib` / `freetier.dll`) into your CPA plugins directory, and enable it in `config.yaml`:
+
+```yaml
+plugins:
+  enabled: true
+  dir: "/path/to/cpa/plugins"
+  configs:
+    freetier:
+      enabled: true
+      enabled_realms: "cn,global"
+```
+
+### Option 3: Build from Source
+
+Requires Go 1.22+ and a C compiler (`CGO_ENABLED=1`), or use the bundled Docker build script (`golang:1.24` Debian glibc image):
+
+```bash
+git clone https://github.com/cxy2730/CLIProxyAPI-freetier2api-plugin.git
+cd CLIProxyAPI-freetier2api-plugin
+./scripts/build.sh
+```
+
+The compiled shared library is written to `dist/freetier.<so|dylib|dll>`.
+
+## Usage
+
+### 1. Open Console & Add Accounts
+
+Once CLIProxyAPI is running, open the embedded console:
+
+```text
+http://<CPA-HOST>:8317/v0/resource/plugins/freetier/console
+```
+
+- Click **"添加账号 ▾" (Add Account)**, choose a provider, and complete the browser OAuth flow or enter an API Key (no account cap).
+- When running on a remote host, Docker, or WSL where `127.0.0.1` callbacks (such as Trae or CodeArts) cannot reach the container directly, expand **"回调没到插件？粘贴回调链接"** in the login box and paste the full localhost callback URL from your browser's address bar.
+
+### 2. Call the API
+
+Call standard CLIProxyAPI endpoints using bare model names or `<vendor>:<model>` prefixes:
+
+```bash
+# OpenAI Chat Completions
+curl http://localhost:8317/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer <CPA_API_KEY>" \
+  -d '{"model":"qodercn-GLM-5.3","messages":[{"role":"user","content":"Hello!"}]}'
+
+# Anthropic Messages
+curl http://localhost:8317/v1/messages \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "x-api-key: <CPA_API_KEY>" \
+  -d '{"model":"qodercn-GLM-5.3-Flash","max_tokens":1024,"messages":[{"role":"user","content":"Hello!"}]}'
+```
+
+### 3. Model Aliases & Cross-Provider Routing
+
+In the Models table of the console, click any model ID or its `✎` icon to assign an external alias. Assigning the same alias to models across different providers merges them into a single logical model ID in CLIProxyAPI for automatic cross-provider load balancing and failover.
+
+### 4. Account Aliases
+
+The Accounts table shows whatever nickname or email the upstream returns, and some platforms only hand out a default nickname that cannot be changed — with several accounts it becomes impossible to tell them apart. Click the account name or its `✎` icon to set a custom alias; the editor is prefilled with the current name, and the display order becomes **alias → upstream nickname/email → file name → account ID**. Saving an empty value, or typing the original name back, means "no alias" — the record is cleared and the upstream name is used, so behavior is unchanged when no alias is set.
+
+Aliases are stored in `state.json` under `account_aliases`, keyed by account identity (the credential file name, i.e. `core.Credential.FileID`) rather than by nickname or token, so they survive token refresh and re-login into the same credential file.
+
+## Configuration
+
+Configure under `plugins.configs.freetier` in `config.yaml` (runtime settings can also be toggled live in the web console):
+
+| Key | Type | Default | Description |
+| --- | --- | --- | --- |
+| `enabled_realms` | string | `cn,global` | Enabled regions (`cn` / `global`) |
+| `auto_checkin` | bool | `true` | Enable automated daily check-in |
+| `auto_checkin_at` | string | `10:00` | Daily check-in time (`HH:MM`, local time). Scheduling is hourly, so any minute above 0 rounds up to the next hour and the run never fires before the configured time |
+| `auto_tasks` | bool | `true` | Enable automated daily tasks |
+| `codearts_credit_enabled` | bool | `false` | Explicitly enable credit-billed CodeArts inference; no automatic channel fallback. Refresh models after changing |
+| `disabled_models` | string / list | empty | Disabled models (`vendor:model` or bare name) |
+| `extra_models` | string | empty | Additional model IDs to register (comma-separated) |
+| `state_dir` | string | `~/.freetier-plugin` | State and cache directory |
+| `log_level` | string | `info` | Log level: `debug` / `info` / `error` |
+| `log_to_file` | bool | `false` | Also write logs to `<state_dir>/logs/`, one file per day |
+| `log_to_host` | bool | `true` | Mirror plugin logs into the host `main.log` so they show up in the CLIProxyAPI panel log page |
+| `host_log_file` | string | auto-detect | Host log path. Empty means derive `<base>/auths/logs/main.log` or `<base>/logs/main.log` from `state_dir`; disabled when neither exists |
+| `host_log_level` | string | `info` | Minimum level mirrored to the host log: `debug` / `info` / `error` |
+
+## Project Architecture
+
+```text
+package main / cgo        C ABI entry (main.go / cgo.go)
+  └─ internal/app         composition root and ABI adapter
+       ├─ internal/admin    management HTTP API + config + model catalog + console
+       ├─ internal/tasks    vendor-neutral task catalog/scheduler/queue/engine
+       ├─ internal/auth     account enumeration/batch/quota formatting + login sessions
+       ├─ internal/vendors/<name>   provider protocol and adapter layer (single package, closed filename whitelist)
+       │    ├─ adapter.go           [required] core.Vendor implementation + Instances/Configure/Match + ConfigFields
+       │    ├─ chat.go              [required] protocol endpoints, signing/headers, payload transforms, Chat/ChatStream, SSE
+       │    ├─ credential.go        [required] credential parsing/ownership/storage, device identity, helpers
+       │    ├─ models.go            [required] model catalog/probing + bundledModels() fallback
+       │    ├─ errors.go            [required] upstream error classification and retryability
+       │    ├─ login.go             [required] AuthMode + login flows + refresh (exactly one)
+       │    ├─ tasks.go             [optional] quota/check-in/plans/tasks/daily rewards/account profile
+       │    ├─ *_test.go            [as needed] beside the source; live tests use *_live_test.go
+       │    └─ assets/              [as needed] go:embed resources
+       └─ internal/core            vendor-neutral contracts
+```
+
+- Vendor packages may depend only on `core` + `hostbridge` + `logger`.
+- `internal/core` depends only on the standard library; only `internal/app/vendors.go` may import concrete vendors.
+- Every new internal package must declare its layer boundary (`layerRules` / `internalPackages`).
+- Root-package (C ABI) tests live beside the source (`cgo_test.go`; host-buffer and read-only-page cases in `cgo_hostbuffer_test.go` on POSIX), not under `tests/`.
+
+## Acknowledgments & Third-Party Notices
+
+This project references or adapts protocol designs, ABI contracts, and metadata from the following open-source projects:
+
+- **[router-for-me/CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)** (MIT): Host plugin ABI/API contracts (`cpasdk/`) and HTTP/SSE bridge design.
+- **[Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)** & **[linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel)** (MIT): WorkBuddy protocol adaptation, prompt sanitization, and task system reference.
+- **[aimod-cc/Agent2API](https://github.com/aimod-cc/Agent2API)**: AutoClaw and Raccoon protocol adaptation (header set/signing, proxy channel, authorize login, model catalog, points & check-in semantics) reference.
+
+## Contributing
+
+Friendly discussion is welcome. If you run into issues, try asking Claude Code, Codex, or similar tools for help first — most problems can be solved that way. PRs are even better.
+
+## License
+
+[MIT](LICENSE)

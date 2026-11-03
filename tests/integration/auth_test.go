@@ -21,8 +21,8 @@ import (
 //
 // 守卫的问题：宿主靠 AuthLoginStartResponse.Metadata 里的 vendor 字段把登录
 // 会话绑定回具体供应商；缺了它宿主拿不到授权链接，页面只显示「获取授权链接
-// 失败」。这条约束曾经只靠各供应商自己记得设置，导致 codearts / trae /
-// traesolo 三个供应商长期无法添加账号——而插件侧 LoginStart 明明成功返回了
+// 失败」。这条约束曾经只靠各供应商自己记得设置，导致 codearts / trae 等
+// 供应商长期无法添加账号——而插件侧 LoginStart 明明成功返回了
 // URL，日志上只有一句 "started login"，排查方向被完全带偏。
 //
 // 现在标识由根层（auth_login.go 的分发点）统一注入，本用例即该契约的守卫。
@@ -89,15 +89,20 @@ func TestAuthParseVendorOwnershipDiscrimination(t *testing.T) {
 		// 既有供应商：仍按各自约定认领。
 		{"workbuddy nested", "workbuddycn-u1.json", "", `{"account":{"uid":"u1"},"auth":{"accessToken":"at","realm":"cn"}}`, true},
 		{"qoder pt token", "qodercn-u1.json", "", `{"token":"pt-abc"}`, true},
-		// 新增供应商：ZCode, TraeSOLO, Trae国内版/国际版, CodeArts, MiniMax Code
+		// 新增供应商：ZCode, Trae 国内版/国际版, CodeArts, MiniMax Code
 		{"zcode filename", "zcode-key1.json", "", `{"api_key":"abc.123"}`, true},
-		{"traesolo filename", "traesolo-user1.json", "", `{"accessToken":"at_123","refreshToken":"rt_456"}`, true},
 		{"traecn filename", "traecn-user1.json", "", `{"accessToken":"at_123"}`, true},
 		{"traeglobal filename", "traeglobal-user1.json", "", `{"accessToken":"at_123","region":"global"}`, true},
 		{"codearts filename", "codearts-user1.json", "", `{"access_key_id":"ak","secret_access_key":"sk"}`, true},
 		{"minimaxcodecn filename", "minimaxcodecn-user1.json", "", `{"token":"at_123"}`, true},
 		{"minimaxcodeglobal filename", "minimaxcodeglobal-user1.json", "", `{"token":"at_123","region":"global"}`, true},
 
+		// 新增供应商：AutoClaw 国内版/国际版、小浣熊。
+		{"autoclawcn filename", "autoclawcn-user1.json", "", `{"accessToken":"at","refreshToken":"rt","region":"cn"}`, true},
+		{"autoclawglobal filename", "autoclawglobal-user1.json", "", `{"accessToken":"at","refreshToken":"rt","region":"global"}`, true},
+		{"autoclaw vendor field", "acc.json", "", `{"vendor":"autoclawcn","accessToken":"at"}`, true},
+		{"raccoon filename", "raccoon-7591340.json", "", `{"access_token":"a","refresh_token":"r","uid":"7591340"}`, true},
+		{"raccoon pinyin filename", "xiaohuanxiong-u1.json", "", `{"access_token":"a","refresh_token":"r","uid":"1"}`, true},
 		// 跨供应商误吞防护：通用结构必须落在**正确**的供应商头上。
 		{"qoder pt token is qoder", "acc.json", "", `{"access_token":"pt-abc"}`, true},
 		{"cline camel is cline", "acc.json", "", `{"accessToken":"at","refreshToken":"rt"}`, true},
@@ -209,15 +214,6 @@ func startVendorLogin(t *testing.T, vendorID string) pluginapi.AuthLoginStartRes
 	}
 	return response
 }
-
-// codeartsPastedCallback 是浏览器授权后停在 127.0.0.1 上的真实回调链接样本。
-//
-// 关键证据：ticket_id / secret 均为**华为云签发**，不是 LoginStart 送进
-// /authorize 的那一对；插件此前拿自造值轮询，控制台因此永远停在「等待授权中…」。
-const codeartsPastedCallback = "http://127.0.0.1/oauth/callback?secret=d55df9259e688e2a71b93f058c748349782ca1a30440473980961ef6833ee280" +
-	"&redirect=https%3A%2F%2Fcodearts.huaweicloud.com%2Fportal%2Flogin%3Ftheme%3Dlight%26locale%3Dzh-cn" +
-	"%26ticket_id%3D657abbb247eab363d1a461285fc50145%26authorizationAvailable%3Dfalse" +
-	"%26secret%3Dd55df9259e688e2a71b93f058c748349782ca1a30440473980961ef6833ee280"
 
 const codeartsUpstreamSecret = "0628ec6bf686e409a532e813dc1a0140e49d1dcef1f96e2252f5a67e01d715d9"
 
@@ -350,5 +346,39 @@ func TestSubmitLoginCallbackRejectsSessionlessVendor(t *testing.T) {
 	if _, errSubmit := testApp.SubmitLoginCallback(
 		context.Background(), started.State, "http://127.0.0.1/authorize?a=1"); errSubmit == nil {
 		t.Fatal("没有本地回调的供应商必须拒绝粘贴")
+	}
+}
+
+// TestVendorAccountLimitEnforced 验证单供应商账号上限行为。
+//
+// core.MaxAccountsPerVendor 为 0 时表示不限制，账号数量只由宿主 auth 目录决定。
+func TestVendorAccountLimitEnforced(t *testing.T) {
+	host := installFakeHost(t)
+	setupTestPlugin(t)
+
+	seeded := 15
+	if core.MaxAccountsPerVendor > 0 {
+		seeded = core.MaxAccountsPerVendor
+	}
+	for i := 1; i <= seeded; i++ {
+		id := string(rune(96 + i))
+		host.AddAccount(id, "codearts-user-"+id+".json", `{"vendor":"codearts","access_key_id":"ak","secret_access_key":"sk"}`)
+	}
+
+	if core.MaxAccountsPerVendor > 0 {
+		_, errStart := testApp.HandleMethod(pluginabi.MethodAuthLoginStart, mustMarshal(map[string]any{
+			"metadata": map[string]any{core.VendorKey: "codearts"},
+		}))
+		if errStart == nil || !strings.Contains(errStart.Error(), "最多添加") {
+			t.Fatalf("expected account limit error for codearts, got %v", errStart)
+		}
+		return
+	}
+
+	// 不限制时，即使已有远超旧上限的账号，仍可继续发起登录。
+	if _, errStart := testApp.HandleMethod(pluginabi.MethodAuthLoginStart, mustMarshal(map[string]any{
+		"metadata": map[string]any{core.VendorKey: "codearts"},
+	})); errStart != nil {
+		t.Fatalf("账号不限制时发起登录不应失败，got %v", errStart)
 	}
 }

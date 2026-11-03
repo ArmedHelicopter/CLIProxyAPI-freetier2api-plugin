@@ -2,8 +2,8 @@ package tests
 
 import (
 	"encoding/json"
-	"net/http"
 	"testing"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -33,10 +33,12 @@ func TestRegisterReturnsFullContract(t *testing.T) {
 		t.Fatalf("all five capabilities must be declared: %+v", capabilities)
 	}
 	// model.for_auth 只在 executor_model_scope 含 oauth/both 时才被宿主调用；
-	// 声明错会让 realm 隔离静默失效。
-	if capabilities.ExecutorModelScope != string(pluginapi.ExecutorModelScopeBoth) {
-		t.Fatalf("executor_model_scope = %q, want %q (model.for_auth depends on it)",
-			capabilities.ExecutorModelScope, pluginapi.ExecutorModelScopeBoth)
+	// 声明错会让 realm 隔离静默失效。反过来，声明 both 会让宿主把 static 目录
+	// 另外注册成一个 model-registry 客户端，与按凭证注册的客户端重复计数——
+	// 删除凭证后模型停在 refcount 1（issue #58 的幽灵模型）。
+	if capabilities.ExecutorModelScope != string(pluginapi.ExecutorModelScopeOAuth) {
+		t.Fatalf("executor_model_scope = %q, want %q (models are auth-bound only)",
+			capabilities.ExecutorModelScope, pluginapi.ExecutorModelScopeOAuth)
 	}
 	// 只声明 chat-completions：多协议由宿主翻译。
 	if len(capabilities.ExecutorInputFormats) != 1 || capabilities.ExecutorInputFormats[0] != app.FormatChatCompletions {
@@ -163,6 +165,12 @@ func TestAuthParsePutsRefreshTokenInMetadata(t *testing.T) {
 	if response.Auth.Metadata["refresh_token"] == nil {
 		t.Fatal("metadata.refresh_token is required for host-driven refresh")
 	}
+	if response.Auth.Metadata["refresh_interval_seconds"] != float64(1800) {
+		t.Fatalf("metadata.refresh_interval_seconds = %v, want 1800", response.Auth.Metadata["refresh_interval_seconds"])
+	}
+	if response.Auth.NextRefreshAfter.IsZero() || response.Auth.NextRefreshAfter.After(time.Now().Add(31*time.Minute)) {
+		t.Fatalf("NextRefreshAfter = %v, want within one refresh interval", response.Auth.NextRefreshAfter)
+	}
 	if response.Auth.Metadata["realm"] != "cn" {
 		t.Fatalf("metadata.realm = %v, want cn", response.Auth.Metadata["realm"])
 	}
@@ -174,29 +182,5 @@ func TestAuthParsePutsRefreshTokenInMetadata(t *testing.T) {
 	}
 	if _, okKey := response.Auth.Attributes["access_token"]; okKey {
 		t.Fatal("attributes must not leak access_token")
-	}
-}
-
-// TestManagementAutoAllRouteDispatched 验证 /tasks/auto_all 路由分发成功且不报 404。
-func TestManagementAutoAllRouteDispatched(t *testing.T) {
-	installFakeHost(t)
-	setupTestPlugin(t)
-
-	raw, err := testApp.HandleMethod(pluginabi.MethodManagementHandle, mustMarshal(pluginapi.ManagementRequest{
-		Method: "POST",
-		Path:   "/v0/management/plugins/freetier2api/tasks/auto_all",
-	}))
-	if err != nil {
-		t.Fatalf("handleMethod error: %v", err)
-	}
-	var env abiEnvelope
-	_ = json.Unmarshal(raw, &env)
-	var resp pluginapi.ManagementResponse
-	_ = json.Unmarshal(env.Result, &resp)
-	if resp.StatusCode == http.StatusNotFound {
-		t.Fatalf("/tasks/auto_all must be routed, got 404: %s", string(resp.Body))
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("/tasks/auto_all expected 200, got: %d", resp.StatusCode)
 	}
 }

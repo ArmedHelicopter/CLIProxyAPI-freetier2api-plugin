@@ -12,7 +12,6 @@ package cline
 import (
 	"context"
 	"strings"
-	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -25,9 +24,8 @@ import (
 type adapter struct {
 	*core.NativeAdapter[*Credential]
 	baseURL string
-	// creditsMu 保护 credits：最近一次模型清单里的计费档。
-	creditsMu sync.RWMutex
-	credits   map[string]string
+	// credits 是最近一次模型清单里的计费档（并发安全，见 core.CreditTable）。
+	credits core.CreditTable
 }
 
 // pendingLogin 是一次进行中的 Cline 登录（会话数据）。
@@ -98,7 +96,7 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	if errModels != nil {
 		// 探测失败退回内置兜底清单：没有模型注册比注册一份可能过时的
 		// 清单更糟（客户端会看不到任何模型）。
-		logger.Debug("cline: list models failed, using bundled list: %v", errModels)
+		logger.Debug("cline：拉取模型列表失败，改用内置清单：%v", errModels)
 		models = bundledModels()
 	}
 	return v.modelsToPluginAPI(models), nil
@@ -106,15 +104,9 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 
 // modelsToPluginAPI 把上游模型条目转成宿主契约类型。
 func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
-	credits := make(map[string]string, len(models))
-	for _, model := range models {
-		if label := costLabel(model.Cost); label != "" {
-			credits[model.ID] = label
-		}
-	}
-	v.creditsMu.Lock()
-	v.credits = credits
-	v.creditsMu.Unlock()
+	core.FillCredits(&v.credits, models,
+		func(model Model) string { return model.ID },
+		func(model Model) string { return costLabel(model.Cost) })
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		id := strings.TrimSpace(model.ID)
 		if id == "" {
@@ -166,16 +158,7 @@ func describeModel(model Model) string {
 // 控制台的「费用倍率」列直接展示这个文案；免费/订阅是 Cline 能给出的
 // 最精确的成本信息（上游不提供数值倍率）。
 func (v *adapter) ModelCredits() map[string]string {
-	v.creditsMu.RLock()
-	defer v.creditsMu.RUnlock()
-	if len(v.credits) == 0 {
-		return nil
-	}
-	out := make(map[string]string, len(v.credits))
-	for id, value := range v.credits {
-		out[id] = value
-	}
-	return out
+	return v.credits.Snapshot()
 }
 
 // costLabel 把计费档转成展示文案；未知档返回空串。
@@ -239,7 +222,7 @@ func (v *adapter) LoginStart(ctx context.Context, _ map[string]any) (*pluginapi.
 	}
 	sessionID := "cline_" + core.RandomHex(16)
 	v.Env.Logins.Register(VendorID, sessionID, time.Until(device.ExpiresAt), device.Interval, &pendingLogin{deviceCode: device.DeviceCode})
-	logger.Info("started cline login (user_code=%s)", device.UserCode)
+	logger.Info("已发起 cline 登录（用户码=%s）", device.UserCode)
 	return &pluginapi.AuthLoginStartResponse{
 		Provider:  core.ProviderKey,
 		URL:       device.VerificationURI,
@@ -301,7 +284,7 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 		}, nil
 	}
 	label := core.FirstNonEmpty(credential.Label, credential.Email, credential.AccountID)
-	logger.Info("completed cline login for %s", core.FirstNonEmpty(credential.Email, credential.AccountID))
+	logger.Info("cline 登录完成：%s", core.FirstNonEmpty(credential.Email, credential.AccountID))
 	return &pluginapi.AuthLoginPollResponse{
 		Status:  pluginapi.AuthLoginStatusSuccess,
 		Message: "登录成功",
@@ -318,3 +301,13 @@ func (v *adapter) LoginPoll(ctx context.Context, state string) (*pluginapi.AuthL
 func (v *adapter) ConfigFields() []pluginapi.ConfigField {
 	return []pluginapi.ConfigField{{Name: "cline_base_url", Type: pluginapi.ConfigFieldTypeString, Description: "上游基地址覆盖。"}}
 }
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor               = (*adapter)(nil)
+	_ core.AuthModeReporter     = (*adapter)(nil)
+	_ core.Configurable         = (*adapter)(nil)
+	_ core.ConfigFieldsProvider = (*adapter)(nil)
+	_ core.CreditsProvider      = (*adapter)(nil)
+	_ core.LoginProvider        = (*adapter)(nil)
+)

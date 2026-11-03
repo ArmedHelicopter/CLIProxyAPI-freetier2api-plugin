@@ -9,11 +9,14 @@ package auth
 
 import (
 	"context"
+	"fmt"
+	"net/http"
 	"os"
 	"strings"
 
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/hostbridge"
+	"freetier2api-plugin/internal/logger"
 )
 
 // Resolver 由根层注入：把原始凭证解析成 (Credential, Vendor)。
@@ -72,6 +75,7 @@ func (p *Pool) Load(ctx context.Context, callbackID string, opts Options) ([]Acc
 	accounts := make([]Account, 0, len(entries))
 	failures := make([]Failure, 0)
 	seen := map[string]bool{}
+	vendorCounts := map[string]int{}
 	for _, entry := range entries {
 		if !opts.IncludeDisabled && !entry.Usable() {
 			continue
@@ -104,11 +108,77 @@ func (p *Pool) Load(ctx context.Context, callbackID string, opts Options) ([]Acc
 			}
 			seen[uid] = true
 		}
+		if core.MaxAccountsPerVendor > 0 && vendorCounts[vendor.ID()] >= core.MaxAccountsPerVendor {
+			failures = append(failures, Failure{Entry: entry, Message: fmt.Sprintf("超过单供应商 %d 个账号上限", core.MaxAccountsPerVendor)})
+			continue
+		}
 		account := Account{Entry: entry, Credential: credential, Vendor: vendor, RawJSON: raw, FilePath: filePath}
 		if opts.Filter != nil && !opts.Filter(account) {
 			continue
 		}
+		vendorCounts[vendor.ID()]++
 		accounts = append(accounts, account)
 	}
 	return accounts, failures
+}
+
+// CheckVendorLimit 校验目标供应商是否已达到单供应商账号上限（MaxAccountsPerVendor）。
+//
+// candidateFileName 非空时，若该文件对应同供应商下已存在的账号（同名覆盖更新），
+// 则放行；新增账号在已有数量达到上限时返回 400 PluginError。
+func (p *Pool) CheckVendorLimit(ctx context.Context, callbackID string, vendor core.Vendor, candidateFileName string) error {
+	if p == nil || vendor == nil {
+		return nil
+	}
+	loaded, _ := p.Load(ctx, callbackID, Options{IncludeDisabled: true})
+	candidateID := strings.TrimSuffix(strings.TrimSpace(candidateFileName), ".json")
+	count := 0
+	for _, account := range loaded {
+		if account.Vendor.ID() != vendor.ID() {
+			continue
+		}
+		if candidateID != "" && (account.Credential.FileIDValue() == candidateID ||
+			strings.TrimSuffix(strings.TrimSpace(account.Entry.Name), ".json") == candidateID ||
+			strings.TrimSuffix(strings.TrimSpace(account.Entry.ID), ".json") == candidateID) {
+			return nil
+		}
+		count++
+	}
+	if core.MaxAccountsPerVendor > 0 && count >= core.MaxAccountsPerVendor {
+		return core.NewPluginError("account_limit_exceeded",
+			fmt.Sprintf("每个供应商最多添加 %d 个账号（%s 已达上限）", core.MaxAccountsPerVendor, vendor.Name()),
+			http.StatusBadRequest)
+	}
+	return nil
+}
+
+// RefreshCredential 保活刷新后从账号池重新取回该账号的凭证。
+//
+// 额度查询（app 侧）与控制台刷新（admin 侧）共用这一段：先跑 keepalive
+// （供应商在这里完成 refresh token → access token 的交换并写回宿主存储），
+// 再从账号池重新加载取到新凭证。两处各写一遍时，任一处忘了重新加载就会拿着
+// 旧凭证重试，401 原样再挂一次。
+//
+// 任一步拿不到就返回 nil，调用方保留原 401 错误如实上报——不要在 nil 上继续
+// 拼请求，也不要把「刷新失败」当成「额度为 0」。
+func RefreshCredential(ctx context.Context, pool *Pool, callbackID, authID, vendorID string, realms []string, keepalive func()) *core.Credential {
+	if pool == nil || authID == "" || vendorID == "" {
+		return nil
+	}
+	if keepalive != nil {
+		keepalive()
+	}
+	loaded, errLoad := pool.Load(ctx, callbackID, Options{Targets: []string{authID}, EnabledRealms: realms})
+	if errLoad != nil {
+		// 加载失败与「刷新后仍然找不到」表现相同（都返回 nil），不记一笔的话
+		// 凭证服务真挂了，排查时只能看到「凭证缺失」（#71 第二轮复审 P2-6）。
+		logger.Debug("刷新后重新加载凭证失败 auth=%s vendor=%s: %v", authID, vendorID, errLoad)
+		return nil
+	}
+	for _, account := range loaded {
+		if account.Vendor != nil && account.Vendor.ID() == vendorID {
+			return account.Credential
+		}
+	}
+	return nil
 }

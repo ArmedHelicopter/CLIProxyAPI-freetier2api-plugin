@@ -50,6 +50,11 @@ type Model struct {
 	SupportsImages bool
 	// Efforts 是可选的推理档位（来自 models.dev 目录）。
 	Efforts []string
+	// Credits 是计费展示文案。
+	//
+	// 只在上游目录明确「输入与输出单价都是 0」时记为零倍率（0.00X）；价格不是
+	// 倍率，有价格的模型不进倍率列（显示「—」），不把美元价伪装成折扣倍数。
+	Credits string
 }
 
 // FetchModels 拉取上游模型清单。
@@ -57,7 +62,7 @@ func FetchModels(ctx context.Context, baseURL, apiKey string) ([]Model, error) {
 	if strings.TrimSpace(apiKey) == "" {
 		return nil, fmt.Errorf("api key is required to list models")
 	}
-	endpoint := BaseURL(baseURL) + ModelsPath
+	endpoint := ModelsBaseURLFor(baseURL) + ModelsPath
 	req, errReq := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if errReq != nil {
 		return nil, fmt.Errorf("build models request: %w", errReq)
@@ -84,6 +89,10 @@ func FetchModels(ctx context.Context, baseURL, apiKey string) ([]Model, error) {
 //
 // 上游返回 OpenAI 风格的 {"data":[{"id":...}]}，但历史上也出现过裸数组
 // 与 {"models":[...]} 两种形态，因此三种都接受。
+//
+// **不按名字过滤**：清单只反映「上游有哪些模型」，是否免费由 models.dev
+// 目录的单价在请求期判定（见 isFreeTierModel）。按名字筛掉不带 "-free"
+// 的零价模型会漏掉 big-pickle 这类官方默认模型。
 func parseModels(body []byte) ([]Model, error) {
 	type rawModel struct {
 		ID            string `json:"id"`
@@ -126,10 +135,6 @@ func parseModels(body []byte) ([]Model, error) {
 	for _, entry := range entries {
 		id := strings.TrimSpace(entry.ID)
 		if id == "" {
-			continue
-		}
-		// 只展示模型ID带 "free" 字符串的模型
-		if !strings.Contains(strings.ToLower(id), "free") {
 			continue
 		}
 		contextWindow := entry.ContextWindow
@@ -208,46 +213,63 @@ type modelsDevEntry struct {
 		Context int64 `json:"context"`
 		Output  int64 `json:"output"`
 	} `json:"limit"`
+	// Cost 是 models.dev 的价格（美元/百万 token，不是倍率）。指针用于区分
+	// 「没有 cost 块」与「cost 全为 0」——前者不能当成免费。
+	Cost *modelsDevCost `json:"cost"`
+}
+
+// modelsDevCost 是 models.dev 的单价（美元/百万 token）。
+//
+// 它不是倍率：换算成折扣倍数没有意义，只用来判定「是否免费」。
+type modelsDevCost struct {
+	Input  float64 `json:"input"`
+	Output float64 `json:"output"`
 }
 
 // modelsDevCatalog 是 provider 下的模型 ID → 条目表。
 type modelsDevCatalog map[string]modelsDevEntry
 
-// modelsDevCache 是目录的进程内缓存（成功与失败分开计时）。
-var modelsDevCache struct {
-	sync.Mutex
+// modelsDevCache 是目录缓存（成功与失败分开计时）。
+//
+// 属于 adapter 实例而不是包级变量：多个 App 实例各缓存各的，互不影响。
+// 零值可用；nil 接收者表示不缓存（一次性调用直接打上游）。
+type modelsDevCache struct {
+	mu         sync.Mutex
 	catalog    modelsDevCatalog
 	validUntil time.Time
 	failedNext time.Time
 }
 
-// fetchModelsDevCatalog 拉取（或命中缓存）models.dev 目录。
-func fetchModelsDevCatalog(ctx context.Context) (modelsDevCatalog, error) {
+// fetch 拉取（或命中缓存）models.dev 目录。
+func (c *modelsDevCache) fetch(ctx context.Context) (modelsDevCatalog, error) {
 	now := time.Now()
-	modelsDevCache.Lock()
-	if modelsDevCache.catalog != nil && now.Before(modelsDevCache.validUntil) {
-		catalog := modelsDevCache.catalog
-		modelsDevCache.Unlock()
-		return catalog, nil
-	}
-	failing := now.Before(modelsDevCache.failedNext)
-	modelsDevCache.Unlock()
-	if failing {
-		return nil, fmt.Errorf("models.dev catalog recently failed; negative cache")
+	if c != nil {
+		c.mu.Lock()
+		if c.catalog != nil && now.Before(c.validUntil) {
+			catalog := c.catalog
+			c.mu.Unlock()
+			return catalog, nil
+		}
+		failing := now.Before(c.failedNext)
+		c.mu.Unlock()
+		if failing {
+			return nil, fmt.Errorf("models.dev catalog recently failed; negative cache")
+		}
 	}
 
 	catalog, errFetch := loadModelsDevCatalog(ctx)
-	now = time.Now()
-	modelsDevCache.Lock()
-	if errFetch != nil {
-		modelsDevCache.failedNext = now.Add(modelsDevNegativeTTL)
-		modelsDevCache.Unlock()
-		return nil, errFetch
+	if c != nil {
+		now = time.Now()
+		c.mu.Lock()
+		if errFetch != nil {
+			c.failedNext = now.Add(modelsDevNegativeTTL)
+		} else {
+			c.catalog = catalog
+			c.validUntil = now.Add(modelsDevCacheTTL)
+		}
+		c.mu.Unlock()
 	}
-	modelsDevCache.catalog = catalog
-	modelsDevCache.validUntil = now.Add(modelsDevCacheTTL)
-	modelsDevCache.Unlock()
-	return catalog, nil
+	return catalog, errFetch
 }
 
 // loadModelsDevCatalog 发起一次目录请求并解析出 ZEN 对应的 provider。
@@ -292,17 +314,39 @@ func parseModelsDevCatalog(body []byte) (modelsDevCatalog, error) {
 	return provider.Models, nil
 }
 
-// enrichWithModelsDev 用 models.dev 目录补全模型元数据。
+// enrich 用 models.dev 目录补全模型元数据。
 //
 // 只在字段为空时填充（ZEN /v1/models 未来若返回元数据则优先）；目录不可
 // 用时只记一条 info，模型列表本身照常返回。
-func enrichWithModelsDev(ctx context.Context, models []Model) {
-	catalog, errCatalog := fetchModelsDevCatalog(ctx)
+func (c *modelsDevCache) enrich(ctx context.Context, models []Model) {
+	catalog, errCatalog := c.fetch(ctx)
 	if errCatalog != nil {
-		logger.Info("opencodezen: models.dev catalog unavailable, keep fallback metadata: %v", errCatalog)
+		logger.Info("opencodezen：models.dev 目录不可用，保留兜底元数据：%v", errCatalog)
 		return
 	}
 	applyModelsDevCatalog(models, catalog)
+}
+
+// freeOnly 只保留免费层模型（目录判定单价为 0）。
+//
+// 本供应商的定位是「接入免费额度」：上游 /v1/models 同时返回几十个付费
+// 模型和调试用的 test 模型，全部注册会把宿主的模型列表撑到上百条，且
+// 付费模型在本插件里必然 402。因此按目录单价筛：目录里没有的模型
+// （如上游的 test）一律不展示——没有价格数据就无法判定它属于免费层。
+//
+// 目录整体不可用时**不过滤**：宁可多展示，也不能因为一次目录抖动让
+// 所有免费模型消失。此时 isFreeTierModel 会退回按名字判定。
+func freeOnly(models []Model, catalog modelsDevCatalog) []Model {
+	if len(catalog) == 0 {
+		return models
+	}
+	out := make([]Model, 0, len(models))
+	for _, model := range models {
+		if free, known := catalogIsFree(catalog, model.ID); known && free {
+			out = append(out, model)
+		}
+	}
+	return out
 }
 
 // applyModelsDevCatalog 把目录条目合并进模型清单（纯函数，只填空字段）。
@@ -336,6 +380,12 @@ func applyModelsDevCatalog(models []Model, catalog modelsDevCatalog) {
 		}
 		if model.Description == "" && entry.Description != "" {
 			model.Description = entry.Description
+		}
+		// 免费信号来自目录的 price 全 0；只做这一种判定，价格本身不进倍率列。
+		// 展示成数值倍率 "0.00X" 而不是「免费」：控制台这一列是费用倍率，
+		// 同一列里混汉字会让排序/比较失去意义。
+		if model.Credits == "" && entry.Cost != nil && entry.Cost.Input == 0 && entry.Cost.Output == 0 {
+			model.Credits = "0.00X"
 		}
 	}
 }

@@ -1,9 +1,14 @@
 package zcode
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"time"
+
+	"freetier2api-plugin/internal/core"
 )
 
 // 对话转换测试：请求侧（tools / tool_calls / tool role / 多模态）与
@@ -233,7 +238,8 @@ func TestConvertResponseMapsToolUse(t *testing.T) {
 	}
 }
 
-// collectChunks 驱动流式转换器并收集所有产出。
+// collectChunks 驱动一次完整流并收集所有产出，与 ChatStream 的生命周期一致：
+// emitStart → 逐条 feed → EOF 时补齐终片（emitFinish 幂等，正常结束不重复）。
 func collectChunks(t *testing.T, events []string) []map[string]any {
 	t.Helper()
 	converter := newStreamConverter("GLM-5.3")
@@ -257,6 +263,9 @@ func collectChunks(t *testing.T, events []string) []map[string]any {
 		if errFeed := converter.feed(parsed, appendChunk); errFeed != nil {
 			t.Fatalf("feed: %v", errFeed)
 		}
+	}
+	if errFinish := converter.emitFinish("", appendChunk); errFinish != nil {
+		t.Fatalf("emit finish: %v", errFinish)
 	}
 	return out
 }
@@ -346,19 +355,34 @@ func TestClassifyEmbeddedError(t *testing.T) {
 	}
 }
 
-func TestResolveTargetURLRequiresAPIKey(t *testing.T) {
-	// 有 API Key 时打到 api.z.ai 的回退端点。
-	target, errResolve := resolveTargetURL("", &Credential{APIKey: "k.s"})
+func TestResolveTargetURLPrefersStartPlanAndUltraGateway(t *testing.T) {
+	// 具备 JWT 时优先走 Start Plan 通道。
+	target, errResolve := resolveTargetURL("", &Credential{JWTToken: "a.b.c", APIKey: "k.s"})
 	if errResolve != nil {
 		t.Fatalf("unexpected error: %v", errResolve)
 	}
-	if target != ZAIOrigin+PathAPIMessages {
-		t.Fatalf("target = %q", target)
+	if target != ZCodeOrigin+PathPlanMessages {
+		t.Fatalf("target = %q, want %q", target, ZCodeOrigin+PathPlanMessages)
 	}
 
-	// 只有 JWT 时必须明确拒绝，而不是发出必然 3007 的请求。
-	if _, errResolve := resolveTargetURL("", &Credential{JWTToken: "a.b.c"}); errResolve == nil {
-		t.Fatal("缺少 API Key 时必须拒绝，而不是走需要验证码的 Plan 通道")
+	// 仅持 API Key 时默认走 ZCode Ultra 网关（避免国内直连 api.z.ai DNS 失败）。
+	target, errResolve = resolveTargetURL("", &Credential{APIKey: "k.s"})
+	if errResolve != nil {
+		t.Fatalf("unexpected error: %v", errResolve)
+	}
+	if target != ZCodeOrigin+PathUltraZAIMessages {
+		t.Fatalf("target = %q, want %q", target, ZCodeOrigin+PathUltraZAIMessages)
+	}
+
+	// 显式指定 baseURL 时走自定义基地址。
+	target, errResolve = resolveTargetURL("https://custom.zcode.test/", &Credential{APIKey: "k.s"})
+	if errResolve != nil || target != "https://custom.zcode.test"+PathAPIMessages {
+		t.Fatalf("custom target = %q, err = %v", target, errResolve)
+	}
+
+	// 两者都缺失时报错。
+	if _, errResolve := resolveTargetURL("", &Credential{}); errResolve == nil {
+		t.Fatal("缺少 JWT 与 API Key 时必须拒绝")
 	}
 }
 
@@ -369,25 +393,56 @@ func TestApplyStartPlanSystemIsIdempotent(t *testing.T) {
 	}
 	applyStartPlanSystem(body, "GLM-5.3")
 	first, _ := body["system"].([]any)
-	if len(first) == 0 {
-		t.Fatal("身份块未注入")
+	if len(first) != 3 {
+		t.Fatalf("system 块数 = %d, want 3（cli_prefix / stable / dynamic）", len(first))
 	}
 
-	// 重复调用不得重复拼接（上游按内容审查，重复块会被判异常）。
+	// 重复调用不得重复拼接（上游按内容审查，超过 3 块会被判 3012 异常）。
 	applyStartPlanSystem(body, "GLM-5.3")
 	second, _ := body["system"].([]any)
 	if len(second) != len(first) {
 		t.Fatalf("重复注入改变了块数: %d != %d", len(second), len(first))
 	}
 
-	// 官方块在最前，用户原有 system 保留在后。
+	// 首块为 CLI prefix（无 cache_control），末块内嵌模型名与用户 system（Output Style 槽位）。
 	head, _ := second[0].(map[string]any)
 	if !strings.Contains(head["text"].(string), "ZCode") {
 		t.Fatalf("首块应为官方身份块: %v", head)
 	}
+	if head["cache_control"] != nil {
+		t.Fatalf("首块 CLI prefix 不应携带 cache_control: %v", head)
+	}
 	tail, _ := second[len(second)-1].(map[string]any)
-	if tail["text"] != "user instructions" {
-		t.Fatalf("用户 system 应保留: %v", tail)
+	tailText, _ := tail["text"].(string)
+	if !strings.Contains(tailText, "account:zai-start-plan/GLM-5.3") {
+		t.Fatalf("动态块应包含当前模型标识: %s", tailText)
+	}
+	if !strings.Contains(tailText, "# Output Style: custom\nuser instructions") {
+		t.Fatalf("用户 system 应内嵌在动态块的 Output Style 槽位: %s", tailText)
+	}
+}
+
+func TestConvertMessagesMergesConsecutiveToolResults(t *testing.T) {
+	body := anthropicBody(t, `{
+		"model": "GLM-5.3",
+		"messages": [
+			{"role": "user", "content": "check two files"},
+			{"role": "assistant", "content": null, "tool_calls": [
+				{"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{}"}},
+				{"id": "call_2", "type": "function", "function": {"name": "read", "arguments": "{}"}}
+			]},
+			{"role": "tool", "tool_call_id": "call_1", "content": "file_a"},
+			{"role": "tool", "tool_call_id": "call_2", "content": "file_b"}
+		]
+	}`, nil)
+	messages, _ := body["messages"].([]any)
+	if len(messages) != 3 {
+		t.Fatalf("连续 tool 消息应合并为单条 user 消息, got %d messages: %v", len(messages), messages)
+	}
+	toolUser, _ := messages[2].(map[string]any)
+	blocks, _ := toolUser["content"].([]any)
+	if len(blocks) != 2 {
+		t.Fatalf("合并后应含 2 个 tool_result 块, got %d: %v", len(blocks), blocks)
 	}
 }
 
@@ -414,4 +469,319 @@ func TestApplyCacheControl(t *testing.T) {
 	if _, isString := first["content"].(string); !isString {
 		t.Fatalf("非末条消息不应被改写: %v", first["content"])
 	}
+}
+
+// ---- Start Plan 出站闸门 ----
+
+// TestChatGateSerializesPerAccount 验证同账号闸门串行：持有者未释放时后来者
+// 排队，释放后可再次获取；不同账号互不阻塞。
+func TestChatGateSerializesPerAccount(t *testing.T) {
+	gate := newChatGate()
+
+	release, errAcquire := gate.acquire(context.Background(), "uid:user-a")
+	if errAcquire != nil {
+		t.Fatalf("first acquire: %v", errAcquire)
+	}
+
+	ctxQuick, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	if _, errSecond := gate.acquire(ctxQuick, "uid:user-a"); errSecond == nil {
+		t.Fatal("second acquire must block while the slot is held")
+	}
+
+	release()
+	releaseAgain, errThird := gate.acquire(context.Background(), "uid:user-a")
+	if errThird != nil {
+		t.Fatalf("acquire after release: %v", errThird)
+	}
+	releaseAgain()
+
+	releaseOther, errOther := gate.acquire(context.Background(), "uid:user-b")
+	if errOther != nil {
+		t.Fatalf("other account must not be blocked: %v", errOther)
+	}
+	releaseOther()
+}
+
+// TestChatGateRespectsCancelledContext 验证宿主取消请求时排队者立即退出。
+func TestChatGateRespectsCancelledContext(t *testing.T) {
+	gate := newChatGate()
+	release, errAcquire := gate.acquire(context.Background(), "uid:cancel")
+	if errAcquire != nil {
+		t.Fatalf("first acquire: %v", errAcquire)
+	}
+	defer release()
+
+	ctxCancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, errSecond := gate.acquire(ctxCancelled, "uid:cancel"); errSecond == nil {
+		t.Fatal("cancelled context must not acquire a held slot")
+	}
+}
+
+// TestHoldStartPlanSlotSkipsAPIKeyChannel 验证纯 API Key 通道不进闸门：该通道
+// 没有 3008/3009/3010 并发上限，不能被同账号的在途对话挡在队列里。
+func TestHoldStartPlanSlotSkipsAPIKeyChannel(t *testing.T) {
+	v := &adapter{gate: newChatGate()}
+	cred := &Credential{APIKey: "k.s"} // 无 JWT，走网关通道
+
+	release, errHold := v.holdStartPlanSlot(context.Background(), cred)
+	if errHold != nil {
+		t.Fatalf("api-key channel must not queue: %v", errHold)
+	}
+	release()
+
+	if _, errNil := v.holdStartPlanSlot(context.Background(), nil); errNil != nil {
+		t.Fatalf("nil credential must fall through: %v", errNil)
+	}
+}
+
+// TestHoldStartPlanSlotCancelWhileQueuedIsClientFault 验证排队中宿主断开时按
+// 客户端取消处理（不重试、不计上游故障），而不是当成上游 5xx。
+func TestHoldStartPlanSlotCancelWhileQueuedIsClientFault(t *testing.T) {
+	v := &adapter{gate: newChatGate()}
+	native := &Credential{JWTToken: "jwt", UserID: "u-queued"}
+
+	held, errHeld := v.gate.acquire(context.Background(), native.AccountKey())
+	if errHeld != nil {
+		t.Fatalf("hold slot: %v", errHeld)
+	}
+	defer held()
+
+	ctxCancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, errHold := v.holdStartPlanSlot(ctxCancelled, native)
+	failure, ok := errHold.(*core.Failure)
+	if !ok || failure.Kind != core.FailureKindClient {
+		t.Fatalf("cancel while queued = %v, want client failure", errHold)
+	}
+}
+
+func TestStreamUsageCumulativeAndTerminalOnly(t *testing.T) {
+	chunks := collectChunks(t, []string{
+		`{"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0,"cache_read_input_tokens":80,"cache_creation_input_tokens":20}}}`,
+		`{"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}`,
+		`{"type":"message_delta","delta":{},"usage":{"output_tokens":4}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":9}}`,
+		`{"type":"message_stop"}`,
+	})
+	// 只产生角色、内容、终片；纯 usage 更新不能提前发送 finish_reason。
+	if len(chunks) != 3 {
+		t.Fatalf("expected role/content/finish, got %v", chunks)
+	}
+	for i, chunk := range chunks {
+		choices := chunk["choices"].([]any)
+		if len(choices) != 1 {
+			t.Fatalf("chunk %d has no choice: %v", i, chunk)
+		}
+		if i < len(chunks)-1 {
+			if _, ok := chunk["usage"]; ok {
+				t.Fatalf("interim usage on chunk %d: %v", i, chunk)
+			}
+			if choices[0].(map[string]any)["finish_reason"] != nil {
+				t.Fatalf("premature finish: %v", chunk)
+			}
+		}
+	}
+	u := usageOf(t, chunks[len(chunks)-1])
+	assertUsage(t, u, 200, 9, 209)
+	details := u["prompt_tokens_details"].(map[string]any)
+	if details["cached_tokens"] != float64(80) || details["cache_creation_tokens"] != float64(20) {
+		t.Fatalf("cache detail = %v", details)
+	}
+}
+
+func TestStreamUsageExplicitZeroAndAbsent(t *testing.T) {
+	chunks := collectChunks(t, []string{
+		`{"type":"message_start","message":{"usage":{"input_tokens":12,"cache_read_input_tokens":5,"cache_creation_input_tokens":2}}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"cache_read_input_tokens":0,"output_tokens":3}}`,
+	})
+	assertUsage(t, usageOf(t, chunks[len(chunks)-1]), 2, 3, 5)
+	for _, chunk := range collectChunks(t, []string{`{"type":"message_delta","delta":{"stop_reason":"end_turn"}}`}) {
+		if _, ok := chunk["usage"]; ok {
+			t.Fatalf("invented usage: %v", chunk)
+		}
+	}
+}
+
+func TestStreamUsageToolCall(t *testing.T) {
+	chunks := collectChunks(t, []string{
+		`{"type":"message_start","message":{"usage":{"input_tokens":10}}}`,
+		`{"type":"content_block_start","content_block":{"type":"tool_use","id":"tool_1","name":"bash"}}`,
+		`{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"ls\"}"}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}`,
+	})
+	last := chunks[len(chunks)-1]
+	if last["choices"].([]any)[0].(map[string]any)["finish_reason"] != "tool_calls" {
+		t.Fatalf("tool finish lost: %v", last)
+	}
+	assertUsage(t, usageOf(t, last), 10, 7, 17)
+}
+
+func TestNonstreamAndCollapsedUsage(t *testing.T) {
+	raw := []byte(`{"id":"msg_cache","model":"GLM-5.3-Flash","stop_reason":"end_turn","content":[{"type":"text","text":"OK"}],"usage":{"input_tokens":100,"output_tokens":9,"cache_read_input_tokens":80,"cache_creation_input_tokens":20}}`)
+	converted, err := anthropicToOpenAICompletion(raw, "GLM-5.3-Flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(converted, &document); err != nil {
+		t.Fatal(err)
+	}
+	assertUsage(t, usageOf(t, document), 200, 9, 209)
+	var chunks []map[string]any
+	err = emitCollapsedCompletion(converted, "GLM-5.3-Flash", func(b []byte) error {
+		var chunk map[string]any
+		if err := json.Unmarshal(b, &chunk); err != nil {
+			return err
+		}
+		chunks = append(chunks, chunk)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, chunk := range chunks[:len(chunks)-1] {
+		if _, ok := chunk["usage"]; ok {
+			t.Fatalf("collapsed interim usage: %v", chunk)
+		}
+	}
+	assertUsage(t, usageOf(t, chunks[len(chunks)-1]), 200, 9, 209)
+}
+
+func TestStreamUsageZeroSnapshot(t *testing.T) {
+	chunks := collectChunks(t, []string{
+		`{"type":"message_start","message":{"usage":{"input_tokens":12,"output_tokens":4}}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":0,"output_tokens":0}}`,
+	})
+	assertUsage(t, usageOf(t, chunks[len(chunks)-1]), 0, 0, 0)
+}
+
+func TestStreamUsageMessageStopFallback(t *testing.T) {
+	for _, tool := range []bool{false, true} {
+		events := []string{`{"type":"message_start","message":{"usage":{"input_tokens":10}}}`}
+		if tool {
+			events = append(events, `{"type":"content_block_start","content_block":{"type":"tool_use","id":"tool_1","name":"bash"}}`)
+		}
+		events = append(events,
+			`{"type":"message_delta","usage":{"output_tokens":7}}`,
+			`{"type":"message_stop"}`, `{"type":"message_stop"}`)
+		chunks := collectChunks(t, events)
+		finishes := 0
+		for _, chunk := range chunks {
+			choice := chunk["choices"].([]any)[0].(map[string]any)
+			if choice["finish_reason"] == nil {
+				continue
+			}
+			finishes++
+			want := "stop"
+			if tool {
+				want = "tool_calls"
+			}
+			if choice["finish_reason"] != want {
+				t.Fatalf("fallback finish=%v, want %s", choice["finish_reason"], want)
+			}
+			assertUsage(t, usageOf(t, chunk), 10, 7, 17)
+		}
+		if finishes != 1 {
+			t.Fatalf("fallback finishes=%d, want 1", finishes)
+		}
+	}
+	// 正常终片之后的 message_stop 不能覆盖 length，也不能重复发送 usage。
+	chunks := collectChunks(t, []string{
+		`{"type":"message_start","message":{"usage":{"input_tokens":10}}}`,
+		`{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":7}}`,
+		`{"type":"message_stop"}`,
+	})
+	if len(chunks) != 2 || chunks[1]["choices"].([]any)[0].(map[string]any)["finish_reason"] != "length" {
+		t.Fatalf("normal terminal duplicated or overwritten: %v", chunks)
+	}
+}
+
+func TestStreamUsageEOFFallback(t *testing.T) {
+	// 上游既不给 stop_reason 也不发 message_stop，只给 usage 就关流：
+	// ChatStream 必须在 EOF 处补终片，且带上已合并的 usage。
+	chunks := collectChunks(t, []string{
+		`{"type":"message_start","message":{"usage":{"input_tokens":10}}}`,
+		`{"type":"content_block_delta","delta":{"type":"text_delta","text":"OK"}}`,
+		`{"type":"message_delta","usage":{"output_tokens":7}}`,
+	})
+	if len(chunks) != 3 {
+		t.Fatalf("expected role/content/finish, got %v", chunks)
+	}
+	last := chunks[len(chunks)-1]
+	choice := last["choices"].([]any)[0].(map[string]any)
+	if choice["finish_reason"] != "stop" {
+		t.Fatalf("EOF fallback finish = %v, want stop", choice["finish_reason"])
+	}
+	assertUsage(t, usageOf(t, last), 10, 7, 17)
+}
+
+func TestMissingUsageOmittedInAllResponsePaths(t *testing.T) {
+	converted, err := anthropicToOpenAICompletion([]byte(`{"content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn"}`), "glm")
+	if err != nil {
+		t.Fatal(err)
+	}
+	check := func(b []byte) error {
+		var chunk map[string]any
+		if err := json.Unmarshal(b, &chunk); err != nil {
+			return err
+		}
+		if _, ok := chunk["usage"]; ok {
+			t.Errorf("missing usage must be omitted: %s", b)
+		}
+		return nil
+	}
+	if err := check(converted); err != nil {
+		t.Fatal(err)
+	}
+	if err := emitCollapsedCompletion(converted, "glm", check); err != nil {
+		t.Fatal(err)
+	}
+	for _, chunk := range collectChunks(t, []string{`{"type":"message_stop"}`}) {
+		if _, ok := chunk["usage"]; ok {
+			t.Fatalf("missing stream usage must be omitted: %v", chunk)
+		}
+	}
+}
+
+func TestStreamUsageErrorAndSinkFailure(t *testing.T) {
+	converter := newStreamConverter("glm")
+	var chunks [][]byte
+	emit := func(b []byte) error { chunks = append(chunks, b); return nil }
+	input := "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":10}}}\n\ndata: {\"type\":\"error\",\"error\":{\"message\":\"interrupted\"}}\n\n"
+	err := parseAnthropicSSE(strings.NewReader(input), converter, emit)
+	if err == nil || !strings.Contains(err.Error(), "interrupted") || len(chunks) != 0 {
+		t.Fatalf("error must propagate without a success/usage chunk: chunks=%q err=%v", chunks, err)
+	}
+	want := errors.New("client disconnected")
+	for _, collapsed := range []bool{false, true} {
+		calls := 0
+		sink := func([]byte) error { calls++; return want }
+		if collapsed {
+			err = emitCollapsedCompletion([]byte(`{"choices":[{"message":{"content":"OK"},"finish_reason":"stop"}],"usage":{"total_tokens":12}}`), "glm", sink)
+		} else {
+			err = converter.feed(map[string]any{"type": "message_delta", "delta": map[string]any{"stop_reason": "end_turn"}}, sink)
+		}
+		if !errors.Is(err, want) || calls != 1 {
+			t.Fatalf("sink error lost or retried: collapsed=%v calls=%d err=%v", collapsed, calls, err)
+		}
+	}
+}
+
+func assertUsage(t *testing.T, usage map[string]any, input, output, total float64) {
+	t.Helper()
+	if usage["prompt_tokens"] != input || usage["completion_tokens"] != output || usage["total_tokens"] != total {
+		t.Fatalf("usage = %v, want input=%v output=%v total=%v", usage, input, output, total)
+	}
+}
+
+// usageOf 取出 payload 的 usage 字段；流式 chunk 与非流式完整文档共用同一形态。
+func usageOf(t *testing.T, payload map[string]any) map[string]any {
+	t.Helper()
+	usage, ok := payload["usage"].(map[string]any)
+	if !ok {
+		t.Fatalf("missing usage: %v", payload)
+	}
+	return usage
 }

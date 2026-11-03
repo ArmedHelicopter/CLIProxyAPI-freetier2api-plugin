@@ -2,6 +2,7 @@ package admin
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -32,7 +33,17 @@ type ratedVendor struct {
 	credits map[string]string
 }
 
-func (v *ratedVendor) ModelCredits() map[string]string { return v.credits }
+// ModelCredits 跟真实供应商一样在本层完成归一化：admin 不再二次格式化，
+// 否则「0」这类合法倍率会被反复改写。
+func (v *ratedVendor) ModelCredits() map[string]string {
+	out := make(map[string]string, len(v.credits))
+	for id, raw := range v.credits {
+		if rate := core.FormatRate(raw); rate != "" {
+			out[id] = rate
+		}
+	}
+	return out
+}
 
 func newTestCatalog(t *testing.T) *Catalog {
 	t.Helper()
@@ -45,6 +56,7 @@ func newTestCatalog(t *testing.T) *Catalog {
 	for _, vendor := range []core.Vendor{
 		&fakeVendor{Meta: core.Meta{VendorID: "workbuddycn", VendorName: "WB CN", VendorRegion: "cn"}},
 		&fakeVendor{Meta: core.Meta{VendorID: "workbuddyglobal", VendorName: "WB Global", VendorRegion: "global"}},
+		&fakeVendor{Meta: core.Meta{VendorID: "codearts", VendorName: "CodeArts", VendorRegion: "cn"}},
 	} {
 		if err := registry.Register(vendor); err != nil {
 			t.Fatal(err)
@@ -198,6 +210,95 @@ func TestMergeSameNameModels(t *testing.T) {
 	}
 }
 
+// TestMergeSameNameModelsUnionsToolParameters 锁定能力取或的两个方向。
+//
+// 回归：之前只并 SupportedGenerationMethods 不并 SupportedParameters，
+// 合并 [无工具条目, 支持工具条目] 会得到「methods 有 tool_calls、params 没有
+// tools」的矛盾组合，客户端据此隐藏工具开关，实际支持的模型反而丢能力。
+func TestMergeSameNameModelsUnionsToolParameters(t *testing.T) {
+	toolModel := pluginapi.ModelInfo{
+		ID:                         "glm-5.2",
+		SupportedGenerationMethods: []string{"tool_calls"},
+		SupportedParameters:        []string{"temperature", "tools", "tool_choice"},
+	}
+	plainModel := pluginapi.ModelInfo{
+		ID:                  "GLM-5.2",
+		SupportedParameters: []string{"temperature", "top_p"},
+	}
+
+	for name, models := range map[string][]pluginapi.ModelInfo{
+		"先无工具有工具":  {plainModel, toolModel},
+		"先有工具后无工具": {toolModel, plainModel},
+	} {
+		merged := MergeSameNameModels(models)
+		if len(merged) != 1 {
+			t.Fatalf("%s: merged len = %d", name, len(merged))
+		}
+		if !slices.Contains(merged[0].SupportedGenerationMethods, "tool_calls") {
+			t.Fatalf("%s: methods = %#v", name, merged[0].SupportedGenerationMethods)
+		}
+		for _, param := range []string{"tools", "tool_choice"} {
+			if !slices.Contains(merged[0].SupportedParameters, param) {
+				t.Fatalf("%s: params = %#v，缺 %q", name, merged[0].SupportedParameters, param)
+			}
+		}
+	}
+}
+
+// TestLoadCachedStateRestoresCapabilities 锁定重启回灌不丢能力。
+//
+// state.json 只存 SupportsImages / SupportsTool，回灌时必须走注册转换
+// 重新派生 modalities / methods / parameters，否则重启后到下一轮探测成功前，
+// 控制台会把视觉模型和工具模型显示成「不支持」。
+func TestLoadCachedStateRestoresCapabilities(t *testing.T) {
+	manager := newTestCatalog(t)
+	manager.LoadCachedState([]core.CachedModel{
+		{VendorID: "codearts", ID: "Qwen3-VL-235B", ContextLength: 131072, MaxOutputTokens: 8192, SupportsImages: true, SupportsTool: true},
+	})
+
+	models := manager.Registered("codearts")
+	if len(models) != 1 {
+		t.Fatalf("cached models = %d", len(models))
+	}
+	info := models[0]
+	if !slices.Contains(info.SupportedInputModalities, "image") {
+		t.Fatalf("modalities = %#v，缺 image", info.SupportedInputModalities)
+	}
+	if !slices.Contains(info.SupportedGenerationMethods, "tool_calls") {
+		t.Fatalf("methods = %#v，缺 tool_calls", info.SupportedGenerationMethods)
+	}
+	for _, param := range []string{"tools", "tool_choice"} {
+		if !slices.Contains(info.SupportedParameters, param) {
+			t.Fatalf("params = %#v，缺 %q", info.SupportedParameters, param)
+		}
+	}
+}
+
+// TestLoadCachedStateDropsRemovedVendor 锁定「已下线供应商不再复活」。
+//
+// 缓存按 vendor_id 落盘，供应商被移除（如 TRAE SOLO 并入国内版）后这些条目
+// 再也没有读取方；若照样回灌，CachedState 会把它们一轮轮写回 state.json，
+// 控制台与禁用清单里就会长期挂着一批不存在的模型。
+func TestLoadCachedStateDropsRemovedVendor(t *testing.T) {
+	manager := newTestCatalog(t)
+	manager.LoadCachedState([]core.CachedModel{
+		{VendorID: "traesolo", ID: "glm-5.2"},
+		{VendorID: "workbuddycn", ID: "glm-5.3"},
+	})
+
+	if got := manager.Registered("traesolo"); len(got) != 0 {
+		t.Fatalf("removed vendor restored %d model(s)", len(got))
+	}
+	if got := manager.Registered("workbuddycn"); len(got) != 1 {
+		t.Fatalf("live vendor cached models = %d, want 1", len(got))
+	}
+	for _, item := range manager.CachedState() {
+		if item.VendorID == "traesolo" {
+			t.Fatal("removed vendor must not be written back to state.json")
+		}
+	}
+}
+
 // TestCacheProbedModelsKeepsPreviousOnEmpty 锁定「探测失败不清空缓存」。
 //
 // 真实事故：OpenCode ZEN 的 model.for_auth 在探测失败时按契约返回空清单
@@ -314,5 +415,104 @@ func TestCreditsChangeTriggersPersist(t *testing.T) {
 	manager.CacheProbedModels("qodercn", []pluginapi.ModelInfo{{ID: "glm-5.3"}})
 	if got := store.Snapshot().Models[0].Credits; got != "0.80X" {
 		t.Fatalf("persisted credits = %q, want 0.80X after repricing", got)
+	}
+}
+
+// legacyVendor 实现 LegacyIDReporter，模拟「从单一 vendorID 拆成多实例」的供应商。
+type legacyVendor struct {
+	fakeVendor
+	legacy []string
+}
+
+func (v *legacyVendor) LegacyIDs() []string { return v.legacy }
+
+// newSplitCatalog 构造 zcodecn / zcodeglobal 两个实例，旧 ID 只在国际版上声明。
+func newSplitCatalog(t *testing.T) *Catalog {
+	t.Helper()
+	store := state.NewStore()
+	store.Configure(t.TempDir())
+	if _, err := store.Load(); err != nil {
+		t.Fatal(err)
+	}
+	registry := core.NewRegistry()
+	for _, vendor := range []core.Vendor{
+		&legacyVendor{fakeVendor: fakeVendor{Meta: core.Meta{VendorID: "zcodecn", VendorName: "ZCode CN", VendorRegion: "cn"}}},
+		&legacyVendor{
+			fakeVendor: fakeVendor{Meta: core.Meta{VendorID: "zcodeglobal", VendorName: "ZCode Global", VendorRegion: "global"}},
+			legacy:     []string{"zcode"},
+		},
+		// 第二个 cn 实例：让区域别名真的对应多家（现实如此），
+		// 才能验证「多实例区域别名不能被当成单一别名作用域」。
+		&fakeVendor{Meta: core.Meta{VendorID: "workbuddycn", VendorName: "WB CN", VendorRegion: "cn"}},
+	} {
+		if err := registry.Register(vendor); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return NewCatalog(store, registry)
+}
+
+// TestLegacyVendorIDKeepsStoredConfig 锁住拆实例后存量配置继续生效。
+//
+// 拆实例换掉了注册表里的 vendorID，用户在 disabled_models 与模型别名里写的
+// <旧ID>:<模型> 必须继续落到演变成的那一个实例，否则升级即静默失效。
+func TestLegacyVendorIDKeepsStoredConfig(t *testing.T) {
+	manager := newSplitCatalog(t)
+
+	// 1) 旧前缀展开成现役键，且只落到国际版。
+	keys := manager.ExpandKeys("zcode:GLM-5.3")
+	if len(keys) != 1 || keys[0] != "zcodeglobal:GLM-5.3" {
+		t.Fatalf("旧前缀展开 = %#v", keys)
+	}
+
+	// 2) 旧前缀的禁用项生效，且不误伤国内版。
+	manager.Configure(ModelSettings{DisabledModels: []string{"zcode:GLM-5.3"}})
+	if !manager.IsDisabled("zcodeglobal", "GLM-5.3") {
+		t.Fatal("旧前缀禁用项应对国际版生效")
+	}
+	if manager.IsDisabled("zcodecn", "GLM-5.3") {
+		t.Fatal("旧前缀禁用项不应影响国内版")
+	}
+	// 带前缀的模型 ID 也要按同一规则判定（客户端可直接请求 vendor:model）。
+	if !manager.IsDisabled("zcodeglobal", "zcode:GLM-5.3") || manager.IsDisabled("zcodecn", "zcode:GLM-5.3") {
+		t.Fatal("带前缀的模型 ID 禁用判定错误")
+	}
+
+	// 3) 存量别名键迁移到现役键：读、反查、清除都要通。
+	manager.ReloadFromState(state.State{ModelAliases: map[string]string{"zcode:GLM-5.3": "my-glm"}})
+	if got := manager.AliasFor("zcodeglobal", "GLM-5.3"); got != "my-glm" {
+		t.Fatalf("存量别名未迁移，AliasFor = %q", got)
+	}
+	if got := manager.ResolveOutboundModel("zcodeglobal", "my-glm"); got != "GLM-5.3" {
+		t.Fatalf("存量别名未参与反查，ResolveOutboundModel = %q", got)
+	}
+	if vendorID, bare := manager.VendorForAliasScope("zcode:GLM-5.3"); vendorID != "zcodeglobal" || bare != "GLM-5.3" {
+		t.Fatalf("别名作用域 = (%q, %q)，want (zcodeglobal, GLM-5.3)", vendorID, bare)
+	}
+	manager.SetAlias("zcodeglobal", "GLM-5.3", "")
+	if got := manager.AliasFor("zcodeglobal", "GLM-5.3"); got != "" {
+		t.Fatalf("清除后别名仍存在：%q", got)
+	}
+	if stored := manager.store.Snapshot().ModelAliases; len(stored) != 0 {
+		t.Fatalf("清除后落盘仍有别名键：%#v", stored)
+	}
+
+	// 4) 区域别名对应多个实例，无法归一成单一别名作用域，交给接口拒绝。
+	if vendorID, _ := manager.VendorForAliasScope("cn:GLM-5.3"); vendorID != "" {
+		t.Fatalf("多实例区域别名不应被当成单实例作用域：%q", vendorID)
+	}
+	// 区域下只有一个实例时归一成它，别名键才能被读回。
+	if vendorID, bare := manager.VendorForAliasScope("global:GLM-5.3"); vendorID != "zcodeglobal" || bare != "GLM-5.3" {
+		t.Fatalf("单实例区域别名 = (%q, %q)", vendorID, bare)
+	}
+}
+
+// TestLegacyVendorIDExpandsExtraModels 锁住 extra_models 里的旧前缀。
+func TestLegacyVendorIDExpandsExtraModels(t *testing.T) {
+	manager := newSplitCatalog(t)
+	manager.Configure(ModelSettings{ExtraModels: []string{"zcode:GLM-5.3"}})
+	extra := manager.ExtraModels()
+	if len(extra) != 1 || extra[0].OwnedBy != "zcodeglobal" || extra[0].ID != "GLM-5.3" {
+		t.Fatalf("extra models = %#v", extra)
 	}
 }

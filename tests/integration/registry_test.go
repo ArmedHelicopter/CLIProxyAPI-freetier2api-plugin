@@ -20,14 +20,11 @@ import (
 	"strings"
 	"testing"
 
-	"freetier2api-plugin/internal/admin"
 	"freetier2api-plugin/internal/app"
 	"freetier2api-plugin/internal/core"
 )
 
 var (
-	// unwrapRe 匹配「再剥一层信封」的写法：.result 后面不接 s（区分合法的 .results）。
-	unwrapRe             = regexp.MustCompile(`\.result\s*[;,)\n]`)
 	pluginIDPattern      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
 	pluginVersionPattern = regexp.MustCompile(`^[0-9][0-9A-Za-z.+-]*$`)
 	githubRepositoryRe   = regexp.MustCompile(`^https://github\.com/[^/]+/[^/]+$`)
@@ -93,41 +90,11 @@ func TestRegistryManifestIsValid(t *testing.T) {
 //
 // 宿主按 {id}{ext} 找动态库；ID 与文件名不一致会让插件静默不被加载。
 func TestPluginIDMatchesLibraryName(t *testing.T) {
-	if app.PluginID != "freetier2api" {
+	if app.PluginID != "freetier" {
 		t.Fatalf("app.PluginID = %q; changing it requires renaming the build output and registry", app.PluginID)
 	}
 	if app.ProviderKey != core.ProviderKey {
 		t.Fatalf("app.ProviderKey (%q) must match core.ProviderKey (%q)", app.ProviderKey, core.ProviderKey)
-	}
-}
-
-// TestConsolePagePathsAreDeclared 验证控制台页引用的路径都在路由表里声明。
-//
-// 页面引用了未声明的路由会表现为「点了没反应」，而宿主不会报错。
-func TestConsolePagePathsAreDeclared(t *testing.T) {
-	installFakeHost(t)
-	setupTestPlugin(t)
-	page := admin.Page(app.ManagementRoutePrefix)
-
-	declared := map[string]bool{}
-	for _, route := range testApp.ManagementRegistration().Routes {
-		suffix := strings.TrimPrefix(route.Path, app.ManagementRoutePrefix)
-		declared[suffix] = true
-	}
-
-	// 页面里通过 MGMT + path 拼接调用接口，因此按已知清单核对。
-	referenced := []string{
-		"/status", "/logs", "/checkin", "/quotas", "/models/refresh",
-		"/models/alias", "/settings", "/tasks/scan", "/tasks/run", "/tasks/queue", "/tasks/auto",
-		"/keepalive",
-	}
-	for _, path := range referenced {
-		if !strings.Contains(page, `"`+path) {
-			t.Fatalf("console page does not reference %q (test list is stale?)", path)
-		}
-		if !declared[path] {
-			t.Fatalf("console page calls %q but the route is not declared", path)
-		}
 	}
 }
 

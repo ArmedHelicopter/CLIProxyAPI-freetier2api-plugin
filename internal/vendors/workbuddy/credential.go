@@ -1,7 +1,7 @@
 package workbuddy
 
 import (
-	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -554,24 +554,12 @@ const (
 	reportGap = 1050 * time.Millisecond
 	// mpActionGap 是小程序任务写动作之间的间隔。
 	mpActionGap = 2 * time.Second
-	// expertSummonGap 是专家召唤链的间隔（实测 8s 成功率最高，取 6s 折中）。
-	expertSummonGap = 6 * time.Second
 	// nightChatGap 是夜间对话之间的间隔。
 	nightChatGap = 4 * time.Second
-	// acceptBatchGap 是批量接受任务的批间间隔。
-	acceptBatchGap = 1050 * time.Millisecond
-	// acceptBatchSize 是批量接受的每批数量。
-	acceptBatchSize = 20
 )
 
 // 异步计分的轮询参数。
 var (
-	// claimPollAttempts 与 claimPollGap 决定普通任务的等待预算（约 12 秒）。
-	claimPollAttempts = 4
-	claimPollGap      = 3 * time.Second
-	// mpPollAttempts / mpPollGap 是小程序任务的等待预算（约 6 秒）。
-	mpPollAttempts = 2
-	mpPollGap      = 3 * time.Second
 	// schoolPollLoops / schoolPollGap 是开学季的等待预算（约 7.5 秒）。
 	schoolPollLoops = 3
 	schoolPollGap   = 2500 * time.Millisecond
@@ -666,7 +654,7 @@ func DesktopChatSequence(conversationID, requestID, messageID, modelID, modelNam
 			"inputLength": 24, "isPlan": false, "isAutoExecuteTerminal": false,
 			"isAutoModify": false, "codebaseEnable": false,
 			"maxToken": 0, "maxSteps": 500, "temperature": 0, "maxRetries": 0,
-			"mentionContexts": []any{}, "knowledgeId": "", "knowledgeName": "",
+			"mentionContexts": []any{}, "knowledgeId": knowledgeIDEmpty, "knowledgeName": knowledgeNameEmpty,
 			"codebaseId": "", "mentionContextCount": 0, "command": "",
 			"expertId": "", "recommendId": "", "skillId": "", "skillCount": 0,
 			"totalCount": 0, "fileUri": "", "presentAt": now,
@@ -806,7 +794,7 @@ func SchoolChatTimesEvents(conversationID, activityID string) []map[string]any {
 		"inputLength": 14, "isPlan": false, "isAutoExecuteTerminal": false,
 		"isAutoModify": false, "codebaseEnable": false,
 		"maxToken": 0, "maxSteps": 500, "temperature": 0, "maxRetries": 0,
-		"mentionContexts": []any{}, "knowledgeId": "", "knowledgeName": "",
+		"mentionContexts": []any{}, "knowledgeId": knowledgeIDEmpty, "knowledgeName": knowledgeNameEmpty,
 		"codebaseId": "", "mentionContextCount": 0, "command": "",
 		"expertId": "", "recommendId": "", "skillId": "", "skillCount": 0,
 		"totalCount": 0, "fileUri": "", "presentAt": nowUnixMs(),
@@ -849,22 +837,6 @@ func MiniExpertUseEvent(expertID, expertName, expertType string) []map[string]an
 
 // SchoolSeasonActivityID 是开学季活动的活动标识（缺它不点亮校园日任务）。
 const SchoolSeasonActivityID = "school_open_day_2026"
-
-// 桌面指纹族请求上下文。
-type desktopContext struct {
-	credential *Credential
-	events     []map[string]any
-}
-
-// run 让事件带上指纹并发出去。
-func (c *desktopContext) run(ctx context.Context, client *Client) error {
-	base := desktopFingerprint(c.credential, client.rt)
-	merged := make([]map[string]any, 0, len(c.events))
-	for _, event := range c.events {
-		merged = append(merged, mergeEvent(base, event))
-	}
-	return client.ReportDesktopEvents(ctx, c.credential, merged)
-}
 
 // ApplyDesktopFingerprint 给事件链注入桌面指纹（导出给 main 包编排使用）。
 func ApplyDesktopFingerprint(credential *Credential, events []map[string]any, rt *runtime) []map[string]any {
@@ -935,13 +907,63 @@ func tailOfString(text string, n int) string {
 
 // 本文件生成请求标识与从请求体里提取会话键。
 
-// NewHexID 生成 32 位十六进制随机 ID（与官方客户端的 messageId 形态一致）。
+// NewHexID 生成 32 位十六进制随机 ID。
 func NewHexID() string {
 	return core.RandomHex(16)
 }
 
 func newHexID() string {
 	return NewHexID()
+}
+
+// NewUUIDv7 生成带连字符的标准 UUIDv7（RFC 9562，36 位）。
+//
+// 官方 5.8.4 客户端的 X-Conversation-ID 要求带连字符的标准 UUID 形态。
+func NewUUIDv7() string {
+	var buf [16]byte
+	if _, errRead := rand.Read(buf[:]); errRead != nil {
+		h := core.RandomHex(16)
+		return fmt.Sprintf("%s-%s-%s-%s-%s", h[0:8], h[8:12], h[12:16], h[16:20], h[20:32])
+	}
+	ms := time.Now().UnixMilli()
+	buf[0] = byte(ms >> 40)
+	buf[1] = byte(ms >> 32)
+	buf[2] = byte(ms >> 24)
+	buf[3] = byte(ms >> 16)
+	buf[4] = byte(ms >> 8)
+	buf[5] = byte(ms)
+	buf[6] = (buf[6] & 0x0F) | 0x70
+	buf[8] = (buf[8] & 0x3F) | 0x80
+	return fmt.Sprintf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+		buf[0], buf[1], buf[2], buf[3],
+		buf[4], buf[5],
+		buf[6], buf[7],
+		buf[8], buf[9],
+		buf[10], buf[11], buf[12], buf[13], buf[14], buf[15])
+}
+
+// NewUUIDv7Hex 生成去横线的 UUIDv7（32 位十六进制）。
+//
+// 官方客户端的 conversationRequestId / messageId 都是 UUIDv7 去横线
+// （客户端断言正则 ^[0-9a-f]{12}7[0-9a-f]{3}[89ab][0-9a-f]{15}$），
+// 纯随机 hex 不是合法 v7 形态。
+func NewUUIDv7Hex() string {
+	var buf [16]byte
+	if _, errRead := rand.Read(buf[:]); errRead != nil {
+		// 随机源失败：退回纯随机旧形态，ID 只要求唯一。
+		return NewHexID()
+	}
+	// 48bit 毫秒时间戳 + version 7 + 随机；variant 按 RFC 9562 置 10。
+	ms := time.Now().UnixMilli()
+	buf[0] = byte(ms >> 40)
+	buf[1] = byte(ms >> 32)
+	buf[2] = byte(ms >> 24)
+	buf[3] = byte(ms >> 16)
+	buf[4] = byte(ms >> 8)
+	buf[5] = byte(ms)
+	buf[6] = (buf[6] & 0x0F) | 0x70
+	buf[8] = (buf[8] & 0x3F) | 0x80
+	return hex.EncodeToString(buf[:])
 }
 
 // ConversationKey 从请求体里提取会话键，用于生成稳定的会话头族。
@@ -1038,55 +1060,6 @@ func contentSignature(content any) string {
 		return strings.Join(parts, "\x1f")
 	}
 	return ""
-}
-
-// TurnKey 返回当前轮次的键（最后一条 user 消息）。
-//
-// 序号入键是刻意的：连续两次内容相同的「继续」必须被识别为不同轮次，
-// 否则第二轮会复用第一轮的请求 ID，后台聚合会把它们合并成一次。
-func TurnKey(body []byte) string {
-	payload := decodeBodyMap(body)
-	if payload == nil {
-		return ""
-	}
-	messages, okMessages := payload["messages"].([]any)
-	if !okMessages {
-		return ""
-	}
-	for index := len(messages) - 1; index >= 0; index-- {
-		message, okMessage := messages[index].(map[string]any)
-		if !okMessage {
-			continue
-		}
-		role, _ := message["role"].(string)
-		if !strings.EqualFold(strings.TrimSpace(role), "user") {
-			continue
-		}
-		signature := contentSignature(message["content"])
-		if signature == "" {
-			continue
-		}
-		return fmt.Sprintf("u%d:%s", index, signature)
-	}
-	return ""
-}
-
-// RequestIDForKey 从会话键派生一个稳定的请求 ID。
-func RequestIDForKey(key string) string {
-	if strings.TrimSpace(key) == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte("req|" + key))
-	return hex.EncodeToString(sum[:16])
-}
-
-// TurnRequestID 从轮次键派生一个稳定的请求 ID。
-func TurnRequestID(key string) string {
-	if strings.TrimSpace(key) == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte("turn|" + key))
-	return hex.EncodeToString(sum[:16])
 }
 
 // RealmDisplayName 返回域的展示名。

@@ -13,7 +13,6 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
-	"runtime"
 	"strings"
 	"time"
 
@@ -23,47 +22,82 @@ import (
 
 // 本文件实现 OpenCode ZEN 的 chat-completions 转发。
 //
-// 与 WorkBuddy / Qoder 的差异：ZEN 上游是标准 OpenAI chat-completions。
 // 特殊要求（参考 opencode2api 与 OpenCode 官方实现）：
 //   1. 会话 ID 必须是 canonical session 格式：`ses_` + 12位十六进制 + 14位 Base62。
-//   2. 免费层模型（ID 包含 "free"）要求完整的 Agent 请求形态：强制使用 stream=true 流式
-//      以及携带核心工具声明（bash, edit, glob, grep, read）。
-//      非流式调用在插件内会自动开启 stream 并在上游返回后通过 CollapseSSEToJSON 合并为标准 JSON 响应。
+//      时间戳部分锚定在近期合理窗口内（30 天内），避免旧实现哈希时间落到 1970 年而触发
+//      上游 429 FreeUsageLimitError；进程启动时生成随机盐值（bootNonce），避免重启后沿用
+//      已在风控状态的会话桶。
+//   2. 项目 ID 不能使用固定的 "global"，上游按 (project, egress) 限额记账；缺省时生成
+//      官方 CLI 规格的 40 位十六进制项目标识，避免共享已被耗尽的配额桶。
+//   3. 客户端工具名称需混淆为 clint_<sha256[:12]>，防止因携带 Claude Code 等外部工具签名
+//      触发上游的客户端指纹风控而返回 429 FreeUsageLimitError。返回时自动恢复原工具名。
+//   4. 免费层模型（单价为 0）走 inference 车道、匿名 public 凭证、强制 stream=true，
+//      并在非流式调用下通过 CollapseSSEToJSON 合并为标准 JSON 响应。
 
-// chatHTTPTimeout 是非流式对话的上限。
-const chatHTTPTimeout = 10 * time.Minute
+const (
+	// chatHTTPTimeout 是非流式对话的上限。
+	chatHTTPTimeout = 10 * time.Minute
+
+	// clientToolPrefix 是免费层工具混淆前缀。
+	clientToolPrefix = "clint_"
+	// clientToolDigestLength 是混淆摘要的十六进制字符长度。
+	clientToolDigestLength = 12
+
+	// sessionTimestampWindow 限制派生会话时间戳距今日 UTC 0 点的最大回退跨度（30 天）。
+	sessionTimestampWindow = 30 * 24 * time.Hour
+
+	// base62Alphabet 是 Base62 字符集。
+	base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+)
 
 // ChatRequest 是一次对话转发的输入。
 type ChatRequest struct {
-	// APIKey 是出站凭证。
+	// APIKey 是付费模型的出站凭证；免费层改用匿名 public 凭证。
 	APIKey string
 	// Body 是宿主翻译好的 chat-completions 请求体。
 	Body []byte
+	// Headers 是客户端原始请求头（用于透传会话与项目信息）。
+	Headers map[string][]string
 	// Stream 报告是否流式。
 	Stream bool
+	// Catalog 是 models.dev 目录，用于按单价判定免费层。
+	// 为空时退回按模型名判定。
+	Catalog modelsDevCatalog
+}
+
+// toolRenames 维护客户端工具名与混淆线名之间的双向映射。
+type toolRenames struct {
+	toWire   map[string]string
+	toClient map[string]string
+}
+
+func (r *toolRenames) add(client, wire string) {
+	if r.toWire == nil {
+		r.toWire = make(map[string]string)
+		r.toClient = make(map[string]string)
+	}
+	r.toWire[client] = wire
+	r.toClient[wire] = client
 }
 
 // Chat 执行一次非流式对话，返回上游的完整响应体。
 func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) {
 	modelName := extractModelName(req.Body)
-	isFree := isFreeTierModel(modelName)
+	isFree := isFreeTierModel(modelName, req.Catalog)
 
 	if isFree {
-		// 免费层强制以流式发送，再将 SSE 聚合回完整 JSON 文档
-		streamReq := req
-		streamReq.Stream = true
-		streamReq.Body = prepareFreeTierBody(req.Body)
-
-		resp, errStream := ChatStream(ctx, baseURL, streamReq)
+		// 免费层只接流式：强制 stream 打开，再把 SSE 聚合回完整 JSON 文档。
+		req.Stream = true
+		resp, renames, errStream := ChatStream(ctx, baseURL, req)
 		if errStream != nil {
 			return nil, errStream
 		}
 		defer func() { _ = resp.Body.Close() }()
 
-		return CollapseSSEToJSON(resp.Body, modelName)
+		return CollapseSSEToJSON(resp.Body, modelName, renames)
 	}
 
-	resp, errDo := doChat(ctx, baseURL, req)
+	resp, _, errDo := doChat(ctx, baseURL, req)
 	if errDo != nil {
 		return nil, errDo
 	}
@@ -79,51 +113,100 @@ func Chat(ctx context.Context, baseURL string, req ChatRequest) ([]byte, error) 
 	return body, nil
 }
 
-// ChatStream 执行一次流式对话，返回上游响应体（调用方负责关闭）。
-func ChatStream(ctx context.Context, baseURL string, req ChatRequest) (*http.Response, error) {
-	endpoint := BaseURL(baseURL) + ChatPath
-	body := req.Body
-	if isFreeTierModel(extractModelName(body)) {
-		body = prepareFreeTierBody(body)
-	}
-
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytesReader(body))
+// ChatStream 执行一次流式对话，返回上游响应体及工具名还原映射（调用方负责关闭）。
+func ChatStream(ctx context.Context, baseURL string, req ChatRequest) (*http.Response, *toolRenames, error) {
+	httpReq, renames, errReq := newChatRequest(ctx, baseURL, req, req.Catalog)
 	if errReq != nil {
-		return nil, fmt.Errorf("build chat stream request: %w", errReq)
+		return nil, nil, errReq
 	}
-	ApplyChatHeaders(httpReq, req.APIKey, sessionIDFor(body), newRequestID())
 
 	resp, errDo := hostbridge.StreamClient(ctx, 0).Do(httpReq)
 	if errDo != nil {
-		return nil, &core.Failure{Msg: "chat stream: " + errDo.Error(), Kind: core.FailureKindTransient}
+		return nil, nil, &core.Failure{Msg: "chat stream: " + errDo.Error(), Kind: core.FailureKindTransient}
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		defer func() { _ = resp.Body.Close() }()
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		return nil, Classify(resp.StatusCode, string(body))
+		return nil, nil, Classify(resp.StatusCode, string(body))
 	}
-	return resp, nil
+	return resp, renames, nil
 }
 
 // doChat 发起一次非流式对话请求。
-func doChat(ctx context.Context, baseURL string, req ChatRequest) (*http.Response, error) {
-	endpoint := BaseURL(baseURL) + ChatPath
-	body := req.Body
-	if isFreeTierModel(extractModelName(body)) {
-		body = prepareFreeTierBody(body)
-	}
-
-	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytesReader(body))
+func doChat(ctx context.Context, baseURL string, req ChatRequest) (*http.Response, *toolRenames, error) {
+	httpReq, renames, errReq := newChatRequest(ctx, baseURL, req, req.Catalog)
 	if errReq != nil {
-		return nil, fmt.Errorf("build chat request: %w", errReq)
+		return nil, nil, errReq
 	}
-	ApplyChatHeaders(httpReq, req.APIKey, sessionIDFor(body), newRequestID())
 
 	resp, errDo := hostbridge.Client(ctx, chatHTTPTimeout).Do(httpReq)
 	if errDo != nil {
-		return nil, &core.Failure{Msg: "chat: " + errDo.Error(), Kind: core.FailureKindTransient}
+		return nil, nil, &core.Failure{Msg: "chat: " + errDo.Error(), Kind: core.FailureKindTransient}
 	}
-	return resp, nil
+	return resp, renames, nil
+}
+
+// newChatRequest 组装一次 chat-completions 请求（流式与非流式共用）。
+func newChatRequest(ctx context.Context, baseURL string, req ChatRequest, catalog modelsDevCatalog) (*http.Request, *toolRenames, error) {
+	body := req.Body
+	credential := req.APIKey
+	var renames *toolRenames
+
+	if isFreeTierModel(extractModelName(body), catalog) {
+		body, renames = prepareFreeTierBody(body)
+		credential = freeTierCredential
+	} else {
+		body = normalizeMaxTokens(body)
+	}
+
+	httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, chatEndpoint(baseURL), bytesReader(body))
+	if errReq != nil {
+		return nil, nil, fmt.Errorf("build chat request: %w", errReq)
+	}
+
+	sessionID := canonicalSessionID(extractSessionID(req.Headers, body))
+	projectID := extractProjectID(req.Headers, body)
+	ApplyChatHeaders(httpReq, credential, sessionID, projectID)
+	return httpReq, renames, nil
+}
+
+// normalizeMaxTokens 把 max_tokens 归一到 max_completion_tokens。
+func normalizeMaxTokens(body []byte) []byte {
+	var payload map[string]any
+	if err := json.Unmarshal(body, &payload); err != nil {
+		return body
+	}
+	value, hasMax := payload["max_tokens"]
+	if !hasMax {
+		return body
+	}
+	if _, hasCompletion := payload["max_completion_tokens"]; !hasCompletion {
+		payload["max_completion_tokens"] = value
+	}
+	delete(payload, "max_tokens")
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		return body
+	}
+	return encoded
+}
+
+// ensureCompletionLimit 规范化输出上限并在缺省时设置默认上限 32000。
+func ensureCompletionLimit(payload map[string]any) {
+	if val, ok := payload["max_tokens"]; ok {
+		if _, hasComp := payload["max_completion_tokens"]; !hasComp {
+			payload["max_completion_tokens"] = val
+		}
+		delete(payload, "max_tokens")
+	}
+	if _, ok := payload["max_completion_tokens"]; !ok {
+		payload["max_completion_tokens"] = 32000
+	}
+}
+
+// chatEndpoint 返回 chat-completions 的完整地址。
+func chatEndpoint(override string) string {
+	return BaseURL(override) + ChatPath
 }
 
 // extractModelName 从请求体中提取 model 字符串。
@@ -135,74 +218,137 @@ func extractModelName(body []byte) string {
 	return payload.Model
 }
 
-// isFreeTierModel 判断是否为 free 免费层模型。
-func isFreeTierModel(model string) bool {
+// isFreeTierModel 判断是否为免费层模型。
+func isFreeTierModel(model string, catalog modelsDevCatalog) bool {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return false
+	}
+	if free, known := catalogIsFree(catalog, model); known {
+		return free
+	}
 	return strings.Contains(strings.ToLower(model), "free")
 }
 
-// coreAgentTools 是 OpenCode 官方客户端默认包含的 Agent 工具集。
-var coreAgentTools = []string{"bash", "edit", "glob", "grep", "read"}
+// catalogIsFree 用目录里该模型的单价回答「是否免费」。
+func catalogIsFree(catalog modelsDevCatalog, model string) (free bool, known bool) {
+	entry, okEntry := catalog[model]
+	if !okEntry || entry.Cost == nil {
+		return false, false
+	}
+	return entry.Cost.Input == 0 && entry.Cost.Output == 0, true
+}
 
-// prepareFreeTierBody 规范化免费层请求体（开启 stream，补充 core agent tools）。
-func prepareFreeTierBody(body []byte) []byte {
+// clientToolWireName 派生不透明工具线名：clint_ + 12位 SHA-256 十六进制。
+// 解决 Claude Code 等客户端携带特征工具名时被上游风控判定为 429 的问题。
+func clientToolWireName(name string, used map[string]bool) string {
+	sum := sha256.Sum256([]byte(name))
+	base := clientToolPrefix + hex.EncodeToString(sum[:])[:clientToolDigestLength]
+	candidate := base
+	for i := 2; used[candidate]; i++ {
+		candidate = fmt.Sprintf("%s_%d", base, i)
+	}
+	used[candidate] = true
+	return candidate
+}
+
+// rewriteToolReferences 同步改写 tool_choice 与 messages 历史记录中的工具名。
+func rewriteToolReferences(payload map[string]any, renames *toolRenames) {
+	if renames == nil || len(renames.toWire) == 0 {
+		return
+	}
+	if choice, ok := payload["tool_choice"].(map[string]any); ok {
+		if fn, ok := choice["function"].(map[string]any); ok {
+			if name, ok := fn["name"].(string); ok {
+				if wire, ok := renames.toWire[name]; ok {
+					fn["name"] = wire
+				}
+			}
+		} else if name, ok := choice["name"].(string); ok {
+			if wire, ok := renames.toWire[name]; ok {
+				choice["name"] = wire
+			}
+		}
+	}
+	if msgs, ok := payload["messages"].([]any); ok {
+		for _, rawMsg := range msgs {
+			msg, ok := rawMsg.(map[string]any)
+			if !ok {
+				continue
+			}
+			if calls, ok := msg["tool_calls"].([]any); ok {
+				for _, rawCall := range calls {
+					call, ok := rawCall.(map[string]any)
+					if !ok {
+						continue
+					}
+					if fn, ok := call["function"].(map[string]any); ok {
+						if name, ok := fn["name"].(string); ok {
+							if wire, ok := renames.toWire[name]; ok {
+								fn["name"] = wire
+							}
+						}
+					}
+				}
+			}
+			if fnCall, ok := msg["function_call"].(map[string]any); ok {
+				if name, ok := fnCall["name"].(string); ok {
+					if wire, ok := renames.toWire[name]; ok {
+						fnCall["name"] = wire
+					}
+				}
+			}
+		}
+	}
+}
+
+// prepareFreeTierBody 规范化免费层请求体：强制流式、用量统计、上限归一与工具混淆。
+func prepareFreeTierBody(body []byte) ([]byte, *toolRenames) {
 	var payload map[string]any
 	if err := json.Unmarshal(body, &payload); err != nil {
-		return body
+		return body, nil
 	}
 
 	payload["stream"] = true
-
-	// 保证 stream_options.include_usage = true
 	if opt, ok := payload["stream_options"].(map[string]any); ok {
 		opt["include_usage"] = true
 	} else {
 		payload["stream_options"] = map[string]any{"include_usage": true}
 	}
 
-	// 补充缺失的 Agent 核心工具定义
-	existingTools := make(map[string]bool)
-	if rawTools, ok := payload["tools"].([]any); ok {
-		for _, item := range rawTools {
-			if toolMap, okTool := item.(map[string]any); okTool {
-				if fnMap, okFn := toolMap["function"].(map[string]any); okFn {
-					if name, okName := fnMap["name"].(string); okName {
-						existingTools[name] = true
-					}
+	ensureCompletionLimit(payload)
+
+	var renames *toolRenames
+	if rawTools, ok := payload["tools"].([]any); ok && len(rawTools) > 0 {
+		renames = &toolRenames{toWire: make(map[string]string), toClient: make(map[string]string)}
+		used := make(map[string]bool)
+		for _, rawTool := range rawTools {
+			toolMap, okTool := rawTool.(map[string]any)
+			if !okTool {
+				continue
+			}
+			if fn, okFn := toolMap["function"].(map[string]any); okFn {
+				if name, okName := fn["name"].(string); okName && name != "" && !strings.HasPrefix(name, clientToolPrefix) {
+					wireName := clientToolWireName(name, used)
+					renames.add(name, wireName)
+					fn["name"] = wireName
 				}
+			} else if name, okName := toolMap["name"].(string); okName && name != "" && !strings.HasPrefix(name, clientToolPrefix) {
+				wireName := clientToolWireName(name, used)
+				renames.add(name, wireName)
+				toolMap["name"] = wireName
 			}
 		}
-	}
-
-	var toolsToAppend []any
-	for _, name := range coreAgentTools {
-		if !existingTools[name] {
-			toolsToAppend = append(toolsToAppend, map[string]any{
-				"type": "function",
-				"function": map[string]any{
-					"name":        name,
-					"description": "Agent tool " + name,
-					"parameters":  map[string]any{"type": "object", "properties": map[string]any{}},
-				},
-			})
-		}
-	}
-
-	if len(toolsToAppend) > 0 {
-		if currentList, ok := payload["tools"].([]any); ok {
-			payload["tools"] = append(currentList, toolsToAppend...)
-		} else {
-			payload["tools"] = toolsToAppend
-		}
+		rewriteToolReferences(payload, renames)
 	}
 
 	encoded, err := json.Marshal(payload)
 	if err != nil {
-		return body
+		return body, nil
 	}
-	return encoded
+	return encoded, renames
 }
 
-// chatCompletionResponse 用于将 SSE 流合并为一个完整的 chat.completion JSON。
 type chatCompletionResponse struct {
 	ID      string       `json:"id"`
 	Object  string       `json:"object"`
@@ -250,8 +396,11 @@ type sseDeltaChunk struct {
 }
 
 // CollapseSSEToJSON 将上游 SSE 流消费并组装成一个完整的 OpenAI 格式 chat.completion JSON 响应。
-func CollapseSSEToJSON(r io.Reader, defaultModel string) ([]byte, error) {
+func CollapseSSEToJSON(r io.Reader, defaultModel string, renames ...*toolRenames) ([]byte, error) {
 	scanner := bufio.NewScanner(r)
+	// 单条 SSE 行的上限：默认 64KB 会被长工具参数/长思考块撑爆，
+	// 撑爆后 Scan 返回 false 且 Err() 是 ErrTooLong，整段回答会被静默截断。
+	scanner.Buffer(make([]byte, 0, 64*1024), hostbridge.SSEScannerBuffer)
 	resp := chatCompletionResponse{
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
@@ -313,6 +462,9 @@ func CollapseSSEToJSON(r io.Reader, defaultModel string) ([]byte, error) {
 			}
 		}
 	}
+	if errScan := scanner.Err(); errScan != nil {
+		return nil, errScan
+	}
 
 	contentStr := contentBuilder.String()
 	resp.Choices[0].Message.Content = contentStr
@@ -320,6 +472,20 @@ func CollapseSSEToJSON(r io.Reader, defaultModel string) ([]byte, error) {
 
 	toolCalls = filterValidToolCalls(toolCalls)
 	if len(toolCalls) > 0 {
+		if len(renames) > 0 && renames[0] != nil && len(renames[0].toClient) > 0 {
+			mapping := renames[0].toClient
+			for _, call := range toolCalls {
+				if callMap, ok := call.(map[string]any); ok {
+					if fn, ok := callMap["function"].(map[string]any); ok {
+						if name, ok := fn["name"].(string); ok {
+							if original, ok := mapping[name]; ok {
+								fn["name"] = original
+							}
+						}
+					}
+				}
+			}
+		}
 		resp.Choices[0].Message.ToolCalls = toolCalls
 		resp.Choices[0].FinishReason = "tool_calls"
 		if contentStr == "" {
@@ -423,6 +589,16 @@ func cloneToolCall(src map[string]any) map[string]any {
 	return dst
 }
 
+// bootNonce 是进程级会话盐值，每次进程启动时生成一次。
+// 免费层会将配额/风险与 session id 绑定；重启后注入新盐值以重置上游 session，避免沿用已 429 的会话桶。
+var bootNonce = func() []byte {
+	buf := make([]byte, 16)
+	if _, err := rand.Read(buf); err != nil {
+		return []byte("opencode-zen-salt")
+	}
+	return buf
+}()
+
 // canonicalSessionPattern 匹配 OpenCode 官方的 session 形态：
 // "ses_" + 12 位小写十六进制 + 14 位 Base62。
 var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{14}$`)
@@ -430,17 +606,58 @@ var canonicalSessionPattern = regexp.MustCompile(`^ses_[0-9a-f]{12}[0-9A-Za-z]{1
 // descendingTimePartPattern 匹配官方客户端 Identifier.descending() 铸造的
 // 时间部分：48 位值 ~(ts_ms<<12|counter) 的十六进制。按位取反会把低 12 位
 // 置成 0xFFF-counter，因此真实时间部分以 f[c-f] 收尾。
-//
-// **这一段是免费层的硬门槛**：形态对但用随机十六进制填时间部分，上游照样
-// 403 FreeTierError——它校验的是编码方式而不只是长度。
 var descendingTimePartPattern = regexp.MustCompile(`^[0-9a-f]{9}f[c-f][0-9a-f]$`)
 
 // sessionIDFor 由请求体派生本次请求的 session ID。
-//
-// 同一段对话（首条 user 消息相同）会得到同一个 session，既通过免费层的
-// 编码校验，也保住上游的 prompt cache 亲和性；派生不出信号时退回随机。
 func sessionIDFor(body []byte) string {
 	return canonicalSessionID(conversationSeed(body))
+}
+
+func extractSessionID(headers map[string][]string, body []byte) string {
+	for _, key := range []string{
+		"x-opencode-session",
+		"x-opencode-session-id",
+		"x-session-affinity",
+		"x-session-id",
+		"session_id",
+	} {
+		if vals, ok := headers[key]; ok && len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
+			return strings.TrimSpace(vals[0])
+		}
+	}
+	return conversationSeed(body)
+}
+
+func extractProjectID(headers map[string][]string, body []byte) string {
+	for _, key := range []string{"x-opencode-project", "project_id"} {
+		if vals, ok := headers[key]; ok && len(vals) > 0 && strings.TrimSpace(vals[0]) != "" {
+			proj := strings.TrimSpace(vals[0])
+			if proj != "global" {
+				return proj
+			}
+		}
+	}
+	var payload struct {
+		Metadata struct {
+			ProjectID string `json:"project_id"`
+		} `json:"metadata"`
+	}
+	if err := json.Unmarshal(body, &payload); err == nil && payload.Metadata.ProjectID != "" {
+		if payload.Metadata.ProjectID != "global" {
+			return payload.Metadata.ProjectID
+		}
+	}
+	return randomProjectID()
+}
+
+// randomProjectID 生成官方 CLI 规格的项目标识（40 位十六进制 git root commit 格式）。
+// 免费层会按 (project, egress) 联合记账，固定为 "global" 会导致所有人共享已被耗尽的配额桶。
+func randomProjectID() string {
+	buf := make([]byte, 20)
+	if _, err := rand.Read(buf); err != nil {
+		return "0000000000000000000000000000000000000000"
+	}
+	return hex.EncodeToString(buf)
 }
 
 // canonicalSessionID 把任意信号确定性地重编码成官方 session 形态。
@@ -450,16 +667,18 @@ func canonicalSessionID(signal string) string {
 		descendingTimePartPattern.MatchString(signal[4:16]) {
 		return signal
 	}
-	sum := sha256.Sum256([]byte("ses\x00" + signal))
-	timePart := descendingTimePart(sum[:6])
+	hasher := sha256.New()
+	hasher.Write([]byte("ses\x00"))
+	hasher.Write(bootNonce)
+	hasher.Write([]byte{0})
+	hasher.Write([]byte(signal))
+	sum := hasher.Sum(nil)
+	timePart := descendingTimePart(time.Now(), sum[:6])
 	randomPart := base62Fixed(new(big.Int).SetBytes(sum[6:16]), 14)
 	return "ses_" + timePart + randomPart
 }
 
 // conversationSeed 取首条 user 消息的序列化内容作为会话种子。
-//
-// 用「开头」而不是整段历史：多轮对话越聊越长，用全文做种子会让同一段对话
-// 每轮都换一个 session，prompt cache 永远命中不了。
 func conversationSeed(body []byte) string {
 	var payload struct {
 		Messages []struct {
@@ -490,19 +709,19 @@ func conversationSeed(body []byte) string {
 func randomSessionSignal() string {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
-		// crypto/rand 失败时仍要产出合法 session；此处只影响缓存亲和性。
 		return "fallback"
 	}
 	return hex.EncodeToString(buf)
 }
 
-// descendingTimePart 把六个哈希字节渲染成官方 Identifier.descending() 的
-// 布局：36 位时间戳顶到 48 位字的高位，OR 上计数器 1，再按位取反，
-// 于是低 12 位读作 ffe。
-func descendingTimePart(hash []byte) string {
-	current := (uint64(hash[0])<<28 | uint64(hash[1])<<20 | uint64(hash[2])<<12 |
-		uint64(hash[3])<<4 | uint64(hash[4])>>4) << 12
-	current |= 1
+// descendingTimePart 渲染一个近期合理时间戳的官方 Identifier.descending() 编码：
+// 36 位时间戳顶到 48 位高位，OR 上计数器 1，再按位取反，低 12 位读作 ffe。
+// 时间戳锚定在今日 UTC 0 点并按哈希在 30 天窗口内取偏移，保证合法且稳定。
+func descendingTimePart(now time.Time, hash []byte) string {
+	window := uint64(sessionTimestampWindow / time.Millisecond)
+	offset := (uint64(hash[0])<<24 | uint64(hash[1])<<16 | uint64(hash[2])<<8 | uint64(hash[3])) % window
+	base := now.UTC().Truncate(24 * time.Hour).Add(-time.Duration(offset) * time.Millisecond)
+	current := uint64(base.UnixMilli())<<12 | 1
 	inverted := ^current & 0xFFFFFFFFFFFF
 	return hex.EncodeToString([]byte{
 		byte(inverted >> 40), byte(inverted >> 32), byte(inverted >> 24),
@@ -521,49 +740,34 @@ func base62Fixed(n *big.Int, width int) string {
 	return string(out)
 }
 
-// newRequestID 生成一个请求 ID。
-func newRequestID() string {
-	return "req_" + core.RandomHex(8)
-}
-
-// base62Alphabet 是 Base62 字符集。
-const base62Alphabet = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-
 // bytesReader 把字节切片包成 io.Reader。
 func bytesReader(data []byte) io.Reader {
 	return bytes.NewReader(data)
 }
 
-// 本文件定义 OpenCode ZEN 的上游端点与请求头。
-//
-// 端点来自上游网关项目的实测值（opencode2api 的 internal/config/config.go
-// 与 internal/gateway/upstream.go）：base 是 https://opencode.ai/zen，
-// 协议路径按模型的原生协议选择。
-//
-// **本插件只处理 chat-completions**（Claude / Codex 客户端由宿主翻译），
-// 因此这里只保留 chat 路径。ZEN 上游还提供 /v1/responses、/v1/messages、
-// /v1/systemone，那些由宿主侧的多协议翻译覆盖，插件不重复实现。
-
 const (
-	// DefaultBaseURL 是 ZEN 的上游基地址。
-	DefaultBaseURL = "https://opencode.ai/zen"
+	// DefaultBaseURL 是 chat-completions 的上游基地址。
+	DefaultBaseURL = "https://opencode.ai/inference/openai"
 	// ChatPath 是 chat-completions 的路径。
 	ChatPath = "/v1/chat/completions"
+	// ModelsBaseURL 是模型清单的基地址，比 chat 少一层 /openai。
+	ModelsBaseURL = "https://opencode.ai/inference"
 	// ModelsPath 是模型清单的路径。
 	ModelsPath = "/v1/models"
+	// freeTierCredential 是官方客户端为免费层使用的匿名凭证。
+	freeTierCredential = "public"
 
-	// clientVersion 是伪装用的 OpenCode 客户端版本。
-	//
-	// 上游按客户端标识做分发，UA 与 x-opencode-client 必须成对出现：
-	// 只改一个会被识别成非官方客户端。
-	clientVersion = "1.18.31"
-	// userAgentFormat 是上游客户端的 UA 形态（实测值）。
-	userAgentFormat = "opencode/%s (%s %s; %s)"
+	// clientVersion 是伪装用的 OpenCode 客户端版本，对齐 v2 稳定版。
+	clientVersion = "2.1.4"
+	// clientChannel 是官方稳定通道名。
+	clientChannel = "latest"
+	// clientName 是官方 CLI 的客户端标识（x-opencode-client 与 UA 共用）。
+	clientName = "cli"
+	// userAgentFormat 是 v2 的 UA 形态：opencode/<channel>/<version>/<name>。
+	userAgentFormat = "opencode/%s/%s/%s"
 )
 
-// BaseURL 返回上游基地址（末尾无斜杠）。
-//
-// 允许配置覆盖：上游换域名或用户要走自建网关时不必改代码。
+// BaseURL 返回 chat-completions 的上游基地址（末尾无斜杠）。
 func BaseURL(override string) string {
 	trimmed := strings.TrimRight(strings.TrimSpace(override), "/")
 	if trimmed == "" {
@@ -572,34 +776,47 @@ func BaseURL(override string) string {
 	return trimmed
 }
 
+// ModelsBaseURLFor 返回模型清单的上游基地址（末尾无斜杠）。
+func ModelsBaseURLFor(override string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(override), "/")
+	if trimmed == "" {
+		return ModelsBaseURL
+	}
+	return strings.TrimSuffix(trimmed, "/openai")
+}
+
 // UserAgent 返回伪装成官方 OpenCode 客户端的 UA。
-//
-// 形态与上游网关实测值一致：opencode/<版本> (<os> <arch>; <go 版本>)。
 func UserAgent() string {
-	return fmt.Sprintf(userAgentFormat, clientVersion, runtime.GOOS, runtime.GOARCH, runtime.Version())
+	return fmt.Sprintf(userAgentFormat, clientChannel, clientVersion, clientName)
 }
 
 // ApplyChatHeaders 写入 chat-completions 请求所需的全部头。
 //
-// 认证与客户端标识是**硬门槛**：ZEN 上游按 x-opencode-client 与 UA 判定
-// 请求来源，缺失会被当成未知客户端拒绝。
-func ApplyChatHeaders(req *http.Request, apiKey, sessionID, requestID string) {
+// 认证与客户端标识是硬门槛：ZEN 上游按 x-opencode-client 与 UA 判定请求来源。
+func ApplyChatHeaders(req *http.Request, apiKey, sessionID string, projectID ...string) {
+	proj := ""
+	if len(projectID) > 0 {
+		proj = projectID[0]
+	}
+	if proj == "" || proj == "global" {
+		proj = randomProjectID()
+	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("User-Agent", UserAgent())
-	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-client", clientName)
 	req.Header.Set("x-opencode-session", sessionID)
+	req.Header.Set("x-opencode-session-id", sessionID)
 	req.Header.Set("x-session-affinity", sessionID)
 	req.Header.Set("X-Session-Id", sessionID)
-	req.Header.Set("x-opencode-request", requestID)
-	req.Header.Set("x-opencode-project", "global")
+	req.Header.Set("x-opencode-project", proj)
 }
 
-// ApplyModelsHeaders 写入模型清单请求的头（只需认证）。
+// ApplyModelsHeaders 写入模型清单请求的头。
 func ApplyModelsHeaders(req *http.Request, apiKey string) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", "Bearer "+apiKey)
 	req.Header.Set("User-Agent", UserAgent())
-	req.Header.Set("x-opencode-client", "cli")
+	req.Header.Set("x-opencode-client", clientName)
 }

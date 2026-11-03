@@ -6,11 +6,8 @@ dist/
 # 容器里跑 `go build` 时，未指定 -o 的产物会落到工作目录，名为 module 名。
 # 它没有扩展名，因此上面的规则拦不住。
 /freetier2api-plugin
-# c-shared 构建会在 dist/ 旁边生成同名头文件；但 bridge.h 是**手写的源码**，
-# 是构建必需文件（见下面的反向规则）。
+# c-shared 构建会在 dist/ 旁边生成同名头文件（构建产物，不入库）。
 *.h
-# bridge.h 是 C ABI 桥的头文件，必须入库——否则别人克隆后编译不过。
-!bridge.h
 
 # 宿主侧的凭证与运行状态（**绝不能进版本库**）
 auths/
@@ -39,3 +36,8 @@ coverage.out
 
 # macOS
 **/.DS_Store
+*_TODO.md
+
+# cgo 中间产物（go build -buildmode=c-shared 的副产物）
+cgo-gcc-input-*.o
+*.o

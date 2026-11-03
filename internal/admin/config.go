@@ -8,11 +8,12 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
+
+	"freetier2api-plugin/internal/core"
 )
 
-// PluginConfig 是 plugins.configs.freetier2api 解析出的有效全局配置。
+// PluginConfig 是 plugins.configs.freetier 解析出的有效全局配置。
 type PluginConfig struct {
 	// EnabledRealms 是启用的域：逗号分隔的 cn / global 子集。
 	EnabledRealms []string
@@ -26,6 +27,12 @@ type PluginConfig struct {
 	LogLevel string
 	// LogToFile 为 true 时把日志写入 <StateDir>/logs。
 	LogToFile bool
+	// LogToHost 为 true 时把插件日志镜像进宿主日志文件（管理面板可见）。
+	LogToHost bool
+	// HostLogFile 是宿主日志文件路径，空表示按 StateDir 自动探测。
+	HostLogFile string
+	// HostLogLevel 是镜像到宿主日志的最低级别：debug / info / error。
+	HostLogLevel string
 
 	// AutoCheckin 开启每日自动签到。
 	AutoCheckin bool
@@ -44,7 +51,7 @@ const (
 	// DefaultCheckinAt 是默认签到时间。
 	DefaultCheckinAt = "10:00"
 	// DefaultStateDirName 是默认状态目录名。
-	DefaultStateDirName = ".freetier2api-plugin"
+	DefaultStateDirName = ".freetier-plugin"
 	// StateDirEnvOverride 是状态目录的环境变量覆盖项。
 	StateDirEnvOverride = "FREETIER2API_PLUGIN_HOME"
 	// StateFileName 是状态文件名。
@@ -57,11 +64,6 @@ const (
 	// RealmCN / RealmGlobal 是受支持的域。
 	RealmCN     = "cn"
 	RealmGlobal = "global"
-
-	// PromptModeCustom / PromptModeAppend / PromptModePassThrough 是合法模式。
-	PromptModeCustom      = "custom"
-	PromptModeAppend      = "append"
-	PromptModePassThrough = "passthrough"
 )
 
 // listValuedConfigKeys 是「允许用 YAML 列表写法」的配置键。
@@ -77,6 +79,10 @@ func DefaultPluginConfig() PluginConfig {
 		EnabledRealms: SplitList(DefaultRealmList),
 		StateDir:      DefaultStateDir(),
 		LogLevel:      DefaultLogLevel,
+		// 宿主日志镜像默认开启：面板日志页只读宿主 main.log，
+		// 不开这个开关插件日志在面板里完全不可见。
+		LogToHost:     true,
+		HostLogLevel:  DefaultLogLevel,
 		AutoCheckin:   true,
 		AutoCheckinAt: DefaultCheckinAt,
 		AutoTasks:     true,
@@ -93,7 +99,7 @@ func DefaultStateDir() string {
 	if home, errHome := os.UserHomeDir(); errHome == nil && strings.TrimSpace(home) != "" {
 		cpaDir := filepath.Join(home, ".cli-proxy-api")
 		if info, errStat := os.Stat(cpaDir); errStat == nil && info.IsDir() {
-			return filepath.Join(cpaDir, "freetier2api")
+			return filepath.Join(cpaDir, "freetier")
 		}
 		return filepath.Join(home, DefaultStateDirName)
 	}
@@ -153,13 +159,15 @@ func applyConfigLine(cfg *PluginConfig, key, value string) error {
 		}
 	case "log_to_file":
 		cfg.LogToFile = ParseBool(value, cfg.LogToFile)
-	case "prompt_mode":
-		// 提示词体系属于供应商标属，但枚举值在全局层校验：
-		// 写错时明确报错，而不是让供应商静默回落 passthrough。
-		switch strings.ToLower(strings.TrimSpace(value)) {
-		case "", PromptModeCustom, PromptModeAppend, PromptModePassThrough:
-		default:
-			return fmt.Errorf("prompt_mode %q is not supported (want passthrough, custom or append)", value)
+	case "log_to_host":
+		cfg.LogToHost = ParseBool(value, cfg.LogToHost)
+	case "host_log_file":
+		if trimmed := strings.TrimSpace(value); trimmed != "" {
+			cfg.HostLogFile = trimmed
+		}
+	case "host_log_level":
+		if trimmed := strings.ToLower(strings.TrimSpace(value)); trimmed != "" {
+			cfg.HostLogLevel = trimmed
 		}
 	case "auto_checkin":
 		cfg.AutoCheckin = ParseBool(value, cfg.AutoCheckin)
@@ -185,6 +193,11 @@ func ValidatePluginConfig(cfg PluginConfig) error {
 	case "debug", "info", "error":
 	default:
 		return fmt.Errorf("log_level %q is not supported (want debug, info or error)", cfg.LogLevel)
+	}
+	switch cfg.HostLogLevel {
+	case "debug", "info", "error":
+	default:
+		return fmt.Errorf("host_log_level %q is not supported (want debug, info or error)", cfg.HostLogLevel)
 	}
 	if strings.TrimSpace(cfg.StateDir) == "" {
 		return fmt.Errorf("state_dir is empty")
@@ -218,32 +231,32 @@ func ParseRealms(raw string) ([]string, error) {
 
 // ParseBool 解析布尔值，无法解析时保留 fallback。
 func ParseBool(raw string, fallback bool) bool {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "true", "yes", "on", "1":
-		return true
-	case "false", "no", "off", "0":
-		return false
+	value, ok := parseStrictBool(raw)
+	if !ok {
+		return fallback
 	}
-	return fallback
+	return value
 }
 
-// ParseClock 解析 HH:MM 格式的本地时间。
+// parseStrictBool 解析布尔值，无法解析时返回 ok=false（配置校验用）。
+func parseStrictBool(raw string) (value bool, ok bool) {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "true", "yes", "on", "1":
+		return true, true
+	case "false", "no", "off", "0":
+		return false, true
+	}
+	return false, false
+}
+
+// ParseClock 解析 HH:MM 格式的本地时间并转成可读错误。
+//
+// 判定本身在 core.ParseClock：后台排程解析同一个字段，两边各写一套曾导致
+// 「校验通过的设置排程不认」。
 func ParseClock(raw string) (hour, minute int, err error) {
-	trimmed := strings.TrimSpace(raw)
-	parts := strings.Split(trimmed, ":")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("%q is not a HH:MM time", raw)
-	}
-	hour, errHour := strconv.Atoi(strings.TrimSpace(parts[0]))
-	if errHour != nil {
-		return 0, 0, fmt.Errorf("%q is not a HH:MM time", raw)
-	}
-	minute, errMinute := strconv.Atoi(strings.TrimSpace(parts[1]))
-	if errMinute != nil {
-		return 0, 0, fmt.Errorf("%q is not a HH:MM time", raw)
-	}
-	if hour < 0 || hour > 23 || minute < 0 || minute > 59 {
-		return 0, 0, fmt.Errorf("%q is out of range (want 00:00-23:59)", raw)
+	hour, minute, ok := core.ParseClock(raw)
+	if !ok {
+		return 0, 0, fmt.Errorf("%q is not a HH:MM time (want 00:00-23:59)", raw)
 	}
 	return hour, minute, nil
 }

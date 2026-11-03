@@ -123,3 +123,106 @@ func TestEffortsFromModelsDevIgnoresNonEffortOptions(t *testing.T) {
 		t.Fatalf("efforts = %v, verbosity option must be ignored", efforts)
 	}
 }
+
+// TestApplyModelsDevCatalogMarksFreeOnlyOnZeroPrice 锁定零倍率的判定来源。
+//
+// models.dev 的 cost 是美元单价，不是倍率；只有输入与输出单价都为 0 才是
+// 零倍率信号。没有 cost 块的条目不能当成零倍率——那只是目录缺数据。
+func TestApplyModelsDevCatalogMarksFreeOnlyOnZeroPrice(t *testing.T) {
+	models := []Model{{ID: "free-model"}, {ID: "paid-model"}, {ID: "unknown-model"}}
+	catalog := modelsDevCatalog{
+		"free-model":    {Cost: &modelsDevCost{}},
+		"paid-model":    {Cost: &modelsDevCost{Input: 1.5, Output: 2}},
+		"unknown-model": {},
+	}
+	applyModelsDevCatalog(models, catalog)
+
+	if models[0].Credits != "0.00X" {
+		t.Fatalf("零单价应记 0.00X，实际 %q", models[0].Credits)
+	}
+	if models[1].Credits != "" {
+		t.Fatalf("有价格的模型不能伪装成倍率，实际 %q", models[1].Credits)
+	}
+	if models[2].Credits != "" {
+		t.Fatalf("缺 cost 块不能当免费，实际 %q", models[2].Credits)
+	}
+}
+
+// TestParseModelsKeepsNonFreeNamedModels 锁定「清单不按名字过滤」。
+//
+// 官方目录里 big-pickle 是零价模型（还是登出状态的默认模型），但不带
+// "-free" 后缀。按名字筛会把官方默认模型从清单里抹掉。
+func TestParseModelsKeepsNonFreeNamedModels(t *testing.T) {
+	body := []byte(`{"object":"list","data":[
+		{"id":"big-pickle","object":"model"},
+		{"id":"glm-5.3","object":"model"},
+		{"id":"deepseek-v4.1-flash-free","object":"model"}
+	]}`)
+	models, errParse := parseModels(body)
+	if errParse != nil {
+		t.Fatalf("parse: %v", errParse)
+	}
+	got := make(map[string]bool, len(models))
+	for _, model := range models {
+		got[model.ID] = true
+	}
+	for _, want := range []string{"big-pickle", "glm-5.3", "deepseek-v4.1-flash-free"} {
+		if !got[want] {
+			t.Fatalf("模型 %q 被过滤掉了；清单应保留上游返回的全部模型", want)
+		}
+	}
+}
+
+// TestFreeOnlyKeepsZeroPriceModels 锁定清单只展示免费层。
+//
+// 上游 /v1/models 同时返回几十个付费模型和调试用的 test 模型；本供应商
+// 只接入免费额度，付费模型在插件里必然 402。判定用目录单价而不是名字，
+// 所以 big-pickle（零价无 free 后缀）要留下，目录里没有的 test 要剔除。
+func TestFreeOnlyKeepsZeroPriceModels(t *testing.T) {
+	catalog := modelsDevCatalog{
+		"big-pickle":               {Cost: &modelsDevCost{}},
+		"deepseek-v4.1-flash-free": {Cost: &modelsDevCost{}},
+		"glm-5.3":                  {Cost: &modelsDevCost{Input: 1.5, Output: 6}},
+	}
+	models := []Model{
+		{ID: "big-pickle"},
+		{ID: "deepseek-v4.1-flash-free"},
+		{ID: "glm-5.3"},
+		{ID: "test"}, // 上游调试模型，目录里没有
+	}
+	got := freeOnly(models, catalog)
+	kept := make(map[string]bool, len(got))
+	for _, model := range got {
+		kept[model.ID] = true
+	}
+	if !kept["big-pickle"] || !kept["deepseek-v4.1-flash-free"] {
+		t.Fatalf("零价模型被剔除：%v", kept)
+	}
+	if kept["glm-5.3"] {
+		t.Fatal("付费模型不应出现在免费供应商的清单里")
+	}
+	if kept["test"] {
+		t.Fatal("目录里没有的模型（无价格数据）不应展示")
+	}
+
+	// 目录不可用时不过滤：一次目录抖动不该让所有免费模型消失。
+	if all := freeOnly(models, nil); len(all) != len(models) {
+		t.Fatalf("目录不可用时不应过滤，得到 %d/%d", len(all), len(models))
+	}
+}
+
+// TestAdapterModelCredits 锁定倍率表与清单同源。
+func TestAdapterModelCredits(t *testing.T) {
+	v := &adapter{}
+	v.modelsToPluginAPI([]Model{
+		{ID: "deepseek-v4-flash-free", Credits: "0.00X"},
+		{ID: "plain"},
+	})
+	credits := v.ModelCredits()
+	if got := credits["deepseek-v4-flash-free"]; got != "0.00X" {
+		t.Fatalf("倍率 = %q, want 0.00X", got)
+	}
+	if _, exists := credits["plain"]; exists {
+		t.Fatal("没有倍率的模型不应进表")
+	}
+}

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -16,6 +17,7 @@ import (
 	"freetier2api-plugin/internal/hostbridge"
 	"freetier2api-plugin/internal/logger"
 	"freetier2api-plugin/internal/state"
+	"freetier2api-plugin/internal/tasks"
 )
 
 // StatusPayload 构造账号状态概览（导出给根层测试/兼容包装）。
@@ -36,90 +38,158 @@ func (s *Service) buildStatusPayload(req pluginapi.ManagementRequest) map[string
 		modelCounts[model.Realm]++
 	}
 	return map[string]any{
-		"ok":                    true,
-		"plugin":                s.deps.Identity().ID,
-		"version":               s.deps.Identity().Version,
-		"enabled_realms":        cfg.EnabledRealms,
-		"workbuddy_prompt_mode": s.deps.WorkbuddyPromptMode(),
-		"log_level":             logger.CurrentLevel(),
-		"state_dir":             cfg.StateDir,
-		"accounts":              accounts,
-		"account_count":         len(accounts),
-		"model_counts":          modelCounts,
-		"models_fetched_at":     current.ModelsFetchedAt,
-		"restart_pending":       current.RestartPending,
-		"settings":              s.tasks.EffectiveSettings(),
-		"scheduler":             s.tasks.Status(),
+		"ok":                true,
+		"plugin":            s.deps.Identity().ID,
+		"version":           s.deps.Identity().Version,
+		"enabled_realms":    cfg.EnabledRealms,
+		"log_level":         logger.CurrentLevel(),
+		"state_dir":         cfg.StateDir,
+		"accounts":          accounts,
+		"account_count":     len(accounts),
+		"model_counts":      modelCounts,
+		"models_fetched_at": current.ModelsFetchedAt,
+		"restart_pending":   current.RestartPending,
+		"settings":          s.settingsView(),
+		"scheduler":         s.tasks.Status(),
 	}
+}
+
+// checkinFlags 从签到记录推出「今天已确认」与「今天待复核」。
+//
+// LastDate 与 ProvisionalDate 都只写不清（见 tasks/checkin.go），所以两者
+// 都必须与 today 比对，不能只看非空：历史上页面就是只看非空，导致凡是签过
+// 到的账号都判定不出「今天待复核」（#71 第二轮复审 P1-2）。
+func checkinFlags(record *state.CheckinRecord, today string) (confirmed bool, pending bool) {
+	if record == nil || today == "" {
+		return false, false
+	}
+	confirmed = record.LastDate == today
+	// 今天已确认就不算待复核，否则页面会在「今天已签到」的账号上挂黄色标记。
+	pending = record.ProvisionalDate == today && !confirmed
+	return confirmed, pending
 }
 
 // accountSummary 是账号概览条目（不含凭证）。
 type accountSummary struct {
-	AuthID          string               `json:"auth_id"`
-	AuthIndex       string               `json:"auth_index"`
-	Label           string               `json:"label"`
-	VendorID        string               `json:"vendor_id"`
-	VendorName      string               `json:"vendor_name"`
-	Realm           string               `json:"realm"`
-	Status          string               `json:"status"`
-	Disabled        bool                 `json:"disabled"`
-	RefreshedAt     string               `json:"refreshed_at,omitempty"`
-	Checkin         *state.CheckinRecord `json:"checkin,omitempty"`
-	Quota           *quotaResult         `json:"quota,omitempty"`
-	SupportsCheckin bool                 `json:"supports_checkin"`
+	AuthID    string `json:"auth_id"`
+	AuthIndex string `json:"auth_index"`
+	// FileID 是账号身份（凭据文件名去 .json）：别名的键，也是页面向
+	// /accounts/alias 提交的唯一标识。头两个字段（host 的 auth_id /
+	// auth_index）会随宿主重扫变化，不能拿来当键。
+	FileID string `json:"file_id,omitempty"`
+	// Label 是**展示名**，链：账号别名 → 上游 label → host label → 文件名 → ID。
+	// 别名是第一优先级，未设置时行为与引入别名之前完全一致。
+	Label string `json:"label"`
+	// NativeLabel 是去掉别名后的上游名称（上游 label → host label → 文件名 → ID）。
+	//
+	// 页面需要它来判断「用户填的名字是否就是原名」：填回原名不该存成一条
+	// 与上游永远同步不了的别名。展示链里别名会覆盖 Label，因此必须单独给出。
+	NativeLabel string `json:"native_label,omitempty"`
+	// Alias 是用户自定义别名；空表示未设置。页面据此决定是否跳过 API key
+	// 脱敏（别名是用户起的名字，不是凭证）。
+	Alias       string               `json:"alias,omitempty"`
+	VendorID    string               `json:"vendor_id"`
+	VendorName  string               `json:"vendor_name"`
+	Realm       string               `json:"realm"`
+	Status      string               `json:"status"`
+	Disabled    bool                 `json:"disabled"`
+	RefreshedAt string               `json:"refreshed_at,omitempty"`
+	Checkin     *state.CheckinRecord `json:"checkin,omitempty"`
+	// CheckinToday 表示「今天已经确认签到成功」（Checkin.LastDate 就是今天）。
+	CheckinToday bool `json:"checkin_today"`
+	// CheckinPending 表示「上游称今天已签到，但还没过可信时刻，需要复核」。
+	//
+	// 这两个结论只能由后端给：LastDate / ProvisionalDate 都只写不清，历史
+	// 账号恒非空，前端拿它们和今天比永远得不出正确结论（#71 第二轮复审 P1-2）。
+	CheckinPending  bool         `json:"checkin_pending"`
+	Quota           *quotaResult `json:"quota,omitempty"`
+	SupportsCheckin bool         `json:"supports_checkin"`
 	// SupportsQuota 是「该供应商能否查出额度」的静态能力，与 Quota（查询结果）
 	// 是两件事：没有结果时它区分「还没查」与「永远查不出来」。
 	SupportsQuota bool `json:"supports_quota"`
 	// Claim 是该账号的套餐领取状态；SupportsClaim 为 false 时前端不渲染入口。
 	Claim         *state.ClaimRecord `json:"claim,omitempty"`
 	SupportsClaim bool               `json:"supports_claim"`
+	// CheckinHistory 是该账号当天的签到执行记录（新→旧；跨天即清空）。
+	CheckinHistory []state.CheckinHistoryEntry `json:"checkin_history,omitempty"`
 }
 
-func (s *Service) getCachedQuota(keys ...string) *quotaResult {
+// quotaCacheKey 返回额度缓存的唯一键：供应商 + 账号身份（FileID 优先，AuthID 兜底）。
+//
+// 键必须同时包含供应商与账号身份。额度结果曾按 Name / Label / AuthIndex 多键落库，
+// 这些字段跨供应商并不唯一（两个账号同昵称、或同一个 auth_index 都很常见），于是 A
+// 账号的额度会被 B 账号读到——OpenCode ZEN 显示 WorkBuddy 的「剩余 / 总额」正是
+// 这条路径。
+func quotaCacheKey(vendorID, fileID, authID string) string {
+	vendorID = strings.TrimSpace(vendorID)
+	accountID := core.FirstNonEmpty(fileID, authID)
+	if vendorID == "" || accountID == "" {
+		return ""
+	}
+	return vendorID + "\x00" + accountID
+}
+
+// getCachedQuota 读取账号额度缓存；身份不完整时视为未命中。
+func (s *Service) getCachedQuota(vendorID, fileID, authID string) *quotaResult {
+	key := quotaCacheKey(vendorID, fileID, authID)
+	if key == "" {
+		return nil
+	}
 	s.quotaMu.RLock()
 	defer s.quotaMu.RUnlock()
-	for _, key := range keys {
-		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			if q, ok := s.quotaCache[trimmed]; ok {
-				copyQ := q
-				return &copyQ
-			}
-		}
+	q, ok := s.quotaCache[key]
+	if !ok {
+		return nil
 	}
-	return nil
+	return &q
 }
 
-func (s *Service) cacheQuotaResult(q quotaResult, keys ...string) {
+// cacheQuotaResult 写入账号额度缓存；身份不完整时不写。
+func (s *Service) cacheQuotaResult(q quotaResult) {
+	key := quotaCacheKey(q.VendorID, q.UID, q.AuthID)
+	if key == "" {
+		return
+	}
 	s.quotaMu.Lock()
 	defer s.quotaMu.Unlock()
-	for _, key := range keys {
-		if trimmed := strings.TrimSpace(key); trimmed != "" {
-			s.quotaCache[trimmed] = q
-		}
+	if s.quotaCache == nil {
+		// 惰性初始化：Service 由 New 构造时已建好，但零值 Service 直接调这里
+		// 会 panic 在 nil map 赋值上。防御成本只是一次 nil 判断，值得。
+		s.quotaCache = map[string]quotaResult{}
 	}
+	s.quotaCache[key] = q
 }
 
 func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) []accountSummary {
 	current := s.deps.State()
+	// today 在循环外取一次：每账号调一次 Today() 会重复格式化时间，且同一批
+	// 账号可能跨零点算出不同的「今天」。
+	today := s.tasks.Today()
 	loaded, failures := s.pool.Load(ctx, callbackID, auth.Options{IncludeDisabled: true})
 	for _, failure := range failures {
-		logger.Debug("skip account %s: %s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
+		logger.Debug("跳过账号 %s：%s", core.FirstNonEmpty(failure.Entry.Name, failure.Entry.ID), failure.Message)
 	}
 	out := make([]accountSummary, 0, len(loaded))
 	for _, account := range loaded {
 		entry := account.Entry
 		credential := account.Credential
 		vendor := account.Vendor
+		uid := credential.FileIDValue()
+		alias := strings.TrimSpace(current.AccountAliases[uid])
+		native := core.FirstNonEmpty(credential.LabelValue(), entry.Label, entry.Name, entry.ID)
 		summary := accountSummary{
 			AuthID:          core.FirstNonEmpty(entry.ID, entry.Name),
 			AuthIndex:       entry.AuthIndex,
-			Label:           core.FirstNonEmpty(credential.LabelValue(), entry.Label, entry.Name, entry.ID),
+			FileID:          uid,
+			Alias:           alias,
+			Label:           core.FirstNonEmpty(alias, native),
+			NativeLabel:     native,
 			VendorID:        vendor.ID(),
 			VendorName:      vendor.Name(),
 			Realm:           credential.RegionValue(),
 			Status:          entry.Status,
 			Disabled:        entry.Disabled,
-			SupportsCheckin: core.SupportsCheckin(vendor),
+			SupportsCheckin: core.SupportsCheckinFor(vendor, credential),
 			SupportsQuota:   supportsQuota(vendor),
 			SupportsClaim:   supportsClaim(vendor),
 		}
@@ -134,22 +204,46 @@ func (s *Service) listAccountSummaries(ctx context.Context, callbackID string) [
 		if !modTime.IsZero() {
 			summary.RefreshedAt = modTime.Format(time.RFC3339)
 		}
-		uid := credential.FileIDValue()
 		if record, okRecord := current.Checkin[uid]; okRecord {
 			summary.Checkin = &record
 		} else if record, okLegacy := lookupLegacyCheckin(current, credential); okLegacy {
 			summary.Checkin = &record
 		}
+		if summary.Checkin != nil {
+			// 「今天是否已确认签到」「今天是否待复核」由后端判定。
+			//
+			// LastDate 只写不清（见 tasks/checkin.go），凡是签过到的账号它恒
+			// 非空，前端拿它和今天比会让待复核标记永远不出现（#71 第二轮复审
+			// P1-2）。判定逻辑抽成 checkinFlags 以便单测。
+			summary.CheckinToday, summary.CheckinPending = checkinFlags(summary.Checkin, today)
+		}
+		summary.CheckinHistory = current.CheckinHistory[state.CheckinHistoryKey(vendor.ID(), uid)]
 		if record, okRecord := current.Claim[uid]; okRecord {
 			claim := record
 			summary.Claim = &claim
 		}
-		if q := s.getCachedQuota(uid, summary.AuthID, summary.AuthIndex, entry.Name, summary.Label); q != nil {
-			summary.Quota = q
+		// 只有支持额度查询的供应商才读取额度缓存。不支持额度的账号（OpenCode
+		// ZEN、Cline 等）不该显示任何「剩余 / 总额」，即便缓存里存在同名字段。
+		if supportsQuota(vendor) {
+			if q := s.getCachedQuota(vendor.ID(), uid, summary.AuthID); q != nil {
+				summary.Quota = q
+				// A successful quota read proves the credential is usable even when
+				// the host retained a stale runtime error from an earlier request.
+				// Do not mutate host auth state; only avoid displaying a contradictory
+				// error in this plugin's account overview.
+				summary.Status = displayedAccountStatus(summary.Status, q.OK)
+			}
 		}
 		out = append(out, summary)
 	}
 	return out
+}
+
+func displayedAccountStatus(status string, quotaOK bool) string {
+	if strings.EqualFold(strings.TrimSpace(status), "error") && quotaOK {
+		return "active"
+	}
+	return status
 }
 
 // supportsQuota 报告该供应商是否提供额度查询。
@@ -177,21 +271,24 @@ func lookupLegacyCheckin(current state.State, credential *core.Credential) (stat
 	return record, okRecord
 }
 
-func (s *Service) buildLogsPayload(req pluginapi.ManagementRequest) map[string]any {
-	since := queryInt64(req.Query, "since", 0)
-	limit := int(queryInt64(req.Query, "limit", 200))
-	entries, newest := logger.Snapshot(uint64(since), limit)
-	return map[string]any{"ok": true, "entries": entries, "next": newest}
-}
-
 type accountBatchRequest struct {
 	AccountIDs []string `json:"account_ids"`
 }
 
-func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountBatchRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+// accountEnabledRequest 是启用/停用账号的请求体。
+type accountEnabledRequest struct {
+	AccountIDs []string `json:"account_ids"`
+	Enabled    bool     `json:"enabled"`
+}
+
+// handleAccountEnabledRequest 批量启用/停用账号。
+//
+// 停用不是删除：凭证文件保留，只在 JSON 上写宿主认的 "disabled" 字段，宿主
+// 扫盘后该账号不再参与路由；启用即删掉该字段。两者都不动 token，随时可逆。
+func (s *Service) handleAccountEnabledRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	body, errDecode := decodeRequest[accountEnabledRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	if len(body.AccountIDs) == 0 {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "account_ids 不能为空"})
@@ -204,14 +301,74 @@ func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pl
 	if errList != nil {
 		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "error": "读取账号列表失败：" + errList.Error()})
 	}
-	wanted := make(map[string]bool, len(body.AccountIDs))
-	for _, target := range body.AccountIDs {
-		wanted[strings.TrimSpace(target)] = true
+	wanted := wantedAccountIDs(body.AccountIDs)
+	results := make([]accountActionResult, 0, len(body.AccountIDs))
+	changed := 0
+	for _, entry := range entries {
+		if !wanted.matches(entry) || entry.Disabled == !body.Enabled {
+			// 已经是目标状态的不重复写盘：宿主扫盘会再触发一次重载。
+			continue
+		}
+		result := accountActionResult{
+			AuthID: core.FirstNonEmpty(entry.ID, entry.Name),
+			Label:  core.FirstNonEmpty(entry.Label, entry.Name, entry.ID),
+		}
+		if errSet := s.setAuthDisabled(ctx, callbackID, entry, !body.Enabled); errSet != nil {
+			result.Message = errSet.Error()
+			results = append(results, result)
+			continue
+		}
+		result.OK = true
+		if body.Enabled {
+			result.Message = "已启用"
+		} else {
+			result.Message = "已停用"
+		}
+		changed++
+		results = append(results, result)
 	}
+	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "changed": changed, "results": results})
+}
+
+// wantedAccountIDs 把页面提交的账号标识集合包成匹配器。
+//
+// 页面用 auth_id 作为勾选键（账号表里的唯一稳定标识），但宿主的三个标识
+// （ID / Name / AuthIndex）都可能在重扫后变化，统一在这里比对一次。
+func wantedAccountIDs(targets []string) accountIDSet {
+	set := make(accountIDSet, len(targets))
+	for _, target := range targets {
+		set[strings.TrimSpace(target)] = true
+	}
+	return set
+}
+
+type accountIDSet map[string]bool
+
+func (s accountIDSet) matches(entry core.HostAuth) bool {
+	return s[entry.ID] || s[entry.Name] || s[entry.AuthIndex]
+}
+
+func (s *Service) handleAccountDeleteRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	body, errDecode := decodeRequest[accountBatchRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
+	}
+	if len(body.AccountIDs) == 0 {
+		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "account_ids 不能为空"})
+	}
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	callbackID := hostbridge.RequestCallbackID(req)
+
+	entries, errList := hostbridge.ListAuths(ctx, callbackID, s.registry)
+	if errList != nil {
+		return JSONResponse(http.StatusOK, map[string]any{"ok": false, "error": "读取账号列表失败：" + errList.Error()})
+	}
+	wanted := wantedAccountIDs(body.AccountIDs)
 	results := make([]accountActionResult, 0, len(body.AccountIDs))
 	deleted := 0
 	for _, entry := range entries {
-		if !wanted[entry.ID] && !wanted[entry.Name] && !wanted[entry.AuthIndex] {
+		if !wanted.matches(entry) {
 			continue
 		}
 		result := accountActionResult{
@@ -237,49 +394,75 @@ func (s *Service) deleteAuthFile(ctx context.Context, callbackID string, entry c
 	if !okRaw {
 		return fmt.Errorf("读取凭证失败，无法确认归属")
 	}
-	if _, okParse := s.registry.ParseCredential(raw, hostbridge.AccountIdentity(entry), nil); !okParse {
-		return fmt.Errorf("该凭证不属于本插件，拒绝删除")
-	}
-	targetPath := strings.TrimSpace(filePath)
-	if targetPath == "" {
-		targetPath = strings.TrimSpace(entry.Path)
-	}
-	if targetPath == "" {
-		return fmt.Errorf("该账号没有对应的凭证文件（运行时凭证），无法删除")
-	}
-	if errSafe := ensureAuthFilePathSafe(targetPath); errSafe != nil {
+	targetPath, errSafe := safeAuthFilePath(s.registry, entry, raw, core.FirstNonEmpty(filePath, entry.Path))
+	if errSafe != nil {
 		return errSafe
 	}
 	if errRemove := os.Remove(targetPath); errRemove != nil {
-		if os.IsNotExist(errRemove) {
-			return nil
-		}
 		return fmt.Errorf("删除文件失败：%w", errRemove)
 	}
-	logger.Info("deleted auth file %s (vendor=%s)", filepath.Base(targetPath), entry.Name)
+	s.purgeAccountState(raw, filepath.Base(targetPath))
+	logger.Info("已删除授权文件 %s（供应商=%s）", filepath.Base(targetPath),
+		credentialVendorLabel(s.registry, raw, filepath.Base(targetPath)))
 	return nil
 }
 
-func ensureAuthFilePathSafe(path string) error {
-	if !filepath.IsAbs(path) {
-		return fmt.Errorf("拒绝删除非绝对路径：%s", path)
+// purgeAccountState 清掉被删账号在 state.json 里的残留。
+//
+// 签到状态与历史按 FileID 落盘，删掉凭证后这些记录会永远挂在一个不存在的
+// 账号名下；同一个账号重新导入时还会读到上一轮的历史，看起来像「刚签过」。
+func (s *Service) purgeAccountState(raw []byte, fileName string) {
+	credential, okCredential := s.registry.ParseCredential(raw, fileName, nil)
+	if !okCredential || credential.FileIDValue() == "" {
+		return
 	}
-	if !strings.HasSuffix(strings.ToLower(path), ".json") {
-		return fmt.Errorf("拒绝删除非凭证文件：%s", filepath.Base(path))
+	fileID := credential.FileIDValue()
+	// 与 tasks.checkinHistoryKey 同口径（vendor.ID() + FileID）：ParseCredential
+	// 已按解析结果补齐 vendor 字段，这里不会再出现空供应商前缀。
+	historyKey := state.CheckinHistoryKey(credential.VendorIDValue(), fileID)
+	s.deps.MutateState(func(current *state.State) {
+		delete(current.Checkin, fileID)
+		delete(current.CheckinHistory, historyKey)
+		delete(current.DailyBonusSent, historyKey)
+	})
+}
+
+// credentialVendorLabel 反查凭证真正的供应商标识，供日志使用。
+//
+// 宿主的 auth 记录只有 provider（=本插件）与文件名，Name 常常就是文件名本身；
+// 直接把它当 vendor 写日志会出现 vendor=codearts-codearts-user.json 这种误导
+// （issue #58）。查不到归属时写 unknown，不拿文件名冒充。
+func credentialVendorLabel(registry *core.Registry, raw []byte, fileName string) string {
+	credential, okCredential := registry.ParseCredential(raw, fileName, nil)
+	if !okCredential {
+		return "unknown"
 	}
-	info, errStat := os.Lstat(path)
-	if errStat != nil {
-		if os.IsNotExist(errStat) {
-			return nil
-		}
-		return fmt.Errorf("检查文件失败：%w", errStat)
+	return core.FirstNonEmpty(credential.VendorIDValue(), "unknown")
+}
+
+// setAuthDisabled 在凭证文件上写/清 disabled 标记。
+//
+// 写回沿用凭证保存的两条路径（见 authfile.go）：优先 host.auth.save，宿主会
+// 同时更新磁盘与内存注册表；不可用时才直接写盘，让宿主自己扫到。校验与删除
+// 同源——先确认这份凭证属于本插件、路径是可写的普通 .json。
+func (s *Service) setAuthDisabled(ctx context.Context, callbackID string, entry core.HostAuth, disabled bool) error {
+	raw, filePath, okRaw := hostbridge.AuthJSONAndPath(ctx, callbackID, entry.AuthIndex)
+	if !okRaw {
+		return fmt.Errorf("读取凭证失败，无法确认归属")
 	}
-	if info.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("拒绝删除符号链接：%s", filepath.Base(path))
+	targetPath, errSafe := safeAuthFilePath(s.registry, entry, raw, core.FirstNonEmpty(filePath, entry.Path))
+	if errSafe != nil {
+		return errSafe
 	}
-	if info.IsDir() {
-		return fmt.Errorf("拒绝删除目录：%s", filepath.Base(path))
+	updated, errUpdate := setCredentialDisabled(raw, disabled)
+	if errUpdate != nil {
+		return errUpdate
 	}
+	if errSave := saveAuthFile(callbackID, filepath.Base(targetPath), updated); errSave != nil {
+		return errSave
+	}
+	logger.Info("授权文件 %s 停用=%t（供应商=%s）", filepath.Base(targetPath), disabled,
+		credentialVendorLabel(s.registry, raw, filepath.Base(targetPath)))
 	return nil
 }
 
@@ -287,12 +470,15 @@ type accountAddRequest struct {
 	Vendor string `json:"vendor"`
 	APIKey string `json:"api_key"`
 	Label  string `json:"label"`
+	// CredentialJSON 是供应商原生凭证 JSON（token 对等复杂凭证）。
+	// 提供时优先于 api_key：原样交给供应商的 Parse 归一，不套 api_key 信封。
+	CredentialJSON string `json:"credential_json,omitempty"`
 }
 
 func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountAddRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[accountAddRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	vendorID := strings.TrimSpace(body.Vendor)
 	apiKey := strings.TrimSpace(body.APIKey)
@@ -300,39 +486,64 @@ func (s *Service) handleAccountAddRequest(req pluginapi.ManagementRequest) plugi
 	if vendorID == "" {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "vendor 不能为空"})
 	}
-	if apiKey == "" {
+	credentialJSON := strings.TrimSpace(body.CredentialJSON)
+	if apiKey == "" && credentialJSON == "" {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "api_key 不能为空"})
 	}
 	vendor, okVendor := s.registry.ByID(vendorID)
 	if !okVendor {
 		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": fmt.Sprintf("未知供应商 %q", vendorID)})
 	}
-	payload := map[string]any{
-		"type":         s.deps.Identity().ProviderKey,
-		core.VendorKey: vendor.ID(),
-		"api_key":      apiKey,
-	}
-	if label != "" {
-		payload["label"] = label
-	}
-	rawJSON, errMarshal := json.MarshalIndent(payload, "", "  ")
-	if errMarshal != nil {
-		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
-	}
+	var rawJSON []byte
 	seed := label
-	if seed == "" {
-		seed = maskedAPIKey(apiKey)
+	if credentialJSON != "" {
+		// 原生凭证 JSON：补 vendor 归属字段后原样落盘，交给供应商 Parse 归一。
+		var doc map[string]any
+		if err := json.Unmarshal([]byte(credentialJSON), &doc); err != nil || doc == nil {
+			return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "credential_json 不是合法的 JSON 对象"})
+		}
+		doc[core.VendorKey] = vendor.ID()
+		encoded, errMarshal := json.MarshalIndent(doc, "", "  ")
+		if errMarshal != nil {
+			return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
+		}
+		rawJSON = encoded
+		if seed == "" {
+			seed = core.RandomHex(8)
+		}
+	} else {
+		payload := map[string]any{
+			"type":         s.deps.Identity().ProviderKey,
+			core.VendorKey: vendor.ID(),
+			"api_key":      apiKey,
+		}
+		if label != "" {
+			payload["label"] = label
+		}
+		encoded, errMarshal := json.MarshalIndent(payload, "", "  ")
+		if errMarshal != nil {
+			return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errMarshal.Error()})
+		}
+		rawJSON = encoded
+		if seed == "" {
+			seed = maskedAPIKey(apiKey)
+		}
 	}
 	if seed == "" {
 		seed = core.RandomHex(8)
 	}
 	fileName := core.FileNameFor(vendor.ID(), seed)
 	callbackID := hostbridge.RequestCallbackID(req)
+	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
+	defer cancel()
+	if errLimit := s.pool.CheckVendorLimit(ctx, callbackID, vendor, fileName); errLimit != nil {
+		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": errLimit.Error()})
+	}
 
 	if errSave := saveAuthFile(callbackID, fileName, rawJSON); errSave != nil {
 		return JSONResponse(http.StatusInternalServerError, map[string]any{"ok": false, "error": errSave.Error()})
 	}
-	logger.Info("added auth file %s for vendor %s", fileName, vendor.ID())
+	logger.Info("已为供应商 %s 添加授权文件 %s", fileName, vendor.ID())
 	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "auth_id": fileName, "message": "账号保存成功"})
 }
 
@@ -348,28 +559,63 @@ func maskedAPIKey(key string) string {
 	return trimmed[:4] + "***" + trimmed[len(trimmed)-4:]
 }
 
+// accountAliasRequest 是设置/清除账号别名的请求体。
+type accountAliasRequest struct {
+	FileID string `json:"file_id"`
+	Alias  string `json:"alias"`
+}
+
+// handleAccountAliasRequest 设置或清除某个账号的展示别名。
+//
+// 键用账号身份（FileID）而不是昵称/邮箱：token 刷新、重登都不改凭证文件名，
+// 别名因此自动保留，也不会因为两个账号同昵称而互相覆盖。
+//
+// 别名是纯展示字段（不参与任何 ID 解析），所以允许空格等字符，只做首尾裁剪；
+// 空串表示清除，恢复上游名称。不需要重建宿主模型注册表——账号名只影响本页。
+func (s *Service) handleAccountAliasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
+	body, errDecode := decodeRequest[accountAliasRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
+	}
+	fileID := strings.TrimSpace(body.FileID)
+	if fileID == "" {
+		return JSONResponse(http.StatusBadRequest, map[string]any{"ok": false, "error": "file_id 不能为空"})
+	}
+	alias := strings.TrimSpace(body.Alias)
+	s.deps.MutateState(func(current *state.State) {
+		if alias == "" {
+			delete(current.AccountAliases, fileID)
+			return
+		}
+		if current.AccountAliases == nil {
+			current.AccountAliases = map[string]string{}
+		}
+		current.AccountAliases[fileID] = alias
+	})
+	logger.Info("账号 %s 别名：%q", fileID, alias)
+	return JSONResponse(http.StatusOK, map[string]any{"ok": true, "alias": alias})
+}
+
 func (s *Service) handleCheckinRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountBatchRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[accountBatchRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
 	results := s.runForAccounts(ctx, hostbridge.RequestCallbackID(req), body.AccountIDs,
 		func(vendor core.Vendor, _ *core.Credential) bool { return core.SupportsCheckin(vendor) },
 		func(ctx context.Context, vendor core.Vendor, credential *core.Credential) (accountActionOutcome, error) {
-			checkin, okCheckin := core.As[core.CheckinProvider](vendor)
-			if !okCheckin {
-				return accountActionOutcome{}, fmt.Errorf("本供应商不提供签到")
+			// 供应商级能力为真时仍要按账号复核：企业账号天生没有签到活动，
+			// 如实报「跳过 + 原因」，而不是让上游 400 变成一条失败记录。
+			if !core.SupportsCheckinFor(vendor, credential) {
+				reason := core.FirstNonEmpty(core.CheckinUnsupportedReason(vendor, credential), "本账号不支持签到")
+				return accountActionOutcome{Message: reason, Skipped: true}, nil
 			}
-			result, errCheckin := checkin.Checkin(ctx, credential)
+			result, errCheckin := s.tasks.Checkin(ctx, vendor, credential, tasks.CheckinTriggerManual)
 			if errCheckin != nil {
 				return accountActionOutcome{}, errCheckin
 			}
-			if result == nil {
-				return accountActionOutcome{}, fmt.Errorf("签到未返回结果")
-			}
-			s.tasks.RecordCheckin(credential, result)
 			// NotRecorded 表示这次签到**没有真正完成**（上游窗口未开启、
 			// 领取被拒、未确认发放）。如实标成「跳过」而不是成功，控制台
 			// 就不会显示「签到完成」而用户实际没拿到积分。
@@ -424,14 +670,18 @@ func (s *Service) runForAccounts(
 			OK:     false, Message: failure.Message,
 		})
 	}
-	jobResults := auth.RunBatch(loaded, batchConcurrency, func(current auth.Account) accountActionResult {
+	jobResults := runGroupedBatch(ctx, loaded, batchConcurrency, batchAccountGap, func(current auth.Account) accountActionResult {
 		result := accountActionResult{
 			AuthID:   core.FirstNonEmpty(current.Entry.ID, current.Entry.Name),
 			Label:    core.FirstNonEmpty(current.Credential.LabelValue(), current.Entry.Label),
 			VendorID: current.Vendor.ID(),
 			Realm:    current.Credential.RegionValue(),
 		}
-		outcome, errAction := action(ctx, current.Vendor, current.Credential)
+		outcome, errAction := runWithAuthRetry(current.Credential, func() *core.Credential {
+			return s.refreshedCredential(ctx, callbackID, current.Entry, current.Vendor)
+		}, func(credential *core.Credential) (accountActionOutcome, error) {
+			return action(ctx, current.Vendor, credential)
+		})
 		if errAction != nil {
 			result.OK = false
 			result.Message = errAction.Error()
@@ -443,4 +693,73 @@ func (s *Service) runForAccounts(
 		return result
 	})
 	return append(results, jobResults...)
+}
+
+// batchAccountGap 是同厂商账号之间的间隔。
+//
+// 上游 WAF 看的是同 IP 的突发速率，不看你有几个账号：6 路并发、零间隔的
+// 批量在实测里一次点击就把三个厂商同时打进 429（8 个账号挂掉 7 个）。定时
+// 路径一直是串行 + accountGap，从没出过这个问题——两条路径不该有两套节奏。
+// 跨厂商并发保留，总耗时基本不变，同厂商的峰值降到 1 路。
+const batchAccountGap = 600 * time.Millisecond
+
+// runGroupedBatch 按厂商分组执行动作：组间并发（上限 groups），组内串行并留间隔。
+//
+// 返回值与 accounts 下标对齐，调用方按原顺序呈现即可。
+func runGroupedBatch(
+	ctx context.Context,
+	accounts []auth.Account,
+	groups int,
+	gap time.Duration,
+	run func(auth.Account) accountActionResult,
+) []accountActionResult {
+	if groups < 1 {
+		groups = 1
+	}
+	order := make([]string, 0, 4)
+	byVendor := make(map[string][]int, 4)
+	for index, account := range accounts {
+		vendor := account.Vendor.ID()
+		if _, seen := byVendor[vendor]; !seen {
+			order = append(order, vendor)
+		}
+		byVendor[vendor] = append(byVendor[vendor], index)
+	}
+	results := make([]accountActionResult, len(accounts))
+	limit := make(chan struct{}, groups)
+	var wg sync.WaitGroup
+	for _, vendor := range order {
+		wg.Add(1)
+		go func(indices []int) {
+			defer wg.Done()
+			limit <- struct{}{}
+			defer func() { <-limit }()
+			for position, index := range indices {
+				if position > 0 && !core.SleepContext(ctx, gap) {
+					// ctx 取消后不再往下打上游：剩下的账号只标取消，不发请求。
+					for _, rest := range indices[position:] {
+						results[rest] = accountActionResult{Message: "已取消"}
+					}
+					return
+				}
+				results[index] = run(accounts[index])
+			}
+		}(byVendor[vendor])
+	}
+	wg.Wait()
+	return results
+}
+
+// runWithAuthRetry 在动作因凭证过期（401）失败时，刷新一次凭证再重试。
+//
+// CodeArts 的 STS security token 过期是**可续期**的：不刷新就重试，一键签到
+// 会一直报「token has expired」，用户只能自己去点 Token 续期。只认 401——
+// 403 / 参数错误刷新不会变好。刷新与重试逻辑见 withAuthRetry。
+func runWithAuthRetry(
+	credential *core.Credential,
+	refresh func() *core.Credential,
+	action func(*core.Credential) (accountActionOutcome, error),
+) (accountActionOutcome, error) {
+	outcome, _, errAction := core.WithAuthRetry(credential, refresh, action)
+	return outcome, errAction
 }

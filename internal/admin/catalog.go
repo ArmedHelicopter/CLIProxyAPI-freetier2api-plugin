@@ -142,8 +142,11 @@ func (c *Catalog) RealmEnabled(region string) bool {
 // ExpandKeys 把模型标识展开成查询键。
 //
 //   - 裸名：原样返回（对所有供应商生效）；
-//   - 供应商 ID 前缀：规范 vendorKey；
+//   - 供应商 ID / 拆分前的旧 ID 前缀：规范成它对应的实例 vendorKey；
 //   - 区域别名：展开成该区域每家供应商的 vendorKey。
+//
+// 旧 ID 的展开是「拆实例后存量配置不失效」的关键：用户写的 zcode:GLM-5.3
+// 会落到 zcodeglobal:GLM-5.3，无需手工迁移。
 func (c *Catalog) ExpandKeys(modelID string) []string {
 	trimmed := strings.TrimSpace(modelID)
 	if trimmed == "" {
@@ -153,19 +156,15 @@ func (c *Catalog) ExpandKeys(modelID string) []string {
 	if prefix == "" {
 		return []string{bare}
 	}
-	if _, okVendor := c.registry.ByID(prefix); okVendor {
-		return []string{c.registry.ModelKeyFor(prefix, bare)}
+	ids := c.registry.VendorIDsForPrefix(prefix)
+	if len(ids) == 0 {
+		return []string{bare}
 	}
-	keys := make([]string, 0, 4)
-	for _, vendor := range c.registry.Vendors() {
-		if vendor.Region() == prefix {
-			keys = append(keys, c.registry.ModelKeyFor(vendor.ID(), bare))
-		}
+	keys := make([]string, 0, len(ids))
+	for _, id := range ids {
+		keys = append(keys, c.registry.ModelKeyFor(id, bare))
 	}
-	if len(keys) > 0 {
-		return keys
-	}
-	return []string{bare}
+	return keys
 }
 
 // ExpandDisabledList 展开配置里的禁用项并稳定排序。
@@ -201,7 +200,7 @@ func (c *Catalog) IsDisabled(vendorID, modelID string) bool {
 		return false
 	}
 	if prefix, rest := c.registry.SplitModelID(bare); prefix != "" {
-		if vendor, okVendor := c.vendorForPrefix(prefix); okVendor && vendor.ID() != vendorID {
+		if !c.prefixCoversVendor(prefix, vendorID) {
 			return false
 		}
 		bare = rest
@@ -231,17 +230,18 @@ func (c *Catalog) registeredLocked(vendorID, modelID string) bool {
 	return false
 }
 
-// vendorForPrefix 把限定前缀（供应商 ID 或区域别名）解析成供应商实例。
-func (c *Catalog) vendorForPrefix(prefix string) (core.Vendor, bool) {
-	if vendor, okVendor := c.registry.ByID(prefix); okVendor {
-		return vendor, true
-	}
-	for _, vendor := range c.registry.Vendors() {
-		if vendor.Region() == prefix {
-			return vendor, true
+// prefixCoversVendor 报告限定前缀是否覆盖该供应商实例。
+//
+// 前缀可能写成区域别名（cn:model 对区域内每家都成立），因此不能用
+// 「解析成唯一实例」判定，否则同区域除首家外的实例都会被漏判。
+func (c *Catalog) prefixCoversVendor(prefix, vendorID string) bool {
+	vendorID = strings.ToLower(strings.TrimSpace(vendorID))
+	for _, id := range c.registry.VendorIDsForPrefix(prefix) {
+		if id == vendorID {
+			return true
 		}
 	}
-	return nil, false
+	return false
 }
 
 // FilterForVendor 剔除某供应商下被禁用的模型。
@@ -350,7 +350,7 @@ func (c *Catalog) CacheProbedModels(vendorID string, models []pluginapi.ModelInf
 // 出现「清单是新的、倍率还是上一批」的错配。
 func (c *Catalog) cacheProbed(vendorID string, models []pluginapi.ModelInfo) bool {
 	if len(models) == 0 {
-		logger.Info("models: %s probe returned 0 model(s); keeping %d cached",
+		logger.Info("模型：%s 探测返回 0 个模型，保留已缓存的 %d 个",
 			vendorID, len(c.Registered(vendorID)))
 		return false
 	}
@@ -370,6 +370,8 @@ func (c *Catalog) cacheProbed(vendorID string, models []pluginapi.ModelInfo) boo
 //
 // 只有实现了 CreditsProvider 的供应商才有倍率；宿主契约里没有这个字段，
 // 因此不能从 models 里推。空值不写入，避免把「没提供」当成「免费」。
+// 倍率的归一化（FormatRate）由各供应商在自己那层完成，这里只做去空格，
+// 不再二次格式化——否则「0」这类合法值会被反复改写。
 // 调用方必须在 Catalog 写锁之外调用。
 func (c *Catalog) creditsFromProvider(vendorID string) map[string]string {
 	vendor, okVendor := c.registry.ByID(vendorID)
@@ -383,9 +385,9 @@ func (c *Catalog) creditsFromProvider(vendorID string) map[string]string {
 	credits := make(map[string]string)
 	for id, value := range provider.ModelCredits() {
 		id = strings.TrimSpace(id)
-		rate := core.FormatRate(value)
-		if id != "" && rate != "" {
-			credits[id] = rate
+		value = strings.TrimSpace(value)
+		if id != "" && value != "" {
+			credits[id] = value
 		}
 	}
 	if len(credits) == 0 {
@@ -524,11 +526,11 @@ func (c *Catalog) probeVendor(vendor core.Vendor, done chan struct{}) {
 
 	wrote := false
 	if errModels != nil {
-		logger.Info("models: %s console probe failed: %v", vendorID, errModels)
+		logger.Info("模型：%s 控制台探测失败：%v", vendorID, errModels)
 	} else {
 		wrote = c.CacheProbedModels(vendorID, models)
 		if wrote {
-			logger.Info("models: %s console probe cached %d model(s)", vendorID, len(models))
+			logger.Info("模型：%s 控制台探测已缓存 %d 个模型", vendorID, len(models))
 		}
 	}
 
@@ -546,6 +548,10 @@ func (c *Catalog) probeVendor(vendor core.Vendor, done chan struct{}) {
 }
 
 // LoadCachedState 从 state.json 恢复全部供应商的模型缓存，并通知供应商预热。
+//
+// 已下线供应商的条目直接丢弃：缓存是按 vendor_id 落盘的，供应商被移除后
+// 这些条目再也没有读取方，留着只会随 CachedState 一轮轮写回 state.json，
+// 让控制台与配置里长期挂着一批不存在的模型。
 func (c *Catalog) LoadCachedState(cached []core.CachedModel) {
 	entries := map[string]cachedVendor{}
 	for _, item := range cached {
@@ -553,14 +559,27 @@ func (c *Catalog) LoadCachedState(cached []core.CachedModel) {
 			continue
 		}
 		vendorID := cachedVendorID(item)
+		if _, okVendor := c.registry.ByID(vendorID); !okVendor {
+			continue
+		}
 		entry := entries[vendorID]
-		entry.models = append(entry.models, pluginapi.ModelInfo{
-			ID: item.ID, Name: item.Name, DisplayName: item.Name,
-			Description: item.Description, ContextLength: item.ContextLength,
-			InputTokenLimit: item.ContextLength, MaxCompletionTokens: item.MaxOutputTokens,
-			OutputTokenLimit: item.MaxOutputTokens, Thinking: thinkingFromCached(item),
+		// 复用注册转换，能力字段（图片、工具、参数）与实时探测保持同一来源；
+		// 手工拼 ModelInfo 会漏掉 SupportedInputModalities / SupportedParameters，
+		// 重启后到下一轮探测成功前，控制台会显示成「不支持」。
+		model := core.ModelInfoToPluginAPI(vendorID, core.ModelDescriptor{
+			ID:              item.ID,
+			Name:            item.Name,
+			Description:     item.Description,
+			ContextLength:   item.ContextLength,
+			MaxOutputTokens: item.MaxOutputTokens,
+			SupportsImages:  item.SupportsImages,
+			SupportsTools:   item.SupportsTool,
 		})
-		if rate := core.FormatRate(item.Credits); rate != "" {
+		model.Thinking = thinkingFromCached(item)
+		entry.models = append(entry.models, model)
+		// 倍率在写入缓存前已由供应商归一化（cacheProbed → creditsFromProvider），
+		// 这里原样还原即可；再格式化一次会把 0.00X 之类的合法值重新解释。
+		if rate := strings.TrimSpace(item.Credits); rate != "" {
 			if entry.credits == nil {
 				entry.credits = map[string]string{}
 			}
@@ -662,10 +681,28 @@ func aliasScopedKey(vendorID, modelID string) string {
 	return strings.ToLower(strings.TrimSpace(vendorID)) + ":" + strings.TrimSpace(modelID)
 }
 
+// canonicalAliasKey 把别名键里的旧前缀改写成现役实例 ID。
+//
+// 拆实例后旧 vendorID 从注册表消失，存量别名键 <旧ID>:<模型> 若不改写，
+// AliasFor / ResolveOutboundModel 按现役 ID 索引就永远读不到（用户设置
+// 静默失效），SetAlias 也清不掉它。区域别名对应多个实例、无法归一，原样保留。
+func (c *Catalog) canonicalAliasKey(key string) string {
+	key = strings.TrimSpace(key)
+	prefix, bare := c.registry.SplitModelID(key)
+	if prefix == "" {
+		return key
+	}
+	ids := c.registry.VendorIDsForPrefix(prefix)
+	if len(ids) != 1 {
+		return key
+	}
+	return aliasScopedKey(ids[0], bare)
+}
+
 func (c *Catalog) reloadAliasesLocked(aliases map[string]string) {
 	next := make(map[string]string, len(aliases))
 	for key, alias := range aliases {
-		trimmedKey := strings.TrimSpace(key)
+		trimmedKey := c.canonicalAliasKey(key)
 		trimmedAlias := strings.TrimSpace(alias)
 		if trimmedKey == "" || trimmedAlias == "" {
 			continue
@@ -686,20 +723,51 @@ func (c *Catalog) AliasFor(vendorID, modelID string) string {
 func (c *Catalog) ApplyAliases(vendorID string, models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if len(models) == 0 || len(c.aliases) == 0 {
+	if len(models) == 0 {
 		return models
 	}
 	prefix := strings.ToLower(strings.TrimSpace(vendorID)) + ":"
+	// 撞车判定用**本次入参清单**构造的 ID 集合：registeredLocked 对缓存为空
+	// 的供应商会把任何名字判成「已存在」，导致标识被整体放弃——同一份清单
+	// 里有的带标识、有的不带，恰好复活本特性要消除的歧义。
+	present := make(map[string]bool, len(models))
+	for _, model := range models {
+		present[strings.ToLower(strings.TrimSpace(model.ID))] = true
+	}
 	out := make([]pluginapi.ModelInfo, 0, len(models))
 	for _, model := range models {
-		if alias := c.aliases[prefix+strings.TrimSpace(model.ID)]; alias != "" {
-			model.ID = alias
-			model.Name = alias
-			model.DisplayName = alias
+		bare := strings.TrimSpace(model.ID)
+		manual := c.aliases[prefix+bare]
+		tagged := c.taggedModelID(vendorID, bare)
+		switch {
+		case manual != "":
+			model.ID = manual
+			model.Name = manual
+			model.DisplayName = manual
+		case tagged != "" && !present[strings.ToLower(tagged)]:
+			// 自动渠道标识不覆盖：手动别名优先；tag 后的名字撞上**同供应商
+			// 清单里的其他模型**时放弃标识（防路由歧义；跨供应商本就不合并）。
+			model.ID = tagged
+			model.Name = tagged
+			model.DisplayName = tagged
 		}
 		out = append(out, model)
 	}
 	return out
+}
+
+// taggedModelID 给模型 ID 加固定的渠道前缀。
+//
+// 前缀写死为「供应商-模型」，不可配置：同名模型在不同渠道下必须天然可区分，
+// 否则客户端最终命中哪个渠道取决于清单顺序。标识统一按**供应商**生成
+// （不同账号之间不区分）：zcode 的 GLM-5.3 无论几个账号对外都是 zcode-GLM-5.3。
+func (c *Catalog) taggedModelID(vendorID, modelID string) string {
+	vendorID = strings.TrimSpace(vendorID)
+	modelID = strings.TrimSpace(modelID)
+	if vendorID == "" || modelID == "" {
+		return ""
+	}
+	return vendorID + "-" + modelID
 }
 
 // ResolveOutboundModel 把客户端请求的模型名还原成上游的官方 ID。
@@ -726,14 +794,38 @@ func (c *Catalog) ResolveOutboundModel(vendorID, model string) string {
 		if c.registeredLocked(vendorID, bare) {
 			return bare
 		}
-		logger.Debug("models: ignoring alias %q -> %q (%s no longer registers it)", alias, bare, vendorID)
+		logger.Debug("模型：忽略别名 %q → %q（%s 已不再注册该模型）", alias, bare, vendorID)
+	}
+	// 自动渠道标识的还原：prefix / suffix **两种形态都试**（不依赖当前模式）。
+	// 模式切换后（如 prefix→off/suffix）宿主注册表仍是旧名字，客户端手里的
+	// 旧标识请求必须仍能还原，否则带标识的名字会直通上游报 invalid model。
+	for _, bare := range c.untagModelID(vendorID, requested) {
+		if c.registeredLocked(vendorID, bare) {
+			return bare
+		}
 	}
 	return model
+}
+
+// untagModelID 尝试把带渠道标识的模型 ID 还原成官方 ID，返回全部候选
+// （prefix 剥离与 suffix 剥离各一个；都不匹配返回空）。
+func (c *Catalog) untagModelID(vendorID, requested string) []string {
+	vendorLower := strings.ToLower(strings.TrimSpace(vendorID))
+	requestedLower := strings.ToLower(requested)
+	var out []string
+	if lead := vendorLower + "-"; strings.HasPrefix(requestedLower, lead) && len(requested) > len(lead) {
+		out = append(out, requested[len(lead):])
+	}
+	if tail := "-" + vendorLower; strings.HasSuffix(requestedLower, tail) && len(requested) > len(tail) {
+		out = append(out, requested[:len(requested)-len(tail)])
+	}
+	return out
 }
 
 // SetAlias 设置或清除某模型的别名。
 //
 // 同一供应商内别名唯一：写入时清掉占用同名别名的旧模型，否则反查会命中两条。
+// 落盘时顺带把旧前缀键改写成现役键，旧配置自然迁移，不会留下清不掉的残留。
 func (c *Catalog) SetAlias(vendorID, bare, alias string) {
 	if c.store == nil {
 		return
@@ -742,25 +834,23 @@ func (c *Catalog) SetAlias(vendorID, bare, alias string) {
 	alias = strings.TrimSpace(alias)
 	var next map[string]string
 	c.store.Mutate(func(s *state.State) {
-		if s.ModelAliases == nil {
-			s.ModelAliases = map[string]string{}
+		next = make(map[string]string, len(s.ModelAliases)+1)
+		for key, value := range s.ModelAliases {
+			next[c.canonicalAliasKey(key)] = value
 		}
 		s.RestartPending = true
 		if alias == "" {
-			delete(s.ModelAliases, scoped)
+			delete(next, scoped)
 		} else {
 			prefix := strings.ToLower(strings.TrimSpace(vendorID)) + ":"
-			for existing, existingAlias := range s.ModelAliases {
+			for existing, existingAlias := range next {
 				if existing != scoped && strings.EqualFold(existingAlias, alias) && strings.HasPrefix(existing, prefix) {
-					delete(s.ModelAliases, existing)
+					delete(next, existing)
 				}
 			}
-			s.ModelAliases[scoped] = alias
+			next[scoped] = alias
 		}
-		next = make(map[string]string, len(s.ModelAliases))
-		for key, value := range s.ModelAliases {
-			next[key] = value
-		}
+		s.ModelAliases = next
 	})
 	c.mu.Lock()
 	c.reloadAliasesLocked(next)
@@ -768,8 +858,17 @@ func (c *Catalog) SetAlias(vendorID, bare, alias string) {
 }
 
 // VendorForAliasScope 解析 <vendor>:<model> 形式，供管理接口校验。
+//
+// 返回的是**现役实例 ID**（旧前缀唯一对应一个实例时归一）：别名键必须与
+// AliasFor / ResolveOutboundModel 的索引键一致，否则出现「设置成功却读不回
+// 来」。区域别名对应多家供应商、无法归一，返回空由接口拒绝。
 func (c *Catalog) VendorForAliasScope(scope string) (string, string) {
-	return c.registry.SplitModelID(strings.TrimSpace(scope))
+	prefix, bare := c.registry.SplitModelID(strings.TrimSpace(scope))
+	ids := c.registry.VendorIDsForPrefix(prefix)
+	if len(ids) != 1 {
+		return "", ""
+	}
+	return ids[0], bare
 }
 
 // StaticModels 返回所有启用且有凭证的供应商的模型并集（同名合并）。
@@ -782,22 +881,22 @@ func (c *Catalog) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	active := hostbridge.ActiveVendorSet(ctx, "", c.registry)
 	for _, vendor := range c.registry.Vendors() {
 		if !c.RealmEnabled(vendor.Region()) {
-			logger.Debug("models: skip %s (realm %q not enabled)", vendor.ID(), vendor.Region())
+			logger.Debug("模型：跳过 %s（区域 %q 未启用）", vendor.ID(), vendor.Region())
 			continue
 		}
 		if !active[vendor.ID()] {
-			logger.Debug("models: skip %s (no usable credential)", vendor.ID())
+			logger.Debug("模型：跳过 %s（无可用凭证）", vendor.ID())
 			continue
 		}
 		models, errModels := vendor.StaticModels(ctx)
 		if errModels != nil {
-			logger.Info("models: %s probe failed: %v", vendor.ID(), errModels)
+			logger.Info("模型：%s 探测失败：%v", vendor.ID(), errModels)
 			if firstErr == nil {
 				firstErr = errModels
 			}
 			continue
 		}
-		logger.Info("models: %s registered %d model(s)", vendor.ID(), len(models))
+		logger.Info("模型：%s 已注册 %d 个模型", vendor.ID(), len(models))
 		// 缓存官方 ID 清单供管理页回读（注册路径随后会换成别名）。
 		c.cacheProbed(vendor.ID(), models)
 		all = append(all, c.ApplyAliases(vendor.ID(), c.FilterForVendor(vendor.ID(), models))...)
@@ -820,19 +919,19 @@ func (c *Catalog) RefreshFromUpstream(ctx context.Context) (int, error) {
 	active := hostbridge.ActiveVendorSet(ctx, "", c.registry)
 	for _, vendor := range c.registry.Vendors() {
 		if !c.RealmEnabled(vendor.Region()) || !active[vendor.ID()] {
-			logger.Debug("models: refresh skip %s (realm enabled=%t, credential=%t)",
+			logger.Debug("模型：刷新跳过 %s（区域启用=%t，有凭证=%t）",
 				vendor.ID(), c.RealmEnabled(vendor.Region()), active[vendor.ID()])
 			continue
 		}
 		models, errModels := vendor.StaticModels(ctx)
 		if errModels != nil {
-			logger.Info("models: refresh %s failed: %v", vendor.ID(), errModels)
+			logger.Info("模型：刷新 %s 失败：%v", vendor.ID(), errModels)
 			if firstErr == nil {
 				firstErr = errModels
 			}
 			continue
 		}
-		logger.Info("models: refresh %s got %d model(s)", vendor.ID(), len(models))
+		logger.Info("模型：刷新 %s 得到 %d 个模型", vendor.ID(), len(models))
 		c.cacheProbed(vendor.ID(), models)
 		total += len(models)
 	}
@@ -854,10 +953,13 @@ func (c *Catalog) ExtraModels() []pluginapi.ModelInfo {
 		if bare == "" {
 			continue
 		}
-		if vendorID, bareModel := c.registry.SplitModelID(bare); vendorID != "" {
-			if vendor, okVendor := c.registry.ByID(vendorID); okVendor &&
-				c.RealmEnabled(vendor.Region()) && !c.IsDisabled(vendor.ID(), bareModel) {
-				out = append(out, c.extraModelInfo(vendor.ID(), bareModel, settings))
+		if prefix, bareModel := c.registry.SplitModelID(bare); prefix != "" {
+			for _, vendorID := range c.registry.VendorIDsForPrefix(prefix) {
+				vendor, okVendor := c.registry.ByID(vendorID)
+				if !okVendor || !c.RealmEnabled(vendor.Region()) || c.IsDisabled(vendorID, bareModel) {
+					continue
+				}
+				out = append(out, c.extraModelInfo(vendorID, bareModel, settings))
 			}
 			continue
 		}
@@ -917,8 +1019,14 @@ func MergeSameNameModels(models []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 		if core.ModelSupportsImages(model) {
 			target.SupportedInputModalities = appendUnique(target.SupportedInputModalities, "image")
 		}
-		if core.ModelSupportsTools(model) {
+		// 能力取或：任一条目支持工具调用，合并结果就要同时声明方法和参数。
+		// 只并 tool_calls 会留下「方法有、参数没有」的矛盾组合，客户端据此
+		// 隐藏工具开关，实际支持工具的模型反而丢了能力。
+		if core.ModelSupportsTools(*target) || core.ModelSupportsTools(model) {
 			target.SupportedGenerationMethods = appendUnique(target.SupportedGenerationMethods, "tool_calls")
+			for _, param := range core.ToolParameters() {
+				target.SupportedParameters = appendUnique(target.SupportedParameters, param)
+			}
 		}
 		target.Thinking = mergeThinking(target.Thinking, model.Thinking)
 	}

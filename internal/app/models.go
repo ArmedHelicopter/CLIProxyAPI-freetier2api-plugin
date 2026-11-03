@@ -56,7 +56,7 @@ func (a *App) handleModelForAuth(request []byte) ([]byte, error) {
 	ctx := hostbridge.WithCallbackID(context.Background(), rpc.HostCallbackID)
 	credential, vendor, errResolve := a.resolveVendorCredential(ctx, rpc.HostCallbackID, rpc.StorageJSON, rpc.AuthID, rpc.Attributes)
 	if errResolve != nil {
-		logger.Debug("model.for_auth: no credential for %s: %v", rpc.AuthID, errResolve)
+		logger.Debug("按授权查模型：%s 无可用凭证：%v", rpc.AuthID, errResolve)
 		return core.OKEnvelope(pluginapi.ModelResponse{Provider: providerKey})
 	}
 	if !a.models.RealmEnabled(vendor.Region()) {
@@ -64,7 +64,21 @@ func (a *App) handleModelForAuth(request []byte) ([]byte, error) {
 	}
 	models, errModels := core.ModelsFor(vendor, ctx, credential)
 	if errModels != nil {
-		logger.Debug("model.for_auth: probe models for %s failed: %v", vendor.ID(), errModels)
+		// 探测失败 ≠ 该凭证没有模型。进程内模型缓存挂在 App 实例上，热重载后
+		// 随旧实例一起消失，宿主重新加载每个凭证都会现场探测一轮；上游一次抖动
+		// （429、超时、瞬时 5xx）就会让整家供应商从 /v1/models 上消失，只能手动
+		// 重存设置才恢复。这里回落到 state.json 里最近一次成功的清单，把「瞬时
+		// 失败」与「凭证真的不可用」分开——后者由供应商返回空清单表达，不走这里。
+		// 计费通道类供应商（core.ModelFallbackVeto）例外：那份清单即权限判据，
+		// 探测失败必须如实报空。
+		if cached := a.models.Registered(vendor.ID()); len(cached) > 0 && !core.VetoesModelFallback(vendor) {
+			logger.Info("按授权查模型：%s 探测失败，回落到缓存 %d 个模型：%v",
+				vendor.ID(), len(cached), errModels)
+			models, errModels = cached, nil
+		}
+	}
+	if errModels != nil {
+		logger.Debug("按授权查模型：%s 探测模型失败：%v", vendor.ID(), errModels)
 		return core.OKEnvelope(pluginapi.ModelResponse{Provider: providerKey})
 	}
 	// 顺手写入控制台回读缓存（官方 ID，未过滤/未换别名）。
@@ -74,7 +88,7 @@ func (a *App) handleModelForAuth(request []byte) ([]byte, error) {
 	// 空清单不写缓存：供应商在探测失败时按契约返回空结果（让宿主淘汰坏凭证），
 	// 若照样覆盖，一次瞬时失败就会把整家供应商从控制台抹掉。
 	if !a.models.CacheProbedModels(vendor.ID(), models) {
-		logger.Info("model.for_auth: %s returned no models for %s (host will drop this credential)",
+		logger.Info("按授权查模型：%s 未返回 %s 的模型（宿主将丢弃该凭证）",
 			vendor.ID(), rpc.AuthID)
 	}
 	return core.OKEnvelope(pluginapi.ModelResponse{
@@ -96,10 +110,6 @@ func (a *App) refreshModelsFromUpstream(ctx context.Context) (int, error) {
 		return 0, core.ToPluginError(errRefresh)
 	}
 	return total, nil
-}
-
-func (a *App) registeredModelsForVendor(vendorID string) []pluginapi.ModelInfo {
-	return a.models.Registered(vendorID)
 }
 
 func (a *App) resolveOutboundModel(vendorID, model string) string {

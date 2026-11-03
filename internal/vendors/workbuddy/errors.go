@@ -28,6 +28,7 @@ import (
 //   - not_found：上游偶发 404 → 固定短冷却，不累计熔断。
 //   - server：上游 5xx → 计入熔断。
 //   - content_blocked：内容策略拦截 → 不罚账号，可降级重试。
+//   - channel_rejected：渠道校验拦截（11128）→ 请求级，不罚号、不换号，保留上游说明。
 //   - bad_params：参数非法 → 不罚账号，但仍换号重试。
 //   - account_fault：账号级故障（request illegal / trial 未激活）→ 冷却轮换。
 //   - model_blocked：该后端无此模型（11102）→ 按（账号, 模型）避让。
@@ -53,25 +54,24 @@ var (
 	accountFaultMarkers = []string{
 		"request illegal", "trial not activated", "trial version is not yet activated",
 	}
-	contentBlockedMarkers = []string{
-		"blocked by security policy", "unapproved channel", "illegal api invocation",
-	}
-	invalidImageMarkers = []string{
+	contentBlockedMarkers = []string{"blocked by security policy"}
+	// channelRejectedMarkers 是渠道校验失败（11128）的文案：说明请求不是官方客户端发出的。
+	channelRejectedMarkers = []string{"unapproved channel", "illegal api invocation"}
+	invalidImageMarkers    = []string{
 		"invalid image_url content", "invalid_image_data", "replace the image",
 	}
 	promptTooLongMarkers = []string{
 		`"code":11115`, `"code": 11115`, `"code":"11115"`, "prompt is too long",
 	}
-	alreadyCheckinMarkers = []string{"已签到", "already"}
 )
 
 const (
 	badParamsMarkerMsg  = "unmarshal chat params failed"
 	badParamsMarkerCode = `"code":11101`
-	// modelRateLimitCode 是「模型级」限流：只避让该模型，不惩罚整个账号。
-	modelRateLimitCode = "6004"
 	// modelBlockCode 是「该后端无此模型」。
 	modelBlockCode = "11102"
+	// channelRejectedCode 是渠道校验失败（非官方客户端）。
+	channelRejectedCode = "11128"
 
 	// ModelBlockReason 是（账号, 模型）避让的固定原因串。
 	ModelBlockReason = "11102 model not available"
@@ -96,8 +96,8 @@ var (
 //   - 429 必须早于 hardMarkers：429 的正文高频携带 "quota exceeded"/"额度不足"
 //     这类跨计费与限流两界的措辞，hardMarkers 先判会把限流误归余额耗尽，
 //     白扔一个号约 12 小时。真正的余额耗尽由 402 或业务码 14018 捕获；
-//   - 11115（上下文超限）必须早于 404/5xx/WAF/内容策略：它是请求级错误，
-//     罚账号是错的；
+//   - 11115（上下文超限）与 11128（渠道校验）必须早于 404/5xx/WAF/内容策略：
+//     它们是请求级错误，罚账号是错的；
 //   - accountFault 必须早于 429：账号被封的措辞里也可能带限流字样。
 func Classify(status int, body string) *core.Failure {
 	lower := strings.ToLower(body)
@@ -106,6 +106,14 @@ func Classify(status int, body string) *core.Failure {
 	// 否则 "11102" 撞在 requestId 上会误避让一个可用模型。
 	if isModelBlocked(status, body) {
 		return &core.Failure{Kind: core.FailureKindModelBlocked, Status: status, Msg: body}
+	}
+	// 渠道校验失败（11128）：上游常把它包在 HTTP 500 里返回，但它是请求级拒绝。
+	// 按 5xx 处理会让宿主把全部账号当服务端故障冷却，后续重试退化成
+	// 503 auth_unavailable（只剩数字码，可读说明丢失）。这里改写成 400，
+	// 并把多语言正文折叠成一条可读消息（原文由调用方写进日志留证）。
+	if codeMarker(lower, channelRejectedCode) || core.ContainsAny(lower, channelRejectedMarkers) {
+		return &core.Failure{Kind: core.FailureKindChannelRejected, Status: http.StatusBadRequest,
+			Code: channelRejectedCode, Msg: channelRejectedMessage(body)}
 	}
 	// 1) 余额耗尽（明确的 402）。
 	if status == http.StatusPaymentRequired {
@@ -216,6 +224,54 @@ func objectHasModelBlock(fields map[string]any) bool {
 	return false
 }
 
+// channelRejectedMessage 把 11128 的正文折叠成一条可读、可反馈的错误消息。
+//
+// 为什么要折叠：上游正文同时带 msg / displayMsg / displayTips 的中英繁体三份文案，
+// 原样透传会把「为什么被拦、找谁对齐」淹在 JSON 里，用户看到的只是一坨 500。
+// 折叠后只留三段：上游英文 msg（可搜索）、面向用户的中文提示、requestId。
+func channelRejectedMessage(body string) string {
+	var payload struct {
+		Msg         string            `json:"msg"`
+		RequestID   string            `json:"requestId"`
+		DisplayMsg  map[string]string `json:"displayMsg"`
+		DisplayTips map[string]string `json:"displayTips"`
+	}
+	text := ""
+	if errUnmarshal := json.Unmarshal([]byte(body), &payload); errUnmarshal == nil {
+		text = strings.TrimSpace(payload.Msg)
+		if hint := localizedText(payload.DisplayTips, payload.DisplayMsg); hint != "" {
+			if text != "" {
+				text += " — "
+			}
+			text += hint
+		}
+	}
+	if text == "" {
+		// 正文不是可解析的业务信封（HTML 拦截页等）：透传截断后的原文，不吞证据。
+		text = core.Truncate(body, 512)
+	}
+	if text == "" {
+		text = "channel verification failed"
+	}
+	trace := "code=" + channelRejectedCode
+	if requestID := strings.TrimSpace(payload.RequestID); requestID != "" {
+		trace += " requestId=" + requestID
+	}
+	return text + " (" + trace + ")"
+}
+
+// localizedText 按「中文 > 英文 > 繁体」取第一条非空文案；tips 优先于 msg。
+func localizedText(tips, msg map[string]string) string {
+	for _, source := range []map[string]string{tips, msg} {
+		for _, key := range []string{"zh", "en", "zh-hant"} {
+			if text := strings.TrimSpace(source[key]); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
 // IsWAFBlocked 判断是否为 WAF 拦截。
 //
 // 判据：403 且正文里没有业务信封标记（"code": 或 "msg":）。
@@ -230,22 +286,6 @@ func IsWAFBlocked(status int, body string) bool {
 // IsModelRateLimit 判断响应体是否表示模型级限流（6004）。
 func IsModelRateLimit(body string) bool {
 	return modelRateLimitRe.MatchString(body)
-}
-
-// IsAlreadyCheckin 判断错误是否为「今天已签到」。
-//
-// 签到接口对重复签到返回业务错误而非成功，调用方需要把它当成幂等成功处理。
-func IsAlreadyCheckin(err error) bool {
-	if err == nil {
-		return false
-	}
-	lower := strings.ToLower(err.Error())
-	for _, marker := range alreadyCheckinMarkers {
-		if strings.Contains(lower, strings.ToLower(marker)) {
-			return true
-		}
-	}
-	return false
 }
 
 // ParseRateReset 从错误正文里解析上游给出的重置时刻。

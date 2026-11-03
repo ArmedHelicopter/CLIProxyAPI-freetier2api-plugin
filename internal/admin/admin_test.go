@@ -3,7 +3,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
-	"reflect"
+	"net/http"
 	"strings"
 	"testing"
 	"time"
@@ -22,18 +22,22 @@ type stubDeps struct {
 
 	callbackResult *core.CallbackSubmitResult
 	callbackErr    error
+
+	loginStart    *pluginapi.AuthLoginStartResponse
+	loginStartErr error
+	captcha       core.CaptchaConfig
+	captchaErr    error
 }
 
 func (s stubDeps) Identity() Identity {
-	return Identity{ID: "freetier2api", DisplayName: "FreeTier 2API", ProviderKey: "freetier", Version: "test"}
+	return Identity{ID: "freetier", DisplayName: "FreeTier 2API", ProviderKey: "freetier", Version: "test"}
 }
 func (s stubDeps) Config() PluginConfig { return DefaultPluginConfig() }
 func (s stubDeps) State() state.State   { return s.store.Snapshot() }
 func (s stubDeps) MutateState(fn func(*state.State)) {
 	s.store.Mutate(fn)
 }
-func (s stubDeps) Model() *Catalog             { return s.manager }
-func (s stubDeps) WorkbuddyPromptMode() string { return "passthrough" }
+func (s stubDeps) Model() *Catalog { return s.manager }
 func (s stubDeps) ResolveCredential(context.Context, string, []byte, string, map[string]string) (*core.Credential, core.Vendor, error) {
 	return nil, nil, context.Canceled
 }
@@ -41,11 +45,34 @@ func (s stubDeps) RefreshModels(context.Context) (int, error) { return 0, nil }
 func (s stubDeps) Reconfigure() error                         { return nil }
 
 // callbackResult / callbackErr 让用例能驱动「粘贴回调链接」的返回分支。
+func (s stubDeps) SendLoginSMS(context.Context, string, string) (string, error) {
+	return "", nil
+}
+
+func (s stubDeps) VerifyLoginSMS(context.Context, string, string, string, string) (string, string, string, error) {
+	return "", "", "", nil
+}
+
 func (s stubDeps) SubmitLoginCallback(context.Context, string, string) (*core.CallbackSubmitResult, error) {
 	if s.callbackErr != nil {
 		return nil, s.callbackErr
 	}
 	return s.callbackResult, nil
+}
+
+// loginStart / loginCaptcha 让用例能驱动页面内登录的两个新入口。
+func (s stubDeps) StartLogin(context.Context, string, map[string]any) (*pluginapi.AuthLoginStartResponse, error) {
+	if s.loginStartErr != nil {
+		return nil, s.loginStartErr
+	}
+	return s.loginStart, nil
+}
+
+func (s stubDeps) LoginCaptchaConfig(context.Context, string) (core.CaptchaConfig, error) {
+	if s.captchaErr != nil {
+		return core.CaptchaConfig{}, s.captchaErr
+	}
+	return s.captcha, nil
 }
 
 func newStubDeps(t *testing.T) stubDeps {
@@ -75,22 +102,32 @@ func TestRegistrationDeclaresRoutes(t *testing.T) {
 	registration := service.Registration()
 	found := false
 	for _, route := range registration.Routes {
-		if route.Path == "/plugins/freetier2api/status" {
+		if route.Path == "/plugins/freetier/status" {
 			found = true
 		}
 	}
 	if !found {
 		t.Fatalf("status route missing: %#v", registration.Routes)
 	}
-	if len(registration.Resources) != 1 || registration.Resources[0].Path != "/console" {
-		t.Fatalf("resources = %#v", registration.Resources)
+	// 控制台保留（账号、额度、模型、设置），任务中心与日志页已下线。
+	var console *pluginapi.ResourceRoute
+	for i := range registration.Resources {
+		if registration.Resources[i].Path == "/console" {
+			console = &registration.Resources[i]
+		}
+	}
+	if console == nil {
+		t.Fatalf("console resource missing: %#v", registration.Resources)
+	}
+	if console.Menu == "" || console.Description == "" {
+		t.Fatalf("console resource must declare menu/description: %#v", *console)
 	}
 }
 
 func TestHandleStatusAndUnknownRoute(t *testing.T) {
 	service := newService(t)
 
-	raw, err := service.Handle([]byte(`{"method":"GET","path":"/v0/management/plugins/freetier2api/status"}`))
+	raw, err := service.Handle([]byte(`{"method":"GET","path":"/v0/management/plugins/freetier/status"}`))
 	if err != nil {
 		t.Fatalf("handle status: %v", err)
 	}
@@ -102,7 +139,7 @@ func TestHandleStatusAndUnknownRoute(t *testing.T) {
 		t.Fatalf("unexpected envelope: %s", raw)
 	}
 
-	raw, err = service.Handle([]byte(`{"method":"GET","path":"/plugins/freetier2api/nope"}`))
+	raw, err = service.Handle([]byte(`{"method":"GET","path":"/plugins/freetier/nope"}`))
 	if err != nil {
 		t.Fatalf("handle unknown: %v", err)
 	}
@@ -116,6 +153,38 @@ func TestHandleStatusAndUnknownRoute(t *testing.T) {
 	}
 	if notFound.Result.StatusCode != 404 {
 		t.Fatalf("unknown route should 404: %s", raw)
+	}
+}
+
+func TestHandleServesConsolePage(t *testing.T) {
+	service := newService(t)
+	raw, err := service.Handle([]byte(`{"method":"GET","path":"/v0/resource/plugins/freetier/console"}`))
+	if err != nil {
+		t.Fatalf("handle console: %v", err)
+	}
+	var envelope struct {
+		Result struct {
+			StatusCode int                 `json:"StatusCode"`
+			Headers    map[string][]string `json:"Headers"`
+			Body       []byte              `json:"Body"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(raw, &envelope); err != nil {
+		t.Fatalf("decode envelope: %v (%s)", err, raw)
+	}
+	if envelope.Result.StatusCode != http.StatusOK {
+		t.Fatalf("console status = %d, want 200", envelope.Result.StatusCode)
+	}
+	page := string(envelope.Result.Body)
+	for _, want := range []string{"FreeTier 2API", "view-accounts", "view-settings"} {
+		if !strings.Contains(page, want) {
+			t.Fatalf("console page missing %q", want)
+		}
+	}
+	for _, gone := range []string{"view-tasks", "view-logs", "/logs"} {
+		if strings.Contains(page, gone) {
+			t.Fatalf("console page still references %q", gone)
+		}
 	}
 }
 
@@ -138,52 +207,48 @@ func (s stubTaskDeps) Config() tasks.Config {
 
 func (s stubTaskDeps) SaveRefreshedCredential(context.Context, string, core.Vendor, core.HostAuth, []byte, *core.Credential, string) {
 }
-func (s stubTaskDeps) State() state.State                     { return s.deps.State() }
-func (s stubTaskDeps) MutateState(fn func(*state.State))      { s.deps.MutateState(fn) }
-func (s stubTaskDeps) Now() time.Time                         { return time.Now() }
-func (s stubTaskDeps) RuntimeFields() []pluginapi.ConfigField { return nil }
+func (s stubTaskDeps) State() state.State                { return s.deps.State() }
+func (s stubTaskDeps) MutateState(fn func(*state.State)) { s.deps.MutateState(fn) }
+func (s stubTaskDeps) Now() time.Time                    { return time.Now() }
 
-// TestSettingsPayloadKeysMatchConsole 锁死「后端字段名 ↔ 页面字段名」的一致性。
-//
-// 真实事故：后端把 prompt_mode 改名为 workbuddy_prompt_mode（GET /status 的
-// 响应键与 POST /settings 的请求键都改了），页面没跟着改，于是——
-//   - 摘要行显示「提示词 -」；
-//   - 下拉框永远回落 passthrough，看不出真实配置；
-//   - 点「保存设置」发的是 prompt_mode，后端直接忽略，改动**根本存不进去**。
-//
-// 编译期已经保证 Go 侧一致，但 HTML 是字符串，编译器看不见。这里用测试把
-// settingsUpdateRequest 的每个 json tag 钉到页面上，防止再次漂移。
-func TestSettingsPayloadKeysMatchConsole(t *testing.T) {
-	page := Page("/plugins/freetier2api")
+// 一键任务的两个端点必须真的挂上：控制台按钮只认这两个路径，
+// 少一条就是「点了没反应」。
+func TestHandleAutoAllRoutes(t *testing.T) {
+	service := newService(t)
 
-	// 兼容旧版页面/脚本的固定字段：后端仍接受，但当前页面不再发送。
-	deprecated := map[string]bool{
-		"checkin_hours": true, "travel_hours": true, "activity_hours": true,
-		"keepalive_hours": true, "blackcat_hours": true,
+	type envelope struct {
+		Result struct {
+			StatusCode int    `json:"StatusCode"`
+			Body       []byte `json:"Body"`
+		} `json:"result"`
+	}
+	decode := func(raw []byte) envelope {
+		var out envelope
+		if err := json.Unmarshal(raw, &out); err != nil {
+			t.Fatalf("decode envelope: %v (%s)", err, raw)
+		}
+		return out
 	}
 
-	var req settingsUpdateRequest
-	typ := reflect.TypeOf(req)
-	for i := 0; i < typ.NumField(); i++ {
-		field := typ.Field(i)
-		jsonTag := strings.Split(field.Tag.Get("json"), ",")[0]
-		if jsonTag == "" || jsonTag == "-" || deprecated[jsonTag] {
-			continue
-		}
-		if !strings.Contains(page, jsonTag) {
-			t.Errorf("POST /settings 的字段 %q（%s）在控制台页面里没有出现，页面改动不会被后端接收",
-				jsonTag, field.Name)
-		}
+	raw, err := service.Handle([]byte(`{"method":"GET","path":"/plugins/freetier/tasks/autoall/status"}`))
+	if err != nil {
+		t.Fatalf("handle autoall status: %v", err)
+	}
+	status := decode(raw)
+	if status.Result.StatusCode != http.StatusOK {
+		t.Fatalf("autoall status = %d, want 200", status.Result.StatusCode)
+	}
+	if !strings.Contains(string(status.Result.Body), `"running"`) {
+		t.Fatalf("status payload must expose running: %s", status.Result.Body)
 	}
 
-	// 反向：页面读取的 /status 键必须在后端载荷里真实存在。
-	for _, key := range []string{"workbuddy_prompt_mode", "version", "settings"} {
-		if !strings.Contains(page, key) {
-			t.Errorf("页面读取的 /status 键 %q 未出现在页面上", key)
-		}
+	// 坏 JSON 走解析失败分支（400），证明 POST 路由已挂上；404 就是没挂。
+	raw, err = service.Handle([]byte(`{"method":"POST","path":"/plugins/freetier/tasks/autoall","body":"ew=="}`))
+	if err != nil {
+		t.Fatalf("handle autoall start: %v", err)
 	}
-	// 旧键名不得复活：后端已不再返回 prompt_mode。
-	if strings.Contains(page, "status.prompt_mode") {
-		t.Error("页面仍在读 status.prompt_mode，但后端返回的是 workbuddy_prompt_mode")
+	start := decode(raw)
+	if start.Result.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad body should 400 (route must be wired), got %d", start.Result.StatusCode)
 	}
 }

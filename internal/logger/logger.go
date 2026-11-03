@@ -64,14 +64,7 @@ var (
 
 // SetLevel 设置日志级别。接受 debug / info / error，未知值回落 info。
 func SetLevel(raw string) {
-	switch strings.ToLower(strings.TrimSpace(raw)) {
-	case "debug":
-		setLevel(LevelDebug)
-	case "error":
-		setLevel(LevelError)
-	default:
-		setLevel(LevelInfo)
-	}
+	setLevel(LevelFromName(raw))
 }
 
 func setLevel(lvl Level) {
@@ -110,7 +103,7 @@ func InitFile(enabled bool, dir string) error {
 
 	if fileSink != nil {
 		if errClose := fileSink.Close(); errClose != nil {
-			fmt.Fprintf(os.Stderr, "[freetier2api] close log file failed: %v\n", errClose)
+			fmt.Fprintf(os.Stderr, "[freetier] close log file failed: %v\n", errClose)
 		}
 		fileSink = nil
 		fileDay = ""
@@ -129,7 +122,7 @@ func InitFile(enabled bool, dir string) error {
 // openLogFileLocked 打开当天的日志文件。调用方必须持有 fileMu。
 func openLogFileLocked(now time.Time) error {
 	day := now.Format("2006-01-02")
-	path := filepath.Join(fileDir, "freetier2api-"+day+".log")
+	path := filepath.Join(fileDir, "freetier-"+day+".log")
 	file, errOpen := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if errOpen != nil {
 		return fmt.Errorf("open log file %s: %w", path, errOpen)
@@ -148,7 +141,7 @@ func pruneLogFiles(dir string) {
 	cutoff := time.Now().AddDate(0, 0, -fileRetentionDays)
 	names := make([]string, 0, len(entries))
 	for _, entry := range entries {
-		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "freetier2api-") {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), "freetier-") {
 			continue
 		}
 		info, errInfo := entry.Info()
@@ -166,12 +159,14 @@ func pruneLogFiles(dir string) {
 // Close 关闭文件 sink。供 shutdown 调用。
 func Close() {
 	fileMu.Lock()
-	defer fileMu.Unlock()
 	if fileSink != nil {
 		_ = fileSink.Close()
 		fileSink = nil
 		fileDay = ""
 	}
+	fileMu.Unlock()
+
+	closeHost()
 }
 
 // Debug 记录一条 debug 日志。
@@ -202,12 +197,15 @@ func log(lvl Level, label string, format string, args ...any) {
 		Message: message,
 	})
 
+	// 镜像进宿主日志文件，让管理面板的日志页能看到插件行为。
+	host.write(lvl, label, now, message)
+
 	fileMu.Lock()
 	if fileSink != nil {
 		// 跨天时先切文件再写。
 		if day := now.Format("2006-01-02"); day != fileDay {
 			if errRotate := openLogFileLocked(now); errRotate != nil {
-				fmt.Fprintf(os.Stderr, "[freetier2api] rotate log file failed: %v\n", errRotate)
+				fmt.Fprintf(os.Stderr, "[freetier] rotate log file failed: %v\n", errRotate)
 			}
 		}
 		if fileSink != nil {
@@ -259,9 +257,7 @@ func Snapshot(since uint64, limit int) ([]Entry, uint64) {
 		if start < 0 {
 			start = 0
 		}
-		for _, entry := range all[start:] {
-			out = append(out, entry)
-		}
+		out = append(out, all[start:]...)
 		return out, newest
 	}
 	for _, entry := range all {

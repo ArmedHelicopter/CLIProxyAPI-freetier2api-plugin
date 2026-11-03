@@ -1,8 +1,15 @@
 package opencodezen
 
 import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
 	"regexp"
+	"strconv"
+	"strings"
 	"testing"
+	"time"
 )
 
 // 本文件锁定 ZEN session ID 的编码规则。
@@ -76,5 +83,298 @@ func TestDescendingTimePartEndsWithFFE(t *testing.T) {
 		if !pattern.MatchString(id[4:16]) {
 			t.Errorf("seed %q 的时间部分 %q 未以 ffe 收尾", seed, id[4:16])
 		}
+	}
+}
+
+// TestUserAgentMatchesV2Shape 锁定 v2 客户端标识。
+//
+// 1.x 的两段式 UA（opencode/1.18.31 (os arch; go)）已被上游拒绝；v2 形态取自
+// 官方 packages/core/src/app.ts 的 App.useragent，版本取自官方
+// packages/cli/package.json。
+func TestUserAgentMatchesV2Shape(t *testing.T) {
+	if got := UserAgent(); got != "opencode/latest/2.1.4/cli" {
+		t.Fatalf("UserAgent = %q，期望 opencode/latest/2.1.4/cli", got)
+	}
+}
+
+// TestApplyChatHeadersCarriesSessionMirrors 锁定会话头的镜像关系。
+//
+// 官方 v2 客户端同时写 x-opencode-session-id / x-opencode-session /
+// x-session-affinity / X-Session-Id；缺 x-opencode-session-id 会被判成非官方客户端。
+func TestApplyChatHeadersCarriesSessionMirrors(t *testing.T) {
+	req, errNew := http.NewRequest(http.MethodPost, "https://example.invalid/chat", nil)
+	if errNew != nil {
+		t.Fatalf("new request: %v", errNew)
+	}
+	ApplyChatHeaders(req, "key", "ses_abc")
+
+	for _, name := range []string{"x-opencode-session", "x-opencode-session-id", "x-session-affinity", "x-session-id"} {
+		if got := req.Header.Get(name); got != "ses_abc" {
+			t.Fatalf("%s = %q，期望 ses_abc", name, got)
+		}
+	}
+	if got := req.Header.Get("x-opencode-client"); got != "cli" {
+		t.Fatalf("x-opencode-client = %q，期望 cli", got)
+	}
+	if got := req.Header.Get("User-Agent"); got != UserAgent() {
+		t.Fatalf("User-Agent = %q", got)
+	}
+	if proj := req.Header.Get("x-opencode-project"); len(proj) != 40 || proj == "global" {
+		t.Fatalf("x-opencode-project = %q，期望 40 位非 global 十六进制", proj)
+	}
+}
+
+func TestChatEndpointUsesInferenceLane(t *testing.T) {
+	// 免费与付费共用同一条 inference 车道（官方 v2 靠凭证区分，不靠路径）。
+	if got, want := chatEndpoint(""), "https://opencode.ai/inference/openai"+ChatPath; got != want {
+		t.Fatalf("出口 = %q，期望 %q", got, want)
+	}
+	// 配置了自建/自托管网关时走覆盖值，便于用户自救。
+	if got, want := chatEndpoint("https://gateway.example/zen/"), "https://gateway.example/zen"+ChatPath; got != want {
+		t.Fatalf("覆盖后的出口 = %q，期望 %q", got, want)
+	}
+}
+
+// TestModelsEndpointStripsOpenAILayer 锁定清单出口比 chat 少一层 /openai。
+//
+// /inference/openai/v1/models 实测 404，清单在 /inference/v1/models；
+// 覆盖值只写一层时也要能退回去，否则自建网关拿不到模型清单。
+func TestModelsEndpointStripsOpenAILayer(t *testing.T) {
+	if got, want := ModelsBaseURLFor(""), "https://opencode.ai/inference"; got != want {
+		t.Fatalf("清单出口 = %q，期望 %q", got, want)
+	}
+	if got, want := ModelsBaseURLFor("https://gw.example/inference/openai/"), "https://gw.example/inference"; got != want {
+		t.Fatalf("覆盖后的清单出口 = %q，期望 %q", got, want)
+	}
+}
+
+func TestNewChatRequestFreeTierUsesAnonymousCredential(t *testing.T) {
+	// mimo-v2.6-flash-free 在目录里是零价，按单价判定应进免费层。
+	catalog := modelsDevCatalog{
+		"mimo-v2.6-flash-free": {Cost: &modelsDevCost{}},
+	}
+	body := []byte(`{"model":"mimo-v2.6-flash-free","messages":[{"role":"user","content":"hi"}]}`)
+	req, _, errReq := newChatRequest(context.Background(), "", ChatRequest{APIKey: "oc_sk_secret", Body: body}, catalog)
+	if errReq != nil {
+		t.Fatalf("newChatRequest: %v", errReq)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer "+freeTierCredential {
+		t.Fatalf("免费层凭证 = %q，期望匿名凭证", got)
+	}
+	if got := req.URL.String(); got != DefaultBaseURL+ChatPath {
+		t.Fatalf("免费层出口 = %q", got)
+	}
+
+	payload := decodePayload(t, req)
+	if payload["stream"] != true {
+		t.Fatal("免费层未强制 stream")
+	}
+	opt, _ := payload["stream_options"].(map[string]any)
+	if opt == nil || opt["include_usage"] != true {
+		t.Fatal("免费层未要求 stream_options.include_usage")
+	}
+	// 官方客户端只透传会话自有工具，不按模型补一份；这里确认我们不注入。
+	if _, ok := payload["tools"]; ok {
+		t.Fatal("免费层不应注入工具定义")
+	}
+}
+
+// TestFreeTierDetectionUsesPriceNotName 锁定免费判定口径。
+//
+// 官方用「单价为 0」判定免费（packages/core/src/plugin/provider/opencode.ts），
+// 目录里 big-pickle 零价但不带 "-free" 后缀，还是官方登出状态的默认模型。
+// 按名字判定会把它错推上付费车道。
+func TestFreeTierDetectionUsesPriceNotName(t *testing.T) {
+	catalog := modelsDevCatalog{
+		"big-pickle":           {Cost: &modelsDevCost{}},
+		"glm-5.3":              {Cost: &modelsDevCost{Input: 1.5, Output: 6}},
+		"payment-free-in-name": {Cost: &modelsDevCost{Input: 2, Output: 4}},
+	}
+
+	if !isFreeTierModel("big-pickle", catalog) {
+		t.Fatal("零价但无 free 后缀的模型应判定为免费")
+	}
+	if isFreeTierModel("glm-5.3", catalog) {
+		t.Fatal("有价格的模型不能判定为免费")
+	}
+	if isFreeTierModel("payment-free-in-name", catalog) {
+		t.Fatal("目录说它收费时，名字里的 free 不能覆盖价格")
+	}
+	// 目录缺失时退回名字判定，不能让免费请求误用用户 key。
+	if !isFreeTierModel("some-model-free", nil) {
+		t.Fatal("目录不可用时应退回按名字判定")
+	}
+	if isFreeTierModel("glm-5.3", nil) {
+		t.Fatal("目录不可用且名字无 free 时应按付费处理")
+	}
+}
+
+func TestNewChatRequestPaidKeepsUserCredential(t *testing.T) {
+	catalog := modelsDevCatalog{
+		"glm-5.3": {Cost: &modelsDevCost{Input: 1.5, Output: 6}},
+	}
+	body := []byte(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`)
+	req, _, errReq := newChatRequest(context.Background(), "", ChatRequest{APIKey: "oc_sk_secret", Body: body}, catalog)
+	if errReq != nil {
+		t.Fatalf("newChatRequest: %v", errReq)
+	}
+	if got := req.Header.Get("Authorization"); got != "Bearer oc_sk_secret" {
+		t.Fatalf("付费凭证 = %q", got)
+	}
+	if got := req.URL.String(); got != DefaultBaseURL+ChatPath {
+		t.Fatalf("付费出口 = %q", got)
+	}
+	if _, ok := decodePayload(t, req)["tools"]; ok {
+		t.Fatal("付费请求不应被注入免费层工具")
+	}
+}
+
+// TestMaxTokensNormalizedToCompletionTokens 锁定上限字段名。
+//
+// 官方 2.1.4 对 opencode 家族一律发 max_completion_tokens
+// （packages/ai/src/protocols/openai-chat.ts 的 detectMaxTokensField 落默认分支）。
+func TestMaxTokensNormalizedToCompletionTokens(t *testing.T) {
+	out := decodeJSON(t, normalizeMaxTokens([]byte(`{"model":"glm-5.3","max_tokens":256}`)))
+	if got := out["max_completion_tokens"]; got != float64(256) {
+		t.Fatalf("max_completion_tokens = %v，期望 256", got)
+	}
+	if _, exists := out["max_tokens"]; exists {
+		t.Fatal("max_tokens 应被移除，避免同时出现两个上限字段")
+	}
+
+	// 已经只给 max_completion_tokens 时保持原样。
+	same := decodeJSON(t, normalizeMaxTokens([]byte(`{"model":"glm-5.3","max_completion_tokens":64}`)))
+	if got := same["max_completion_tokens"]; got != float64(64) {
+		t.Fatalf("max_completion_tokens = %v，期望 64", got)
+	}
+
+	// 两个都给时以 max_completion_tokens 为准。
+	both := decodeJSON(t, normalizeMaxTokens([]byte(`{"max_tokens":10,"max_completion_tokens":99}`)))
+	if got := both["max_completion_tokens"]; got != float64(99) {
+		t.Fatalf("max_completion_tokens = %v，期望保留 99", got)
+	}
+}
+
+// decodePayload 取出请求体并解码。
+func decodePayload(t *testing.T, req *http.Request) map[string]any {
+	t.Helper()
+	raw, errRead := io.ReadAll(req.Body)
+	if errRead != nil {
+		t.Fatalf("read body: %v", errRead)
+	}
+	return decodeJSON(t, raw)
+}
+
+func decodeJSON(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	var payload map[string]any
+	if errUnmarshal := json.Unmarshal(raw, &payload); errUnmarshal != nil {
+		t.Fatalf("unmarshal body: %v", errUnmarshal)
+	}
+	return payload
+}
+
+// TestDescendingTimePartDecodesToRecentTimestamp 验证时间戳锚定在近期，而不是旧实现的 1970 年。
+func TestDescendingTimePartDecodesToRecentTimestamp(t *testing.T) {
+	now := time.Now().UTC()
+	hash := []byte{0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc}
+	part := descendingTimePart(now, hash)
+
+	if len(part) != 12 {
+		t.Fatalf("timePart 长度 = %d，期望 12", len(part))
+	}
+
+	// 解码 ~(ts_ms << 12 | counter)
+	inverted, errParse := strconv.ParseUint(part, 16, 64)
+	if errParse != nil {
+		t.Fatalf("ParseUint: %v", errParse)
+	}
+	current := ^inverted & 0xFFFFFFFFFFFF
+	tsLow36 := current >> 12
+
+	// 官方 48 位降序标识中，高 36 位为毫秒时间戳的低 36 位
+	nowLow36 := uint64(now.UnixMilli()) & 0xFFFFFFFFF
+	windowMs := uint64(sessionTimestampWindow / time.Millisecond)
+
+	// tsLow36 应当在 [nowLow36 - windowMs - 1天, nowLow36 + 1天] 范围内（允许时区整天截断）
+	diff := (nowLow36 - tsLow36) & 0xFFFFFFFFF
+	if diff > windowMs+uint64(24*time.Hour/time.Millisecond) {
+		t.Fatalf("解码时间戳低36位偏差 %d ms，超出 30 天窗口 %d ms", diff, windowMs)
+	}
+}
+
+// TestCanonicalSessionIDSaltedByBootNonce 验证不同进程盐值会产出不同的 session。
+func TestCanonicalSessionIDSaltedByBootNonce(t *testing.T) {
+	original := bootNonce
+	defer func() { bootNonce = original }()
+
+	bootNonce = []byte("salt-1----------")
+	first := canonicalSessionID("user-turn-1")
+	bootNonce = []byte("salt-2----------")
+	second := canonicalSessionID("user-turn-1")
+
+	if first == second {
+		t.Fatalf("更换盐值后 session 未改变：%q", first)
+	}
+}
+
+// TestPrepareFreeTierBodyHidesClientToolNames 验证客户端工具名被混淆并不暴露原始特征。
+func TestPrepareFreeTierBodyHidesClientToolNames(t *testing.T) {
+	body := []byte(`{
+		"model": "deepseek-v4.1-flash-free",
+		"messages": [
+			{"role": "user", "content": "hi"},
+			{"role": "assistant", "content": "", "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "ReportFindings", "arguments": "{}"}}]}
+		],
+		"tools": [
+			{"type": "function", "function": {"name": "ReportFindings", "description": "Report findings", "parameters": {}}},
+			{"type": "function", "function": {"name": "ScheduleWakeup", "description": "Schedule a wakeup", "parameters": {}}}
+		],
+		"tool_choice": {"type": "function", "function": {"name": "ReportFindings"}}
+	}`)
+
+	shaped, renames := prepareFreeTierBody(body)
+	if renames == nil {
+		t.Fatal("未返回 renames 映射")
+	}
+
+	shapedStr := string(shaped)
+	for _, marker := range []string{"ReportFindings", "ScheduleWakeup"} {
+		if strings.Contains(shapedStr, marker) {
+			t.Fatalf("混淆后的请求体仍包含特征工具名 %q", marker)
+		}
+	}
+
+	wireReport, ok := renames.toWire["ReportFindings"]
+	if !ok || !strings.HasPrefix(wireReport, clientToolPrefix) {
+		t.Fatalf("ReportFindings 未被混淆为 clint_ 开头：%q", wireReport)
+	}
+
+	// 验证 CollapseSSEToJSON 还原工具名
+	sseInput := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"" + wireReport + "\",\"arguments\":\"{}\"}}]}}]}" + "\n\ndata: [DONE]\n\n"
+	collapsed, errCollapse := CollapseSSEToJSON(strings.NewReader(sseInput), "deepseek-v4.1-flash-free", renames)
+	if errCollapse != nil {
+		t.Fatalf("CollapseSSEToJSON: %v", errCollapse)
+	}
+	if !strings.Contains(string(collapsed), "ReportFindings") {
+		t.Fatalf("合并结果未还原原始工具名：%s", string(collapsed))
+	}
+}
+
+// TestEnsureCompletionLimit 验证上限归一与默认 32000。
+func TestEnsureCompletionLimit(t *testing.T) {
+	p1 := map[string]any{"model": "test"}
+	ensureCompletionLimit(p1)
+	if p1["max_completion_tokens"] != 32000 {
+		t.Fatalf("默认上限期望 32000，得到 %v", p1["max_completion_tokens"])
+	}
+
+	p2 := map[string]any{"max_tokens": 128}
+	ensureCompletionLimit(p2)
+	if p2["max_completion_tokens"] != 128 {
+		t.Fatalf("max_tokens 应被归一，得到 %v", p2["max_completion_tokens"])
+	}
+	if _, hasMax := p2["max_tokens"]; hasMax {
+		t.Fatal("max_tokens 应被删除")
 	}
 }

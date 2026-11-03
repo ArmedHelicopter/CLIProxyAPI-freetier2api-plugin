@@ -1,5 +1,7 @@
 package hostbridge
 
+//lint:file-ignore SA1012 测试刻意验证 nil context 边界（CallbackID/WithCallbackID 对 nil 的安全行为）。
+
 // 本文件测试宿主 HTTP 桥的契约兼容性。
 //
 // 重点是 host.http.do 的响应键名：宿主把无 json tag 的 pluginapi.HTTPResponse
@@ -8,7 +10,9 @@ package hostbridge
 // 看起来像「凭证被拒」——极难排查。因此两种形态都必须能解。
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 )
 
@@ -67,6 +71,52 @@ func TestHostHTTPStreamResponseUsesSnakeCase(t *testing.T) {
 	}
 	if response.StatusCode != 200 || response.StreamID != "s1" {
 		t.Fatalf("stream response = %+v", response)
+	}
+}
+
+func TestStreamBodyStopsAfterTooManyEmptyChunks(t *testing.T) {
+	calls := 0
+	Configure(func(_, method string, _ any) (json.RawMessage, error) {
+		if method != "host.http.stream_read" {
+			return json.RawMessage(`{"done":true}`), nil
+		}
+		calls++
+		return json.RawMessage(`{"payload":null}`), nil
+	})
+	t.Cleanup(func() { Configure(nil) })
+
+	body := &streamBody{ctx: context.Background(), streamID: "s1"}
+	_, errRead := body.Read(make([]byte, 1))
+	if !errors.Is(errRead, errTooManyEmptyReads) {
+		t.Fatalf("Read error = %v, want %v", errRead, errTooManyEmptyReads)
+	}
+	if calls != maxConsecutiveEmptyReads {
+		t.Fatalf("stream_read calls = %d, want %d", calls, maxConsecutiveEmptyReads)
+	}
+}
+
+func TestStreamBodyEmptyChunksHonorContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	calls := 0
+	Configure(func(_, method string, _ any) (json.RawMessage, error) {
+		if method != "host.http.stream_read" {
+			return json.RawMessage(`{"done":true}`), nil
+		}
+		calls++
+		if calls == 2 {
+			cancel()
+		}
+		return json.RawMessage(`{"payload":null}`), nil
+	})
+	t.Cleanup(func() { Configure(nil); cancel() })
+
+	body := &streamBody{ctx: ctx, streamID: "s1"}
+	_, errRead := body.readChunk()
+	if !errors.Is(errRead, context.Canceled) {
+		t.Fatalf("readChunk error = %v, want context.Canceled", errRead)
+	}
+	if calls != 2 {
+		t.Fatalf("stream_read calls = %d, want 2", calls)
 	}
 }
 

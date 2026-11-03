@@ -59,8 +59,6 @@ func parseCredential(raw []byte, defaultVendor string, defaultRegion Region) (*C
 		string(defaultRegion),
 	))
 	switch {
-	case vendor == VendorIDSolo:
-		r = RegionCN
 	case regionStr == "global" || regionStr == "sg" || regionStr == "traeglobal":
 		r = RegionGlobal
 	default:
@@ -101,21 +99,10 @@ func LooksLikeCredential(raw map[string]any, fileName, provider string, targetRe
 
 // LooksLikeCredentialFor 判断文件或数据是否属于某个 Trae profile。
 func LooksLikeCredentialFor(raw map[string]any, fileName, provider string, cfg Config) bool {
-	if cfg.Solo {
-		if decided, claimed := core.VendorFieldVerdict(raw, VendorIDSolo, "trae"); decided {
-			return claimed
-		}
-		if core.FileNameMatchesConvention(fileName, VendorIDSolo) {
-			return true
-		}
-		return core.GetString(raw, "function") == FunctionSolo || strings.Contains(core.GetString(raw, "api_host"), "mchost.guru")
-	}
-
-	expectedVendor := cfg.VendorID
-	if decided, claimed := core.VendorFieldVerdict(raw, expectedVendor, "trae"); decided {
+	if decided, claimed := core.VendorFieldVerdict(raw, cfg.VendorID, "trae"); decided {
 		return claimed
 	}
-	if core.FileNameMatchesConvention(fileName, expectedVendor) {
+	if core.FileNameMatchesConvention(fileName, cfg.VendorID) {
 		return true
 	}
 	// 旧的家族前缀 trae-*.json：按文件内 region 判定。
@@ -153,6 +140,27 @@ func (c *Credential) StorageJSON() ([]byte, error) {
 	return json.MarshalIndent(m, "", "  ")
 }
 
-// 签到相关实现：国内版与 TRAE SOLO 支持签到，国际版不支持。
+// 签到：国内版支持，国际版上游无对应端点；额度两端都有（路径不同）。
 
-// 额度查询：获取 Trae / TRAE SOLO 账号积分与用量。
+// RegionHeader 返回客户端上报的区域码：国内 CN，国际 SG。
+//
+// 国际版额度端点按区域路由，带 CN 会被网关当成跨区请求拒绝。
+func (c *Credential) RegionHeader() string {
+	if c != nil && c.Region == RegionGlobal {
+		return "SG"
+	}
+	return "CN"
+}
+
+// PackageTypeHeader 返回客户端的 Package-Type：国内谱系 stable_cn，国际谱系 stable。
+//
+// 取值对齐参考实现的抓包结论（Agent2API usage.rs：intl/solo-intl → stable）。
+// 本机同一账号实测：改前额度请求返回 401/1001，改后返回 200 与空额度包。该账号
+// 期间也可能被保活刷新过 token，因此这条只作为「端点和头部可用」的证据，
+// 不构成因果结论。
+func (c *Credential) PackageTypeHeader() string {
+	if c != nil && c.Region == RegionGlobal {
+		return "stable"
+	}
+	return "stable_cn"
+}

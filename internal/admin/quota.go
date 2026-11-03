@@ -2,8 +2,6 @@ package admin
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"net/http"
 	"time"
 
@@ -50,9 +48,56 @@ type quotaResult struct {
 	Summary    string `json:"summary,omitempty"`
 	Remain     int64  `json:"remain"`
 	Total      int64  `json:"total"`
+	// HasTotal 报告上游是否真的报了总额。
+	//
+	// 多数渠道（AutoClaw、Raccoon、MiniMax 等）只给余额不给总额；此时 Total
+	// 是 0 而不是「总额为 0」，展示层必须据此显示「余额 / —」。
+	//
+	// 反过来，HasTotal 为真也不代表 Total 大于 0：CodeArts 未开通福利、Qoder
+	// 的 0/0 桶都会给出 total=0。展示层算百分比时必须同时校验 Total > 0，
+	// 否则 0/0 会渲染成 NaN%（见 #71 第二轮复审 P1-1）。
+	HasTotal bool `json:"has_total,omitempty"`
 	// Unlimited 报告剩余额度无上限，展示层据此显示「无限」。
 	Unlimited bool                    `json:"unlimited,omitempty"`
 	Metrics   []pluginapi.QuotaMetric `json:"metrics,omitempty"`
+	// Stale 标记这份读数是上次成功取到的结果，本次刷新失败。
+	//
+	// 上游限流/超时/5xx 是常态：失败时把额度列清空，用户分不清「没额度了」和
+	// 「这次没取到」。保留上次读数并标非实时，比给一个空白更有信息量。
+	Stale bool `json:"stale,omitempty"`
+	// StaleReason 是本次刷新失败的原因（Stale 为 true 时才有）。
+	StaleReason string `json:"stale_reason,omitempty"`
+	// FetchedAt 是这份读数的实际获取时间（RFC3339）。
+	FetchedAt string `json:"fetched_at,omitempty"`
+}
+
+// claimNote 给「有领取状态但没有额度明细」的账号补一句说明。
+//
+// 上游在活动套餐生效前不会生成额度桶：此时 Claim 显示「已领取」，额度却是
+// 空的。不解释一句，页面看上去像取数失败。文案由这里统一生成，而不是让每个
+// 供应商自己拼——说明属于展示层，宿主契约里不该出现插件专用字段。
+//
+// 只陈述能从契约字段推出的事实：这里拿不到套餐到期时间，所以不说「已过期」
+// ——把「不知道」说成「过期」比不说更糟。
+func claimNote(claim *pluginapi.ClaimStatus, result quotaResult) string {
+	if claim == nil || claim.Error != "" {
+		return ""
+	}
+	// 额度本身没查到就别编说明：额度列已经写着失败原因，这里再说一句「上游
+	// 暂未返回明细」，会让人以为是活动还没生效，而不是这次取数根本没成功。
+	//
+	// 防御性检查：生产路径下 outcome.claim 仅在额度查询成功后赋值，此时 result.OK
+	// 必然为 true；此处保留守卫，防止未来重构调用链路时误把失败态传入。
+	if !result.OK {
+		return ""
+	}
+	if len(result.Metrics) > 0 || (result.HasTotal && result.Total > 0) {
+		return ""
+	}
+	if claim.Claimable > 0 {
+		return "有可领取的套餐，领取后才会生成额度"
+	}
+	return "已领取，上游暂未返回额度明细"
 }
 
 // quotaBatchOutcome 是一轮批量查询里单个账号的产出。
@@ -65,9 +110,9 @@ type quotaBatchOutcome struct {
 }
 
 func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi.ManagementResponse {
-	var body accountBatchRequest
-	if len(req.Body) > 0 {
-		_ = json.Unmarshal(req.Body, &body)
+	body, errDecode := decodeRequest[accountBatchRequest](req.Body)
+	if errDecode != nil {
+		return BadJSONRequestResponse()
 	}
 	ctx, cancel := hostbridge.ManagementContext(req, requestTimeout)
 	defer cancel()
@@ -96,7 +141,18 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 	// 已有一轮在跑时不重复打上游：等它结束，再回读缓存。
 	jobs := make([]quotaJob, 0, len(loaded))
 	for _, account := range loaded {
-		jobs = append(jobs, quotaJob{entry: account.Entry, vendor: account.Vendor, credential: account.Credential})
+		job := quotaJob{entry: account.Entry, vendor: account.Vendor, credential: account.Credential}
+		// 不支持额度查询的供应商（如 OpenCode ZEN）不进查询轮次、不写缓存，
+		// 也不进 /quotas 结果——页面据 /status 的 supports_quota=false 直接显示
+		// 「-- / --」，不需要一条注定失败的结果。
+		if !supportsQuota(account.Vendor) {
+			continue
+		}
+		jobs = append(jobs, job)
+	}
+	if len(jobs) == 0 {
+		// 全是失败项或不支持额度的账号：没有要跑的一轮，直接回结果。
+		return JSONResponse(http.StatusOK, map[string]any{"ok": true, "results": results})
 	}
 	done, owner := s.acquireQuotaRun()
 	if owner {
@@ -110,7 +166,7 @@ func (s *Service) handleQuotasRequest(req pluginapi.ManagementRequest) pluginapi
 
 	for _, job := range jobs {
 		identity := job.identity()
-		if cached := s.getCachedQuota(identity.UID, identity.AuthID, identity.AuthIndex, identity.Name, identity.Label); cached != nil {
+		if cached := s.getCachedQuota(identity.VendorID, identity.UID, identity.AuthID); cached != nil {
 			results = append(results, *cached)
 			continue
 		}
@@ -161,10 +217,21 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 		// 而「上游没有额度接口」这类结论早已确定，不存在还会变。
 		defer func() {
 			result := outcome.result
-			s.cacheQuotaResult(result, result.UID, result.AuthID, result.AuthIndex, result.Name, result.Label)
+			// 失败时保留的上次读数不写回缓存：缓存要保持「最后一次成功」，
+			// 否则 Stale 标记会一直粘着，下次成功前页面永远显示非实时。
+			if result.Stale {
+				return
+			}
+			s.cacheQuotaResult(result)
 		}()
 		quota, errQuota := s.queryQuota(ctx, current)
 		if errQuota != nil {
+			identity := current.identity()
+			if kept, okKept := keepLastQuota(s.getCachedQuota(identity.VendorID, identity.UID, identity.AuthID), errQuota); okKept {
+				// 有上次成功读数：返回它并标非实时，附上本次失败原因。
+				outcome.result = kept
+				return outcome
+			}
 			outcome.result.Message = errQuota.Error()
 			return outcome
 		}
@@ -173,9 +240,13 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 			outcome.claim = quota.Claim
 		}
 		result.OK = true
+		result.Stale = false
+		result.StaleReason = ""
+		result.FetchedAt = time.Now().Format(time.RFC3339)
 		result.Summary = accountpkg.Summary(quota)
 		totals := accountpkg.Totals(quota)
 		result.Remain, result.Total, result.Unlimited = totals.Remaining, totals.Total, totals.Unlimited
+		result.HasTotal = totals.HasTotal
 		result.Metrics = quota.Summary
 		return outcome
 	})
@@ -187,6 +258,7 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 		if outcome.claim != nil {
 			claims[outcome.result.UID] = state.ClaimRecord{
 				ClaimStatus: *outcome.claim,
+				Note:        claimNote(outcome.claim, outcome.result),
 				CheckedAt:   time.Now().Format(time.RFC3339),
 			}
 		}
@@ -200,6 +272,27 @@ func (s *Service) runQuotaBatch(done chan struct{}, jobs []quotaJob) {
 	}
 }
 
+// keepLastQuota 把「本次刷新失败」折算成「上次成功读数 + 非实时标记」。
+//
+// 上游限流（429）、超时、5xx 是常态而非异常：失败时把额度列清空，用户分不清
+// 「没额度了」和「这次没取到」。保留上次读数并标非实时，比给一个空白更有
+// 信息量。没有上次成功读数时返回 false，调用方退回报错。
+func keepLastQuota(previous *quotaResult, errQuota error) (quotaResult, bool) {
+	if previous == nil || !previous.OK || errQuota == nil {
+		return quotaResult{}, false
+	}
+	// 确定类失败不能拿旧读数顶：硬额度耗尽、凭证失效、内容拦截这些不会自己
+	// 好转，保留上次的正常读数等于把「额度已经没了」显示成还有额度。只有
+	// 限流/超时/5xx 这类过一会儿就能恢复的失败才走「上次读数 + 非实时」。
+	if core.IsDefinitiveFailure(errQuota) {
+		return quotaResult{}, false
+	}
+	kept := *previous
+	kept.Stale = true
+	kept.StaleReason = errQuota.Error()
+	return kept, true
+}
+
 // queryQuota 查询单个账号的额度（含一次过期凭证的保活重试）。
 //
 // 只负责取数；缓存、领取状态落盘由 runQuotaBatch 统一负责。
@@ -208,53 +301,26 @@ func (s *Service) queryQuota(ctx context.Context, job quotaJob) (*pluginapi.Quot
 	if !okQuota {
 		return nil, core.QuotaUnsupported(job.vendor)
 	}
-	quota, errQuota := quotaProvider.Quota(ctx, job.credential)
-	if errQuota != nil && isAuthExpired(errQuota) {
-		// 凭证过期类错误：先保活刷新一次再重试。MiniMax 的 access token 只有
-		// 1 小时有效期，不刷新的话额度列会一直挂着 401，用户只能自己想到去点
-		// 「一键保活」——那条路还要求他先认出这是凭证问题。
-		if refreshed := s.refreshedCredential(ctx, "", job); refreshed != nil {
-			quota, errQuota = quotaProvider.Quota(ctx, refreshed)
-		}
-	}
-	return quota, errQuota
+	return core.QueryWithRetry(ctx,
+		func(credential *core.Credential) (*pluginapi.QuotaFetchResponse, error) {
+			return quotaProvider.Quota(ctx, credential)
+		},
+		job.credential,
+		func() *core.Credential {
+			return s.refreshedCredential(ctx, "", job.entry, job.vendor)
+		},
+	)
 }
 
-// isAuthExpired 判断错误是否属于「凭证已过期/失效」类（401）。
+// refreshedCredential 在额度查询遇到 401 时保活刷新一次凭证。
 //
-// 只认 401：403/404 往往意味着账号没这个权限或上游改版，刷新不会变好，
-// 盲目刷新只会白白多打一次上游。
-func isAuthExpired(err error) bool {
-	var failure *core.Failure
-	if errors.As(err, &failure) {
-		return failure.Kind == core.FailureKindCredential || failure.HTTPStatus() == http.StatusUnauthorized
-	}
-	var pluginErr *core.PluginError
-	if errors.As(err, &pluginErr) {
-		return pluginErr.HTTPStatus == http.StatusUnauthorized
-	}
-	return false
-}
-
-// refreshedCredential 对单个账号跑一次保活，并返回刷新后的凭证。
-//
-// 复用保活那条既有通道（它负责刷新 + 写盘 + 热更新宿主），额度查询因此不需要
-// 自己再造一套刷新逻辑。保活失败或账号消失时返回 nil，由调用方按原错误上报。
-func (s *Service) refreshedCredential(ctx context.Context, callbackID string, target quotaJob) *core.Credential {
-	authID := core.FirstNonEmpty(target.entry.ID, target.entry.Name)
-	if authID == "" {
+// 与宿主额度路由（app.refreshedQuotaCredential）同源，实现见
+// accountpkg.RefreshCredential；刷新失败返回 nil，调用方保留原 401 如实上报。
+func (s *Service) refreshedCredential(ctx context.Context, callbackID string, entry core.HostAuth, vendor core.Vendor) *core.Credential {
+	if vendor == nil {
 		return nil
 	}
-	s.tasks.Keepalive(ctx, callbackID, []string{authID}, 1)
-
-	loaded, _ := s.pool.Load(ctx, callbackID, accountpkg.Options{
-		Targets:       []string{authID},
-		EnabledRealms: s.deps.Config().EnabledRealms,
-	})
-	for _, account := range loaded {
-		if account.Vendor.ID() == target.vendor.ID() {
-			return account.Credential
-		}
-	}
-	return nil
+	authID := core.FirstNonEmpty(entry.ID, entry.Name)
+	return accountpkg.RefreshCredential(ctx, s.pool, callbackID, authID, vendor.ID(), s.deps.Config().EnabledRealms,
+		func() { s.tasks.Keepalive(ctx, callbackID, []string{authID}, 1) })
 }

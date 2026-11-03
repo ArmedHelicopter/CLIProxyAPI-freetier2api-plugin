@@ -1,8 +1,8 @@
 package trae
 
-// 本文件把 Trae 国内版、Trae 国际版与 TRAE SOLO 适配成 core.Vendor。
+// 本文件把 Trae 国内版与 Trae 国际版适配成 core.Vendor。
 //
-// 三个实例共享同一套协议实现，差异由 Config/profile 描述。
+// 两个实例共享同一套协议实现，差异由 Config/profile 描述。
 
 import (
 	"context"
@@ -19,12 +19,16 @@ type adapter struct {
 	// config 是构造期的 profile，只读。
 	config Config
 	// ideVersion 是 IDE 版本号的配置覆盖；空串表示沿用 config 的编译期默认值。
-	// 三个实例的版本线互不相同（CN 3.3.x / global 3.3.x / SOLO 0.1.x），
-	// 所以配置键按实例 ID 区分（见 Configure），不能共用族级键。
+	// 两个实例的版本线不同（CN / global 各自是 3.3.x），所以配置键按实例 ID 区分
+	// （见 Configure），不能共用族级键。
 	ideVersionMu   sync.RWMutex
 	ideVersion     string
 	ideVersionCode string
 	sessions       *SessionStore
+	// catalog 是模型目录缓存（按账号），随实例隔离。
+	catalog catalogCache
+	// credits 缓存最近一轮目录探测的倍率表（官方模型 ID → 展示文案）。
+	credits core.CreditTable
 }
 
 // profile 返回当前 profile 快照（编译期 profile + 运行期版本覆盖）。
@@ -54,6 +58,11 @@ func Instances(env core.Env) []core.Vendor {
 	return out
 }
 
+// newInstance 构造一个 region 实例。
+//
+// profile 的完整性（额度端点、主机、版本号）由 ConfigFor 统一保证，并由
+// TestAllConfigsAreComplete 在测试期锁住——构造函数里不留 panic：供应商构造
+// 失败会把整个插件启动打挂，代价远高于一个可测的静态断言。
 func newInstance(env core.Env, cfg Config, sessions *SessionStore) core.Vendor {
 	return &adapter{
 		NativeAdapter: core.NewNativeAdapter(core.NativeSpec[*Credential]{
@@ -72,10 +81,7 @@ func newInstance(env core.Env, cfg Config, sessions *SessionStore) core.Vendor {
 				label := native.Label
 				if label == "" {
 					prefix := "TraeCN-"
-					switch {
-					case cfg.Solo:
-						prefix = "TRAESOLO-"
-					case cfg.Region == RegionGlobal:
+					if cfg.Region == RegionGlobal {
 						prefix = "TraeGlobal-"
 					}
 					if native.Nickname != "" {
@@ -141,14 +147,21 @@ func (v *adapter) StaticModels(ctx context.Context) ([]pluginapi.ModelInfo, erro
 	if !okCred || cred == nil {
 		return nil, fmt.Errorf("trae: 无可用凭证，无法拉取模型目录")
 	}
-	models, errModels := FetchModels(ctx, cred, v.profile())
+	models, errModels := v.catalog.fetchModels(ctx, cred, v.profile())
 	if errModels != nil {
 		return nil, errModels
 	}
-	return modelsToPluginAPI(models), nil
+	return v.modelsToPluginAPI(models), nil
 }
 
-func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
+// modelsToPluginAPI 把上游模型条目转成宿主契约类型，顺带记下倍率表。
+//
+// 倍率与清单必须出自同一轮探测：分开取会出现「模型换了一批、倍率还是
+// 上一批」的错配。
+func (v *adapter) modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
+	core.FillCredits(&v.credits, models,
+		func(model Model) string { return model.ID },
+		func(model Model) string { return model.Credits })
 	return core.ConvertModels(models, func(model Model) (core.ModelDescriptor, bool) {
 		if strings.TrimSpace(model.ID) == "" {
 			return core.ModelDescriptor{}, false
@@ -165,6 +178,11 @@ func modelsToPluginAPI(models []Model) []pluginapi.ModelInfo {
 	})
 }
 
+// ModelCredits 实现 core.CreditsProvider：返回「官方模型 ID → 计费倍率」。
+func (v *adapter) ModelCredits() map[string]string {
+	return v.credits.Snapshot()
+}
+
 // ---- 执行 ----
 
 func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.ExecuteRequest) (*pluginapi.ExecutorResponse, error) {
@@ -177,6 +195,7 @@ func (v *adapter) Execute(ctx context.Context, cred *core.Credential, req *core.
 		Profile:    v.profile(),
 		Body:       req.Payload,
 		Stream:     false,
+		catalog:    &v.catalog,
 	})
 	if errChat != nil {
 		return nil, core.ToPluginError(errChat)
@@ -197,6 +216,7 @@ func (v *adapter) ExecuteStream(ctx context.Context, cred *core.Credential, req 
 		Profile:    v.profile(),
 		Body:       req.Payload,
 		Stream:     true,
+		catalog:    &v.catalog,
 	}, sink.Emit)
 }
 
@@ -257,3 +277,162 @@ func (v *adapter) SubmitCallback(ctx context.Context, state, rawURL string) (*co
 }
 
 func (v *adapter) SupportsCheckin() bool { return SupportsCheckin(v.profile()) }
+
+// ---- 任务族 ----
+
+// TaskKindUG 是「活动福利领取」任务族。
+//
+// 族名不带供应商前缀：相邻 vendor 的族名都是 dailybonus / travel 这种，宿主
+// 的排程键也按族名保存，两套命名口径会让配置看起来像两种东西。
+const TaskKindUG = "ug"
+
+// TaskSpecs 声明 Trae 家族自己的任务族。
+//
+// 只声明活动福利这一个族，且刻意不给 DefaultHours：2 个入口都是活动期才开的
+// 领奖口，不是每天都有东西可领，默认排程只会每天白打 2 次空请求。需要时在
+// 控制台手动触发（或自己加排程）。国际版没有这套活动，故不声明。
+func (v *adapter) TaskSpecs() []core.TaskSpec {
+	if !v.SupportsCheckin() {
+		return nil
+	}
+	return []core.TaskSpec{{
+		Kind:        TaskKindUG,
+		Label:       "活动福利领取",
+		Description: "领取 Trae 国内版活动福利：活动中心（竞赛、作品、新用户等）与分享裂变积分",
+		// Route 让控制台按 ManualSpecs 自动出现手动触发入口：宿主只注册带
+		// Route 的手动族（admin 里 Route 为空直接跳过），少了它这个「手动族」
+		// 就只能靠手改排程配置触发。
+		Route:  "/ug/claim",
+		Manual: true,
+	}}
+}
+
+// RunScheduled 执行本供应商声明的任务族。
+func (v *adapter) RunScheduled(ctx context.Context, cred *core.Credential, kind string) (string, error) {
+	if kind != TaskKindUG {
+		// 宿主的排程是全局的，别家的族走到这里说明宿主没过滤干净；按「无实现」返回。
+		return "", fmt.Errorf("trae: 不支持的任务族 %q", kind)
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return "", errNative
+	}
+	results, errClaim := ClaimUG(ctx, native, v.profile())
+	if errClaim != nil {
+		if len(results) > 0 {
+			// 部分成功：把已拿到的结果一并带出，别让一次取消/凭证问题抹掉战果。
+			return SummarizeUG(results), core.ToPluginError(errClaim)
+		}
+		return "", core.ToPluginError(errClaim)
+	}
+	return SummarizeUG(results), nil
+}
+
+// AutoTaskCodeUG 是一键任务里「活动福利」那一行的任务码。
+const AutoTaskCodeUG = "(活动福利)"
+
+// RunTask 执行单条任务。trae 只有两类可自动执行的动作：签到与活动福利，
+// 其余任务码一律按「该供应商没有这条任务」返回，避免静默成功。
+func (v *adapter) RunTask(ctx context.Context, cred *core.Credential, code string) (core.TaskRunResult, error) {
+	switch strings.TrimSpace(code) {
+	case core.AutoTaskCodeCheckin:
+		row := core.CheckinAutoTask(ctx, v, cred)
+		if row == nil {
+			return core.TaskRunResult{Status: "skipped", Message: "该账号不支持签到"}, nil
+		}
+		return core.TaskRunResult{Status: row.Status, Message: row.Message}, nil
+	case AutoTaskCodeUG:
+		native, errNative := v.Native(cred)
+		if errNative != nil {
+			return core.TaskRunResult{}, errNative
+		}
+		ugResults, errClaim := ClaimUG(ctx, native, v.profile())
+		status, message := summarizeUGForAutoTask(ugResults)
+		if errClaim != nil {
+			return core.TaskRunResult{Status: status, Message: message}, errClaim
+		}
+		return core.TaskRunResult{Status: status, Message: message}, nil
+	default:
+		return core.TaskRunResult{Status: "skipped", Message: "该供应商没有这条任务"}, nil
+	}
+}
+
+// RunAllTasks 执行一键任务：先签到，再领取活动中心/裂变/比赛的活动奖励。
+//
+// trae 的活动福利全部挂在 UG 端点上（活动总览、邀请码裂变、比赛领取），
+// 与定时排程的 ug 族是同一套调用，这里只是把它接进一键任务，让用户不用
+// 等排程也能立刻把能领的领掉。领取本身幂等：已领过的返回「此前已领取」。
+func (v *adapter) RunAllTasks(ctx context.Context, cred *core.Credential) []core.AutoTaskResult {
+	results := make([]core.AutoTaskResult, 0, 2)
+	if row := core.CheckinAutoTask(ctx, v, cred); row != nil {
+		results = append(results, *row)
+	}
+	native, errNative := v.Native(cred)
+	if errNative != nil {
+		return append(results, core.AutoTaskResult{
+			Code:    AutoTaskCodeUG,
+			Status:  "error",
+			Message: core.ToPluginError(errNative).Error(),
+		})
+	}
+	ugResults, errClaim := ClaimUG(ctx, native, v.profile())
+	status, message := summarizeUGForAutoTask(ugResults)
+	if errClaim != nil {
+		if len(ugResults) == 0 {
+			return append(results, core.AutoTaskResult{
+				Code:    AutoTaskCodeUG,
+				Status:  "error",
+				Message: core.ToPluginError(errClaim).Error(),
+			})
+		}
+		// 部分成功：已拿到的战果照常展示，只把错误附在后面。
+		message = message + "；" + core.ToPluginError(errClaim).Error()
+	}
+	return append(results, core.AutoTaskResult{
+		Code:    AutoTaskCodeUG,
+		Status:  status,
+		Message: message,
+	})
+}
+
+// summarizeUGForAutoTask 把逐条 UG 结果压成一行：领取数量决定状态，
+// 明细交给 SummarizeUG（它已经处理了「有信息量的不可领项」的取舍）。
+func summarizeUGForAutoTask(results []UGResult) (string, string) {
+	if len(results) == 0 {
+		return "skipped", "没有可领取的活动入口"
+	}
+	var claimed, already, failed int
+	for _, result := range results {
+		switch result.Status {
+		case UGClaimed:
+			claimed++
+		case UGAlready:
+			already++
+		case UGFailed:
+			failed++
+		}
+	}
+	switch {
+	case claimed > 0:
+		return "done", SummarizeUG(results)
+	case failed > 0 && already == 0:
+		return "error", SummarizeUG(results)
+	default:
+		return "skipped", SummarizeUG(results)
+	}
+}
+
+// 编译期断言：适配器实际具备的供应商能力。
+var (
+	_ core.Vendor              = (*adapter)(nil)
+	_ core.CallbackSubmitter   = (*adapter)(nil)
+	_ core.CheckinProvider     = (*adapter)(nil)
+	_ core.Configurable        = (*adapter)(nil)
+	_ core.LoginProvider       = (*adapter)(nil)
+	_ core.LoginSessionOwner   = (*adapter)(nil)
+	_ core.QuotaProvider       = (*adapter)(nil)
+	_ core.CreditsProvider     = (*adapter)(nil)
+	_ core.TaskCatalogProvider = (*adapter)(nil)
+	_ core.ScheduledRunner     = (*adapter)(nil)
+	_ core.TaskRunner          = (*adapter)(nil)
+)

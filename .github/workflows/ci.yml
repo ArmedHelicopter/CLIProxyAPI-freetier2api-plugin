@@ -1,6 +1,7 @@
 name: CI
 
-# main 分支与 PR 上跑测试 + 构建；打 v* tag 时额外发布 Release（含各平台动态库）。
+# main 分支提交与 PR 仅运行轻量测试门禁（ubuntu 单机环境，1~2 分钟）；
+# 打 v* tag（或手动 workflow_dispatch）时额外触发 5 平台多架构编译，并在 tag 时发布 Release。
 on:
   push:
     branches: [main]
@@ -54,21 +55,24 @@ jobs:
       - name: 编译 live 探针
         run: go test -tags live ./tests/live -run '^$' -count=1
 
+      - name: 校验 c-shared 编译
+        run: go build -buildmode=c-shared -o /dev/null .
+
   build:
     name: 构建 ${{ matrix.goos }}/${{ matrix.goarch }}
     needs: test
+    # 仅在推送 v* tag 或手动触发时才执行多平台重型构建，避免日常 PR/commit 消耗 Windows runner 配额
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
     runs-on: ${{ matrix.os }}
-    # darwin/amd64 与 windows/amd64 属于尽力而为的平台：失败不阻塞其他平台出产物与 Release。
-    continue-on-error: ${{ matrix.experimental }}
+    # 三个平台全部是必选：任一失败即不发版（不再有「尽力而为」的档位）。
+    # macOS 已下线（GitHub 跑位抢占不可控，v0.1.40/v0.1.41 因此卡过发版）。
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { os: ubuntu-latest,  goos: linux,   goarch: amd64, ext: so,    cc: gcc,                   experimental: false }
-          - { os: ubuntu-latest,  goos: linux,   goarch: arm64, ext: so,    cc: aarch64-linux-gnu-gcc, experimental: false }
-          - { os: macos-14,       goos: darwin,  goarch: arm64, ext: dylib, cc: clang,                 experimental: false }
-          - { os: macos-14,       goos: darwin,  goarch: amd64, ext: dylib, cc: 'clang -arch x86_64', experimental: true }
-          - { os: windows-latest, goos: windows, goarch: amd64, ext: dll,   cc: gcc,                   experimental: true }
+          - { os: ubuntu-latest,  goos: linux,   goarch: amd64, ext: so,    cc: gcc }
+          - { os: ubuntu-latest,  goos: linux,   goarch: arm64, ext: so,    cc: aarch64-linux-gnu-gcc }
+          - { os: windows-latest, goos: windows, goarch: amd64, ext: dll,   cc: gcc }
     steps:
       - uses: actions/checkout@v4
 
@@ -102,7 +106,7 @@ jobs:
           mkdir -p dist
           go build -buildmode=c-shared -trimpath \
             -ldflags "-s -w -X main.pluginVersion=${VERSION}" \
-            -o "dist/freetier2api-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}" .
+            -o "dist/freetier-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}" .
           ls -la dist
 
       # 插件商店安装要求归档名 {id}_{version}_{goos}_{goarch}.zip，
@@ -116,8 +120,8 @@ jobs:
           set -euo pipefail
           # 归档名里的版本号是 tag 去掉前导 v（宿主按同样规则从 tag 推导）。
           go run ./scripts/packstore \
-            -lib "dist/freetier2api-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}" \
-            -id freetier2api \
+            -lib "dist/freetier-${{ matrix.goos }}-${{ matrix.goarch }}.${{ matrix.ext }}" \
+            -id freetier \
             -version "${VERSION_TAG#v}" \
             -goos ${{ matrix.goos }} \
             -goarch ${{ matrix.goarch }} \
@@ -128,14 +132,18 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: startsWith(github.ref, 'refs/tags/v')
         with:
-          name: freetier2api-${{ matrix.goos }}-${{ matrix.goarch }}
-          path: dist/freetier2api_*_${{ matrix.goos }}_${{ matrix.goarch }}.zip
+          name: freetier-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: dist/freetier_*_${{ matrix.goos }}_${{ matrix.goarch }}.zip
           if-no-files-found: error
 
   release:
     name: 发布 Release
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    # always() 不能省：任一平台 runner 被取消（抢不到跑位、排队超时）时 build 的
+    # result 是 cancelled，隐式的 success() 判断会把发版直接 skip 掉，tag 推了却
+    # 什么都没出（v0.1.40 就是这么空的）。真正的失败仍然拦：result 是 failure 时不发。
+    # 缺哪个平台产物由下面的校验步骤兜底。
+    if: always() && startsWith(github.ref, 'refs/tags/v') && needs.build.result != 'failure'
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -151,6 +159,26 @@ jobs:
         with:
           path: assets
           merge-multiple: true
+
+      # 实验性平台可以缺席，必选平台不行：取消/失败都可能在 assets 里留个空目录，
+      # 直接打包会发出一个缺 linux 或缺 Apple Silicon 的 Release。
+      - name: 校验必选平台产物齐全
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          missing=0
+          for goos in linux_amd64 linux_arm64 windows_amd64; do
+            archive="assets/freetier_${version}_${goos}.zip"
+            if [ ! -f "$archive" ]; then
+              echo "::error::缺少必选产物 $archive"
+              missing=1
+            fi
+          done
+          ls -la assets
+          exit "$missing"
 
       - uses: actions/setup-go@v5
         with:
@@ -171,32 +199,35 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # actions/checkout 按 commit 检出 tag（fetch-tags 默认 false），本地的
+          # refs/tags/<tag> 是**轻量标签**：%(contents) 只会拿到 commit 标题，
+          # 「本版要点」因此一直是空的（v0.1.18 起就这样）。显式取回注解对象。
+          git fetch --force --no-tags origin "+refs/tags/${TAG}:refs/tags/${TAG}"
+          if [ "$(git cat-file -t "refs/tags/${TAG}")" != "tag" ]; then
+            echo "::warning::${TAG} 不是注解标签，本版要点只会有 commit 标题"
+          fi
           {
-            echo '## 通过 CPA 插件商店安装（推荐）'
+            echo '## 手动安装（当前推荐）'
             echo
-            echo '本插件已收录进 CPA 官方插件源，无需额外配置三方源。'
-            echo '在管理面板的插件商店里直接搜 **FreeTier 2API** 一键安装即可。'
+            echo '插件商店里的 `freetier` 条目仍指向已失效的原仓库，一键安装会失败；'
+            echo '在插件源更新之前，请按下面的方式手动安装。'
             echo
-            echo '## 手动安装'
-            echo
-            echo '下载对应平台的 `freetier2api_<版本>_<goos>_<goarch>.zip`，解压后把其中的'
-            echo '`freetier2api` 动态库放进 CPA 的 `plugins/` 目录。'
-            echo '归档里已经用的是宿主要求的 `freetier2api{ext}` 文件名，解压后无需改名。'
+            echo '下载对应平台的 `freetier_<版本>_<goos>_<goarch>.zip`，解压后把其中的'
+            echo '`freetier` 动态库放进 CPA 的 `plugins/` 目录。'
+            echo '归档里已经用的是宿主要求的 `freetier{ext}` 文件名，解压后无需改名。'
             echo
             echo '| 平台 | 下载归档 |'
             echo '| --- | --- |'
-            echo '| Linux x86_64 | `freetier2api_<版本>_linux_amd64.zip` |'
-            echo '| Linux arm64 | `freetier2api_<版本>_linux_arm64.zip` |'
-            echo '| macOS Apple Silicon | `freetier2api_<版本>_darwin_arm64.zip` |'
-            echo '| macOS Intel | `freetier2api_<版本>_darwin_amd64.zip` |'
-            echo '| Windows x64 | `freetier2api_<版本>_windows_amd64.zip` |'
+            echo '| Linux x86_64 | `freetier_<版本>_linux_amd64.zip` |'
+            echo '| Linux arm64 | `freetier_<版本>_linux_arm64.zip` |'
+            echo '| Windows x64 | `freetier_<版本>_windows_amd64.zip` |'
             echo
             echo '`checksums.txt` 可用于核对归档完整性；配置与账号导入见仓库 README。'
             echo
             echo '## 本版要点'
             echo
-            # tag 注解作为本版要点；首行为空时去掉。
-            git tag -l --format='%(contents)' "$TAG" | sed '1{/^$/d}'
+            # tag 注解作为本版要点；首行为空时去掉（sed 用 -e 拆写，BSD/GNU 都认）。
+            git tag -l --format='%(contents)' "$TAG" | sed -e '1{' -e '/^$/d' -e '}'
           } > release-notes.md
           cat release-notes.md
 

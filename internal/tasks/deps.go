@@ -6,7 +6,6 @@ import (
 	"context"
 	"time"
 
-	"freetier2api-plugin/cpasdk/pluginapi"
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/state"
@@ -20,7 +19,6 @@ type Deps interface {
 	State() state.State
 	MutateState(func(*state.State))
 	Now() time.Time
-	RuntimeFields() []pluginapi.ConfigField
 	// SaveRefreshedCredential 把续期后的凭证写回宿主与磁盘。
 	//
 	// 由组合根实现（内部走 core.StorageMerger → host.auth.save → 落盘）。
