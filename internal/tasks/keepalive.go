@@ -12,11 +12,25 @@ package tasks
 
 import (
 	"context"
+	"errors"
+	"net/http"
+	"strings"
 	"sync"
+	"time"
 
 	"freetier2api-plugin/internal/auth"
 	"freetier2api-plugin/internal/core"
 	"freetier2api-plugin/internal/logger"
+)
+
+const (
+	// expiryKeepaliveInitialDelay 是启动后第一次按过期时间巡检的延迟。
+	expiryKeepaliveInitialDelay = 5 * time.Second
+	// expiryKeepaliveCheckInterval 是短效 OAuth 凭证的巡检周期。
+	// MiniMax access token 只有 1 小时，整点排程盖不住这个窗口。
+	expiryKeepaliveCheckInterval = 5 * time.Minute
+	// expiryKeepaliveLead 是提前续期阈值。
+	expiryKeepaliveLead = 25 * time.Minute
 )
 
 // KeepaliveResult 是一个账号的续期结果（管理端点 JSON 契约的一部分）。
@@ -159,4 +173,102 @@ func (s *Service) keepaliveOne(ctx context.Context, callbackID string, account *
 	}
 	logger.Info("保活 %s：已刷新=%t", label, refreshed)
 	return result
+}
+
+// runExpiryKeepaliveLoop 巡检带 expires_at 的短效 OAuth 凭证，在过期前写回新 token。
+func (s *Service) runExpiryKeepaliveLoop(ctx context.Context) {
+	if !core.SleepContext(ctx, expiryKeepaliveInitialDelay) {
+		return
+	}
+	s.RunExpiryKeepalivePass(ctx)
+	ticker := time.NewTicker(expiryKeepaliveCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.RunExpiryKeepalivePass(ctx)
+		}
+	}
+}
+
+// RunExpiryKeepalivePass 刷新已经过期或进入提前窗口的凭证，返回成功账号数。
+func (s *Service) RunExpiryKeepalivePass(ctx context.Context) int {
+	if s == nil || s.deps == nil || s.deps.Pool() == nil {
+		return 0
+	}
+	now := s.deps.Now()
+	accounts, _ := s.deps.Pool().Load(ctx, "", auth.Options{EnabledRealms: s.deps.Config().EnabledRealms})
+	refreshed := 0
+	for _, item := range accounts {
+		if ctx.Err() != nil {
+			break
+		}
+		if _, ok := core.As[core.Refresher](item.Vendor); !ok {
+			continue
+		}
+		refreshToken := strings.TrimSpace(item.Credential.RefreshTokenValue())
+		expiresAt := item.Credential.ExpiresAtValue()
+		if refreshToken == "" || expiresAt <= 0 || time.Unix(expiresAt, 0).Sub(now) > expiryKeepaliveLead {
+			continue
+		}
+		account := newAccountContext(item)
+		key := account.keepaliveKey()
+		if s.isRejectedRefresh(key, refreshToken) {
+			continue
+		}
+		_, errRefresh := s.RefreshAccount(ctx, "", account)
+		if errRefresh == nil {
+			s.clearRejectedRefresh(key)
+			refreshed++
+		} else if isPermanentRefreshRejection(errRefresh) {
+			s.markRejectedRefresh(key, refreshToken)
+		}
+		if !core.SleepContext(ctx, accountGap) {
+			break
+		}
+	}
+	return refreshed
+}
+
+func (a *accountContext) keepaliveKey() string {
+	return a.vendor.ID() + ":" + core.FirstNonEmpty(a.uid(), a.entry.ID, a.entry.Name)
+}
+
+func (s *Service) isRejectedRefresh(key, refreshToken string) bool {
+	s.keepaliveMu.Lock()
+	defer s.keepaliveMu.Unlock()
+	return key != "" && s.rejectedRefresh[key] == refreshToken
+}
+
+func (s *Service) markRejectedRefresh(key, refreshToken string) {
+	if key == "" || refreshToken == "" {
+		return
+	}
+	s.keepaliveMu.Lock()
+	defer s.keepaliveMu.Unlock()
+	if s.rejectedRefresh == nil {
+		s.rejectedRefresh = map[string]string{}
+	}
+	s.rejectedRefresh[key] = refreshToken
+}
+
+func (s *Service) clearRejectedRefresh(key string) {
+	s.keepaliveMu.Lock()
+	defer s.keepaliveMu.Unlock()
+	delete(s.rejectedRefresh, key)
+}
+
+func isPermanentRefreshRejection(err error) bool {
+	var upstream core.UpstreamError
+	if errors.As(err, &upstream) && !upstream.Retryable() {
+		return upstream.HTTPStatus() == http.StatusUnauthorized || upstream.HTTPStatus() == http.StatusForbidden
+	}
+	var pluginErr *core.PluginError
+	if errors.As(err, &pluginErr) && !pluginErr.Retryable {
+		return pluginErr.HTTPStatus == http.StatusUnauthorized || pluginErr.HTTPStatus == http.StatusForbidden
+	}
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "重新授权") || strings.Contains(message, "invalid_grant") || strings.Contains(message, "revoked")
 }
