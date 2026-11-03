@@ -117,9 +117,33 @@ func buildAuthDataFor(vendor core.Vendor, credential *core.Credential, fileName 
 		StorageJSON: storage,
 		Metadata:    credentialMetadata(credential, vendor.ID()),
 		Attributes:  credentialAttributes(credential, vendor.ID()),
-		// 让宿主在启动后不久就驱动一次刷新校验。
-		NextRefreshAfter: time.Now().Add(authRefreshInterval),
+		// 已过期或临近过期的凭证立即排程，其余按固定周期。
+		NextRefreshAfter: nextRefreshAfterFor(credential, time.Now()),
 	}, nil
+}
+
+// nextRefreshAfterFor 计算宿主下一次自动刷新校验的时间。
+//
+// freetier 在宿主里没有内建 RefreshLead。凭证若带 expires_at，且已经过期
+// 或距过期不足一个刷新周期，就返回当前时刻，避免启动后继续拿着过期 token
+// 空等一个完整周期。
+func nextRefreshAfterFor(credential *core.Credential, now time.Time) time.Time {
+	next := now.Add(authRefreshInterval)
+	if credential == nil || credential.RefreshTokenValue() == "" {
+		return next
+	}
+	expiresAt := credential.ExpiresAtValue()
+	if expiresAt <= 0 {
+		return next
+	}
+	due := time.Unix(expiresAt, 0).Add(-authRefreshInterval)
+	if !due.After(now) {
+		return now
+	}
+	if due.Before(next) {
+		return due
+	}
+	return next
 }
 
 // ensureVendorField 保证凭证 JSON 里带 vendor 字段。
@@ -165,6 +189,10 @@ func credentialMetadata(credential *core.Credential, vendorID string) map[string
 	if refreshToken := credential.RefreshTokenValue(); refreshToken != "" {
 		metadata["refresh_token"] = refreshToken
 		metadata["auth_mode"] = "oauth"
+		// 宿主自动刷新循环在 NextRefreshAfter 到期后，只对声明了该字段的
+		// 无内建 RefreshLead 凭证继续排程。缺了它，freetier 会在第一次到期后
+		// 被移出自动刷新队列。
+		metadata["refresh_interval_seconds"] = int(authRefreshInterval / time.Second)
 	}
 	if expiresAt := credential.ExpiresAtValue(); expiresAt > 0 {
 		metadata["expires_at"] = expiresAt
@@ -249,9 +277,11 @@ func (a *App) handleAuthRefresh(request []byte) ([]byte, error) {
 	if errData != nil {
 		return nil, errData
 	}
+	nextRefresh := nextRefreshAfterFor(updated, time.Now())
+	auth.NextRefreshAfter = nextRefresh
 	return core.OKEnvelope(pluginapi.AuthRefreshResponse{
 		Auth:             auth,
-		NextRefreshAfter: time.Now().Add(authRefreshInterval),
+		NextRefreshAfter: nextRefresh,
 	})
 }
 

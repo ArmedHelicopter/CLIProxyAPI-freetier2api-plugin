@@ -3,6 +3,7 @@ package tests
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"freetier2api-plugin/cpasdk/pluginabi"
 	"freetier2api-plugin/cpasdk/pluginapi"
@@ -163,6 +164,12 @@ func TestAuthParsePutsRefreshTokenInMetadata(t *testing.T) {
 	}
 	if response.Auth.Metadata["refresh_token"] == nil {
 		t.Fatal("metadata.refresh_token is required for host-driven refresh")
+	}
+	if response.Auth.Metadata["refresh_interval_seconds"] != float64(1800) {
+		t.Fatalf("metadata.refresh_interval_seconds = %v, want 1800", response.Auth.Metadata["refresh_interval_seconds"])
+	}
+	if response.Auth.NextRefreshAfter.IsZero() || response.Auth.NextRefreshAfter.After(time.Now().Add(31*time.Minute)) {
+		t.Fatalf("NextRefreshAfter = %v, want within one refresh interval", response.Auth.NextRefreshAfter)
 	}
 	if response.Auth.Metadata["realm"] != "cn" {
 		t.Fatalf("metadata.realm = %v, want cn", response.Auth.Metadata["realm"])
