@@ -356,3 +356,37 @@ func TestChatStreamEndToEndPlainMessageFallback(t *testing.T) {
 		t.Fatalf("content want final answer only, got %q", got)
 	}
 }
+
+func TestChatStreamEmitsUsageForHostAccounting(t *testing.T) {
+	var body strings.Builder
+	body.WriteString(sseFrame(map[string]any{"agent_message_chunk": map[string]any{"reasoning_content": "先推理", "msg_content": "回答"}}))
+	body.WriteString("data: [DONE]\n\n")
+	installFakeUpstream(t, body.String())
+	payload, _ := json.Marshal(map[string]any{"model": "minimax-m3-thinking", "messages": []any{map[string]any{"role": "user", "content": "问题"}}, "stream": true})
+	var usage map[string]any
+	trailing := false
+	errStream := minimaxcode.ChatStream(context.Background(), fakeLiveCredential(), &core.ExecuteRequest{Payload: payload}, "", func(chunk []byte) error {
+		var frame struct {
+			Choices []any          `json:"choices"`
+			Usage   map[string]any `json:"usage"`
+		}
+		if err := json.Unmarshal(chunk, &frame); err != nil {
+			return err
+		}
+		if len(frame.Usage) > 0 {
+			usage = frame.Usage
+			trailing = len(frame.Choices) == 0
+		}
+		return nil
+	})
+	if errStream != nil {
+		t.Fatal(errStream)
+	}
+	if !trailing || usage["prompt_tokens"].(float64) <= 0 || usage["completion_tokens"].(float64) <= 0 {
+		t.Fatalf("usage = %+v trailing=%v", usage, trailing)
+	}
+	details := usage["completion_tokens_details"].(map[string]any)
+	if details["reasoning_tokens"].(float64) <= 0 {
+		t.Fatalf("reasoning usage = %+v", usage)
+	}
+}
