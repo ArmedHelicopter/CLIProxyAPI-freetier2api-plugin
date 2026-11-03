@@ -61,6 +61,7 @@ type frameAggregator struct {
 	promptTokens             int
 	completionTokens         int
 	reasoningTokens          int
+	nativeCalls              []ToolCall
 	finishReason             string
 	err                      string
 }
@@ -78,6 +79,7 @@ func (a *frameAggregator) add(payload map[string]any) {
 	}
 	a.observeUsage(payload)
 
+	a.observeNativeToolCalls(payload)
 	chunkNode, hasChunk := payload["agent_message_chunk"].(map[string]any)
 	msgNode, hasMsg := payload["agent_message"].(map[string]any)
 
@@ -137,6 +139,49 @@ func (a *frameAggregator) errorText() string {
 		return a.err
 	}
 	return ""
+}
+
+func (a *frameAggregator) observeNativeToolCalls(payload map[string]any) {
+	for _, node := range []any{payload, payload["agent_message_chunk"], payload["agent_message"]} {
+		object, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
+		rawCalls, ok := object["tool_calls"].([]any)
+		if !ok {
+			continue
+		}
+		for _, raw := range rawCalls {
+			call, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			status := int(core.GetInt64(call, "tool_call_status"))
+			if status != 0 && status != 2 && status != 5 {
+				continue
+			}
+			name := core.GetString(call, "tool_name", "name")
+			if name == "" {
+				continue
+			}
+			id := core.GetString(call, "tool_call_id", "id")
+			args := core.GetString(call, "tool_call_args", "arguments")
+			if args == "" {
+				args = "{}"
+			}
+			replaced := false
+			for index := range a.nativeCalls {
+				if id != "" && a.nativeCalls[index].ID == id {
+					a.nativeCalls[index] = ToolCall{ID: id, Name: name, Arguments: args}
+					replaced = true
+					break
+				}
+			}
+			if !replaced {
+				a.nativeCalls = append(a.nativeCalls, ToolCall{ID: id, Name: name, Arguments: args})
+			}
+		}
+	}
 }
 
 func (a *frameAggregator) observeUsage(payload map[string]any) {
@@ -337,7 +382,9 @@ func chat(ctx context.Context, cred *Credential, req *core.ExecuteRequest, baseU
 
 	contentStr, reasoningStr := agg.finalize()
 	var calls []ToolCall
-	if toolsEnabled {
+	if len(agg.nativeCalls) > 0 {
+		calls = agg.nativeCalls
+	} else if toolsEnabled {
 		contentStr, calls = parseToolCalls(contentStr)
 	}
 	if contentStr == "" && reasoningStr == "" && len(calls) == 0 {
@@ -487,7 +534,10 @@ func chatStream(ctx context.Context, cred *Credential, req *core.ExecuteRequest,
 
 	// 没有任何 chunk 增量时，完整消息就是回复正文（错误检测已在 add 内触发）。
 	var calls []ToolCall
-	if !agg.hasChunkContent() {
+	if len(agg.nativeCalls) > 0 {
+		calls = agg.nativeCalls
+	}
+	if len(calls) == 0 && !agg.hasChunkContent() {
 		finalText, _ := agg.finalize()
 		if finalText != "" {
 			if toolsEnabled {
@@ -512,35 +562,35 @@ func chatStream(ctx context.Context, cred *Credential, req *core.ExecuteRequest,
 		}
 	}
 
-	if toolsEnabled {
+	if len(calls) == 0 && toolsEnabled {
 		rest, parsedCalls := parser.flush()
 		if errEmit := emitContent(rest); errEmit != nil {
 			return errEmit
 		}
 		calls = parsedCalls
-		for i, call := range calls {
-			id := call.ID
-			if id == "" {
-				id = fmt.Sprintf("call_%s", RandomUUID()[:8])
-			}
-			// 一次性发出完整调用：宿主按 index 累加 arguments，
-			// 分多帧发送会造成重复拼接。
-			errEmit := emitDelta(map[string]any{
-				"tool_calls": []any{
-					map[string]any{
-						"index": i,
-						"id":    id,
-						"type":  "function",
-						"function": map[string]any{
-							"name":      call.Name,
-							"arguments": call.Arguments,
-						},
+	}
+	for i, call := range calls {
+		id := call.ID
+		if id == "" {
+			id = fmt.Sprintf("call_%s", RandomUUID()[:8])
+		}
+		// 一次性发出完整调用：宿主按 index 累加 arguments，
+		// 分多帧发送会造成重复拼接。
+		errEmit := emitDelta(map[string]any{
+			"tool_calls": []any{
+				map[string]any{
+					"index": i,
+					"id":    id,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      call.Name,
+						"arguments": call.Arguments,
 					},
 				},
-			})
-			if errEmit != nil {
-				return errEmit
-			}
+			},
+		})
+		if errEmit != nil {
+			return errEmit
 		}
 	}
 
@@ -609,6 +659,12 @@ func doMessageRequest(ctx context.Context, cred *Credential, req *core.ExecuteRe
 		"turn_id":      RandomUUID(),
 		"worktreeMode": false,
 	}
+	if nativeTools := nativeToolDefinitions(cp.Tools); len(nativeTools) > 0 {
+		bodyMap["tools"] = nativeTools
+	}
+	if attachments := imageAttachments(cp.Messages); len(attachments) > 0 {
+		bodyMap["attachments"] = attachments
+	}
 	if modelCfg.UpstreamModel != "" {
 		sel := map[string]any{
 			"model_id":    modelCfg.UpstreamModel,
@@ -643,6 +699,105 @@ func doMessageRequest(ctx context.Context, cred *Credential, req *core.ExecuteRe
 	}
 
 	return resp.Body, modelCfg.ID, promptTokens, nil
+}
+
+func nativeToolDefinitions(tools []any) []map[string]any {
+	out := make([]map[string]any, 0, len(tools))
+	for _, item := range tools {
+		object, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		function, _ := object["function"].(map[string]any)
+		if function == nil {
+			function = object
+		}
+		name := strings.TrimSpace(core.GetString(function, "name"))
+		if name == "" {
+			continue
+		}
+		entry := map[string]any{"name": name}
+		if description := core.GetString(function, "description"); description != "" {
+			entry["description"] = description
+		}
+		if parameters, ok := function["parameters"]; ok && parameters != nil {
+			entry["parameters"] = parameters
+		}
+		out = append(out, entry)
+	}
+	return out
+}
+
+func imageAttachments(messages []any) []map[string]any {
+	var out []map[string]any
+	for _, message := range messages {
+		object, ok := message.(map[string]any)
+		if !ok {
+			continue
+		}
+		parts, ok := object["content"].([]any)
+		if !ok {
+			continue
+		}
+		for _, part := range parts {
+			partObject, ok := part.(map[string]any)
+			if !ok || (partObject["type"] != "image_url" && partObject["type"] != "input_image") {
+				continue
+			}
+			url := ""
+			switch image := partObject["image_url"].(type) {
+			case string:
+				url = image
+			case map[string]any:
+				url = core.GetString(image, "url")
+			}
+			if url == "" {
+				continue
+			}
+			attachment := map[string]any{
+				"type": "image", "file_name": imageFileName(url), "mime_type": imageMIME(url),
+			}
+			if strings.HasPrefix(url, "data:") {
+				attachment["data_url"] = url
+			} else if strings.HasPrefix(url, "http://") || strings.HasPrefix(url, "https://") {
+				attachment["url"] = url
+			} else {
+				attachment["file_path"] = url
+			}
+			out = append(out, attachment)
+		}
+	}
+	return out
+}
+
+func imageFileName(url string) string {
+	if strings.HasPrefix(url, "data:") {
+		return "image." + strings.TrimPrefix(strings.TrimPrefix(imageMIME(url), "image/"), "jpeg")
+	}
+	name := url
+	if index := strings.LastIndexAny(name, `/\`); index >= 0 {
+		name = name[index+1:]
+	}
+	if query := strings.IndexAny(name, "?#"); query >= 0 {
+		name = name[:query]
+	}
+	if strings.TrimSpace(name) == "" {
+		return "image.png"
+	}
+	return name
+}
+
+func imageMIME(url string) string {
+	switch {
+	case strings.HasPrefix(url, "data:image/jpeg"), strings.Contains(strings.ToLower(url), ".jpg"), strings.Contains(strings.ToLower(url), ".jpeg"):
+		return "image/jpeg"
+	case strings.HasPrefix(url, "data:image/webp"), strings.Contains(strings.ToLower(url), ".webp"):
+		return "image/webp"
+	case strings.HasPrefix(url, "data:image/gif"), strings.Contains(strings.ToLower(url), ".gif"):
+		return "image/gif"
+	default:
+		return "image/png"
+	}
 }
 
 func extractUpstreamError(payload map[string]any) string {
